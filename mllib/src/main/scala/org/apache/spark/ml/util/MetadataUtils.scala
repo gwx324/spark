@@ -20,7 +20,8 @@ package org.apache.spark.ml.util
 import scala.collection.immutable.HashMap
 
 import org.apache.spark.ml.attribute._
-import org.apache.spark.ml.linalg.VectorUDT
+import org.apache.spark.ml.linalg.{Vector, VectorUDT}
+import org.apache.spark.sql.Dataset
 import org.apache.spark.sql.types.StructField
 
 
@@ -42,13 +43,42 @@ private[spark] object MetadataUtils {
   }
 
   /**
+   * Obtain the number of features in a vector column.
+   * If no metadata is available, extract it from the dataset.
+   */
+  def getNumFeatures(dataset: Dataset[_], vectorCol: String): Int = {
+    getNumFeatures(dataset.schema(vectorCol)).getOrElse {
+      dataset.select(DatasetUtils.columnToVector(dataset, vectorCol))
+        .head.getAs[Vector](0).size
+    }
+  }
+
+  /**
+   * Examine a schema to identify the number of features in a vector column.
+   * Returns None if the number of features is not specified.
+   */
+  def getNumFeatures(vectorSchema: StructField): Option[Int] = {
+    if (vectorSchema.dataType == new VectorUDT) {
+      val group = AttributeGroup.fromStructField(vectorSchema)
+      val size = group.size
+      if (size >= 0) {
+        Some(size)
+      } else {
+        None
+      }
+    } else {
+      None
+    }
+  }
+
+  /**
    * Examine a schema to identify categorical (Binary and Nominal) features.
    *
    * @param featuresSchema  Schema of the features column.
    *                        If a feature does not have metadata, it is assumed to be continuous.
    *                        If a feature is Nominal, then it must have the number of values
    *                        specified.
-   * @return  Map: feature index --> number of categories.
+   * @return  Map: feature index to number of categories.
    *          The map's set of keys will be the set of categorical feature indices.
    */
   def getCategoricalFeatures(featuresSchema: StructField): Map[Int, Int] = {

@@ -36,7 +36,7 @@ function toggleThreadStackTrace(threadId, forceAdd) {
     if (stackTrace.length == 0) {
         var stackTraceText = $('#' + threadId + "_td_stacktrace").html()
         var threadCell = $("#thread_" + threadId + "_tr")
-        threadCell.after("<tr id=\"" + threadId +"_stacktrace\" class=\"accordion-body\"><td colspan=\"3\"><pre>" +
+        threadCell.after("<tr id=\"" + threadId +"_stacktrace\" class=\"accordion-body\"><td colspan=\"4\"><pre>" +
             stackTraceText +  "</pre></td></tr>")
     } else {
         if (!forceAdd) {
@@ -48,13 +48,13 @@ function toggleThreadStackTrace(threadId, forceAdd) {
 function expandAllThreadStackTrace(toggleButton) {
     $('.accordion-heading').each(function() {
         //get thread ID
-        if (!$(this).hasClass("hidden")) {
+        if (!$(this).hasClass("d-none")) {
             var trId = $(this).attr('id').match(/thread_([0-9]+)_tr/m)[1]
             toggleThreadStackTrace(trId, true)
         }
     })
     if (toggleButton) {
-        $('.expandbutton').toggleClass('hidden')
+        $('.expandbutton').toggleClass('d-none')
     }
 }
 
@@ -63,7 +63,7 @@ function collapseAllThreadStackTrace(toggleButton) {
         $(this).remove()
     })
     if (toggleButton) {
-        $('.expandbutton').toggleClass('hidden');
+        $('.expandbutton').toggleClass('d-none');
     }
 }
 
@@ -73,6 +73,7 @@ function onMouseOverAndOut(threadId) {
     $("#" + threadId + "_td_id").toggleClass("threaddump-td-mouseover");
     $("#" + threadId + "_td_name").toggleClass("threaddump-td-mouseover");
     $("#" + threadId + "_td_state").toggleClass("threaddump-td-mouseover");
+    $("#" + threadId + "_td_locking").toggleClass("threaddump-td-mouseover");
 }
 
 function onSearchStringChange() {
@@ -81,22 +82,22 @@ function onSearchStringChange() {
     collapseAllThreadStackTrace(false)
     if (searchString.length == 0) {
         $('tr').each(function() {
-            $(this).removeClass('hidden')
+            $(this).removeClass('d-none')
         })
     } else {
         $('tr').each(function(){
             if($(this).attr('id') && $(this).attr('id').match(/thread_[0-9]+_tr/) ) {
                 var children = $(this).children()
                 var found = false
-                for (i = 0; i < children.length; i++) {
+                for (var i = 0; i < children.length; i++) {
                     if (children.eq(i).text().toLowerCase().indexOf(searchString) >= 0) {
                         found = true
                     }
                 }
                 if (found) {
-                    $(this).removeClass('hidden')
+                    $(this).removeClass('d-none')
                 } else {
-                    $(this).addClass('hidden')
+                    $(this).addClass('d-none')
                 }
             }
         });

@@ -17,37 +17,48 @@
 
 package org.apache.spark.internal.config
 
-import java.util.{Map => JMap}
+// ====================================================================================
+//                      The guideline for naming configurations
+// ====================================================================================
+/*
+In general, the config name should be a noun that describes its basic purpose. It's
+recommended to add prefix to the config name to make the scope clearer. For example,
+`spark.scheduler.mode` clearly indicates that this config is for the scheduler.
 
-import scala.util.matching.Regex
+A config name can have multiple prefixes that are structured, which is similar to a
+qualified Java class name. Each prefix behaves like a namespace. We should only create
+a namespace if it's meaningful and can be shared by multiple configs. For example,
+`buffer.inMemoryThreshold` is preferred over `buffer.in.memory.threshold`.
 
-import org.apache.spark.SparkConf
+The followings are best practices of naming configs for some common cases:
+1. When adding configs for a big feature, it's better to create an umbrella config that
+   can turn the feature on/off, with a name like `featureName.enabled`. The other configs
+   of this feature should be put under the `featureName` namespace. For example:
+     - spark.sql.cbo.enabled
+     - spark.sql.cbo.starSchemaDetection
+     - spark.sql.cbo.joinReorder.enabled
+     - spark.sql.cbo.joinReorder.dp.threshold
+2. When adding a boolean config, the name should be a verb that describes what
+   happens if this config is set to true, e.g. `spark.shuffle.sort.useRadixSort`.
+3. When adding a config to specify a time duration, it's better to put the time unit
+   in the config name. For example, `featureName.timeoutMs`, which clearly indicates
+   that the time unit is millisecond. The config entry should be created with
+   `ConfigBuilder#timeConf`, to support time strings like `2 minutes`.
+*/
 
 /**
  * An entry contains all meta information for a configuration.
  *
- * Config options created using this feature support variable expansion. If the config value
- * contains variable references of the form "${prefix:variableName}", the reference will be replaced
- * with the value of the variable depending on the prefix. The prefix can be one of:
- *
- * - no prefix: if the config key starts with "spark", looks for the value in the Spark config
- * - system: looks for the value in the system properties
- * - env: looks for the value in the environment
- *
- * So referencing "${spark.master}" will look for the value of "spark.master" in the Spark
- * configuration, while referencing "${env:MASTER}" will read the value from the "MASTER"
- * environment variable.
- *
- * For known Spark configuration keys (i.e. those created using `ConfigBuilder`), references
- * will also consider the default value when it exists.
- *
- * If the reference cannot be resolved, the original string will be retained.
+ * When applying variable substitution to config values, only references starting with "spark." are
+ * considered in the default namespace. For known Spark configuration keys (i.e. those created using
+ * `ConfigBuilder`), references will also consider the default value when it exists.
  *
  * Variable expansion is also applied to the default values of config entries that have a default
  * value declared as a string.
  *
  * @param key the key for the configuration
- * @param defaultValue the default value for the configuration
+ * @param prependedKey the key for the configuration which will be prepended
+ * @param prependSeparator the separator which is used for prepending
  * @param valueConverter how to convert a string to the value. It should throw an exception if the
  *                       string does not have the required format.
  * @param stringConverter how to convert a value to a string that the user can use it as a valid
@@ -57,14 +68,19 @@ import org.apache.spark.SparkConf
  * @param doc the documentation for the configuration
  * @param isPublic if this configuration is public to the user. If it's `false`, this
  *                 configuration is only used internally and we should not expose it to users.
+ * @param version the spark version when the configuration was released.
  * @tparam T the value type
  */
 private[spark] abstract class ConfigEntry[T] (
     val key: String,
+    val prependedKey: Option[String],
+    val prependSeparator: String,
+    val alternatives: List[String],
     val valueConverter: String => T,
     val stringConverter: T => String,
     val doc: String,
-    val isPublic: Boolean) {
+    val isPublic: Boolean,
+    val version: String) {
 
   import ConfigEntry._
 
@@ -72,63 +88,123 @@ private[spark] abstract class ConfigEntry[T] (
 
   def defaultValueString: String
 
-  def readFrom(conf: JMap[String, String], getenv: String => String): T
+  protected def readString(reader: ConfigReader): Option[String] = {
+    val values = Seq(
+      prependedKey.flatMap(reader.get(_)),
+      alternatives.foldLeft(reader.get(key))((res, nextKey) => res.orElse(reader.get(nextKey)))
+    ).flatten
+    if (values.nonEmpty) {
+      Some(values.mkString(prependSeparator))
+    } else {
+      None
+    }
+  }
+
+  def readFrom(reader: ConfigReader): T
 
   def defaultValue: Option[T] = None
 
   override def toString: String = {
-    s"ConfigEntry(key=$key, defaultValue=$defaultValueString, doc=$doc, public=$isPublic)"
+    s"ConfigEntry(key=$key, defaultValue=$defaultValueString, doc=$doc, " +
+      s"public=$isPublic, version=$version)"
   }
-
-  protected def readAndExpand(
-      conf: JMap[String, String],
-      getenv: String => String,
-      usedRefs: Set[String] = Set()): Option[String] = {
-    Option(conf.get(key)).map(expand(_, conf, getenv, usedRefs))
-  }
-
 }
 
 private class ConfigEntryWithDefault[T] (
     key: String,
+    prependedKey: Option[String],
+    prependSeparator: String,
+    alternatives: List[String],
     _defaultValue: T,
     valueConverter: String => T,
     stringConverter: T => String,
     doc: String,
-    isPublic: Boolean)
-    extends ConfigEntry(key, valueConverter, stringConverter, doc, isPublic) {
+    isPublic: Boolean,
+    version: String)
+  extends ConfigEntry(
+    key,
+    prependedKey,
+    prependSeparator,
+    alternatives,
+    valueConverter,
+    stringConverter,
+    doc,
+    isPublic,
+    version
+  ) {
 
   override def defaultValue: Option[T] = Some(_defaultValue)
 
   override def defaultValueString: String = stringConverter(_defaultValue)
 
-  def readFrom(conf: JMap[String, String], getenv: String => String): T = {
-    readAndExpand(conf, getenv).map(valueConverter).getOrElse(_defaultValue)
+  def readFrom(reader: ConfigReader): T = {
+    readString(reader).map(valueConverter).getOrElse(_defaultValue)
   }
+}
 
+private class ConfigEntryWithDefaultFunction[T] (
+    key: String,
+    prependedKey: Option[String],
+    prependSeparator: String,
+    alternatives: List[String],
+    _defaultFunction: () => T,
+    valueConverter: String => T,
+    stringConverter: T => String,
+    doc: String,
+    isPublic: Boolean,
+    version: String)
+  extends ConfigEntry(
+    key,
+    prependedKey,
+    prependSeparator,
+    alternatives,
+    valueConverter,
+    stringConverter,
+    doc,
+    isPublic,
+    version
+  ) {
+
+  override def defaultValue: Option[T] = Some(_defaultFunction())
+
+  override def defaultValueString: String = stringConverter(_defaultFunction())
+
+  def readFrom(reader: ConfigReader): T = {
+    readString(reader).map(valueConverter).getOrElse(_defaultFunction())
+  }
 }
 
 private class ConfigEntryWithDefaultString[T] (
     key: String,
+    prependedKey: Option[String],
+    prependSeparator: String,
+    alternatives: List[String],
     _defaultValue: String,
     valueConverter: String => T,
     stringConverter: T => String,
     doc: String,
-    isPublic: Boolean)
-    extends ConfigEntry(key, valueConverter, stringConverter, doc, isPublic) {
+    isPublic: Boolean,
+    version: String)
+  extends ConfigEntry(
+    key,
+    prependedKey,
+    prependSeparator,
+    alternatives,
+    valueConverter,
+    stringConverter,
+    doc,
+    isPublic,
+    version
+  ) {
 
   override def defaultValue: Option[T] = Some(valueConverter(_defaultValue))
 
   override def defaultValueString: String = _defaultValue
 
-  def readFrom(conf: JMap[String, String], getenv: String => String): T = {
-    Option(conf.get(key))
-      .orElse(Some(_defaultValue))
-      .map(ConfigEntry.expand(_, conf, getenv, Set()))
-      .map(valueConverter)
-      .get
+  def readFrom(reader: ConfigReader): T = {
+    val value = readString(reader).getOrElse(reader.substitute(_defaultValue))
+    valueConverter(value)
   }
-
 }
 
 
@@ -137,44 +213,70 @@ private class ConfigEntryWithDefaultString[T] (
  */
 private[spark] class OptionalConfigEntry[T](
     key: String,
+    prependedKey: Option[String],
+    prependSeparator: String,
+    alternatives: List[String],
     val rawValueConverter: String => T,
     val rawStringConverter: T => String,
     doc: String,
-    isPublic: Boolean)
-    extends ConfigEntry[Option[T]](key, s => Some(rawValueConverter(s)),
-      v => v.map(rawStringConverter).orNull, doc, isPublic) {
+    isPublic: Boolean,
+    version: String)
+  extends ConfigEntry[Option[T]](
+    key,
+    prependedKey,
+    prependSeparator,
+    alternatives,
+    s => Some(rawValueConverter(s)),
+    v => v.map(rawStringConverter).orNull,
+    doc,
+    isPublic,
+    version
+  ) {
 
-  override def defaultValueString: String = "<undefined>"
+  override def defaultValueString: String = ConfigEntry.UNDEFINED
 
-  override def readFrom(conf: JMap[String, String], getenv: String => String): Option[T] = {
-    readAndExpand(conf, getenv).map(rawValueConverter)
+  override def readFrom(reader: ConfigReader): Option[T] = {
+    readString(reader).map(rawValueConverter)
   }
-
 }
 
 /**
  * A config entry whose default value is defined by another config entry.
  */
-private class FallbackConfigEntry[T] (
+private[spark] class FallbackConfigEntry[T] (
     key: String,
+    prependedKey: Option[String],
+    prependSeparator: String,
+    alternatives: List[String],
     doc: String,
     isPublic: Boolean,
-    private[config] val fallback: ConfigEntry[T])
-    extends ConfigEntry[T](key, fallback.valueConverter, fallback.stringConverter, doc, isPublic) {
+    version: String,
+    val fallback: ConfigEntry[T])
+  extends ConfigEntry[T](
+    key,
+    prependedKey,
+    prependSeparator,
+    alternatives,
+    fallback.valueConverter,
+    fallback.stringConverter,
+    doc,
+    isPublic,
+    version
+  ) {
 
   override def defaultValueString: String = s"<value of ${fallback.key}>"
 
-  override def readFrom(conf: JMap[String, String], getenv: String => String): T = {
-    Option(conf.get(key)).map(valueConverter).getOrElse(fallback.readFrom(conf, getenv))
+  override def readFrom(reader: ConfigReader): T = {
+    readString(reader).map(valueConverter).getOrElse(fallback.readFrom(reader))
   }
-
 }
 
-private object ConfigEntry {
+private[spark] object ConfigEntry {
 
-  private val knownConfigs = new java.util.concurrent.ConcurrentHashMap[String, ConfigEntry[_]]()
+  val UNDEFINED = "<undefined>"
 
-  private val REF_RE = "\\$\\{(?:(\\w+?):)?(\\S+?)\\}".r
+  private[spark] val knownConfigs =
+    new java.util.concurrent.ConcurrentHashMap[String, ConfigEntry[_]]()
 
   def registerEntry(entry: ConfigEntry[_]): Unit = {
     val existing = knownConfigs.putIfAbsent(entry.key, entry)
@@ -182,44 +284,5 @@ private object ConfigEntry {
   }
 
   def findEntry(key: String): ConfigEntry[_] = knownConfigs.get(key)
-
-  /**
-   * Expand the `value` according to the rules explained in ConfigEntry.
-   */
-  def expand(
-      value: String,
-      conf: JMap[String, String],
-      getenv: String => String,
-      usedRefs: Set[String]): String = {
-    REF_RE.replaceAllIn(value, { m =>
-      val prefix = m.group(1)
-      val name = m.group(2)
-      val replacement = prefix match {
-        case null =>
-          require(!usedRefs.contains(name), s"Circular reference in $value: $name")
-          if (name.startsWith("spark.")) {
-            Option(findEntry(name))
-              .flatMap(_.readAndExpand(conf, getenv, usedRefs = usedRefs + name))
-              .orElse(Option(conf.get(name)))
-              .orElse(defaultValueString(name))
-          } else {
-            None
-          }
-        case "system" => sys.props.get(name)
-        case "env" => Option(getenv(name))
-        case _ => None
-      }
-      Regex.quoteReplacement(replacement.getOrElse(m.matched))
-    })
-  }
-
-  private def defaultValueString(key: String): Option[String] = {
-    findEntry(key) match {
-      case e: ConfigEntryWithDefault[_] => Some(e.defaultValueString)
-      case e: ConfigEntryWithDefaultString[_] => Some(e.defaultValueString)
-      case e: FallbackConfigEntry[_] => defaultValueString(e.fallback.key)
-      case _ => None
-    }
-  }
 
 }

@@ -22,10 +22,14 @@ import java.nio.charset.StandardCharsets
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 
-import com.amazonaws.services.kinesis.producer.{KinesisProducer => KPLProducer, KinesisProducerConfiguration, UserRecordResult}
+import com.amazonaws.services.kinesis.producer.{KinesisProducer => KPLProducer,
+  KinesisProducerConfiguration, UserRecordResult}
 import com.google.common.util.concurrent.{FutureCallback, Futures}
 
-private[kinesis] class KPLBasedKinesisTestUtils extends KinesisTestUtils {
+import org.apache.spark.util.ThreadUtils
+
+private[kinesis] class KPLBasedKinesisTestUtils(streamShardCount: Int = 2)
+    extends KinesisTestUtils(streamShardCount) {
   override protected def getProducer(aggregate: Boolean): KinesisDataGenerator = {
     if (!aggregate) {
       new SimpleDataGenerator(kinesisClient)
@@ -65,9 +69,9 @@ private[kinesis] class KPLDataGenerator(regionName: String) extends KinesisDataG
           sentSeqNumbers += ((num, seqNumber))
         }
       }
-      Futures.addCallback(future, kinesisCallBack)
+      Futures.addCallback(future, kinesisCallBack, ThreadUtils.sameThreadExecutorService)
     }
     producer.flushSync()
-    shardIdToSeqNumbers.toMap
+    shardIdToSeqNumbers.mapValues(_.toSeq).toMap
   }
 }

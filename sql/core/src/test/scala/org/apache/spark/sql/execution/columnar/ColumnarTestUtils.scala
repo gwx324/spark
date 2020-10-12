@@ -21,14 +21,14 @@ import scala.collection.immutable.HashSet
 import scala.util.Random
 
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{GenericInternalRow, GenericMutableRow}
+import org.apache.spark.sql.catalyst.expressions.GenericInternalRow
 import org.apache.spark.sql.catalyst.util.{ArrayBasedMapData, GenericArrayData}
 import org.apache.spark.sql.types.{AtomicType, Decimal}
-import org.apache.spark.unsafe.types.UTF8String
+import org.apache.spark.unsafe.types.{CalendarInterval, UTF8String}
 
 object ColumnarTestUtils {
-  def makeNullRow(length: Int): GenericMutableRow = {
-    val row = new GenericMutableRow(length)
+  def makeNullRow(length: Int): GenericInternalRow = {
+    val row = new GenericInternalRow(length)
     (0 until length).foreach(row.setNullAt)
     row
   }
@@ -51,6 +51,8 @@ object ColumnarTestUtils {
       case DOUBLE => Random.nextDouble()
       case STRING => UTF8String.fromString(Random.nextString(Random.nextInt(32)))
       case BINARY => randomBytes(Random.nextInt(32))
+      case CALENDAR_INTERVAL =>
+        new CalendarInterval(Random.nextInt(), Random.nextInt(), Random.nextLong())
       case COMPACT_DECIMAL(precision, scale) => Decimal(Random.nextLong() % 100, precision, scale)
       case LARGE_DECIMAL(precision, scale) => Decimal(Random.nextLong(), precision, scale)
       case STRUCT(_) =>
@@ -86,7 +88,7 @@ object ColumnarTestUtils {
       tail: ColumnType[_]*): InternalRow = makeRandomRow(Seq(head) ++ tail)
 
   def makeRandomRow(columnTypes: Seq[ColumnType[_]]): InternalRow = {
-    val row = new GenericMutableRow(columnTypes.length)
+    val row = new GenericInternalRow(columnTypes.length)
     makeRandomValues(columnTypes).zipWithIndex.foreach { case (value, index) =>
       row(index) = value
     }
@@ -95,11 +97,11 @@ object ColumnarTestUtils {
 
   def makeUniqueValuesAndSingleValueRows[T <: AtomicType](
       columnType: NativeColumnType[T],
-      count: Int): (Seq[T#InternalType], Seq[GenericMutableRow]) = {
+      count: Int): (Seq[T#InternalType], Seq[GenericInternalRow]) = {
 
     val values = makeUniqueRandomValues(columnType, count)
     val rows = values.map { value =>
-      val row = new GenericMutableRow(1)
+      val row = new GenericInternalRow(1)
       row(0) = value
       row
     }

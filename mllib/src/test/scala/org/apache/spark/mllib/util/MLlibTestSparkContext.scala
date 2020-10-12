@@ -22,8 +22,10 @@ import java.io.File
 import org.scalatest.Suite
 
 import org.apache.spark.SparkContext
+import org.apache.spark.ml.feature._
+import org.apache.spark.ml.stat.Summarizer
 import org.apache.spark.ml.util.TempDirectory
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.{SparkSession, SQLContext, SQLImplicits}
 import org.apache.spark.util.Utils
 
 trait MLlibTestSparkContext extends TempDirectory { self: Suite =>
@@ -31,7 +33,7 @@ trait MLlibTestSparkContext extends TempDirectory { self: Suite =>
   @transient var sc: SparkContext = _
   @transient var checkpointDir: String = _
 
-  override def beforeAll() {
+  override def beforeAll(): Unit = {
     super.beforeAll()
     spark = SparkSession.builder
       .master("local[2]")
@@ -43,7 +45,7 @@ trait MLlibTestSparkContext extends TempDirectory { self: Suite =>
     sc.setCheckpointDir(checkpointDir)
   }
 
-  override def afterAll() {
+  override def afterAll(): Unit = {
     try {
       Utils.deleteRecursively(new File(checkpointDir))
       SparkSession.clearActiveSession()
@@ -54,5 +56,25 @@ trait MLlibTestSparkContext extends TempDirectory { self: Suite =>
     } finally {
       super.afterAll()
     }
+  }
+
+  /**
+   * A helper object for importing SQL implicits.
+   *
+   * Note that the alternative of importing `spark.implicits._` is not possible here.
+   * This is because we create the `SQLContext` immediately before the first test is run,
+   * but the implicits import is needed in the constructor.
+   */
+  protected object testImplicits extends SQLImplicits {
+    protected override def _sqlContext: SQLContext = self.spark.sqlContext
+  }
+
+  private[spark] def standardize(instances: Array[Instance]): Array[Instance] = {
+    val (featuresSummarizer, _) =
+      Summarizer.getClassificationSummarizers(sc.parallelize(instances))
+    val inverseStd = featuresSummarizer.std.toArray
+      .map { std => if (std != 0) 1.0 / std else 0.0 }
+    val func = StandardScalerModel.getTransformFunc(Array.empty, inverseStd, false, true)
+    instances.map { case Instance(label, weight, vec) => Instance(label, weight, func(vec)) }
   }
 }

@@ -15,15 +15,10 @@
 # limitations under the License.
 #
 
-import sys
-if sys.version >= '3':
-    long = int
-    unicode = str
-
 import py4j.protocol
 from py4j.protocol import Py4JJavaError
 from py4j.java_gateway import JavaObject
-from py4j.java_collections import ListConverter, JavaArray, JavaList
+from py4j.java_collections import JavaArray, JavaList
 
 from pyspark import RDD, SparkContext
 from pyspark.serializers import PickleSerializer, AutoBatchedSerializer
@@ -78,10 +73,10 @@ def _py2java(sc, obj):
     elif isinstance(obj, SparkContext):
         obj = obj._jsc
     elif isinstance(obj, list):
-        obj = ListConverter().convert([_py2java(sc, x) for x in obj], sc._gateway._gateway_client)
+        obj = [_py2java(sc, x) for x in obj]
     elif isinstance(obj, JavaObject):
         pass
-    elif isinstance(obj, (int, long, float, bool, bytes, unicode)):
+    elif isinstance(obj, (int, float, bool, bytes, str)):
         pass
     else:
         data = bytearray(PickleSerializer().dumps(obj))

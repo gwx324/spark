@@ -23,10 +23,10 @@ import org.apache.spark.sql.SparkSession
 
 
 /**
- * Usage: MultiBroadcastTest [slices] [numElem]
+ * Usage: MultiBroadcastTest [partitions] [numElem]
  */
 object MultiBroadcastTest {
-  def main(args: Array[String]) {
+  def main(args: Array[String]): Unit = {
 
     val spark = SparkSession
       .builder

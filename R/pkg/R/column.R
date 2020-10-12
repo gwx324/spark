@@ -29,7 +29,6 @@ setOldClass("jobj")
 #' @rdname column
 #'
 #' @slot jc reference to JVM SparkDataFrame column
-#' @export
 #' @note Column since 1.4.0
 setClass("Column",
          slots = list(jc = "jobj"))
@@ -56,7 +55,6 @@ setMethod("column",
 #' @rdname show
 #' @name show
 #' @aliases show,Column-method
-#' @export
 #' @note show(Column) since 1.4.0
 setMethod("show", "Column",
           function(object) {
@@ -67,8 +65,7 @@ operators <- list(
   "+" = "plus", "-" = "minus", "*" = "multiply", "/" = "divide", "%%" = "mod",
   "==" = "equalTo", ">" = "gt", "<" = "lt", "!=" = "notEqual", "<=" = "leq", ">=" = "geq",
   # we can not override `&&` and `||`, so use `&` and `|` instead
-  "&" = "and", "|" = "or", #, "!" = "unary_$bang"
-  "^" = "pow"
+  "&" = "and", "|" = "or", "^" = "pow"
 )
 column_functions1 <- c("asc", "desc", "isNaN", "isNull", "isNotNull")
 column_functions2 <- c("like", "rlike", "getField", "getItem", "contains")
@@ -131,19 +128,19 @@ createMethods <- function() {
 
 createMethods()
 
-#' alias
-#'
-#' Set a new name for a column
-#'
-#' @param object Column to rename
-#' @param data new name to use
-#'
 #' @rdname alias
 #' @name alias
 #' @aliases alias,Column-method
 #' @family colum_func
-#' @export
-#' @note alias since 1.4.0
+#' @examples
+#' \dontrun{
+#' df <- createDataFrame(iris)
+#'
+#' head(select(
+#'   df, alias(df$Sepal_Length, "slength"), alias(df$Petal_Length, "plength")
+#' ))
+#' }
+#' @note alias(Column) since 1.4.0
 setMethod("alias",
           signature(object = "Column"),
           function(object, data) {
@@ -163,12 +160,19 @@ setMethod("alias",
 #' @family colum_func
 #' @aliases substr,Column-method
 #'
-#' @param start starting position
-#' @param stop ending position
+#' @param x a Column.
+#' @param start starting position. It should be 1-base.
+#' @param stop ending position.
+#' @examples
+#' \dontrun{
+#' df <- createDataFrame(list(list(a="abcdef")))
+#' collect(select(df, substr(df$a, 1, 4))) # the result is `abcd`.
+#' collect(select(df, substr(df$a, 2, 4))) # the result is `bcd`.
+#' }
 #' @note substr since 1.4.0
 setMethod("substr", signature(x = "Column"),
           function(x, start, stop) {
-            jc <- callJMethod(x@jc, "substr", as.integer(start - 1), as.integer(stop - start + 1))
+            jc <- callJMethod(x@jc, "substr", as.integer(start), as.integer(stop - start + 1))
             column(jc)
           })
 
@@ -219,6 +223,7 @@ setMethod("endsWith", signature(x = "Column"),
 #' @family colum_func
 #' @aliases between,Column-method
 #'
+#' @param x a Column
 #' @param bounds lower and upper bounds
 #' @note between since 1.5.0
 setMethod("between", signature(x = "Column"),
@@ -233,12 +238,20 @@ setMethod("between", signature(x = "Column"),
 
 #' Casts the column to a different data type.
 #'
+#' @param x a Column.
+#' @param dataType a character object describing the target data type.
+#'        See
+# nolint start
+#'        \href{https://spark.apache.org/docs/latest/sparkr.html#data-type-mapping-between-r-and-spark}{
+#'        Spark Data Types} for available data types.
+# nolint end
 #' @rdname cast
 #' @name cast
 #' @family colum_func
 #' @aliases cast,Column-method
 #'
-#' @examples \dontrun{
+#' @examples
+#' \dontrun{
 #'   cast(df$age, "string")
 #' }
 #' @note cast since 1.4.0
@@ -254,11 +267,12 @@ setMethod("cast",
 
 #' Match a column with given values.
 #'
+#' @param x a Column.
+#' @param table a collection of values (coercible to list) to compare with.
 #' @rdname match
 #' @name %in%
 #' @aliases %in%,Column-method
-#' @return a matched values as a result of comparing with given values.
-#' @export
+#' @return A matched values as a result of comparing with given values.
 #' @examples
 #' \dontrun{
 #' filter(df, "age in (10, 30)")
@@ -275,18 +289,170 @@ setMethod("%in%",
 #' otherwise
 #'
 #' If values in the specified column are null, returns the value.
-#' Can be used in conjunction with `when` to specify a default value for expressions.
+#' Can be used in conjunction with \code{when} to specify a default value for expressions.
 #'
+#' @param x a Column.
+#' @param value value to replace when the corresponding entry in \code{x} is NA.
+#'              Can be a single value or a Column.
 #' @rdname otherwise
 #' @name otherwise
 #' @family colum_func
 #' @aliases otherwise,Column-method
-#' @export
 #' @note otherwise since 1.5.0
 setMethod("otherwise",
           signature(x = "Column", value = "ANY"),
           function(x, value) {
             value <- if (class(value) == "Column") { value@jc } else { value }
             jc <- callJMethod(x@jc, "otherwise", value)
+            column(jc)
+          })
+
+#' \%<=>\%
+#'
+#' Equality test that is safe for null values.
+#'
+#' Can be used, unlike standard equality operator, to perform null-safe joins.
+#' Equivalent to Scala \code{Column.<=>} and \code{Column.eqNullSafe}.
+#'
+#' @param x a Column
+#' @param value a value to compare
+#' @rdname eq_null_safe
+#' @name %<=>%
+#' @aliases %<=>%,Column-method
+#' @examples
+#' \dontrun{
+#' df1 <- createDataFrame(data.frame(
+#'   x = c(1, NA, 3, NA), y = c(2, 6, 3, NA)
+#' ))
+#'
+#' head(select(df1, df1$x == df1$y, df1$x %<=>% df1$y))
+#'
+#' df2 <- createDataFrame(data.frame(y = c(3, NA)))
+#' count(join(df1, df2, df1$y == df2$y))
+#'
+#' count(join(df1, df2, df1$y %<=>% df2$y))
+#' }
+#' @note \%<=>\% since 2.3.0
+setMethod("%<=>%",
+          signature(x = "Column", value = "ANY"),
+          function(x, value) {
+            value <- if (class(value) == "Column") { value@jc } else { value }
+            jc <- callJMethod(x@jc, "eqNullSafe", value)
+            column(jc)
+          })
+
+#' !
+#'
+#' Inversion of boolean expression.
+#'
+#' @rdname not
+#' @name not
+#' @aliases !,Column-method
+#' @examples
+#' \dontrun{
+#' df <- createDataFrame(data.frame(x = c(-1, 0, 1)))
+#'
+#' head(select(df, !column("x") > 0))
+#' }
+#' @note ! since 2.3.0
+setMethod("!", signature(x = "Column"), function(x) not(x))
+
+#' withField
+#'
+#' Adds/replaces field in a struct \code{Column} by name.
+#'
+#' @param x a Column
+#' @param fieldName a character
+#' @param col a Column expression
+#'
+#' @rdname withField
+#' @aliases withField withField,Column-method
+#' @examples
+#' \dontrun{
+#' df <- withColumn(
+#'   createDataFrame(iris),
+#'   "sepal",
+#'    struct(column("Sepal_Width"), column("Sepal_Length"))
+#' )
+#'
+#' head(select(
+#'   df,
+#'   withField(df$sepal, "product", df$Sepal_Length * df$Sepal_Width)
+#' ))
+#' }
+#' @note withField since 3.1.0
+setMethod("withField",
+          signature(x = "Column", fieldName = "character", col = "Column"),
+          function(x, fieldName, col) {
+            jc <- callJMethod(x@jc, "withField", fieldName, col@jc)
+            column(jc)
+          })
+
+#' dropFields
+#'
+#' Drops fields in a struct \code{Column} by name.
+#'
+#' @param x a Column
+#' @param ... names of the fields to be dropped.
+#'
+#' @rdname dropFields
+#' @aliases dropFields dropFields,Column-method
+#' @examples
+#' \dontrun{
+#' df <- select(
+#'   createDataFrame(iris),
+#'   alias(
+#'     struct(
+#'       column("Sepal_Width"), column("Sepal_Length"),
+#'       alias(
+#'         struct(
+#'           column("Petal_Width"), column("Petal_Length"),
+#'           alias(
+#'             column("Petal_Width") * column("Petal_Length"),
+#'             "Petal_Product"
+#'           )
+#'         ),
+#'         "Petal"
+#'       )
+#'     ),
+#'     "dimensions"
+#'   )
+#' )
+#' head(withColumn(df, "dimensions", dropFields(df$dimensions, "Petal")))
+#'
+#' head(
+#'   withColumn(
+#'     df, "dimensions",
+#'     dropFields(df$dimensions, "Sepal_Width", "Sepal_Length")
+#'   )
+#' )
+#'
+#' # This method supports dropping multiple nested fields directly e.g.
+#' head(
+#'   withColumn(
+#'     df, "dimensions",
+#'     dropFields(df$dimensions, "Petal.Petal_Width", "Petal.Petal_Length")
+#'   )
+#' )
+#'
+#' # However, if you are going to add/replace multiple nested fields,
+#' # it is preffered to extract out the nested struct before
+#' # adding/replacing multiple fields e.g.
+#' head(
+#'   withColumn(
+#'     df, "dimensions",
+#'     withField(
+#'       column("dimensions"),
+#'       "Petal",
+#'       dropFields(column("dimensions.Petal"), "Petal_Width", "Petal_Length")
+#'     )
+#'   )
+#' )
+#' }
+#' @note dropFields since 3.1.0
+setMethod("dropFields",
+          signature(x = "Column"),
+          function(x, ...) {
+            jc <- callJMethod(x@jc, "dropFields", list(...))
             column(jc)
           })

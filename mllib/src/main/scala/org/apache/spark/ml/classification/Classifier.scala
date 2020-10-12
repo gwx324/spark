@@ -18,16 +18,17 @@
 package org.apache.spark.ml.classification
 
 import org.apache.spark.SparkException
-import org.apache.spark.annotation.DeveloperApi
+import org.apache.spark.annotation.Since
 import org.apache.spark.ml.{PredictionModel, Predictor, PredictorParams}
-import org.apache.spark.ml.feature.LabeledPoint
+import org.apache.spark.ml.feature.{Instance, LabeledPoint}
 import org.apache.spark.ml.linalg.{Vector, VectorUDT}
+import org.apache.spark.ml.param.ParamMap
 import org.apache.spark.ml.param.shared.HasRawPredictionCol
 import org.apache.spark.ml.util.{MetadataUtils, SchemaUtils}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{DataFrame, Dataset, Row}
 import org.apache.spark.sql.functions._
-import org.apache.spark.sql.types.{DataType, DoubleType, StructType}
+import org.apache.spark.sql.types.{DataType, StructType}
 
 /**
  * (private[spark]) Params for classification.
@@ -42,11 +43,26 @@ private[spark] trait ClassifierParams
     val parentSchema = super.validateAndTransformSchema(schema, fitting, featuresDataType)
     SchemaUtils.appendColumn(parentSchema, $(rawPredictionCol), new VectorUDT)
   }
+
+  /**
+   * Extract [[labelCol]], weightCol(if any) and [[featuresCol]] from the given dataset,
+   * and put it in an RDD with strong types.
+   * Validates the label on the classifier is a valid integer in the range [0, numClasses).
+   */
+  protected def extractInstances(
+      dataset: Dataset[_],
+      numClasses: Int): RDD[Instance] = {
+    val validateInstance = (instance: Instance) => {
+      val label = instance.label
+      require(label.toLong == label && label >= 0 && label < numClasses, s"Classifier was given" +
+        s" dataset with invalid label $label. Labels must be integers in range" +
+        s" [0, $numClasses).")
+    }
+    extractInstances(dataset, validateInstance)
+  }
 }
 
 /**
- * :: DeveloperApi ::
- *
  * Single-label binary or multiclass classification.
  * Classes are indexed {0, 1, ..., numClasses - 1}.
  *
@@ -54,7 +70,6 @@ private[spark] trait ClassifierParams
  * @tparam E  Concrete Estimator type
  * @tparam M  Concrete Model type
  */
-@DeveloperApi
 abstract class Classifier[
     FeaturesType,
     E <: Classifier[FeaturesType, E, M],
@@ -71,21 +86,41 @@ abstract class Classifier[
    * and put it in an RDD with strong types.
    *
    * @param dataset  DataFrame with columns for labels ([[org.apache.spark.sql.types.NumericType]])
-   *                 and features ([[Vector]]). Labels are cast to [[DoubleType]].
+   *                 and features (`Vector`).
    * @param numClasses  Number of classes label can take.  Labels must be integers in the range
    *                    [0, numClasses).
-   * @throws SparkException  if any label is not an integer >= 0
+   * @note Throws `SparkException` if any label is a non-integer or is negative
    */
   protected def extractLabeledPoints(dataset: Dataset[_], numClasses: Int): RDD[LabeledPoint] = {
-    require(numClasses > 0, s"Classifier (in extractLabeledPoints) found numClasses =" +
-      s" $numClasses, but requires numClasses > 0.")
-    dataset.select(col($(labelCol)).cast(DoubleType), col($(featuresCol))).rdd.map {
+    validateNumClasses(numClasses)
+    dataset.select(col($(labelCol)), col($(featuresCol))).rdd.map {
       case Row(label: Double, features: Vector) =>
-        require(label % 1 == 0 && label >= 0 && label < numClasses, s"Classifier was given" +
-          s" dataset with invalid label $label.  Labels must be integers in range" +
-          s" [0, 1, ..., $numClasses), where numClasses=$numClasses.")
+        validateLabel(label, numClasses)
         LabeledPoint(label, features)
     }
+  }
+
+  /**
+   * Validates that number of classes is greater than zero.
+   *
+   * @param numClasses Number of classes label can take.
+   */
+  protected def validateNumClasses(numClasses: Int): Unit = {
+    require(numClasses > 0, s"Classifier (in extractLabeledPoints) found numClasses =" +
+      s" $numClasses, but requires numClasses > 0.")
+  }
+
+  /**
+   * Validates the label on the classifier is a valid integer in the range [0, numClasses).
+   *
+   * @param label The label to validate.
+   * @param numClasses Number of classes label can take.  Labels must be integers in the range
+   *                  [0, numClasses).
+   */
+  protected def validateLabel(label: Double, numClasses: Int): Unit = {
+    require(label.toLong == label && label >= 0 && label < numClasses, s"Classifier was given" +
+      s" dataset with invalid label $label.  Labels must be integers in range" +
+      s" [0, $numClasses).")
   }
 
   /**
@@ -94,7 +129,7 @@ abstract class Classifier[
    * by finding the maximum label value.
    *
    * Label validation (ensuring all labels are integers >= 0) needs to be handled elsewhere,
-   * such as in [[extractLabeledPoints()]].
+   * such as in `extractLabeledPoints()`.
    *
    * @param dataset  Dataset which contains a column [[labelCol]]
    * @param maxNumClasses  Maximum number of classes allowed when inferred from data.  If numClasses
@@ -109,7 +144,7 @@ abstract class Classifier[
       case None =>
         // Get number of classes from dataset itself.
         val maxLabelRow: Array[Row] = dataset.select(max($(labelCol))).take(1)
-        if (maxLabelRow.isEmpty) {
+        if (maxLabelRow.isEmpty || maxLabelRow(0).get(0) == null) {
           throw new SparkException("ML algorithm was given empty dataset.")
         }
         val maxDoubleLabel: Double = maxLabelRow.head.getDouble(0)
@@ -129,15 +164,12 @@ abstract class Classifier[
 }
 
 /**
- * :: DeveloperApi ::
- *
  * Model produced by a [[Classifier]].
  * Classes are indexed {0, 1, ..., numClasses - 1}.
  *
  * @tparam FeaturesType  Type of input features.  E.g., `Vector`
  * @tparam M  Concrete Model type
  */
-@DeveloperApi
 abstract class ClassificationModel[FeaturesType, M <: ClassificationModel[FeaturesType, M]]
   extends PredictionModel[FeaturesType, M] with ClassifierParams {
 
@@ -147,57 +179,75 @@ abstract class ClassificationModel[FeaturesType, M <: ClassificationModel[Featur
   /** Number of classes (values which the label can take). */
   def numClasses: Int
 
+  override def transformSchema(schema: StructType): StructType = {
+    var outputSchema = super.transformSchema(schema)
+    if ($(predictionCol).nonEmpty) {
+      outputSchema = SchemaUtils.updateNumValues(schema,
+        $(predictionCol), numClasses)
+    }
+    if ($(rawPredictionCol).nonEmpty) {
+      outputSchema = SchemaUtils.updateAttributeGroupSize(outputSchema,
+        $(rawPredictionCol), numClasses)
+    }
+    outputSchema
+  }
+
   /**
    * Transforms dataset by reading from [[featuresCol]], and appending new columns as specified by
    * parameters:
-   *  - predicted labels as [[predictionCol]] of type [[Double]]
+   *  - predicted labels as [[predictionCol]] of type `Double`
    *  - raw predictions (confidences) as [[rawPredictionCol]] of type `Vector`.
    *
    * @param dataset input dataset
    * @return transformed dataset
    */
   override def transform(dataset: Dataset[_]): DataFrame = {
-    transformSchema(dataset.schema, logging = true)
+    val outputSchema = transformSchema(dataset.schema, logging = true)
 
     // Output selected columns only.
     // This is a bit complicated since it tries to avoid repeated computation.
     var outputData = dataset
     var numColsOutput = 0
     if (getRawPredictionCol != "") {
-      val predictRawUDF = udf { (features: Any) =>
+      val predictRawUDF = udf { features: Any =>
         predictRaw(features.asInstanceOf[FeaturesType])
       }
-      outputData = outputData.withColumn(getRawPredictionCol, predictRawUDF(col(getFeaturesCol)))
+      outputData = outputData.withColumn(getRawPredictionCol, predictRawUDF(col(getFeaturesCol)),
+        outputSchema($(rawPredictionCol)).metadata)
       numColsOutput += 1
     }
     if (getPredictionCol != "") {
-      val predUDF = if (getRawPredictionCol != "") {
+      val predCol = if (getRawPredictionCol != "") {
         udf(raw2prediction _).apply(col(getRawPredictionCol))
       } else {
-        val predictUDF = udf { (features: Any) =>
+        val predictUDF = udf { features: Any =>
           predict(features.asInstanceOf[FeaturesType])
         }
         predictUDF(col(getFeaturesCol))
       }
-      outputData = outputData.withColumn(getPredictionCol, predUDF)
+      outputData = outputData.withColumn(getPredictionCol, predCol,
+        outputSchema($(predictionCol)).metadata)
       numColsOutput += 1
     }
 
     if (numColsOutput == 0) {
-      logWarning(s"$uid: ClassificationModel.transform() was called as NOOP" +
-        " since no output columns were set.")
+      logWarning(s"$uid: ClassificationModel.transform() does nothing" +
+        " because no output columns were set.")
     }
     outputData.toDF
   }
 
+  final override def transformImpl(dataset: Dataset[_]): DataFrame =
+    throw new UnsupportedOperationException(s"transformImpl is not supported in $getClass")
+
   /**
    * Predict label for the given features.
-   * This internal method is used to implement [[transform()]] and output [[predictionCol]].
+   * This method is used to implement `transform()` and output [[predictionCol]].
    *
    * This default implementation for classification predicts the index of the maximum value
-   * from [[predictRaw()]].
+   * from `predictRaw()`.
    */
-  override protected def predict(features: FeaturesType): Double = {
+  override def predict(features: FeaturesType): Double = {
     raw2prediction(predictRaw(features))
   }
 
@@ -205,13 +255,14 @@ abstract class ClassificationModel[FeaturesType, M <: ClassificationModel[Featur
    * Raw prediction for each possible label.
    * The meaning of a "raw" prediction may vary between algorithms, but it intuitively gives
    * a measure of confidence in each possible label (where larger = more confident).
-   * This internal method is used to implement [[transform()]] and output [[rawPredictionCol]].
+   * This internal method is used to implement `transform()` and output [[rawPredictionCol]].
    *
    * @return  vector where element i is the raw prediction for label i.
    *          This raw prediction may be any real number, where a larger value indicates greater
    *          confidence for that label.
    */
-  protected def predictRaw(features: FeaturesType): Vector
+  @Since("3.0.0")
+  def predictRaw(features: FeaturesType): Vector
 
   /**
    * Given a vector of raw predictions, select the predicted label.
@@ -219,4 +270,26 @@ abstract class ClassificationModel[FeaturesType, M <: ClassificationModel[Featur
    * @return  predicted label
    */
   protected def raw2prediction(rawPrediction: Vector): Double = rawPrediction.argmax
+
+  /**
+   * If the rawPrediction and prediction columns are set, this method returns the current model,
+   * otherwise it generates new columns for them and sets them as columns on a new copy of
+   * the current model
+   */
+  private[classification] def findSummaryModel():
+  (ClassificationModel[FeaturesType, M], String, String) = {
+    val model = if ($(rawPredictionCol).isEmpty && $(predictionCol).isEmpty) {
+      copy(ParamMap.empty)
+        .setRawPredictionCol("rawPrediction_" + java.util.UUID.randomUUID.toString)
+        .setPredictionCol("prediction_" + java.util.UUID.randomUUID.toString)
+    } else if ($(rawPredictionCol).isEmpty) {
+      copy(ParamMap.empty).setRawPredictionCol("rawPrediction_" +
+        java.util.UUID.randomUUID.toString)
+    } else if ($(predictionCol).isEmpty) {
+      copy(ParamMap.empty).setPredictionCol("prediction_" + java.util.UUID.randomUUID.toString)
+    } else {
+      this
+    }
+    (model, model.getRawPredictionCol, model.getPredictionCol)
+  }
 }

@@ -17,17 +17,45 @@
 
 package org.apache.spark.sql.jdbc
 
-import org.apache.spark.sql.types.{BooleanType, DataType, StringType}
+import java.sql.Types
+import java.util.Locale
+
+import org.apache.spark.sql.types._
 
 private object DB2Dialect extends JdbcDialect {
 
-  override def canHandle(url: String): Boolean = url.startsWith("jdbc:db2")
+  override def canHandle(url: String): Boolean =
+    url.toLowerCase(Locale.ROOT).startsWith("jdbc:db2")
+
+  override def getCatalystType(
+      sqlType: Int,
+      typeName: String,
+      size: Int,
+      md: MetadataBuilder): Option[DataType] = sqlType match {
+    case Types.REAL => Option(FloatType)
+    case Types.OTHER =>
+      typeName match {
+        case "DECFLOAT" => Option(DecimalType(38, 18))
+        case "XML" => Option(StringType)
+        case t if (t.startsWith("TIMESTAMP")) => Option(TimestampType) // TIMESTAMP WITH TIMEZONE
+        case _ => None
+      }
+    case _ => None
+  }
 
   override def getJDBCType(dt: DataType): Option[JdbcType] = dt match {
     case StringType => Option(JdbcType("CLOB", java.sql.Types.CLOB))
     case BooleanType => Option(JdbcType("CHAR(1)", java.sql.Types.CHAR))
+    case ShortType | ByteType => Some(JdbcType("SMALLINT", java.sql.Types.SMALLINT))
     case _ => None
   }
 
   override def isCascadingTruncateTable(): Option[Boolean] = Some(false)
+
+  // scalastyle:off line.size.limit
+  // See https://www.ibm.com/support/knowledgecenter/en/SSEPGG_11.5.0/com.ibm.db2.luw.sql.ref.doc/doc/r0000980.html
+  // scalastyle:on line.size.limit
+  override def renameTable(oldTable: String, newTable: String): String = {
+    s"RENAME TABLE $oldTable TO $newTable"
+  }
 }

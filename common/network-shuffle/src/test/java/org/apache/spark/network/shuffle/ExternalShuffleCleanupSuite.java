@@ -24,19 +24,18 @@ import java.util.Random;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import com.google.common.util.concurrent.MoreExecutors;
 import org.junit.Test;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
-import org.apache.spark.network.util.SystemPropertyConfigProvider;
+import org.apache.spark.network.util.MapConfigProvider;
 import org.apache.spark.network.util.TransportConf;
 
 public class ExternalShuffleCleanupSuite {
 
   // Same-thread Executor used to ensure cleanup happens synchronously in test thread.
-  private Executor sameThreadExecutor = MoreExecutors.sameThreadExecutor();
-  private TransportConf conf = new TransportConf("shuffle", new SystemPropertyConfigProvider());
+  private Executor sameThreadExecutor = Runnable::run;
+  private TransportConf conf = new TransportConf("shuffle", MapConfigProvider.EMPTY);
   private static final String SORT_MANAGER = "org.apache.spark.shuffle.sort.SortShuffleManager";
 
   @Test
@@ -60,12 +59,10 @@ public class ExternalShuffleCleanupSuite {
   public void cleanupUsesExecutor() throws IOException {
     TestShuffleDataContext dataContext = createSomeData();
 
-    final AtomicBoolean cleanupCalled = new AtomicBoolean(false);
+    AtomicBoolean cleanupCalled = new AtomicBoolean(false);
 
     // Executor which does nothing to ensure we're actually using it.
-    Executor noThreadExecutor = new Executor() {
-      @Override public void execute(Runnable runnable) { cleanupCalled.set(true); }
-    };
+    Executor noThreadExecutor = runnable -> cleanupCalled.set(true);
 
     ExternalShuffleBlockResolver manager =
       new ExternalShuffleBlockResolver(conf, null, noThreadExecutor);

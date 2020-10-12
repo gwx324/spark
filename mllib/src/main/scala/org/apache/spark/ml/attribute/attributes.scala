@@ -19,14 +19,11 @@ package org.apache.spark.ml.attribute
 
 import scala.annotation.varargs
 
-import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.sql.types.{DoubleType, Metadata, MetadataBuilder, NumericType, StructField}
 
 /**
- * :: DeveloperApi ::
  * Abstract class for ML attributes.
  */
-@DeveloperApi
 sealed abstract class Attribute extends Serializable {
 
   name.foreach { n =>
@@ -98,7 +95,7 @@ sealed abstract class Attribute extends Serializable {
   def toMetadata(): Metadata = toMetadata(Metadata.empty)
 
   /**
-   * Converts to a [[StructField]] with some existing metadata.
+   * Converts to a `StructField` with some existing metadata.
    * @param existingMetadata existing metadata to carry over
    */
   def toStructField(existingMetadata: Metadata): StructField = {
@@ -109,7 +106,9 @@ sealed abstract class Attribute extends Serializable {
     StructField(name.get, DoubleType, nullable = false, newMetadata)
   }
 
-  /** Converts to a [[StructField]]. */
+  /**
+   * Converts to a `StructField`.
+   */
   def toStructField(): StructField = toStructField(Metadata.empty)
 
   override def toString: String = toMetadataImpl(withType = true).toString
@@ -119,12 +118,12 @@ sealed abstract class Attribute extends Serializable {
 private[attribute] trait AttributeFactory {
 
   /**
-   * Creates an [[Attribute]] from a [[Metadata]] instance.
+   * Creates an [[Attribute]] from a `Metadata` instance.
    */
   private[attribute] def fromMetadata(metadata: Metadata): Attribute
 
   /**
-   * Creates an [[Attribute]] from a [[StructField]] instance, optionally preserving name.
+   * Creates an [[Attribute]] from a `StructField` instance, optionally preserving name.
    */
   private[ml] def decodeStructField(field: StructField, preserveName: Boolean): Attribute = {
     require(field.dataType.isInstanceOf[NumericType])
@@ -143,15 +142,11 @@ private[attribute] trait AttributeFactory {
   }
 
   /**
-   * Creates an [[Attribute]] from a [[StructField]] instance.
+   * Creates an [[Attribute]] from a `StructField` instance.
    */
   def fromStructField(field: StructField): Attribute = decodeStructField(field, false)
 }
 
-/**
- * :: DeveloperApi ::
- */
-@DeveloperApi
 object Attribute extends AttributeFactory {
 
   private[attribute] override def fromMetadata(metadata: Metadata): Attribute = {
@@ -180,7 +175,6 @@ object Attribute extends AttributeFactory {
 
 
 /**
- * :: DeveloperApi ::
  * A numeric attribute with optional summary statistics.
  * @param name optional name
  * @param index optional index
@@ -189,7 +183,6 @@ object Attribute extends AttributeFactory {
  * @param std optional standard deviation
  * @param sparsity optional sparsity (ratio of zeros)
  */
-@DeveloperApi
 class NumericAttribute private[ml] (
     override val name: Option[String] = None,
     override val index: Option[Int] = None,
@@ -297,10 +290,8 @@ class NumericAttribute private[ml] (
 }
 
 /**
- * :: DeveloperApi ::
  * Factory methods for numeric attributes.
  */
-@DeveloperApi
 object NumericAttribute extends AttributeFactory {
 
   /** The default numeric attribute. */
@@ -319,7 +310,6 @@ object NumericAttribute extends AttributeFactory {
 }
 
 /**
- * :: DeveloperApi ::
  * A nominal attribute.
  * @param name optional name
  * @param index optional index
@@ -328,7 +318,6 @@ object NumericAttribute extends AttributeFactory {
  *                  defined.
  * @param values optional values. At most one of `numValues` and `values` can be defined.
  */
-@DeveloperApi
 class NominalAttribute private[ml] (
     override val name: Option[String] = None,
     override val index: Option[Int] = None,
@@ -369,12 +358,16 @@ class NominalAttribute private[ml] (
   override def withIndex(index: Int): NominalAttribute = copy(index = Some(index))
   override def withoutIndex: NominalAttribute = copy(index = None)
 
-  /** Copy with new values and empty `numValues`. */
+  /**
+   * Copy with new values and empty `numValues`.
+   */
   def withValues(values: Array[String]): NominalAttribute = {
     copy(numValues = None, values = Some(values))
   }
 
-  /** Copy with new values and empty `numValues`. */
+  /**
+   * Copy with new values and empty `numValues`.
+   */
   @varargs
   def withValues(first: String, others: String*): NominalAttribute = {
     copy(numValues = None, values = Some((first +: others).toArray))
@@ -385,12 +378,16 @@ class NominalAttribute private[ml] (
     copy(values = None)
   }
 
-  /** Copy with a new `numValues` and empty `values`. */
+  /**
+   * Copy with a new `numValues` and empty `values`.
+   */
   def withNumValues(numValues: Int): NominalAttribute = {
     copy(numValues = Some(numValues), values = None)
   }
 
-  /** Copy without the `numValues`. */
+  /**
+   * Copy without the `numValues`.
+   */
   def withoutNumValues: NominalAttribute = copy(numValues = None)
 
   /**
@@ -454,10 +451,8 @@ class NominalAttribute private[ml] (
 }
 
 /**
- * :: DeveloperApi ::
  * Factory methods for nominal attributes.
  */
-@DeveloperApi
 object NominalAttribute extends AttributeFactory {
 
   /** The default nominal attribute. */
@@ -477,13 +472,11 @@ object NominalAttribute extends AttributeFactory {
 }
 
 /**
- * :: DeveloperApi ::
  * A binary attribute.
  * @param name optional name
  * @param index optional index
  * @param values optional values. If set, its size must be 2.
  */
-@DeveloperApi
 class BinaryAttribute private[ml] (
     override val name: Option[String] = None,
     override val index: Option[Int] = None,
@@ -556,10 +549,8 @@ class BinaryAttribute private[ml] (
 }
 
 /**
- * :: DeveloperApi ::
  * Factory methods for binary attributes.
  */
-@DeveloperApi
 object BinaryAttribute extends AttributeFactory {
 
   /** The default binary attribute. */
@@ -576,10 +567,8 @@ object BinaryAttribute extends AttributeFactory {
 }
 
 /**
- * :: DeveloperApi ::
  * An unresolved attribute.
  */
-@DeveloperApi
 object UnresolvedAttribute extends Attribute {
 
   override def attrType: AttributeType = AttributeType.Unresolved

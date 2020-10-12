@@ -17,8 +17,9 @@
 
 package org.apache.spark.ml
 
-import org.apache.spark.annotation.{DeveloperApi, Since}
-import org.apache.spark.ml.feature.LabeledPoint
+import org.apache.spark.annotation.Since
+import org.apache.spark.ml.feature.{Instance, LabeledPoint}
+import org.apache.spark.ml.functions.checkNonNegativeWeight
 import org.apache.spark.ml.linalg.{Vector, VectorUDT}
 import org.apache.spark.ml.param._
 import org.apache.spark.ml.param.shared._
@@ -40,7 +41,7 @@ private[ml] trait PredictorParams extends Params
    * @param schema input schema
    * @param fitting whether this is in fitting
    * @param featuresDataType  SQL DataType for FeaturesType.
-   *                          E.g., [[org.apache.spark.mllib.linalg.VectorUDT]] for vector features.
+   *                          E.g., `VectorUDT` for vector features.
    * @return output schema
    */
   protected def validateAndTransformSchema(
@@ -51,23 +52,66 @@ private[ml] trait PredictorParams extends Params
     SchemaUtils.checkColumnType(schema, $(featuresCol), featuresDataType)
     if (fitting) {
       SchemaUtils.checkNumericType(schema, $(labelCol))
+
+      this match {
+        case p: HasWeightCol =>
+          if (isDefined(p.weightCol) && $(p.weightCol).nonEmpty) {
+            SchemaUtils.checkNumericType(schema, $(p.weightCol))
+          }
+        case _ =>
+      }
     }
     SchemaUtils.appendColumn(schema, $(predictionCol), DoubleType)
+  }
+
+  /**
+   * Extract [[labelCol]], weightCol(if any) and [[featuresCol]] from the given dataset,
+   * and put it in an RDD with strong types.
+   */
+  protected def extractInstances(dataset: Dataset[_]): RDD[Instance] = {
+    val w = this match {
+      case p: HasWeightCol =>
+        if (isDefined(p.weightCol) && $(p.weightCol).nonEmpty) {
+          checkNonNegativeWeight((col($(p.weightCol)).cast(DoubleType)))
+        } else {
+          lit(1.0)
+        }
+    }
+
+    dataset.select(col($(labelCol)).cast(DoubleType), w, col($(featuresCol))).rdd.map {
+      case Row(label: Double, weight: Double, features: Vector) =>
+        Instance(label, weight, features)
+    }
+  }
+
+  /**
+   * Extract [[labelCol]], weightCol(if any) and [[featuresCol]] from the given dataset,
+   * and put it in an RDD with strong types.
+   * Validate the output instances with the given function.
+   */
+  protected def extractInstances(
+      dataset: Dataset[_],
+      validateInstance: Instance => Unit): RDD[Instance] = {
+    extractInstances(dataset).map { instance =>
+      validateInstance(instance)
+      instance
+    }
   }
 }
 
 /**
- * :: DeveloperApi ::
- * Abstraction for prediction problems (regression and classification).
+ * Abstraction for prediction problems (regression and classification). It accepts all NumericType
+ * labels and will automatically cast it to DoubleType in `fit()`. If this predictor supports
+ * weights, it accepts all NumericType weights, which will be automatically casted to DoubleType
+ * in `fit()`.
  *
  * @tparam FeaturesType  Type of features.
- *                       E.g., [[org.apache.spark.mllib.linalg.VectorUDT]] for vector features.
+ *                       E.g., `VectorUDT` for vector features.
  * @tparam Learner  Specialization of this class.  If you subclass this type, use this type
  *                  parameter to specify the concrete type.
  * @tparam M  Specialization of [[PredictionModel]].  If you subclass this type, use this type
  *            parameter to specify the concrete type for the corresponding model.
  */
-@DeveloperApi
 abstract class Predictor[
     FeaturesType,
     Learner <: Predictor[FeaturesType, Learner, M],
@@ -87,14 +131,31 @@ abstract class Predictor[
     // This handles a few items such as schema validation.
     // Developers only need to implement train().
     transformSchema(dataset.schema, logging = true)
-    copyValues(train(dataset).setParent(this))
+
+    // Cast LabelCol to DoubleType and keep the metadata.
+    val labelMeta = dataset.schema($(labelCol)).metadata
+    val labelCasted = dataset.withColumn($(labelCol), col($(labelCol)).cast(DoubleType), labelMeta)
+
+    // Cast WeightCol to DoubleType and keep the metadata.
+    val casted = this match {
+      case p: HasWeightCol =>
+        if (isDefined(p.weightCol) && $(p.weightCol).nonEmpty) {
+          val weightMeta = dataset.schema($(p.weightCol)).metadata
+          labelCasted.withColumn($(p.weightCol), col($(p.weightCol)).cast(DoubleType), weightMeta)
+        } else {
+          labelCasted
+        }
+      case _ => labelCasted
+    }
+
+    copyValues(train(casted).setParent(this))
   }
 
   override def copy(extra: ParamMap): Learner
 
   /**
    * Train a model using the given dataset and parameters.
-   * Developers can implement this instead of [[fit()]] to avoid dealing with schema validation
+   * Developers can implement this instead of `fit()` to avoid dealing with schema validation
    * and copying parameters into the model.
    *
    * @param dataset  Training dataset
@@ -105,7 +166,7 @@ abstract class Predictor[
   /**
    * Returns the SQL DataType corresponding to the FeaturesType type parameter.
    *
-   * This is used by [[validateAndTransformSchema()]].
+   * This is used by `validateAndTransformSchema()`.
    * This workaround is needed since SQL has different APIs for Scala and Java.
    *
    * The default value is VectorUDT, but it may be overridden if FeaturesType is not Vector.
@@ -121,22 +182,20 @@ abstract class Predictor[
    * and put it in an RDD with strong types.
    */
   protected def extractLabeledPoints(dataset: Dataset[_]): RDD[LabeledPoint] = {
-    dataset.select(col($(labelCol)).cast(DoubleType), col($(featuresCol))).rdd.map {
+    dataset.select(col($(labelCol)), col($(featuresCol))).rdd.map {
       case Row(label: Double, features: Vector) => LabeledPoint(label, features)
     }
   }
 }
 
 /**
- * :: DeveloperApi ::
  * Abstraction for a model for prediction tasks (regression and classification).
  *
  * @tparam FeaturesType  Type of features.
- *                       E.g., [[org.apache.spark.mllib.linalg.VectorUDT]] for vector features.
+ *                       E.g., `VectorUDT` for vector features.
  * @tparam M  Specialization of [[PredictionModel]].  If you subclass this type, use this type
  *            parameter to specify the concrete type for the corresponding model.
  */
-@DeveloperApi
 abstract class PredictionModel[FeaturesType, M <: PredictionModel[FeaturesType, M]]
   extends Model[M] with PredictorParams {
 
@@ -153,7 +212,7 @@ abstract class PredictionModel[FeaturesType, M <: PredictionModel[FeaturesType, 
   /**
    * Returns the SQL DataType corresponding to the FeaturesType type parameter.
    *
-   * This is used by [[validateAndTransformSchema()]].
+   * This is used by `validateAndTransformSchema()`.
    * This workaround is needed since SQL has different APIs for Scala and Java.
    *
    * The default value is VectorUDT, but it may be overridden if FeaturesType is not Vector.
@@ -161,7 +220,11 @@ abstract class PredictionModel[FeaturesType, M <: PredictionModel[FeaturesType, 
   protected def featuresDataType: DataType = new VectorUDT
 
   override def transformSchema(schema: StructType): StructType = {
-    validateAndTransformSchema(schema, fitting = false, featuresDataType)
+    var outputSchema = validateAndTransformSchema(schema, fitting = false, featuresDataType)
+    if ($(predictionCol).nonEmpty) {
+      outputSchema = SchemaUtils.updateNumeric(outputSchema, $(predictionCol))
+    }
+    outputSchema
   }
 
   /**
@@ -169,29 +232,32 @@ abstract class PredictionModel[FeaturesType, M <: PredictionModel[FeaturesType, 
    * the predictions as a new column [[predictionCol]].
    *
    * @param dataset input dataset
-   * @return transformed dataset with [[predictionCol]] of type [[Double]]
+   * @return transformed dataset with [[predictionCol]] of type `Double`
    */
   override def transform(dataset: Dataset[_]): DataFrame = {
     transformSchema(dataset.schema, logging = true)
     if ($(predictionCol).nonEmpty) {
       transformImpl(dataset)
     } else {
-      this.logWarning(s"$uid: Predictor.transform() was called as NOOP" +
-        " since no output columns were set.")
+      this.logWarning(s"$uid: Predictor.transform() does nothing" +
+        " because no output columns were set.")
       dataset.toDF
     }
   }
 
   protected def transformImpl(dataset: Dataset[_]): DataFrame = {
-    val predictUDF = udf { (features: Any) =>
+    val outputSchema = transformSchema(dataset.schema, logging = true)
+    val predictUDF = udf { features: Any =>
       predict(features.asInstanceOf[FeaturesType])
     }
-    dataset.withColumn($(predictionCol), predictUDF(col($(featuresCol))))
+    dataset.withColumn($(predictionCol), predictUDF(col($(featuresCol))),
+      outputSchema($(predictionCol)).metadata)
   }
 
   /**
    * Predict label for the given features.
-   * This internal method is used to implement [[transform()]] and output [[predictionCol]].
+   * This method is used to implement `transform()` and output [[predictionCol]].
    */
-  protected def predict(features: FeaturesType): Double
+  @Since("2.4.0")
+  def predict(features: FeaturesType): Double
 }

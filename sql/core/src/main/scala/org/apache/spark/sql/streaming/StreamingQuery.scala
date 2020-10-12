@@ -17,41 +17,56 @@
 
 package org.apache.spark.sql.streaming
 
-import org.apache.spark.annotation.Experimental
+import java.util.UUID
+import java.util.concurrent.TimeoutException
+
+import org.apache.spark.annotation.Evolving
 import org.apache.spark.sql.SparkSession
 
 /**
- * :: Experimental ::
  * A handle to a query that is executing continuously in the background as new data arrives.
  * All these methods are thread-safe.
  * @since 2.0.0
  */
-@Experimental
+@Evolving
 trait StreamingQuery {
 
   /**
-   * Returns the name of the query. This name is unique across all active queries. This can be
-   * set in the [[org.apache.spark.sql.DataStreamWriter DataStreamWriter]] as
-   * `dataframe.writeStream.queryName("query").start()`.
+   * Returns the user-specified name of the query, or null if not specified.
+   * This name can be specified in the `org.apache.spark.sql.streaming.DataStreamWriter`
+   * as `dataframe.writeStream.queryName("query").start()`.
+   * This name, if set, must be unique across all active queries.
+   *
    * @since 2.0.0
    */
   def name: String
 
   /**
-   * Returns the unique id of this query. This id is automatically generated and is unique across
-   * all queries that have been started in the current process.
-   * @since 2.0.0
+   * Returns the unique id of this query that persists across restarts from checkpoint data.
+   * That is, this id is generated when a query is started for the first time, and
+   * will be the same every time it is restarted from checkpoint data. Also see [[runId]].
+   *
+   * @since 2.1.0
    */
-  def id: Long
+  def id: UUID
 
   /**
-   * Returns the [[SparkSession]] associated with `this`.
+   * Returns the unique id of this run of the query. That is, every start/restart of a query will
+   * generated a unique runId. Therefore, every time a query is restarted from
+   * checkpoint, it will have the same [[id]] but different [[runId]]s.
+   */
+  def runId: UUID
+
+  /**
+   * Returns the `SparkSession` associated with `this`.
+   *
    * @since 2.0.0
    */
   def sparkSession: SparkSession
 
   /**
-   * Whether the query is currently active or not
+   * Returns `true` if this query is actively running.
+   *
    * @since 2.0.0
    */
   def isActive: Boolean
@@ -63,13 +78,27 @@ trait StreamingQuery {
   def exception: Option[StreamingQueryException]
 
   /**
-   * Returns current status of all the sources.
-   * @since 2.0.0
+   * Returns the current status of the query.
+   *
+   * @since 2.0.2
    */
-  def sourceStatuses: Array[SourceStatus]
+  def status: StreamingQueryStatus
 
-  /** Returns current status of the sink. */
-  def sinkStatus: SinkStatus
+  /**
+   * Returns an array of the most recent [[StreamingQueryProgress]] updates for this query.
+   * The number of progress updates retained for each stream is configured by Spark session
+   * configuration `spark.sql.streaming.numRecentProgressUpdates`.
+   *
+   * @since 2.1.0
+   */
+  def recentProgress: Array[StreamingQueryProgress]
+
+  /**
+   * Returns the most recent [[StreamingQueryProgress]] update of this streaming query.
+   *
+   * @since 2.1.0
+   */
+  def lastProgress: StreamingQueryProgress
 
   /**
    * Waits for the termination of `this` query, either by `query.stop()` or by an exception.
@@ -79,10 +108,11 @@ trait StreamingQuery {
    * immediately (if the query was terminated by `stop()`), or throw the exception
    * immediately (if the query has terminated with exception).
    *
-   * @throws StreamingQueryException, if `this` query has terminated with an exception.
+   * @throws StreamingQueryException if the query has terminated with an exception.
    *
    * @since 2.0.0
    */
+  @throws[StreamingQueryException]
   def awaitTermination(): Unit
 
   /**
@@ -95,27 +125,35 @@ trait StreamingQuery {
    * `true` immediately (if the query was terminated by `stop()`), or throw the exception
    * immediately (if the query has terminated with exception).
    *
-   * @throws StreamingQueryException, if `this` query has terminated with an exception
+   * @throws StreamingQueryException if the query has terminated with an exception
    *
    * @since 2.0.0
    */
+  @throws[StreamingQueryException]
   def awaitTermination(timeoutMs: Long): Boolean
 
   /**
    * Blocks until all available data in the source has been processed and committed to the sink.
    * This method is intended for testing. Note that in the case of continually arriving data, this
    * method may block forever. Additionally, this method is only guaranteed to block until data that
-   * has been synchronously appended data to a [[org.apache.spark.sql.execution.streaming.Source]]
+   * has been synchronously appended data to a `org.apache.spark.sql.execution.streaming.Source`
    * prior to invocation. (i.e. `getOffset` must immediately reflect the addition).
    * @since 2.0.0
    */
   def processAllAvailable(): Unit
 
   /**
-   * Stops the execution of this query if it is running. This method blocks until the threads
-   * performing execution has stopped.
+   * Stops the execution of this query if it is running. This waits until the termination of the
+   * query execution threads or until a timeout is hit.
+   *
+   * By default stop will block indefinitely. You can configure a timeout by the configuration
+   * `spark.sql.streaming.stopTimeout`. A timeout of 0 (or negative) milliseconds will block
+   * indefinitely. If a `TimeoutException` is thrown, users can retry stopping the stream. If the
+   * issue persists, it is advisable to kill the Spark application.
+   *
    * @since 2.0.0
    */
+  @throws[TimeoutException]
   def stop(): Unit
 
   /**

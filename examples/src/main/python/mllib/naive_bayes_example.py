@@ -22,8 +22,6 @@ Usage:
   `spark-submit --master local[4] examples/src/main/python/mllib/naive_bayes_example.py`
 """
 
-from __future__ import print_function
-
 import shutil
 
 from pyspark import SparkContext
@@ -50,7 +48,7 @@ if __name__ == "__main__":
 
     # Make prediction and test accuracy.
     predictionAndLabel = test.map(lambda p: (model.predict(p.features), p.label))
-    accuracy = 1.0 * predictionAndLabel.filter(lambda (x, v): x == v).count() / test.count()
+    accuracy = 1.0 * predictionAndLabel.filter(lambda pl: pl[0] == pl[1]).count() / test.count()
     print('model accuracy {}'.format(accuracy))
 
     # Save and load model
@@ -59,7 +57,7 @@ if __name__ == "__main__":
     model.save(sc, output_dir)
     sameModel = NaiveBayesModel.load(sc, output_dir)
     predictionAndLabel = test.map(lambda p: (sameModel.predict(p.features), p.label))
-    accuracy = 1.0 * predictionAndLabel.filter(lambda (x, v): x == v).count() / test.count()
+    accuracy = 1.0 * predictionAndLabel.filter(lambda pl: pl[0] == pl[1]).count() / test.count()
     print('sameModel accuracy {}'.format(accuracy))
 
     # $example off$

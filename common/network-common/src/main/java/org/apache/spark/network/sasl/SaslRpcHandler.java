@@ -29,8 +29,8 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.spark.network.client.RpcResponseCallback;
 import org.apache.spark.network.client.TransportClient;
+import org.apache.spark.network.server.AbstractAuthRpcHandler;
 import org.apache.spark.network.server.RpcHandler;
-import org.apache.spark.network.server.StreamManager;
 import org.apache.spark.network.util.JavaUtils;
 import org.apache.spark.network.util.TransportConf;
 
@@ -42,7 +42,7 @@ import org.apache.spark.network.util.TransportConf;
  * Note that the authentication process consists of multiple challenge-response pairs, each of
  * which are individual RPCs.
  */
-class SaslRpcHandler extends RpcHandler {
+public class SaslRpcHandler extends AbstractAuthRpcHandler {
   private static final Logger logger = LoggerFactory.getLogger(SaslRpcHandler.class);
 
   /** Transport configuration. */
@@ -51,59 +51,53 @@ class SaslRpcHandler extends RpcHandler {
   /** The client channel. */
   private final Channel channel;
 
-  /** RpcHandler we will delegate to for authenticated connections. */
-  private final RpcHandler delegate;
-
   /** Class which provides secret keys which are shared by server and client on a per-app basis. */
   private final SecretKeyHolder secretKeyHolder;
 
   private SparkSaslServer saslServer;
-  private boolean isComplete;
 
-  SaslRpcHandler(
+  public SaslRpcHandler(
       TransportConf conf,
       Channel channel,
       RpcHandler delegate,
       SecretKeyHolder secretKeyHolder) {
+    super(delegate);
     this.conf = conf;
     this.channel = channel;
-    this.delegate = delegate;
     this.secretKeyHolder = secretKeyHolder;
     this.saslServer = null;
-    this.isComplete = false;
   }
 
   @Override
-  public void receive(TransportClient client, ByteBuffer message, RpcResponseCallback callback) {
-    if (isComplete) {
-      // Authentication complete, delegate to base handler.
-      delegate.receive(client, message, callback);
-      return;
-    }
+  public boolean doAuthChallenge(
+      TransportClient client,
+      ByteBuffer message,
+      RpcResponseCallback callback) {
+    if (saslServer == null || !saslServer.isComplete()) {
+      ByteBuf nettyBuf = Unpooled.wrappedBuffer(message);
+      SaslMessage saslMessage;
+      try {
+        saslMessage = SaslMessage.decode(nettyBuf);
+      } finally {
+        nettyBuf.release();
+      }
 
-    ByteBuf nettyBuf = Unpooled.wrappedBuffer(message);
-    SaslMessage saslMessage;
-    try {
-      saslMessage = SaslMessage.decode(nettyBuf);
-    } finally {
-      nettyBuf.release();
-    }
+      if (saslServer == null) {
+        // First message in the handshake, setup the necessary state.
+        client.setClientId(saslMessage.appId);
+        saslServer = new SparkSaslServer(saslMessage.appId, secretKeyHolder,
+          conf.saslServerAlwaysEncrypt());
+      }
 
-    if (saslServer == null) {
-      // First message in the handshake, setup the necessary state.
-      client.setClientId(saslMessage.appId);
-      saslServer = new SparkSaslServer(saslMessage.appId, secretKeyHolder,
-        conf.saslServerAlwaysEncrypt());
+      byte[] response;
+      try {
+        response = saslServer.response(JavaUtils.bufferToArray(
+          saslMessage.body().nioByteBuffer()));
+      } catch (IOException ioe) {
+        throw new RuntimeException(ioe);
+      }
+      callback.onSuccess(ByteBuffer.wrap(response));
     }
-
-    byte[] response;
-    try {
-      response = saslServer.response(JavaUtils.bufferToArray(
-        saslMessage.body().nioByteBuffer()));
-    } catch (IOException ioe) {
-      throw new RuntimeException(ioe);
-    }
-    callback.onSuccess(ByteBuffer.wrap(response));
 
     // Setup encryption after the SASL response is sent, otherwise the client can't parse the
     // response. It's ok to change the channel pipeline here since we are processing an incoming
@@ -111,38 +105,24 @@ class SaslRpcHandler extends RpcHandler {
     // method returns. This assumes that the code ensures, through other means, that no outbound
     // messages are being written to the channel while negotiation is still going on.
     if (saslServer.isComplete()) {
-      logger.debug("SASL authentication successful for channel {}", client);
-      isComplete = true;
-      if (SparkSaslServer.QOP_AUTH_CONF.equals(saslServer.getNegotiatedProperty(Sasl.QOP))) {
-        logger.debug("Enabling encryption for channel {}", client);
-        SaslEncryption.addToChannel(channel, saslServer, conf.maxSaslEncryptedBlockSize());
-        saslServer = null;
-      } else {
-        saslServer.dispose();
-        saslServer = null;
+      if (!SparkSaslServer.QOP_AUTH_CONF.equals(saslServer.getNegotiatedProperty(Sasl.QOP))) {
+        logger.debug("SASL authentication successful for channel {}", client);
+        complete(true);
+        return true;
       }
+
+      logger.debug("Enabling encryption for channel {}", client);
+      SaslEncryption.addToChannel(channel, saslServer, conf.maxSaslEncryptedBlockSize());
+      complete(false);
+      return true;
     }
-  }
-
-  @Override
-  public void receive(TransportClient client, ByteBuffer message) {
-    delegate.receive(client, message);
-  }
-
-  @Override
-  public StreamManager getStreamManager() {
-    return delegate.getStreamManager();
-  }
-
-  @Override
-  public void channelActive(TransportClient client) {
-    delegate.channelActive(client);
+    return false;
   }
 
   @Override
   public void channelInactive(TransportClient client) {
     try {
-      delegate.channelInactive(client);
+      super.channelInactive(client);
     } finally {
       if (saslServer != null) {
         saslServer.dispose();
@@ -150,9 +130,16 @@ class SaslRpcHandler extends RpcHandler {
     }
   }
 
-  @Override
-  public void exceptionCaught(Throwable cause, TransportClient client) {
-    delegate.exceptionCaught(cause, client);
+  private void complete(boolean dispose) {
+    if (dispose) {
+      try {
+        saslServer.dispose();
+      } catch (RuntimeException e) {
+        logger.error("Error while disposing SASL server", e);
+      }
+    }
+
+    saslServer = null;
   }
 
 }

@@ -18,7 +18,10 @@
 package org.apache.spark.mllib.feature
 
 import org.apache.spark.SparkFunSuite
+import org.apache.spark.internal.config.Kryo._
+import org.apache.spark.mllib.linalg.Vectors
 import org.apache.spark.mllib.util.MLlibTestSparkContext
+import org.apache.spark.sql.internal.SQLConf._
 import org.apache.spark.util.Utils
 
 class Word2VecSuite extends SparkFunSuite with MLlibTestSparkContext {
@@ -40,7 +43,8 @@ class Word2VecSuite extends SparkFunSuite with MLlibTestSparkContext {
     // and a Word2VecMap give the same values.
     val word2VecMap = model.getVectors
     val newModel = new Word2VecModel(word2VecMap)
-    assert(newModel.getVectors.mapValues(_.toSeq) === word2VecMap.mapValues(_.toSeq))
+    assert(newModel.getVectors.mapValues(_.toSeq).toMap ===
+      word2VecMap.mapValues(_.toSeq).toMap)
   }
 
   test("Word2Vec throws exception when vocabulary is empty") {
@@ -68,6 +72,21 @@ class Word2VecSuite extends SparkFunSuite with MLlibTestSparkContext {
     assert(syms(1)._1 == "japan")
   }
 
+  test("findSynonyms doesn't reject similar word vectors when called with a vector") {
+    val num = 2
+    val word2VecMap = Map(
+      ("china", Array(0.50f, 0.50f, 0.50f, 0.50f)),
+      ("japan", Array(0.40f, 0.50f, 0.50f, 0.50f)),
+      ("taiwan", Array(0.60f, 0.50f, 0.50f, 0.50f)),
+      ("korea", Array(0.45f, 0.60f, 0.60f, 0.60f))
+    )
+    val model = new Word2VecModel(word2VecMap)
+    val syms = model.findSynonyms(Vectors.dense(Array(0.52, 0.5, 0.5, 0.5)), num)
+    assert(syms.length == num)
+    assert(syms(0)._1 == "china")
+    assert(syms(1)._1 == "taiwan")
+  }
+
   test("model load / save") {
 
     val word2VecMap = Map(
@@ -84,7 +103,8 @@ class Word2VecSuite extends SparkFunSuite with MLlibTestSparkContext {
     try {
       model.save(sc, path)
       val sameModel = Word2VecModel.load(sc, path)
-      assert(sameModel.getVectors.mapValues(_.toSeq) === model.getVectors.mapValues(_.toSeq))
+      assert(sameModel.getVectors.mapValues(_.toSeq).toMap ===
+        model.getVectors.mapValues(_.toSeq).toMap)
     } finally {
       Utils.deleteRecursively(tempDir)
     }
@@ -93,12 +113,16 @@ class Word2VecSuite extends SparkFunSuite with MLlibTestSparkContext {
 
   test("big model load / save") {
     // backupping old values
-    val oldBufferConfValue = spark.conf.get("spark.kryoserializer.buffer.max", "64m")
-    val oldBufferMaxConfValue = spark.conf.get("spark.kryoserializer.buffer", "64k")
+    val oldBufferConfValue = spark.conf.get(KRYO_SERIALIZER_BUFFER_SIZE.key, "64m")
+    val oldBufferMaxConfValue = spark.conf.get(KRYO_SERIALIZER_MAX_BUFFER_SIZE.key, "64k")
+    val oldSetCommandRejectsSparkCoreConfs = spark.conf.get(
+      SET_COMMAND_REJECTS_SPARK_CORE_CONFS.key, "true")
 
     // setting test values to trigger partitioning
-    spark.conf.set("spark.kryoserializer.buffer", "50b")
-    spark.conf.set("spark.kryoserializer.buffer.max", "50b")
+
+    // this is needed to set configurations which are also defined to SparkConf
+    spark.conf.set(SET_COMMAND_REJECTS_SPARK_CORE_CONFS.key, "false")
+    spark.conf.set(KRYO_SERIALIZER_BUFFER_SIZE.key, "50b")
 
     // create a model bigger than 50 Bytes
     val word2VecMap = Map((0 to 10).map(i => s"$i" -> Array.fill(10)(0.1f)): _*)
@@ -114,15 +138,17 @@ class Word2VecSuite extends SparkFunSuite with MLlibTestSparkContext {
     try {
       model.save(sc, path)
       val sameModel = Word2VecModel.load(sc, path)
-      assert(sameModel.getVectors.mapValues(_.toSeq) === model.getVectors.mapValues(_.toSeq))
+      assert(sameModel.getVectors.mapValues(_.toSeq).toMap ===
+        model.getVectors.mapValues(_.toSeq).toMap)
     }
     catch {
       case t: Throwable => fail("exception thrown persisting a model " +
         "that spans over multiple partitions", t)
     } finally {
       Utils.deleteRecursively(tempDir)
-      spark.conf.set("spark.kryoserializer.buffer", oldBufferConfValue)
-      spark.conf.set("spark.kryoserializer.buffer.max", oldBufferMaxConfValue)
+      spark.conf.set(KRYO_SERIALIZER_BUFFER_SIZE.key, oldBufferConfValue)
+      spark.conf.set(KRYO_SERIALIZER_MAX_BUFFER_SIZE.key, oldBufferMaxConfValue)
+      spark.conf.set(SET_COMMAND_REJECTS_SPARK_CORE_CONFS.key, oldSetCommandRejectsSparkCoreConfs)
     }
 
   }

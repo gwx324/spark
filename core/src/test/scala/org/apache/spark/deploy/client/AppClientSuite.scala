@@ -17,34 +17,41 @@
 
 package org.apache.spark.deploy.client
 
-import java.util.concurrent.ConcurrentLinkedQueue
+import java.io.Closeable
+import java.util.concurrent.{ConcurrentHashMap, ConcurrentLinkedQueue}
 
 import scala.concurrent.duration._
 
 import org.scalatest.BeforeAndAfterAll
-import org.scalatest.concurrent.Eventually._
+import org.scalatest.concurrent.{Eventually, ScalaFutures}
 
 import org.apache.spark._
 import org.apache.spark.deploy.{ApplicationDescription, Command}
 import org.apache.spark.deploy.DeployMessages.{MasterStateResponse, RequestMasterState}
 import org.apache.spark.deploy.master.{ApplicationInfo, Master}
 import org.apache.spark.deploy.worker.Worker
-import org.apache.spark.internal.Logging
+import org.apache.spark.internal.{config, Logging}
 import org.apache.spark.rpc.RpcEnv
+import org.apache.spark.scheduler.ExecutorDecommissionInfo
 import org.apache.spark.util.Utils
 
 /**
  * End-to-end tests for application client in standalone mode.
  */
-class AppClientSuite extends SparkFunSuite with LocalSparkContext with BeforeAndAfterAll {
+class AppClientSuite
+    extends SparkFunSuite
+    with LocalSparkContext
+    with BeforeAndAfterAll
+    with Eventually
+    with ScalaFutures {
   private val numWorkers = 2
-  private val conf = new SparkConf()
-  private val securityManager = new SecurityManager(conf)
 
+  private var conf: SparkConf = null
   private var masterRpcEnv: RpcEnv = null
   private var workerRpcEnvs: Seq[RpcEnv] = null
   private var master: Master = null
   private var workers: Seq[Worker] = null
+  private var securityManager: SecurityManager = null
 
   /**
    * Start the local cluster.
@@ -52,6 +59,8 @@ class AppClientSuite extends SparkFunSuite with LocalSparkContext with BeforeAnd
    */
   override def beforeAll(): Unit = {
     super.beforeAll()
+    conf = new SparkConf().set(config.DECOMMISSION_ENABLED.key, "true")
+    securityManager = new SecurityManager(conf)
     masterRpcEnv = RpcEnv.create(Master.SYSTEM_NAME, "localhost", 0, conf, securityManager)
     workerRpcEnvs = (0 until numWorkers).map { i =>
       RpcEnv.create(Worker.SYSTEM_NAME + i, "localhost", 0, conf, securityManager)
@@ -59,7 +68,7 @@ class AppClientSuite extends SparkFunSuite with LocalSparkContext with BeforeAnd
     master = makeMaster()
     workers = makeWorkers(10, 2048)
     // Wait until all workers register with master successfully
-    eventually(timeout(60.seconds), interval(10.millis)) {
+    eventually(timeout(1.minute), interval(10.milliseconds)) {
       assert(getMasterState.workers.size === numWorkers)
     }
   }
@@ -80,49 +89,87 @@ class AppClientSuite extends SparkFunSuite with LocalSparkContext with BeforeAnd
   }
 
   test("interface methods of AppClient using local Master") {
-    val ci = new AppClientInst(masterRpcEnv.address.toSparkURL)
+    Utils.tryWithResource(new AppClientInst(masterRpcEnv.address.toSparkURL)) { ci =>
 
-    ci.client.start()
+      ci.client.start()
 
-    // Client should connect with one Master which registers the application
-    eventually(timeout(10.seconds), interval(10.millis)) {
-      val apps = getApplications()
-      assert(ci.listener.connectedIdList.size === 1, "client listener should have one connection")
-      assert(apps.size === 1, "master should have 1 registered app")
-    }
+      // Client should connect with one Master which registers the application
+      eventually(timeout(10.seconds), interval(10.millis)) {
+        val apps = getApplications()
+        assert(ci.listener.connectedIdList.size === 1, "client listener should have one connection")
+        assert(apps.size === 1, "master should have 1 registered app")
+      }
 
-    // Send message to Master to request Executors, verify request by change in executor limit
-    val numExecutorsRequested = 1
-    assert(ci.client.requestTotalExecutors(numExecutorsRequested))
+      // Send message to Master to request Executors, verify request by change in executor limit
+      val numExecutorsRequested = 1
+      whenReady(
+        ci.client.requestTotalExecutors(numExecutorsRequested),
+        timeout(10.seconds),
+        interval(10.millis)) { acknowledged =>
+        assert(acknowledged)
+      }
 
-    eventually(timeout(10.seconds), interval(10.millis)) {
-      val apps = getApplications()
-      assert(apps.head.getExecutorLimit === numExecutorsRequested, s"executor request failed")
-    }
+      eventually(timeout(10.seconds), interval(10.millis)) {
+        val apps = getApplications()
+        assert(apps.head.getExecutorLimit === numExecutorsRequested, s"executor request failed")
+      }
 
-    // Send request to kill executor, verify request was made
-    assert {
-      val apps = getApplications()
-      val executorId: String = apps.head.executors.head._2.fullId
-      ci.client.killExecutors(Seq(executorId))
-    }
 
-    // Issue stop command for Client to disconnect from Master
-    ci.client.stop()
+      // Save the executor id before decommissioning so we can kill it
+      val application = getApplications().head
+      val executors = application.executors
+      val executorId: String = executors.head._2.fullId
 
-    // Verify Client is marked dead and unregistered from Master
-    eventually(timeout(10.seconds), interval(10.millis)) {
-      val apps = getApplications()
-      assert(ci.listener.deadReasonList.size === 1, "client should have been marked dead")
-      assert(apps.isEmpty, "master should have 0 registered apps")
+      // Send a decommission self to all the workers
+      // Note: normally the worker would send this on their own.
+      workers.foreach(worker => worker.decommissionSelf())
+
+      // Decommissioning is async.
+      eventually(timeout(1.seconds), interval(10.millis)) {
+        // We only record decommissioning for the executor we've requested
+        assert(ci.listener.execDecommissionedMap.size === 1)
+        val decommissionInfo = ci.listener.execDecommissionedMap.get(executorId)
+        assert(decommissionInfo != null && decommissionInfo.workerHost.isDefined,
+          s"$executorId should have been decommissioned along with its worker")
+      }
+
+      // Send request to kill executor, verify request was made
+      whenReady(
+        ci.client.killExecutors(Seq(executorId)),
+        timeout(10.seconds),
+        interval(10.millis)) { acknowledged =>
+        assert(acknowledged)
+      }
+
+      // Verify that asking for executors on the decommissioned workers fails
+      whenReady(
+        ci.client.requestTotalExecutors(numExecutorsRequested),
+        timeout(10.seconds),
+        interval(10.millis)) { acknowledged =>
+        assert(acknowledged)
+      }
+      assert(getApplications().head.executors.size === 0)
+
+      // Issue stop command for Client to disconnect from Master
+      ci.client.stop()
+
+      // Verify Client is marked dead and unregistered from Master
+      eventually(timeout(10.seconds), interval(10.millis)) {
+        val apps = getApplications()
+        assert(ci.listener.deadReasonList.size === 1, "client should have been marked dead")
+        assert(apps.isEmpty, "master should have 0 registered apps")
+      }
     }
   }
 
   test("request from AppClient before initialized with master") {
-    val ci = new AppClientInst(masterRpcEnv.address.toSparkURL)
+    Utils.tryWithResource(new AppClientInst(masterRpcEnv.address.toSparkURL)) { ci =>
 
-    // requests to master should fail immediately
-    assert(ci.client.requestTotalExecutors(3) === false)
+      // requests to master should fail immediately
+      whenReady(ci.client.requestTotalExecutors(3), timeout(1.seconds)) { success =>
+        assert(success === false)
+      }
+    }
   }
 
   // ===============================
@@ -157,7 +204,7 @@ class AppClientSuite extends SparkFunSuite with LocalSparkContext with BeforeAnd
 
   /** Get the Master state */
   private def getMasterState: MasterStateResponse = {
-    master.self.askWithRetry[MasterStateResponse](RequestMasterState)
+    master.self.askSync[MasterStateResponse](RequestMasterState)
   }
 
   /** Get the applications that are active from Master */
@@ -172,6 +219,7 @@ class AppClientSuite extends SparkFunSuite with LocalSparkContext with BeforeAnd
     val deadReasonList = new ConcurrentLinkedQueue[String]()
     val execAddedList = new ConcurrentLinkedQueue[String]()
     val execRemovedList = new ConcurrentLinkedQueue[String]()
+    val execDecommissionedMap = new ConcurrentHashMap[String, ExecutorDecommissionInfo]()
 
     def connected(id: String): Unit = {
       connectedIdList.add(id)
@@ -196,19 +244,31 @@ class AppClientSuite extends SparkFunSuite with LocalSparkContext with BeforeAnd
       execAddedList.add(id)
     }
 
-    def executorRemoved(id: String, message: String, exitStatus: Option[Int]): Unit = {
+    def executorRemoved(
+        id: String, message: String, exitStatus: Option[Int], workerHost: Option[String]): Unit = {
       execRemovedList.add(id)
     }
+
+    def executorDecommissioned(id: String, decommissionInfo: ExecutorDecommissionInfo): Unit = {
+      val previousDecommissionInfo = execDecommissionedMap.putIfAbsent(id, decommissionInfo)
+      assert(previousDecommissionInfo === null, s"Expected no previous decommission info for $id")
+    }
+
+    def workerRemoved(workerId: String, host: String, message: String): Unit = {}
   }
 
   /** Create AppClient and supporting objects */
-  private class AppClientInst(masterUrl: String) {
+  private class AppClientInst(masterUrl: String) extends Closeable {
     val rpcEnv = RpcEnv.create("spark", Utils.localHostName(), 0, conf, securityManager)
     private val cmd = new Command(TestExecutor.getClass.getCanonicalName.stripSuffix("$"),
       List(), Map(), Seq(), Seq(), Seq())
     private val desc = new ApplicationDescription("AppClientSuite", Some(1), 512, cmd, "ignored")
     val listener = new AppClientCollector
     val client = new StandaloneAppClient(rpcEnv, Array(masterUrl), desc, listener, new SparkConf)
+
+    override def close(): Unit = {
+      rpcEnv.shutdown()
+    }
   }
 
 }

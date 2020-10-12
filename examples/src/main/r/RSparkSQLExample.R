@@ -15,10 +15,13 @@
 # limitations under the License.
 #
 
+# To run this example use
+# ./bin/spark-submit examples/src/main/r/RSparkSQLExample.R
+
 library(SparkR)
 
 # $example on:init_session$
-sparkR.session(appName = "MyApp", sparkConfig = list(spark.some.config.option = "some-value"))
+sparkR.session(appName = "R Spark SQL basic example", sparkConfig = list(spark.some.config.option = "some-value"))
 # $example off:init_session$
 
 
@@ -96,6 +99,26 @@ createOrReplaceTempView(df, "table")
 df <- sql("SELECT * FROM table")
 # $example off:run_sql$
 
+# Ignore corrupt files
+# $example on:ignore_corrupt_files$
+# enable ignore corrupt files
+sql("set spark.sql.files.ignoreCorruptFiles=true")
+# dir1/file3.json is corrupt from parquet's view
+testCorruptDF <- read.parquet(c("examples/src/main/resources/dir1/", "examples/src/main/resources/dir1/dir2/"))
+head(testCorruptDF)
+#            file
+# 1 file1.parquet
+# 2 file2.parquet
+# $example off:ignore_corrupt_files$
+
+# $example on:recursive_file_lookup$
+recursiveLoadedDF <- read.df("examples/src/main/resources/dir1", "parquet", recursiveFileLookup = "true")
+head(recursiveLoadedDF)
+#            file
+# 1 file1.parquet
+# 2 file2.parquet
+# $example off:recursive_file_lookup$
+sql("set spark.sql.files.ignoreCorruptFiles=false")
 
 # $example on:generic_load_save_functions$
 df <- read.df("examples/src/main/resources/users.parquet")
@@ -109,6 +132,22 @@ namesAndAges <- select(df, "name", "age")
 write.df(namesAndAges, "namesAndAges.parquet", "parquet")
 # $example off:manual_load_options$
 
+
+# $example on:manual_load_options_csv$
+df <- read.df("examples/src/main/resources/people.csv", "csv", sep = ";", inferSchema = TRUE, header = TRUE)
+namesAndAges <- select(df, "name", "age")
+# $example off:manual_load_options_csv$
+
+# $example on:load_with_path_glob_filter$
+df <- read.df("examples/src/main/resources/dir1", "parquet", pathGlobFilter = "*.parquet")
+#            file
+# 1 file1.parquet
+# $example off:load_with_path_glob_filter$
+
+# $example on:manual_save_options_orc$
+df <- read.df("examples/src/main/resources/users.orc", "orc")
+write.orc(df, "users_with_options.orc", orc.bloom.filter.columns = "favorite_color", orc.dictionary.key.threshold = 1.0, orc.column.encoding.direct = "name")
+# $example off:manual_save_options_orc$
 
 # $example on:direct_sql$
 df <- sql("SELECT * FROM parquet.`examples/src/main/resources/users.parquet`")
@@ -195,7 +234,7 @@ head(teenagers)
 # $example on:spark_hive$
 # enableHiveSupport defaults to TRUE
 sparkR.session(enableHiveSupport = TRUE)
-sql("CREATE TABLE IF NOT EXISTS src (key INT, value STRING)")
+sql("CREATE TABLE IF NOT EXISTS src (key INT, value STRING) USING hive")
 sql("LOAD DATA LOCAL INPATH 'examples/src/main/resources/kv1.txt' INTO TABLE src")
 
 # Queries can be expressed in HiveQL.
@@ -204,7 +243,11 @@ results <- collect(sql("FROM src SELECT key, value"))
 
 
 # $example on:jdbc_dataset$
+# Loading data from a JDBC source
 df <- read.jdbc("jdbc:postgresql:dbserver", "schema.tablename", user = "username", password = "password")
+
+# Saving data to a JDBC source
+write.jdbc(df, "jdbc:postgresql:dbserver", "schema.tablename", user = "username", password = "password")
 # $example off:jdbc_dataset$
 
 # Stop the SparkSession now

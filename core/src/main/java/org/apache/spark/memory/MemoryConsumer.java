@@ -54,14 +54,12 @@ public abstract class MemoryConsumer {
   /**
    * Returns the size of used memory in bytes.
    */
-  protected long getUsed() {
+  public long getUsed() {
     return used;
   }
 
   /**
    * Force spill during building.
-   *
-   * For testing.
    */
   public void spill() throws IOException {
     spill(Long.MAX_VALUE, this);
@@ -80,24 +78,23 @@ public abstract class MemoryConsumer {
    * @param size the amount of memory should be released
    * @param trigger the MemoryConsumer that trigger this spilling
    * @return the amount of released memory in bytes
-   * @throws IOException
    */
   public abstract long spill(long size, MemoryConsumer trigger) throws IOException;
 
   /**
-   * Allocates a LongArray of `size`.
+   * Allocates a LongArray of `size`. Note that this method may throw `SparkOutOfMemoryError`
+   * if Spark doesn't have enough memory for this allocation, or throw `TooLargePageException`
+   * if this `LongArray` is too large to fit in a single page. The caller side should take care of
+   * these two exceptions, or make sure the `size` is small enough that won't trigger exceptions.
+   *
+   * @throws SparkOutOfMemoryError
+   * @throws TooLargePageException
    */
   public LongArray allocateArray(long size) {
     long required = size * 8L;
     MemoryBlock page = taskMemoryManager.allocatePage(required, this);
     if (page == null || page.size() < required) {
-      long got = 0;
-      if (page != null) {
-        got = page.size();
-        taskMemoryManager.freePage(page, this);
-      }
-      taskMemoryManager.showMemoryUsage();
-      throw new OutOfMemoryError("Unable to acquire " + required + " bytes of memory, got " + got);
+      throwOom(page, required);
     }
     used += required;
     return new LongArray(page);
@@ -113,20 +110,12 @@ public abstract class MemoryConsumer {
   /**
    * Allocate a memory block with at least `required` bytes.
    *
-   * Throws IOException if there is not enough memory.
-   *
-   * @throws OutOfMemoryError
+   * @throws SparkOutOfMemoryError
    */
   protected MemoryBlock allocatePage(long required) {
     MemoryBlock page = taskMemoryManager.allocatePage(Math.max(pageSize, required), this);
     if (page == null || page.size() < required) {
-      long got = 0;
-      if (page != null) {
-        got = page.size();
-        taskMemoryManager.freePage(page, this);
-      }
-      taskMemoryManager.showMemoryUsage();
-      throw new OutOfMemoryError("Unable to acquire " + required + " bytes of memory, got " + got);
+      throwOom(page, required);
     }
     used += page.size();
     return page;
@@ -155,5 +144,18 @@ public abstract class MemoryConsumer {
   public void freeMemory(long size) {
     taskMemoryManager.releaseExecutionMemory(size, this);
     used -= size;
+  }
+
+  private void throwOom(final MemoryBlock page, final long required) {
+    long got = 0;
+    if (page != null) {
+      got = page.size();
+      taskMemoryManager.freePage(page, this);
+    }
+    taskMemoryManager.showMemoryUsage();
+    // checkstyle.off: RegexpSinglelineJava
+    throw new SparkOutOfMemoryError("Unable to acquire " + required + " bytes of memory, got " +
+      got);
+    // checkstyle.on: RegexpSinglelineJava
   }
 }

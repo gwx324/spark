@@ -37,6 +37,15 @@ object TestRelations {
     AttributeReference("g", DoubleType)(),
     AttributeReference("h", DecimalType(10, 2))())
 
+  // This is the same with `testRelation3` but only `h` is incompatible type.
+  val testRelation4 = LocalRelation(
+    AttributeReference("e", StringType)(),
+    AttributeReference("f", StringType)(),
+    AttributeReference("g", StringType)(),
+    AttributeReference("h", MapType(IntegerType, IntegerType))())
+
+  val testRelation5 = LocalRelation(AttributeReference("i", StringType)())
+
   val nestedRelation = LocalRelation(
     AttributeReference("top", StructType(
       StructField("duplicateField", StringType) ::

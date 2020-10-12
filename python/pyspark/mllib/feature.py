@@ -18,24 +18,14 @@
 """
 Python package for feature in MLlib.
 """
-from __future__ import absolute_import
-
 import sys
 import warnings
-import random
-import binascii
-if sys.version >= '3':
-    basestring = str
-    unicode = str
-
 from py4j.protocol import Py4JJavaError
 
 from pyspark import since
-from pyspark.rdd import RDD, ignore_unicode_prefix
+from pyspark.rdd import RDD
 from pyspark.mllib.common import callMLlibFunc, JavaModelWrapper
-from pyspark.mllib.linalg import (
-    Vector, Vectors, DenseVector, SparseVector, _convert_to_vector)
-from pyspark.mllib.regression import LabeledPoint
+from pyspark.mllib.linalg import Vectors, _convert_to_vector
 from pyspark.mllib.util import JavaLoader, JavaSaveable
 
 __all__ = ['Normalizer', 'StandardScalerModel', 'StandardScaler',
@@ -45,8 +35,6 @@ __all__ = ['Normalizer', 'StandardScalerModel', 'StandardScaler',
 
 class VectorTransformer(object):
     """
-    .. note:: DeveloperApi
-
     Base class for transformation of a vector or RDD of vector
     """
     def transform(self, vector):
@@ -59,7 +47,7 @@ class VectorTransformer(object):
 
 
 class Normalizer(VectorTransformer):
-    """
+    r"""
     Normalizes samples individually to unit L\ :sup:`p`\  norm
 
     For any 1 <= `p` < float('inf'), normalizes samples using
@@ -70,6 +58,7 @@ class Normalizer(VectorTransformer):
 
     :param p: Normalization in L^p^ space, p = 2 by default.
 
+    >>> from pyspark.mllib.linalg import Vectors
     >>> v = Vectors.dense(range(3))
     >>> nor = Normalizer(1)
     >>> nor.transform(v)
@@ -114,9 +103,9 @@ class JavaVectorTransformer(JavaModelWrapper, VectorTransformer):
         """
         Applies transformation on a vector or an RDD[Vector].
 
-        Note: In Python, transform cannot currently be used within
-              an RDD transformation or action.
-              Call transform directly on the RDD instead.
+        .. note:: In Python, transform cannot currently be used within
+            an RDD transformation or action.
+            Call transform directly on the RDD instead.
 
         :param vector: Vector or RDD of Vector to be transformed.
         """
@@ -139,9 +128,9 @@ class StandardScalerModel(JavaVectorTransformer):
         """
         Applies standardization transformation on a vector.
 
-        Note: In Python, transform cannot currently be used within
-              an RDD transformation or action.
-              Call transform directly on the RDD instead.
+        .. note:: In Python, transform cannot currently be used within
+            an RDD transformation or action.
+            Call transform directly on the RDD instead.
 
         :param vector: Vector or RDD of Vector to be standardized.
         :return: Standardized vector. If the variance of a column is
@@ -208,9 +197,8 @@ class StandardScaler(object):
     training set.
 
     :param withMean: False by default. Centers the data with mean
-                     before scaling. It will build a dense output, so this
-                     does not work on sparse input and will raise an
-                     exception.
+                     before scaling. It will build a dense output, so take
+                     care when applying to sparse input.
     :param withStd: True by default. Scales the data to unit
                     standard deviation.
 
@@ -275,25 +263,114 @@ class ChiSqSelectorModel(JavaVectorTransformer):
 class ChiSqSelector(object):
     """
     Creates a ChiSquared feature selector.
+    The selector supports different selection methods: `numTopFeatures`, `percentile`, `fpr`,
+    `fdr`, `fwe`.
 
-    :param numTopFeatures: number of features that selector will select.
+     * `numTopFeatures` chooses a fixed number of top features according to a chi-squared test.
 
-    >>> data = [
+     * `percentile` is similar but chooses a fraction of all features
+       instead of a fixed number.
+
+     * `fpr` chooses all features whose p-values are below a threshold,
+       thus controlling the false positive rate of selection.
+
+     * `fdr` uses the `Benjamini-Hochberg procedure <https://en.wikipedia.org/wiki/
+       False_discovery_rate#Benjamini.E2.80.93Hochberg_procedure>`_
+       to choose all features whose false discovery rate is below a threshold.
+
+     * `fwe` chooses all features whose p-values are below a threshold. The threshold is scaled by
+       1/numFeatures, thus controlling the family-wise error rate of selection.
+
+    By default, the selection method is `numTopFeatures`, with the default number of top features
+    set to 50.
+
+    >>> from pyspark.mllib.linalg import SparseVector, DenseVector
+    >>> from pyspark.mllib.regression import LabeledPoint
+    >>> data = sc.parallelize([
     ...     LabeledPoint(0.0, SparseVector(3, {0: 8.0, 1: 7.0})),
     ...     LabeledPoint(1.0, SparseVector(3, {1: 9.0, 2: 6.0})),
     ...     LabeledPoint(1.0, [0.0, 9.0, 8.0]),
-    ...     LabeledPoint(2.0, [8.0, 9.0, 5.0])
-    ... ]
-    >>> model = ChiSqSelector(1).fit(sc.parallelize(data))
+    ...     LabeledPoint(2.0, [7.0, 9.0, 5.0]),
+    ...     LabeledPoint(2.0, [8.0, 7.0, 3.0])
+    ... ])
+    >>> model = ChiSqSelector(numTopFeatures=1).fit(data)
     >>> model.transform(SparseVector(3, {1: 9.0, 2: 6.0}))
-    SparseVector(1, {0: 6.0})
-    >>> model.transform(DenseVector([8.0, 9.0, 5.0]))
-    DenseVector([5.0])
+    SparseVector(1, {})
+    >>> model.transform(DenseVector([7.0, 9.0, 5.0]))
+    DenseVector([7.0])
+    >>> model = ChiSqSelector(selectorType="fpr", fpr=0.2).fit(data)
+    >>> model.transform(SparseVector(3, {1: 9.0, 2: 6.0}))
+    SparseVector(1, {})
+    >>> model.transform(DenseVector([7.0, 9.0, 5.0]))
+    DenseVector([7.0])
+    >>> model = ChiSqSelector(selectorType="percentile", percentile=0.34).fit(data)
+    >>> model.transform(DenseVector([7.0, 9.0, 5.0]))
+    DenseVector([7.0])
 
     .. versionadded:: 1.4.0
     """
-    def __init__(self, numTopFeatures):
+    def __init__(self, numTopFeatures=50, selectorType="numTopFeatures", percentile=0.1, fpr=0.05,
+                 fdr=0.05, fwe=0.05):
+        self.numTopFeatures = numTopFeatures
+        self.selectorType = selectorType
+        self.percentile = percentile
+        self.fpr = fpr
+        self.fdr = fdr
+        self.fwe = fwe
+
+    @since('2.1.0')
+    def setNumTopFeatures(self, numTopFeatures):
+        """
+        set numTopFeature for feature selection by number of top features.
+        Only applicable when selectorType = "numTopFeatures".
+        """
         self.numTopFeatures = int(numTopFeatures)
+        return self
+
+    @since('2.1.0')
+    def setPercentile(self, percentile):
+        """
+        set percentile [0.0, 1.0] for feature selection by percentile.
+        Only applicable when selectorType = "percentile".
+        """
+        self.percentile = float(percentile)
+        return self
+
+    @since('2.1.0')
+    def setFpr(self, fpr):
+        """
+        set FPR [0.0, 1.0] for feature selection by FPR.
+        Only applicable when selectorType = "fpr".
+        """
+        self.fpr = float(fpr)
+        return self
+
+    @since('2.2.0')
+    def setFdr(self, fdr):
+        """
+        set FDR [0.0, 1.0] for feature selection by FDR.
+        Only applicable when selectorType = "fdr".
+        """
+        self.fdr = float(fdr)
+        return self
+
+    @since('2.2.0')
+    def setFwe(self, fwe):
+        """
+        set FWE [0.0, 1.0] for feature selection by FWE.
+        Only applicable when selectorType = "fwe".
+        """
+        self.fwe = float(fwe)
+        return self
+
+    @since('2.1.0')
+    def setSelectorType(self, selectorType):
+        """
+        set the selector type of the ChisqSelector.
+        Supported options: "numTopFeatures" (default), "percentile", "fpr", "fdr", "fwe".
+        """
+        self.selectorType = str(selectorType)
+        return self
 
     @since('1.4.0')
     def fit(self, data):
@@ -305,7 +382,8 @@ class ChiSqSelector(object):
                      treated as categorical for each distinct value.
                      Apply feature discretizer before using this function.
         """
-        jmodel = callMLlibFunc("fitChiSqSelector", self.numTopFeatures, data)
+        jmodel = callMLlibFunc("fitChiSqSelector", self.selectorType, self.numTopFeatures,
+                               self.percentile, self.fpr, self.fdr, self.fwe, data)
         return ChiSqSelectorModel(jmodel)
 
 
@@ -354,7 +432,7 @@ class HashingTF(object):
     Maps a sequence of terms to their term frequencies using the hashing
     trick.
 
-    Note: the terms must be hashable (can not be dict/set/list...).
+    .. note:: The terms must be hashable (can not be dict/set/list...).
 
     :param numFeatures: number of features (default: 2^20)
 
@@ -416,9 +494,9 @@ class IDFModel(JavaVectorTransformer):
         the terms which occur in fewer than `minDocFreq`
         documents will have an entry of 0.
 
-        Note: In Python, transform cannot currently be used within
-              an RDD transformation or action.
-              Call transform directly on the RDD instead.
+        .. note:: In Python, transform cannot currently be used within
+            an RDD transformation or action.
+            Call transform directly on the RDD instead.
 
         :param x: an RDD of term frequency vectors or a term frequency
                   vector
@@ -432,6 +510,20 @@ class IDFModel(JavaVectorTransformer):
         Returns the current IDF vector.
         """
         return self.call('idf')
+
+    @since('3.0.0')
+    def docFreq(self):
+        """
+        Returns the document frequency.
+        """
+        return self.call('docFreq')
+
+    @since('3.0.0')
+    def numDocs(self):
+        """
+        Returns number of documents evaluated to compute idf
+        """
+        return self.call('numDocs')
 
 
 class IDF(object):
@@ -498,7 +590,7 @@ class Word2VecModel(JavaVectorTransformer, JavaSaveable, JavaLoader):
         """
         Transforms a word to its vector representation
 
-        Note: local use only
+        .. note:: Local use only
 
         :param word: a word
         :return: vector representation of word(s)
@@ -517,9 +609,9 @@ class Word2VecModel(JavaVectorTransformer, JavaSaveable, JavaLoader):
         :param num: number of synonyms to find
         :return: array of (word, cosineSimilarity)
 
-        Note: local use only
+        .. note:: Local use only
         """
-        if not isinstance(word, basestring):
+        if not isinstance(word, str):
             word = _convert_to_vector(word)
         words, similarity = self.call("findSynonyms", word, num)
         return zip(words, similarity)
@@ -543,10 +635,8 @@ class Word2VecModel(JavaVectorTransformer, JavaSaveable, JavaLoader):
         return Word2VecModel(model)
 
 
-@ignore_unicode_prefix
 class Word2Vec(object):
-    """
-    Word2Vec creates vector representation of words in a text corpus.
+    """Word2Vec creates vector representation of words in a text corpus.
     The algorithm first constructs a vocabulary from the corpus
     and then learns vector representation of words in the vocabulary.
     The vector representation can be used as features in
@@ -568,13 +658,19 @@ class Word2Vec(object):
     >>> doc = sc.parallelize(localDoc).map(lambda line: line.split(" "))
     >>> model = Word2Vec().setVectorSize(10).setSeed(42).fit(doc)
 
+    Querying for synonyms of a word will not return that word:
+
     >>> syms = model.findSynonyms("a", 2)
     >>> [s[0] for s in syms]
-    [u'b', u'c']
+    ['b', 'c']
+
+    But querying for synonyms of a vector may return the word whose
+    representation is that vector:
+
     >>> vec = model.transform("a")
     >>> syms = model.findSynonyms(vec, 2)
     >>> [s[0] for s in syms]
-    [u'b', u'c']
+    ['a', 'b']
 
     >>> import os, tempfile
     >>> path = tempfile.mkdtemp()
@@ -584,7 +680,7 @@ class Word2Vec(object):
     True
     >>> syms = sameModel.findSynonyms("a", 2)
     >>> [s[0] for s in syms]
-    [u'b', u'c']
+    ['b', 'c']
     >>> from shutil import rmtree
     >>> try:
     ...     rmtree(path)
@@ -592,6 +688,7 @@ class Word2Vec(object):
     ...     pass
 
     .. versionadded:: 1.2.0
+
     """
     def __init__(self):
         """
@@ -601,7 +698,7 @@ class Word2Vec(object):
         self.learningRate = 0.025
         self.numPartitions = 1
         self.numIterations = 1
-        self.seed = random.randint(0, sys.maxsize)
+        self.seed = None
         self.minCount = 5
         self.windowSize = 5
 
@@ -676,7 +773,7 @@ class Word2Vec(object):
             raise TypeError("data should be an RDD of list of string")
         jmodel = callMLlibFunc("trainWord2VecModel", data, int(self.vectorSize),
                                float(self.learningRate), int(self.numPartitions),
-                               int(self.numIterations), int(self.seed),
+                               int(self.numIterations), self.seed,
                                int(self.minCount), int(self.windowSize))
         return Word2VecModel(jmodel)
 
@@ -726,7 +823,7 @@ def _test():
     (failure_count, test_count) = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
     spark.stop()
     if failure_count:
-        exit(-1)
+        sys.exit(-1)
 
 if __name__ == "__main__":
     sys.path.pop(0)

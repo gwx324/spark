@@ -17,16 +17,13 @@
 
 package org.apache.spark.mllib.optimization
 
-import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.mllib.linalg.{DenseVector, Vector, Vectors}
 import org.apache.spark.mllib.linalg.BLAS.{axpy, dot, scal}
 import org.apache.spark.mllib.util.MLUtils
 
 /**
- * :: DeveloperApi ::
  * Class used to compute the gradient for a loss function, given a single data point.
  */
-@DeveloperApi
 abstract class Gradient extends Serializable {
   /**
    * Compute the gradient and loss given the features of a single data point.
@@ -58,7 +55,6 @@ abstract class Gradient extends Serializable {
 }
 
 /**
- * :: DeveloperApi ::
  * Compute gradient and loss for a multinomial logistic loss function, as used
  * in multi-class classification (it is also used in binary logistic regression).
  *
@@ -67,23 +63,23 @@ abstract class Gradient extends Serializable {
  * http://statweb.stanford.edu/~tibs/ElemStatLearn/ , Eq. (4.17) on page 119 gives the formula of
  * multinomial logistic regression model. A simple calculation shows that
  *
- * <p><blockquote>
+ * <blockquote>
  *    $$
  *    P(y=0|x, w) = 1 / (1 + \sum_i^{K-1} \exp(x w_i))\\
  *    P(y=1|x, w) = exp(x w_1) / (1 + \sum_i^{K-1} \exp(x w_i))\\
  *    ...\\
  *    P(y=K-1|x, w) = exp(x w_{K-1}) / (1 + \sum_i^{K-1} \exp(x w_i))\\
  *    $$
- * </blockquote></p>
+ * </blockquote>
  *
  * for K classes multiclass classification problem.
  *
- * The model weights $w = (w_1, w_2, ..., w_{K-1})^T$ becomes a matrix which has dimension of
+ * The model weights \(w = (w_1, w_2, ..., w_{K-1})^T\) becomes a matrix which has dimension of
  * (K-1) * (N+1) if the intercepts are added. If the intercepts are not added, the dimension
  * will be (K-1) * N.
  *
  * As a result, the loss of objective function for a single instance of data can be written as
- * <p><blockquote>
+ * <blockquote>
  *    $$
  *    \begin{align}
  *    l(w, x) &= -log P(y|x, w) = -\alpha(y) log P(y=0|x, w) - (1-\alpha(y)) log P(y|x, w) \\
@@ -91,16 +87,16 @@ abstract class Gradient extends Serializable {
  *            &= log(1 + \sum_i^{K-1}\exp(margins_i)) - (1-\alpha(y)) margins_{y-1}
  *    \end{align}
  *    $$
- * </blockquote></p>
+ * </blockquote>
  *
- * where $\alpha(i) = 1$ if $i \ne 0$, and
- *       $\alpha(i) = 0$ if $i == 0$,
- *       $margins_i = x w_i$.
+ * where $\alpha(i) = 1$ if \(i \ne 0\), and
+ *       $\alpha(i) = 0$ if \(i == 0\),
+ *       \(margins_i = x w_i\).
  *
  * For optimization, we have to calculate the first derivative of the loss function, and
  * a simple calculation shows that
  *
- * <p><blockquote>
+ * <blockquote>
  *    $$
  *    \begin{align}
  *      \frac{\partial l(w, x)}{\partial w_{ij}} &=
@@ -108,22 +104,23 @@ abstract class Gradient extends Serializable {
  *                                               &= multiplier_i * x_j
  *    \end{align}
  *    $$
- * </blockquote></p>
+ * </blockquote>
  *
- * where $\delta_{i, j} = 1$ if $i == j$,
- *       $\delta_{i, j} = 0$ if $i != j$, and
+ * where $\delta_{i, j} = 1$ if \(i == j\),
+ *       $\delta_{i, j} = 0$ if \(i != j\), and
  *       multiplier =
  *         $\exp(margins_i) / (1 + \sum_k^{K-1} \exp(margins_i)) - (1-\alpha(y)\delta_{y, i+1})$
  *
  * If any of margins is larger than 709.78, the numerical computation of multiplier and loss
  * function will be suffered from arithmetic overflow. This issue occurs when there are outliers
  * in data which are far away from hyperplane, and this will cause the failing of training once
- * infinity / infinity is introduced. Note that this is only a concern when max(margins) > 0.
+ * infinity / infinity is introduced. Note that this is only a concern when max(margins)
+ * {@literal >} 0.
  *
- * Fortunately, when max(margins) = maxMargin > 0, the loss function and the multiplier can be
- * easily rewritten into the following equivalent numerically stable formula.
+ * Fortunately, when max(margins) = maxMargin {@literal >} 0, the loss function and the multiplier
+ * can be easily rewritten into the following equivalent numerically stable formula.
  *
- * <p><blockquote>
+ * <blockquote>
  *    $$
  *    \begin{align}
  *      l(w, x) &= log(1 + \sum_i^{K-1}\exp(margins_i)) - (1-\alpha(y)) margins_{y-1} \\
@@ -132,8 +129,8 @@ abstract class Gradient extends Serializable {
  *              &= log(1 + sum) + maxMargin - (1-\alpha(y)) margins_{y-1}
  *    \end{align}
  *    $$
- * </blockquote></p>
-
+ * </blockquote>
+ *
  * where sum = $\exp(-maxMargin) + \sum_i^{K-1}\exp(margins_i - maxMargin) - 1$.
  *
  * Note that each term, $(margins_i - maxMargin)$ in $\exp$ is smaller than zero; as a result,
@@ -141,7 +138,7 @@ abstract class Gradient extends Serializable {
  *
  * For multiplier, similar trick can be applied as the following,
  *
- * <p><blockquote>
+ * <blockquote>
  *    $$
  *    \begin{align}
  *      multiplier
@@ -150,7 +147,7 @@ abstract class Gradient extends Serializable {
  *       &= \exp(margins_i - maxMargin) / (1 + sum) - (1-\alpha(y)\delta_{y, i+1})
  *    \end{align}
  *    $$
- * </blockquote></p>
+ * </blockquote>
  *
  * where each term in $\exp$ is also smaller than zero, so overflow is not a concern.
  *
@@ -161,7 +158,6 @@ abstract class Gradient extends Serializable {
  *                   Multinomial Logistic Regression. By default, it is binary logistic regression
  *                   so numClasses will be set to 2.
  */
-@DeveloperApi
 class LogisticGradient(numClasses: Int) extends Gradient {
 
   def this() = this(2)
@@ -217,8 +213,8 @@ class LogisticGradient(numClasses: Int) extends Gradient {
 
         val margins = Array.tabulate(numClasses - 1) { i =>
           var margin = 0.0
-          data.foreachActive { (index, value) =>
-            if (value != 0.0) margin += value * weightsArray((i * dataSize) + index)
+          data.foreachNonZero { (index, value) =>
+            margin += value * weightsArray((i * dataSize) + index)
           }
           if (i == label.toInt - 1) marginY = margin
           if (margin > maxMargin) {
@@ -257,8 +253,8 @@ class LogisticGradient(numClasses: Int) extends Gradient {
           val multiplier = math.exp(margins(i)) / (sum + 1.0) - {
             if (label != 0.0 && label == i + 1) 1.0 else 0.0
           }
-          data.foreachActive { (index, value) =>
-            if (value != 0.0) cumGradientArray(i * dataSize + index) += multiplier * value
+          data.foreachNonZero { (index, value) =>
+            cumGradientArray(i * dataSize + index) += multiplier * value
           }
         }
 
@@ -274,13 +270,11 @@ class LogisticGradient(numClasses: Int) extends Gradient {
 }
 
 /**
- * :: DeveloperApi ::
  * Compute gradient and loss for a Least-squared loss function, as used in linear regression.
  * This is correct for the averaged least squares loss function (mean squared error)
  *              L = 1/2n ||A weights-y||^2
  * See also the documentation for the precise formulation.
  */
-@DeveloperApi
 class LeastSquaresGradient extends Gradient {
   override def compute(data: Vector, label: Double, weights: Vector): (Vector, Double) = {
     val diff = dot(data, weights) - label
@@ -302,12 +296,11 @@ class LeastSquaresGradient extends Gradient {
 }
 
 /**
- * :: DeveloperApi ::
  * Compute gradient and loss for a Hinge loss function, as used in SVM binary classification.
  * See also the documentation for the precise formulation.
- * NOTE: This assumes that the labels are {0,1}
+ *
+ * @note This assumes that the labels are {0,1}
  */
-@DeveloperApi
 class HingeGradient extends Gradient {
   override def compute(data: Vector, label: Double, weights: Vector): (Vector, Double) = {
     val dotProduct = dot(data, weights)

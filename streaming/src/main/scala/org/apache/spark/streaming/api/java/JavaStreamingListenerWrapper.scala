@@ -65,7 +65,7 @@ private[streaming] class JavaStreamingListenerWrapper(javaStreamingListener: Jav
   private def toJavaBatchInfo(batchInfo: BatchInfo): JavaBatchInfo = {
     JavaBatchInfo(
       batchInfo.batchTime,
-      batchInfo.streamIdToInputInfo.mapValues(toJavaStreamInputInfo(_)).asJava,
+      batchInfo.streamIdToInputInfo.mapValues(toJavaStreamInputInfo).toMap.asJava,
       batchInfo.submissionTime,
       batchInfo.processingStartTime.getOrElse(-1),
       batchInfo.processingEndTime.getOrElse(-1),
@@ -73,8 +73,13 @@ private[streaming] class JavaStreamingListenerWrapper(javaStreamingListener: Jav
       batchInfo.processingDelay.getOrElse(-1),
       batchInfo.totalDelay.getOrElse(-1),
       batchInfo.numRecords,
-      batchInfo.outputOperationInfos.mapValues(toJavaOutputOperationInfo(_)).asJava
+      batchInfo.outputOperationInfos.mapValues(toJavaOutputOperationInfo).toMap.asJava
     )
+  }
+
+  override def onStreamingStarted(streamingStarted: StreamingListenerStreamingStarted): Unit = {
+    javaStreamingListener.onStreamingStarted(
+      new JavaStreamingListenerStreamingStarted(streamingStarted.time))
   }
 
   override def onReceiverStarted(receiverStarted: StreamingListenerReceiverStarted): Unit = {

@@ -17,17 +17,20 @@
 
 package org.apache.spark.sql
 
+import org.apache.spark.annotation.Stable
+import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.{ConfigEntry, OptionalConfigEntry}
 import org.apache.spark.sql.internal.SQLConf
-
+import org.apache.spark.sql.internal.SQLConf.{DeprecatedConfig, RemovedConfig}
 
 /**
- * Runtime configuration interface for Spark. To access this, use [[SparkSession.conf]].
+ * Runtime configuration interface for Spark. To access this, use `SparkSession.conf`.
  *
  * Options set here are automatically propagated to the Hadoop configuration during I/O.
  *
  * @since 2.0.0
  */
+@Stable
 class RuntimeConfig private[sql](sqlConf: SQLConf = new SQLConf) {
 
   /**
@@ -36,6 +39,7 @@ class RuntimeConfig private[sql](sqlConf: SQLConf = new SQLConf) {
    * @since 2.0.0
    */
   def set(key: String, value: String): Unit = {
+    requireNonStaticConf(key)
     sqlConf.setConfString(key, value)
   }
 
@@ -60,7 +64,8 @@ class RuntimeConfig private[sql](sqlConf: SQLConf = new SQLConf) {
   /**
    * Returns the value of Spark runtime configuration property for the given key.
    *
-   * @throws NoSuchElementException if the key is not set and does not have a default value
+   * @throws java.util.NoSuchElementException if the key is not set and does not have a default
+   *                                          value
    * @since 2.0.0
    */
   @throws[NoSuchElementException]("if the key is not set")
@@ -122,8 +127,20 @@ class RuntimeConfig private[sql](sqlConf: SQLConf = new SQLConf) {
    * @since 2.0.0
    */
   def unset(key: String): Unit = {
+    requireNonStaticConf(key)
     sqlConf.unsetConf(key)
   }
+
+  /**
+   * Indicates whether the configuration property with the given key
+   * is modifiable in the current session.
+   *
+   * @return `true` if the configuration property is modifiable. For static SQL, Spark Core,
+   *         invalid (not existing) and other non-modifiable configuration properties,
+   *         the returned value is `false`.
+   * @since 2.4.0
+   */
+  def isModifiable(key: String): Boolean = sqlConf.isModifiable(key)
 
   /**
    * Returns whether a particular key is set.
@@ -132,4 +149,13 @@ class RuntimeConfig private[sql](sqlConf: SQLConf = new SQLConf) {
     sqlConf.contains(key)
   }
 
+  private def requireNonStaticConf(key: String): Unit = {
+    if (SQLConf.staticConfKeys.contains(key)) {
+      throw new AnalysisException(s"Cannot modify the value of a static config: $key")
+    }
+    if (sqlConf.setCommandRejectsSparkCoreConfs &&
+        ConfigEntry.findEntry(key) != null && !SQLConf.sqlConfEntries.containsKey(key)) {
+      throw new AnalysisException(s"Cannot modify the value of a Spark config: $key")
+    }
+  }
 }

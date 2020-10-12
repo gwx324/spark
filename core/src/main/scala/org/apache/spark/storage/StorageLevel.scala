@@ -31,7 +31,7 @@ import org.apache.spark.util.Utils
  * ExternalBlockStore, whether to keep the data in memory in a serialized format, and whether
  * to replicate the RDD partitions on multiple nodes.
  *
- * The [[org.apache.spark.storage.StorageLevel$]] singleton object contains some static constants
+ * The [[org.apache.spark.storage.StorageLevel]] singleton object contains some static constants
  * for commonly useful storage levels. To create your own storage level object, use the
  * factory method of the singleton object (`StorageLevel(...)`).
  */
@@ -153,6 +153,7 @@ object StorageLevel {
   val NONE = new StorageLevel(false, false, false, false)
   val DISK_ONLY = new StorageLevel(true, false, false, false)
   val DISK_ONLY_2 = new StorageLevel(true, false, false, false, 2)
+  val DISK_ONLY_3 = new StorageLevel(true, false, false, false, 3)
   val MEMORY_ONLY = new StorageLevel(false, true, false, true)
   val MEMORY_ONLY_2 = new StorageLevel(false, true, false, true, 2)
   val MEMORY_ONLY_SER = new StorageLevel(false, true, false, false)
@@ -172,6 +173,7 @@ object StorageLevel {
     case "NONE" => NONE
     case "DISK_ONLY" => DISK_ONLY
     case "DISK_ONLY_2" => DISK_ONLY_2
+    case "DISK_ONLY_3" => DISK_ONLY_3
     case "MEMORY_ONLY" => MEMORY_ONLY
     case "MEMORY_ONLY_2" => MEMORY_ONLY_2
     case "MEMORY_ONLY_SER" => MEMORY_ONLY_SER

@@ -18,7 +18,6 @@
 // scalastyle:off println
 package org.apache.spark.examples.sql.streaming
 
-import org.apache.spark.sql.functions._
 import org.apache.spark.sql.SparkSession
 
 /**
@@ -35,7 +34,7 @@ import org.apache.spark.sql.SparkSession
  *    localhost 9999`
  */
 object StructuredNetworkWordCount {
-  def main(args: Array[String]) {
+  def main(args: Array[String]): Unit = {
     if (args.length < 2) {
       System.err.println("Usage: StructuredNetworkWordCount <hostname> <port>")
       System.exit(1)

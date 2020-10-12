@@ -2,6 +2,21 @@
 layout: global
 title: "MLlib: Main Guide"
 displayTitle: "Machine Learning Library (MLlib) Guide"
+license: |
+  Licensed to the Apache Software Foundation (ASF) under one or more
+  contributor license agreements.  See the NOTICE file distributed with
+  this work for additional information regarding copyright ownership.
+  The ASF licenses this file to You under the Apache License, Version 2.0
+  (the "License"); you may not use this file except in compliance with
+  the License.  You may obtain a copy of the License at
+ 
+     http://www.apache.org/licenses/LICENSE-2.0
+ 
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
 ---
 
 MLlib is Spark's machine learning (ML) library.
@@ -18,7 +33,7 @@ At a high level, it provides tools such as:
 
 **The MLlib RDD-based API is now in maintenance mode.**
 
-As of Spark 2.0, the [RDD](programming-guide.html#resilient-distributed-datasets-rdds)-based APIs in the `spark.mllib` package have entered maintenance mode.
+As of Spark 2.0, the [RDD](rdd-programming-guide.html#resilient-distributed-datasets-rdds)-based APIs in the `spark.mllib` package have entered maintenance mode.
 The primary Machine Learning API for Spark is now the [DataFrame](sql-programming-guide.html)-based API in the `spark.ml` package.
 
 *What are the implications?*
@@ -26,8 +41,6 @@ The primary Machine Learning API for Spark is now the [DataFrame](sql-programmin
 * MLlib will still support the RDD-based API in `spark.mllib` with bug fixes.
 * MLlib will not add new features to the RDD-based API.
 * In the Spark 2.x releases, MLlib will add features to the DataFrames-based API to reach feature parity with the RDD-based API.
-* After reaching feature parity (roughly estimated for Spark 2.2), the RDD-based API will be deprecated.
-* The RDD-based API is expected to be removed in Spark 3.0.
 
 *Why is MLlib switching to the DataFrame-based API?*
 
@@ -35,180 +48,60 @@ The primary Machine Learning API for Spark is now the [DataFrame](sql-programmin
 * The DataFrame-based API for MLlib provides a uniform API across ML algorithms and across multiple languages.
 * DataFrames facilitate practical ML Pipelines, particularly feature transformations.  See the [Pipelines guide](ml-pipeline.html) for details.
 
+*What is "Spark ML"?*
+
+* "Spark ML" is not an official name but occasionally used to refer to the MLlib DataFrame-based API.
+  This is majorly due to the `org.apache.spark.ml` Scala package name used by the DataFrame-based API, 
+  and the "Spark ML Pipelines" term we used initially to emphasize the pipeline concept.
+  
+*Is MLlib deprecated?*
+
+* No. MLlib includes both the RDD-based API and the DataFrame-based API.
+  The RDD-based API is now in maintenance mode.
+  But neither API is deprecated, nor MLlib as a whole.
+
 # Dependencies
 
-MLlib uses the linear algebra package [Breeze](http://www.scalanlp.org/), which depends on
-[netlib-java](https://github.com/fommil/netlib-java) for optimised numerical processing.
-If native libraries[^1] are not available at runtime, you will see a warning message and a pure JVM
-implementation will be used instead.
+MLlib uses linear algebra packages [Breeze](http://www.scalanlp.org/) and [netlib-java](https://github.com/fommil/netlib-java) for optimised numerical processing[^1]. Those packages may call native acceleration libraries such as [Intel MKL](https://software.intel.com/content/www/us/en/develop/tools/math-kernel-library.html) or [OpenBLAS](http://www.openblas.net) if they are available as system libraries or in runtime library paths. 
 
-Due to licensing issues with runtime proprietary binaries, we do not include `netlib-java`'s native
-proxies by default.
-To configure `netlib-java` / Breeze to use system optimised binaries, include
-`com.github.fommil.netlib:all:1.1.2` (or build Spark with `-Pnetlib-lgpl`) as a dependency of your
-project and read the [netlib-java](https://github.com/fommil/netlib-java) documentation for your
-platform's additional installation instructions.
+Due to differing OSS licenses, `netlib-java`'s native proxies can't be distributed with Spark. See [MLlib Linear Algebra Acceleration Guide](ml-linalg-guide.html) for how to enable accelerated linear algebra processing. If accelerated native libraries are not enabled, you will see a warning message like below and a pure JVM implementation will be used instead:
+```
+WARN BLAS: Failed to load implementation from:com.github.fommil.netlib.NativeSystemBLAS
+WARN BLAS: Failed to load implementation from:com.github.fommil.netlib.NativeRefBLAS
+```
 
 To use MLlib in Python, you will need [NumPy](http://www.numpy.org) version 1.4 or newer.
 
 [^1]: To learn more about the benefits and background of system optimised natives, you may wish to
     watch Sam Halliday's ScalaX talk on [High Performance Linear Algebra in Scala](http://fommil.github.io/scalax14/#/).
 
-# Migration guide
+# Highlights in 3.0
 
-MLlib is under active development.
-The APIs marked `Experimental`/`DeveloperApi` may change in future releases,
-and the migration guide below will explain all changes between releases.
+The list below highlights some of the new features and enhancements added to MLlib in the `3.0`
+release of Spark:
 
-## From 1.6 to 2.0
+* Multiple columns support was added to `Binarizer` ([SPARK-23578](https://issues.apache.org/jira/browse/SPARK-23578)), `StringIndexer` ([SPARK-11215](https://issues.apache.org/jira/browse/SPARK-11215)), `StopWordsRemover` ([SPARK-29808](https://issues.apache.org/jira/browse/SPARK-29808)) and PySpark `QuantileDiscretizer` ([SPARK-22796](https://issues.apache.org/jira/browse/SPARK-22796)).
+* Tree-Based Feature Transformation was added
+([SPARK-13677](https://issues.apache.org/jira/browse/SPARK-13677)).
+* Two new evaluators `MultilabelClassificationEvaluator` ([SPARK-16692](https://issues.apache.org/jira/browse/SPARK-16692)) and `RankingEvaluator` ([SPARK-28045](https://issues.apache.org/jira/browse/SPARK-28045)) were added.
+* Sample weights support was added in `DecisionTreeClassifier/Regressor` ([SPARK-19591](https://issues.apache.org/jira/browse/SPARK-19591)), `RandomForestClassifier/Regressor` ([SPARK-9478](https://issues.apache.org/jira/browse/SPARK-9478)), `GBTClassifier/Regressor` ([SPARK-9612](https://issues.apache.org/jira/browse/SPARK-9612)),  `MulticlassClassificationEvaluator` ([SPARK-24101](https://issues.apache.org/jira/browse/SPARK-24101)), `RegressionEvaluator` ([SPARK-24102](https://issues.apache.org/jira/browse/SPARK-24102)), `BinaryClassificationEvaluator` ([SPARK-24103](https://issues.apache.org/jira/browse/SPARK-24103)), `BisectingKMeans` ([SPARK-30351](https://issues.apache.org/jira/browse/SPARK-30351)), `KMeans` ([SPARK-29967](https://issues.apache.org/jira/browse/SPARK-29967)) and `GaussianMixture` ([SPARK-30102](https://issues.apache.org/jira/browse/SPARK-30102)).
+* R API for `PowerIterationClustering` was added
+([SPARK-19827](https://issues.apache.org/jira/browse/SPARK-19827)).
+* Added Spark ML listener for tracking ML pipeline status
+([SPARK-23674](https://issues.apache.org/jira/browse/SPARK-23674)).
+* Fit with validation set was added to Gradient Boosted Trees in Python
+([SPARK-24333](https://issues.apache.org/jira/browse/SPARK-24333)).
+* [`RobustScaler`](ml-features.html#robustscaler) transformer was added
+([SPARK-28399](https://issues.apache.org/jira/browse/SPARK-28399)).
+* [`Factorization Machines`](ml-classification-regression.html#factorization-machines) classifier and regressor were added
+([SPARK-29224](https://issues.apache.org/jira/browse/SPARK-29224)).
+* Gaussian Naive Bayes Classifier ([SPARK-16872](https://issues.apache.org/jira/browse/SPARK-16872)) and Complement Naive Bayes Classifier ([SPARK-29942](https://issues.apache.org/jira/browse/SPARK-29942)) were added.
+* ML function parity between Scala and Python
+([SPARK-28958](https://issues.apache.org/jira/browse/SPARK-28958)).
+* `predictRaw` is made public in all the Classification models. `predictProbability` is made public in all the Classification models except `LinearSVCModel`
+([SPARK-30358](https://issues.apache.org/jira/browse/SPARK-30358)).
 
-### Breaking changes
+# Migration Guide
 
-There were several breaking changes in Spark 2.0, which are outlined below.
+The migration guide is now archived [on this page](ml-migration-guide.html).
 
-**Linear algebra classes for DataFrame-based APIs**
-
-Spark's linear algebra dependencies were moved to a new project, `mllib-local` 
-(see [SPARK-13944](https://issues.apache.org/jira/browse/SPARK-13944)). 
-As part of this change, the linear algebra classes were copied to a new package, `spark.ml.linalg`. 
-The DataFrame-based APIs in `spark.ml` now depend on the `spark.ml.linalg` classes, 
-leading to a few breaking changes, predominantly in various model classes 
-(see [SPARK-14810](https://issues.apache.org/jira/browse/SPARK-14810) for a full list).
-
-**Note:** the RDD-based APIs in `spark.mllib` continue to depend on the previous package `spark.mllib.linalg`.
-
-_Converting vectors and matrices_
-
-While most pipeline components support backward compatibility for loading, 
-some existing `DataFrames` and pipelines in Spark versions prior to 2.0, that contain vector or matrix 
-columns, may need to be migrated to the new `spark.ml` vector and matrix types. 
-Utilities for converting `DataFrame` columns from `spark.mllib.linalg` to `spark.ml.linalg` types
-(and vice versa) can be found in `spark.mllib.util.MLUtils`.
-
-There are also utility methods available for converting single instances of 
-vectors and matrices. Use the `asML` method on a `mllib.linalg.Vector` / `mllib.linalg.Matrix`
-for converting to `ml.linalg` types, and 
-`mllib.linalg.Vectors.fromML` / `mllib.linalg.Matrices.fromML` 
-for converting to `mllib.linalg` types.
-
-<div class="codetabs">
-<div data-lang="scala"  markdown="1">
-
-{% highlight scala %}
-import org.apache.spark.mllib.util.MLUtils
-
-// convert DataFrame columns
-val convertedVecDF = MLUtils.convertVectorColumnsToML(vecDF)
-val convertedMatrixDF = MLUtils.convertMatrixColumnsToML(matrixDF)
-// convert a single vector or matrix
-val mlVec: org.apache.spark.ml.linalg.Vector = mllibVec.asML
-val mlMat: org.apache.spark.ml.linalg.Matrix = mllibMat.asML
-{% endhighlight %}
-
-Refer to the [`MLUtils` Scala docs](api/scala/index.html#org.apache.spark.mllib.util.MLUtils$) for further detail.
-</div>
-
-<div data-lang="java" markdown="1">
-
-{% highlight java %}
-import org.apache.spark.mllib.util.MLUtils;
-import org.apache.spark.sql.Dataset;
-
-// convert DataFrame columns
-Dataset<Row> convertedVecDF = MLUtils.convertVectorColumnsToML(vecDF);
-Dataset<Row> convertedMatrixDF = MLUtils.convertMatrixColumnsToML(matrixDF);
-// convert a single vector or matrix
-org.apache.spark.ml.linalg.Vector mlVec = mllibVec.asML();
-org.apache.spark.ml.linalg.Matrix mlMat = mllibMat.asML();
-{% endhighlight %}
-
-Refer to the [`MLUtils` Java docs](api/java/org/apache/spark/mllib/util/MLUtils.html) for further detail.
-</div>
-
-<div data-lang="python"  markdown="1">
-
-{% highlight python %}
-from pyspark.mllib.util import MLUtils
-
-# convert DataFrame columns
-convertedVecDF = MLUtils.convertVectorColumnsToML(vecDF)
-convertedMatrixDF = MLUtils.convertMatrixColumnsToML(matrixDF)
-# convert a single vector or matrix
-mlVec = mllibVec.asML()
-mlMat = mllibMat.asML()
-{% endhighlight %}
-
-Refer to the [`MLUtils` Python docs](api/python/pyspark.mllib.html#pyspark.mllib.util.MLUtils) for further detail.
-</div>
-</div>
-
-**Deprecated methods removed**
-
-Several deprecated methods were removed in the `spark.mllib` and `spark.ml` packages:
-
-* `setScoreCol` in `ml.evaluation.BinaryClassificationEvaluator`
-* `weights` in `LinearRegression` and `LogisticRegression` in `spark.ml`
-* `setMaxNumIterations` in `mllib.optimization.LBFGS` (marked as `DeveloperApi`)
-* `treeReduce` and `treeAggregate` in `mllib.rdd.RDDFunctions` (these functions are available on `RDD`s directly, and were marked as `DeveloperApi`)
-* `defaultStategy` in `mllib.tree.configuration.Strategy`
-* `build` in `mllib.tree.Node`
-* libsvm loaders for multiclass and load/save labeledData methods in `mllib.util.MLUtils`
-
-A full list of breaking changes can be found at [SPARK-14810](https://issues.apache.org/jira/browse/SPARK-14810).
-
-### Deprecations and changes of behavior
-
-**Deprecations**
-
-Deprecations in the `spark.mllib` and `spark.ml` packages include:
-
-* [SPARK-14984](https://issues.apache.org/jira/browse/SPARK-14984):
- In `spark.ml.regression.LinearRegressionSummary`, the `model` field has been deprecated.
-* [SPARK-13784](https://issues.apache.org/jira/browse/SPARK-13784):
- In `spark.ml.regression.RandomForestRegressionModel` and `spark.ml.classification.RandomForestClassificationModel`,
- the `numTrees` parameter has been deprecated in favor of `getNumTrees` method.
-* [SPARK-13761](https://issues.apache.org/jira/browse/SPARK-13761):
- In `spark.ml.param.Params`, the `validateParams` method has been deprecated.
- We move all functionality in overridden methods to the corresponding `transformSchema`.
-* [SPARK-14829](https://issues.apache.org/jira/browse/SPARK-14829):
- In `spark.mllib` package, `LinearRegressionWithSGD`, `LassoWithSGD`, `RidgeRegressionWithSGD` and `LogisticRegressionWithSGD` have been deprecated.
- We encourage users to use `spark.ml.regression.LinearRegresson` and `spark.ml.classification.LogisticRegresson`.
-* [SPARK-14900](https://issues.apache.org/jira/browse/SPARK-14900):
- In `spark.mllib.evaluation.MulticlassMetrics`, the parameters `precision`, `recall` and `fMeasure` have been deprecated in favor of `accuracy`.
-* [SPARK-15644](https://issues.apache.org/jira/browse/SPARK-15644):
- In `spark.ml.util.MLReader` and `spark.ml.util.MLWriter`, the `context` method has been deprecated in favor of `session`.
-* In `spark.ml.feature.ChiSqSelectorModel`, the `setLabelCol` method has been deprecated since it was not used by `ChiSqSelectorModel`.
-
-**Changes of behavior**
-
-Changes of behavior in the `spark.mllib` and `spark.ml` packages include:
-
-* [SPARK-7780](https://issues.apache.org/jira/browse/SPARK-7780):
- `spark.mllib.classification.LogisticRegressionWithLBFGS` directly calls `spark.ml.classification.LogisticRegresson` for binary classification now.
- This will introduce the following behavior changes for `spark.mllib.classification.LogisticRegressionWithLBFGS`:
-    * The intercept will not be regularized when training binary classification model with L1/L2 Updater.
-    * If users set without regularization, training with or without feature scaling will return the same solution by the same convergence rate.
-* [SPARK-13429](https://issues.apache.org/jira/browse/SPARK-13429):
- In order to provide better and consistent result with `spark.ml.classification.LogisticRegresson`,
- the default value of `spark.mllib.classification.LogisticRegressionWithLBFGS`: `convergenceTol` has been changed from 1E-4 to 1E-6.
-* [SPARK-12363](https://issues.apache.org/jira/browse/SPARK-12363):
- Fix a bug of `PowerIterationClustering` which will likely change its result.
-* [SPARK-13048](https://issues.apache.org/jira/browse/SPARK-13048):
- `LDA` using the `EM` optimizer will keep the last checkpoint by default, if checkpointing is being used.
-* [SPARK-12153](https://issues.apache.org/jira/browse/SPARK-12153):
- `Word2Vec` now respects sentence boundaries. Previously, it did not handle them correctly.
-* [SPARK-10574](https://issues.apache.org/jira/browse/SPARK-10574):
- `HashingTF` uses `MurmurHash3` as default hash algorithm in both `spark.ml` and `spark.mllib`.
-* [SPARK-14768](https://issues.apache.org/jira/browse/SPARK-14768):
- The `expectedType` argument for PySpark `Param` was removed.
-* [SPARK-14931](https://issues.apache.org/jira/browse/SPARK-14931):
- Some default `Param` values, which were mismatched between pipelines in Scala and Python, have been changed.
-* [SPARK-13600](https://issues.apache.org/jira/browse/SPARK-13600):
- `QuantileDiscretizer` now uses `spark.sql.DataFrameStatFunctions.approxQuantile` to find splits (previously used custom sampling logic).
- The output buckets will differ for same input data and params.
-
-## Previous Spark versions
-
-Earlier migration guides are archived [on this page](ml-migration-guides.html).
-
----

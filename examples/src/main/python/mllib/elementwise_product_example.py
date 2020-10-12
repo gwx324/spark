@@ -15,8 +15,6 @@
 # limitations under the License.
 #
 
-from __future__ import print_function
-
 from pyspark import SparkContext
 # $example on$
 from pyspark.mllib.feature import ElementwiseProduct
@@ -45,7 +43,7 @@ if __name__ == "__main__":
         print(each)
 
     print("transformedData2:")
-    for each in transformedData2.collect():
+    for each in transformedData2:
         print(each)
 
     sc.stop()

@@ -17,13 +17,19 @@
 
 package org.apache.spark.sql.execution.aggregate
 
+import scala.reflect.runtime.universe.TypeTag
+
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.Row
+import org.apache.spark.sql.{Column, Row}
 import org.apache.spark.sql.catalyst.{CatalystTypeConverters, InternalRow}
-import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Expression, MutableRow, _}
-import org.apache.spark.sql.catalyst.expressions.aggregate.ImperativeAggregate
-import org.apache.spark.sql.catalyst.expressions.codegen.GenerateMutableProjection
-import org.apache.spark.sql.expressions.{MutableAggregationBuffer, UserDefinedAggregateFunction}
+import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
+import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Expression, _}
+import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, Complete}
+import org.apache.spark.sql.catalyst.expressions.aggregate.{ImperativeAggregate, TypedImperativeAggregate}
+import org.apache.spark.sql.catalyst.expressions.codegen.{GenerateMutableProjection, GenerateSafeProjection}
+import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.catalyst.rules.Rule
+import org.apache.spark.sql.expressions.{Aggregator, MutableAggregationBuffer, UserDefinedAggregateFunction}
 import org.apache.spark.sql.types._
 
 /**
@@ -96,18 +102,18 @@ sealed trait BufferSetterGetterUtils {
     getters
   }
 
-  def createSetters(schema: StructType): Array[((MutableRow, Int, Any) => Unit)] = {
+  def createSetters(schema: StructType): Array[((InternalRow, Int, Any) => Unit)] = {
     val dataTypes = schema.fields.map(_.dataType)
-    val setters = new Array[(MutableRow, Int, Any) => Unit](dataTypes.length)
+    val setters = new Array[(InternalRow, Int, Any) => Unit](dataTypes.length)
 
     var i = 0
     while (i < setters.length) {
       setters(i) = dataTypes(i) match {
         case NullType =>
-          (row: MutableRow, ordinal: Int, value: Any) => row.setNullAt(ordinal)
+          (row: InternalRow, ordinal: Int, value: Any) => row.setNullAt(ordinal)
 
         case b: BooleanType =>
-          (row: MutableRow, ordinal: Int, value: Any) =>
+          (row: InternalRow, ordinal: Int, value: Any) =>
             if (value != null) {
               row.setBoolean(ordinal, value.asInstanceOf[Boolean])
             } else {
@@ -115,7 +121,7 @@ sealed trait BufferSetterGetterUtils {
             }
 
         case ByteType =>
-          (row: MutableRow, ordinal: Int, value: Any) =>
+          (row: InternalRow, ordinal: Int, value: Any) =>
             if (value != null) {
               row.setByte(ordinal, value.asInstanceOf[Byte])
             } else {
@@ -123,7 +129,7 @@ sealed trait BufferSetterGetterUtils {
             }
 
         case ShortType =>
-          (row: MutableRow, ordinal: Int, value: Any) =>
+          (row: InternalRow, ordinal: Int, value: Any) =>
             if (value != null) {
               row.setShort(ordinal, value.asInstanceOf[Short])
             } else {
@@ -131,7 +137,7 @@ sealed trait BufferSetterGetterUtils {
             }
 
         case IntegerType =>
-          (row: MutableRow, ordinal: Int, value: Any) =>
+          (row: InternalRow, ordinal: Int, value: Any) =>
             if (value != null) {
               row.setInt(ordinal, value.asInstanceOf[Int])
             } else {
@@ -139,7 +145,7 @@ sealed trait BufferSetterGetterUtils {
             }
 
         case LongType =>
-          (row: MutableRow, ordinal: Int, value: Any) =>
+          (row: InternalRow, ordinal: Int, value: Any) =>
             if (value != null) {
               row.setLong(ordinal, value.asInstanceOf[Long])
             } else {
@@ -147,7 +153,7 @@ sealed trait BufferSetterGetterUtils {
             }
 
         case FloatType =>
-          (row: MutableRow, ordinal: Int, value: Any) =>
+          (row: InternalRow, ordinal: Int, value: Any) =>
             if (value != null) {
               row.setFloat(ordinal, value.asInstanceOf[Float])
             } else {
@@ -155,7 +161,7 @@ sealed trait BufferSetterGetterUtils {
             }
 
         case DoubleType =>
-          (row: MutableRow, ordinal: Int, value: Any) =>
+          (row: InternalRow, ordinal: Int, value: Any) =>
             if (value != null) {
               row.setDouble(ordinal, value.asInstanceOf[Double])
             } else {
@@ -164,13 +170,13 @@ sealed trait BufferSetterGetterUtils {
 
         case dt: DecimalType =>
           val precision = dt.precision
-          (row: MutableRow, ordinal: Int, value: Any) =>
+          (row: InternalRow, ordinal: Int, value: Any) =>
             // To make it work with UnsafeRow, we cannot use setNullAt.
             // Please see the comment of UnsafeRow's setDecimal.
             row.setDecimal(ordinal, value.asInstanceOf[Decimal], precision)
 
         case DateType =>
-          (row: MutableRow, ordinal: Int, value: Any) =>
+          (row: InternalRow, ordinal: Int, value: Any) =>
             if (value != null) {
               row.setInt(ordinal, value.asInstanceOf[Int])
             } else {
@@ -178,7 +184,7 @@ sealed trait BufferSetterGetterUtils {
             }
 
         case TimestampType =>
-          (row: MutableRow, ordinal: Int, value: Any) =>
+          (row: InternalRow, ordinal: Int, value: Any) =>
             if (value != null) {
               row.setLong(ordinal, value.asInstanceOf[Long])
             } else {
@@ -186,7 +192,7 @@ sealed trait BufferSetterGetterUtils {
             }
 
         case other =>
-          (row: MutableRow, ordinal: Int, value: Any) =>
+          (row: InternalRow, ordinal: Int, value: Any) =>
             if (value != null) {
               row.update(ordinal, value)
             } else {
@@ -209,7 +215,7 @@ private[aggregate] class MutableAggregationBufferImpl(
     toCatalystConverters: Array[Any => Any],
     toScalaConverters: Array[Any => Any],
     bufferOffset: Int,
-    var underlyingBuffer: MutableRow)
+    var underlyingBuffer: InternalRow)
   extends MutableAggregationBuffer with BufferSetterGetterUtils {
 
   private[this] val offsets: Array[Int] = {
@@ -324,7 +330,11 @@ case class ScalaUDAF(
     udaf: UserDefinedAggregateFunction,
     mutableAggBufferOffset: Int = 0,
     inputAggBufferOffset: Int = 0)
-  extends ImperativeAggregate with NonSQLExpression with Logging {
+  extends ImperativeAggregate
+  with NonSQLExpression
+  with Logging
+  with ImplicitCastInputTypes
+  with UserDefinedExpression {
 
   override def withNewMutableAggBufferOffset(newMutableAggBufferOffset: Int): ImperativeAggregate =
     copy(mutableAggBufferOffset = newMutableAggBufferOffset)
@@ -336,7 +346,7 @@ case class ScalaUDAF(
 
   override def dataType: DataType = udaf.dataType
 
-  override def deterministic: Boolean = udaf.deterministic
+  override lazy val deterministic: Boolean = udaf.deterministic
 
   override val inputTypes: Seq[DataType] = udaf.inputSchema.map(_.dataType)
 
@@ -361,7 +371,7 @@ case class ScalaUDAF(
     val inputAttributes = childrenSchema.toAttributes
     log.debug(
       s"Creating MutableProj: $children, inputSchema: $inputAttributes.")
-    GenerateMutableProjection.generate(children, inputAttributes)
+    MutableProjection.create(children, inputAttributes)
   }
 
   private[this] lazy val inputToScalaConverters: Any => Any =
@@ -413,13 +423,13 @@ case class ScalaUDAF(
       null)
   }
 
-  override def initialize(buffer: MutableRow): Unit = {
+  override def initialize(buffer: InternalRow): Unit = {
     mutableAggregateBuffer.underlyingBuffer = buffer
 
     udaf.initialize(mutableAggregateBuffer)
   }
 
-  override def update(buffer: MutableRow, input: InternalRow): Unit = {
+  override def update(buffer: InternalRow, input: InternalRow): Unit = {
     mutableAggregateBuffer.underlyingBuffer = buffer
 
     udaf.update(
@@ -427,7 +437,7 @@ case class ScalaUDAF(
       inputToScalaConverters(inputProjection(input)).asInstanceOf[Row])
   }
 
-  override def merge(buffer1: MutableRow, buffer2: InternalRow): Unit = {
+  override def merge(buffer1: InternalRow, buffer2: InternalRow): Unit = {
     mutableAggregateBuffer.underlyingBuffer = buffer1
     inputAggregateBuffer.underlyingInputBuffer = buffer2
 
@@ -445,4 +455,82 @@ case class ScalaUDAF(
   }
 
   override def nodeName: String = udaf.getClass.getSimpleName
+}
+
+case class ScalaAggregator[IN, BUF, OUT](
+    children: Seq[Expression],
+    agg: Aggregator[IN, BUF, OUT],
+    inputEncoder: ExpressionEncoder[IN],
+    bufferEncoder: ExpressionEncoder[BUF],
+    nullable: Boolean = true,
+    isDeterministic: Boolean = true,
+    mutableAggBufferOffset: Int = 0,
+    inputAggBufferOffset: Int = 0)
+  extends TypedImperativeAggregate[BUF]
+  with NonSQLExpression
+  with UserDefinedExpression
+  with ImplicitCastInputTypes
+  with Logging {
+
+  // input and buffer encoders are resolved by ResolveEncodersInScalaAgg
+  private[this] lazy val inputDeserializer = inputEncoder.createDeserializer()
+  private[this] lazy val bufferSerializer = bufferEncoder.createSerializer()
+  private[this] lazy val bufferDeserializer = bufferEncoder.createDeserializer()
+  private[this] lazy val outputEncoder = agg.outputEncoder.asInstanceOf[ExpressionEncoder[OUT]]
+  private[this] lazy val outputSerializer = outputEncoder.createSerializer()
+
+  def dataType: DataType = outputEncoder.objSerializer.dataType
+
+  def inputTypes: Seq[DataType] = inputEncoder.schema.map(_.dataType)
+
+  override lazy val deterministic: Boolean = isDeterministic
+
+  def withNewMutableAggBufferOffset(newMutableAggBufferOffset: Int): ScalaAggregator[IN, BUF, OUT] =
+    copy(mutableAggBufferOffset = newMutableAggBufferOffset)
+
+  def withNewInputAggBufferOffset(newInputAggBufferOffset: Int): ScalaAggregator[IN, BUF, OUT] =
+    copy(inputAggBufferOffset = newInputAggBufferOffset)
+
+  private[this] lazy val inputProjection = UnsafeProjection.create(children)
+
+  def createAggregationBuffer(): BUF = agg.zero
+
+  def update(buffer: BUF, input: InternalRow): BUF =
+    agg.reduce(buffer, inputDeserializer(inputProjection(input)))
+
+  def merge(buffer: BUF, input: BUF): BUF = agg.merge(buffer, input)
+
+  def eval(buffer: BUF): Any = {
+    val row = outputSerializer(agg.finish(buffer))
+    if (outputEncoder.isSerializedAsStruct) row else row.get(0, dataType)
+  }
+
+  private[this] lazy val bufferRow = new UnsafeRow(bufferEncoder.namedExpressions.length)
+
+  def serialize(agg: BUF): Array[Byte] =
+    bufferSerializer(agg).asInstanceOf[UnsafeRow].getBytes()
+
+  def deserialize(storageFormat: Array[Byte]): BUF = {
+    bufferRow.pointTo(storageFormat, storageFormat.length)
+    bufferDeserializer(bufferRow)
+  }
+
+  override def toString: String = s"""${nodeName}(${children.mkString(",")})"""
+
+  override def nodeName: String = agg.getClass.getSimpleName
+}
+
+/**
+ * An extension rule to resolve encoder expressions from a [[ScalaAggregator]]
+ */
+object ResolveEncodersInScalaAgg extends Rule[LogicalPlan] {
+  override def apply(plan: LogicalPlan): LogicalPlan = plan.resolveOperatorsUp {
+    case p if !p.resolved => p
+    case p => p.transformExpressionsUp {
+      case agg: ScalaAggregator[_, _, _] =>
+        agg.copy(
+          inputEncoder = agg.inputEncoder.resolveAndBind(),
+          bufferEncoder = agg.bufferEncoder.resolveAndBind())
+    }
+  }
 }

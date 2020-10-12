@@ -21,7 +21,7 @@ import java.nio.ByteBuffer
 
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.sql.catalyst.CatalystTypeConverters
-import org.apache.spark.sql.catalyst.expressions.{GenericMutableRow, UnsafeProjection}
+import org.apache.spark.sql.catalyst.expressions.{GenericInternalRow, UnsafeProjection}
 import org.apache.spark.sql.types._
 
 class TestNullableColumnAccessor[JvmType](
@@ -44,7 +44,8 @@ class NullableColumnAccessorSuite extends SparkFunSuite {
     NULL, BOOLEAN, BYTE, SHORT, INT, LONG, FLOAT, DOUBLE,
     STRING, BINARY, COMPACT_DECIMAL(15, 10), LARGE_DECIMAL(20, 10),
     STRUCT(StructType(StructField("a", StringType) :: Nil)),
-    ARRAY(ArrayType(IntegerType)), MAP(MapType(IntegerType, StringType)))
+    ARRAY(ArrayType(IntegerType)), MAP(MapType(IntegerType, StringType)),
+    CALENDAR_INTERVAL)
     .foreach {
     testNullableColumnAccessor(_)
   }
@@ -72,7 +73,7 @@ class NullableColumnAccessorSuite extends SparkFunSuite {
       }
 
       val accessor = TestNullableColumnAccessor(builder.build(), columnType)
-      val row = new GenericMutableRow(1)
+      val row = new GenericInternalRow(1)
       val converter = CatalystTypeConverters.createToScalaConverter(columnType.dataType)
 
       (0 until 4).foreach { _ =>

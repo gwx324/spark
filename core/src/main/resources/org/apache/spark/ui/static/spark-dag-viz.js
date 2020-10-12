@@ -35,7 +35,7 @@
  * primitives (e.g. take, any SQL query).
  *
  * In the visualization, an RDD is expressed as a node, and its dependencies
- * as directed edges (from parent to child). operation scopes, stages, and
+ * as directed edges (from parent to child). Operation scopes, stages, and
  * jobs are expressed as clusters that may contain one or many nodes. These
  * clusters may be nested inside of each other in the scenarios described
  * above.
@@ -172,7 +172,16 @@ function renderDagViz(forJob) {
     svg.selectAll("g." + nodeId).classed("cached", true);
   });
 
+  metadataContainer().selectAll(".barrier-rdd").each(function() {
+    var opId = d3.select(this).text().trim();
+    var opClusterId = VizConstants.clusterPrefix + opId;
+    var stageId = $(this).parents(".stage-metadata").attr("stage-id");
+    var stageClusterId = VizConstants.graphPrefix + stageId;
+    svg.selectAll("g[id=" + stageClusterId + "] g." + opClusterId).classed("barrier", true)
+  });
+
   resizeSvg(svg);
+  interpretLineBreak(svg);
 }
 
 /* Render the RDD DAG visualization on the stage page. */
@@ -209,7 +218,7 @@ function renderDagVizForJob(svgContainer) {
     var dot = metadata.select(".dot-file").text();
     var stageId = metadata.attr("stage-id");
     var containerId = VizConstants.graphPrefix + stageId;
-    var isSkipped = metadata.attr("skipped") == "true";
+    var isSkipped = metadata.attr("skipped") === "true";
     var container;
     if (isSkipped) {
       container = svgContainer
@@ -218,11 +227,8 @@ function renderDagVizForJob(svgContainer) {
         .attr("skipped", "true");
     } else {
       // Link each graph to the corresponding stage page (TODO: handle stage attempts)
-      // Use the link from the stage table so it also works for the history server
-      var attemptId = 0
-      var stageLink = d3.select("#stage-" + stageId + "-" + attemptId)
-        .select("a.name-link")
-        .attr("href");
+      var attemptId = 0;
+      var stageLink = uiRoot + appBasePath + "/stages/stage/?id=" + stageId + "&attempt=" + attemptId;
       container = svgContainer
         .append("a")
         .attr("xlink:href", stageLink)
@@ -235,7 +241,7 @@ function renderDagVizForJob(svgContainer) {
     // existing ones, taking into account the position and width of the last stage's
     // container. We do not need to do this for the first stage of this job.
     if (i > 0) {
-      var existingStages = svgContainer.selectAll("g.cluster.stage")
+      var existingStages = svgContainer.selectAll("g.cluster.stage");
       if (!existingStages.empty()) {
         var lastStage = d3.select(existingStages[0].pop());
         var lastStageWidth = toFloat(lastStage.select("rect").attr("width"));
@@ -275,11 +281,7 @@ function renderDagVizForJob(svgContainer) {
 
 /* Render the dot file as an SVG in the given container. */
 function renderDot(dot, container, forJob) {
-  var escaped_dot = dot
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, "\"");
-  var g = graphlibDot.read(escaped_dot);
+  var g = graphlibDot.read(dot);
   var renderer = new dagreD3.render();
   preprocessGraphLayout(g, forJob);
   renderer(container, g);
@@ -360,6 +362,27 @@ function resizeSvg(svg) {
   svg.attr("viewBox", startX + " " + startY + " " + width + " " + height)
      .attr("width", width)
      .attr("height", height);
+}
+
+/*
+ * Helper function to interpret line break for tag 'tspan'.
+ * For tag 'tspan', line break '/n' is display in UI as raw for both stage page and job page,
+ * here this function is to enable line break.
+ */
+function interpretLineBreak(svg) {
+  svg.selectAll("tspan").each(function() {
+    var node = d3.select(this);
+    var original = node[0][0].innerHTML;
+    if (original.indexOf("\\n") != -1) {
+      var arr = original.split("\\n");
+      var newNode = this.cloneNode(this);
+
+      node[0][0].innerHTML = arr[0];
+      newNode.innerHTML = arr[1];
+
+      this.parentNode.appendChild(newNode);
+    }
+  });
 }
 
 /*
@@ -478,7 +501,8 @@ function addTooltipsForRDDs(svgContainer) {
     if (tooltipText) {
       node.select("circle")
         .attr("data-toggle", "tooltip")
-        .attr("data-placement", "bottom")
+        .attr("data-placement", "top")
+        .attr("data-html", "true") // to interpret line break, tooltipText is showing <circle> title
         .attr("title", tooltipText);
     }
     // Link tooltips for all nodes that belong to the same RDD

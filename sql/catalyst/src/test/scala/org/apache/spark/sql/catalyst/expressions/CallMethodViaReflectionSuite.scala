@@ -17,8 +17,11 @@
 
 package org.apache.spark.sql.catalyst.expressions
 
+import java.sql.Timestamp
+
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult.TypeCheckFailure
+import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeProjection
 import org.apache.spark.sql.types.{IntegerType, StringType}
 
 /** A static class for testing purpose. */
@@ -85,11 +88,23 @@ class CallMethodViaReflectionSuite extends SparkFunSuite with ExpressionEvalHelp
     assert(createExpr(staticClassName, "method1").checkInputDataTypes().isSuccess)
   }
 
+  test("unsupported type checking") {
+    val ret = createExpr(staticClassName, "method1", new Timestamp(1)).checkInputDataTypes()
+    assert(ret.isFailure)
+    val errorMsg = ret.asInstanceOf[TypeCheckFailure].message
+    assert(errorMsg.contains("arguments from the third require boolean, byte, short"))
+  }
+
   test("invoking methods using acceptable types") {
     checkEvaluation(createExpr(staticClassName, "method1"), "m1")
     checkEvaluation(createExpr(staticClassName, "method2", 2), "m2")
     checkEvaluation(createExpr(staticClassName, "method3", 3), "m3")
     checkEvaluation(createExpr(staticClassName, "method4", 4, "four"), "m4four")
+  }
+
+  test("escaping of class and method names") {
+    GenerateUnsafeProjection.generate(
+      CallMethodViaReflection(Seq(Literal("\"quote"), Literal("\"quote"), Literal(null))) :: Nil)
   }
 
   private def createExpr(className: String, methodName: String, args: Any*) = {

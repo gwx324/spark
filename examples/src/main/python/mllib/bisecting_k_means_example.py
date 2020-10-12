@@ -15,15 +15,13 @@
 # limitations under the License.
 #
 
-from __future__ import print_function
-
 # $example on$
 from numpy import array
 # $example off$
 
 from pyspark import SparkContext
 # $example on$
-from pyspark.mllib.clustering import BisectingKMeans, BisectingKMeansModel
+from pyspark.mllib.clustering import BisectingKMeans
 # $example off$
 
 if __name__ == "__main__":
@@ -40,11 +38,6 @@ if __name__ == "__main__":
     # Evaluate clustering
     cost = model.computeCost(parsedData)
     print("Bisecting K-means Cost = " + str(cost))
-
-    # Save and load model
-    path = "target/org/apache/spark/PythonBisectingKMeansExample/BisectingKMeansModel"
-    model.save(sc, path)
-    sameModel = BisectingKMeansModel.load(sc, path)
     # $example off$
 
     sc.stop()

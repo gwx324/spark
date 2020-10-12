@@ -18,12 +18,13 @@
 package org.apache.spark.storage
 
 import java.io.{BufferedOutputStream, File, FileOutputStream, OutputStream}
-import java.nio.channels.FileChannel
+import java.nio.channels.{ClosedByInterruptException, FileChannel}
 
-import org.apache.spark.executor.ShuffleWriteMetrics
 import org.apache.spark.internal.Logging
-import org.apache.spark.serializer.{SerializationStream, SerializerInstance}
+import org.apache.spark.serializer.{SerializationStream, SerializerInstance, SerializerManager}
+import org.apache.spark.shuffle.ShuffleWriteMetricsReporter
 import org.apache.spark.util.Utils
+import org.apache.spark.util.collection.PairsWriter
 
 /**
  * A class for writing JVM objects directly to a file on disk. This class allows data to be appended
@@ -37,16 +38,17 @@ import org.apache.spark.util.Utils
  */
 private[spark] class DiskBlockObjectWriter(
     val file: File,
+    serializerManager: SerializerManager,
     serializerInstance: SerializerInstance,
     bufferSize: Int,
-    compressStream: OutputStream => OutputStream,
     syncWrites: Boolean,
     // These write metrics concurrently shared with other active DiskBlockObjectWriters who
     // are themselves performing writes. All updates must be relative.
-    writeMetrics: ShuffleWriteMetrics,
+    writeMetrics: ShuffleWriteMetricsReporter,
     val blockId: BlockId = null)
   extends OutputStream
-  with Logging {
+  with Logging
+  with PairsWriter {
 
   /**
    * Guards against close calls, e.g. from a wrapping stream.
@@ -95,6 +97,7 @@ private[spark] class DiskBlockObjectWriter(
   /**
    * Keep track of number of records written and also use this to periodically
    * output bytes written since the latter is expensive to do for each record.
+   * And we reset it after every commitAndGet called.
    */
   private var numRecordsWritten = 0
 
@@ -115,7 +118,8 @@ private[spark] class DiskBlockObjectWriter(
       initialize()
       initialized = true
     }
-    bs = compressStream(mcs)
+
+    bs = serializerManager.wrapStream(blockId, mcs)
     objOut = serializerInstance.serializeStream(bs)
     streamOpen = true
     this
@@ -127,23 +131,26 @@ private[spark] class DiskBlockObjectWriter(
    */
   private def closeResources(): Unit = {
     if (initialized) {
-      mcs.manualClose()
-      channel = null
-      mcs = null
-      bs = null
-      fos = null
-      ts = null
-      objOut = null
-      initialized = false
-      streamOpen = false
-      hasBeenClosed = true
+      Utils.tryWithSafeFinally {
+        mcs.manualClose()
+      } {
+        channel = null
+        mcs = null
+        bs = null
+        fos = null
+        ts = null
+        objOut = null
+        initialized = false
+        streamOpen = false
+        hasBeenClosed = true
+      }
     }
   }
 
   /**
    * Commits any remaining partial writes and closes resources.
    */
-  override def close() {
+  override def close(): Unit = {
     if (initialized) {
       Utils.tryWithSafeFinally {
         commitAndGet()
@@ -181,6 +188,7 @@ private[spark] class DiskBlockObjectWriter(
       // In certain compression codecs, more bytes are written after streams are closed
       writeMetrics.incBytesWritten(committedPosition - reportedPosition)
       reportedPosition = committedPosition
+      numRecordsWritten = 0
       fileSegment
     } else {
       new FileSegment(file, committedPosition, 0)
@@ -198,32 +206,41 @@ private[spark] class DiskBlockObjectWriter(
   def revertPartialWritesAndClose(): File = {
     // Discard current writes. We do this by flushing the outstanding writes and then
     // truncating the file to its initial position.
-    try {
+    Utils.tryWithSafeFinally {
       if (initialized) {
         writeMetrics.decBytesWritten(reportedPosition - committedPosition)
         writeMetrics.decRecordsWritten(numRecordsWritten)
         streamOpen = false
         closeResources()
       }
-
-      val truncateStream = new FileOutputStream(file, true)
+    } {
+      var truncateStream: FileOutputStream = null
       try {
+        truncateStream = new FileOutputStream(file, true)
         truncateStream.getChannel.truncate(committedPosition)
-        file
+      } catch {
+        // ClosedByInterruptException is an excepted exception when kill task,
+        // don't log the exception stack trace to avoid confusing users.
+        // See: SPARK-28340
+        case ce: ClosedByInterruptException =>
+          logError("Exception occurred while reverting partial writes to file "
+            + file + ", " + ce.getMessage)
+        case e: Exception =>
+          logError("Uncaught exception while reverting partial writes to file " + file, e)
       } finally {
-        truncateStream.close()
+        if (truncateStream != null) {
+          truncateStream.close()
+          truncateStream = null
+        }
       }
-    } catch {
-      case e: Exception =>
-        logError("Uncaught exception while reverting partial writes to file " + file, e)
-        file
     }
+    file
   }
 
   /**
    * Writes a key-value pair.
    */
-  def write(key: Any, value: Any) {
+  override def write(key: Any, value: Any): Unit = {
     if (!streamOpen) {
       open()
     }
@@ -259,14 +276,14 @@ private[spark] class DiskBlockObjectWriter(
    * Report the number of bytes written in this writer's shuffle write metrics.
    * Note that this is only valid before the underlying streams are closed.
    */
-  private def updateBytesWritten() {
+  private def updateBytesWritten(): Unit = {
     val pos = channel.position()
     writeMetrics.incBytesWritten(pos - reportedPosition)
     reportedPosition = pos
   }
 
   // For testing
-  private[spark] override def flush() {
+  private[spark] override def flush(): Unit = {
     objOut.flush()
     bs.flush()
   }

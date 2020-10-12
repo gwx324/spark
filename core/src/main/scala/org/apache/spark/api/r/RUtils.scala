@@ -21,6 +21,8 @@ import java.io.File
 import java.util.Arrays
 
 import org.apache.spark.{SparkEnv, SparkException}
+import org.apache.spark.api.java.JavaSparkContext
+import org.apache.spark.internal.config._
 
 private[spark] object RUtils {
   // Local path where R binary packages built from R source code contained in the spark
@@ -58,10 +60,10 @@ private[spark] object RUtils {
   def sparkRPackagePath(isDriver: Boolean): Seq[String] = {
     val (master, deployMode) =
       if (isDriver) {
-        (sys.props("spark.master"), sys.props("spark.submit.deployMode"))
+        (sys.props("spark.master"), sys.props(SUBMIT_DEPLOY_MODE.key))
       } else {
         val sparkConf = SparkEnv.get.conf
-        (sparkConf.get("spark.master"), sparkConf.get("spark.submit.deployMode", "client"))
+        (sparkConf.get("spark.master"), sparkConf.get(SUBMIT_DEPLOY_MODE))
       }
 
     val isYarnCluster = master != null && master.contains("yarn") && deployMode == "cluster"
@@ -84,7 +86,6 @@ private[spark] object RUtils {
       }
     } else {
       // Otherwise, assume the package is local
-      // TODO: support this for Mesos
       val sparkRPkgPath = localSparkRPackagePath.getOrElse {
           throw new SparkException("SPARK_HOME not set. Can't locate SparkR package.")
       }
@@ -104,5 +105,9 @@ private[spark] object RUtils {
     } catch {
       case e: Exception => false
     }
+  }
+
+  def isEncryptionEnabled(sc: JavaSparkContext): Boolean = {
+    sc.conf.get(org.apache.spark.internal.config.IO_ENCRYPTION_ENABLED)
   }
 }

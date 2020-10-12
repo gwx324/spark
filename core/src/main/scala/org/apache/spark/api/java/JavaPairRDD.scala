@@ -32,9 +32,11 @@ import org.apache.hadoop.mapreduce.{OutputFormat => NewOutputFormat}
 
 import org.apache.spark.{HashPartitioner, Partitioner}
 import org.apache.spark.Partitioner._
+import org.apache.spark.annotation.Since
 import org.apache.spark.api.java.JavaSparkContext.fakeClassTag
 import org.apache.spark.api.java.JavaUtils.mapAsSerializableJavaMap
-import org.apache.spark.api.java.function.{Function => JFunction, Function2 => JFunction2, PairFunction}
+import org.apache.spark.api.java.function.{FlatMapFunction, Function => JFunction,
+  Function2 => JFunction2, PairFunction}
 import org.apache.spark.partial.{BoundedDouble, PartialResult}
 import org.apache.spark.rdd.{OrderedRDDFunctions, RDD}
 import org.apache.spark.rdd.RDD.rddToPairRDDFunctions
@@ -54,7 +56,9 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
 
   // Common RDD functions
 
-  /** Persist this RDD with the default storage level (`MEMORY_ONLY`). */
+  /**
+   * Persist this RDD with the default storage level (`MEMORY_ONLY`).
+   */
   def cache(): JavaPairRDD[K, V] = new JavaPairRDD[K, V](rdd.cache())
 
   /**
@@ -164,7 +168,7 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
    * Return a subset of this RDD sampled by key (via stratified sampling) containing exactly
    * math.ceil(numItems * samplingRate) for each stratum (group of pairs with the same key).
    *
-   * This method differs from [[sampleByKey]] in that we make additional passes over the RDD to
+   * This method differs from `sampleByKey` in that we make additional passes over the RDD to
    * create a sample size that's exactly equal to the sum of math.ceil(numItems * samplingRate)
    * over all key values with a 99.99% confidence. When sampling without replacement, we need one
    * additional pass over the RDD to guarantee sample size; when sampling with replacement, we need
@@ -182,7 +186,7 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
    * Return a subset of this RDD sampled by key (via stratified sampling) containing exactly
    * math.ceil(numItems * samplingRate) for each stratum (group of pairs with the same key).
    *
-   * This method differs from [[sampleByKey]] in that we make additional passes over the RDD to
+   * This method differs from `sampleByKey` in that we make additional passes over the RDD to
    * create a sample size that's exactly equal to the sum of math.ceil(numItems * samplingRate)
    * over all key values with a 99.99% confidence. When sampling without replacement, we need one
    * additional pass over the RDD to guarantee sample size; when sampling with replacement, we need
@@ -206,7 +210,7 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
    * Return the intersection of this RDD and another one. The output will not contain any duplicate
    * elements, even if the input RDDs did.
    *
-   * Note that this method performs a shuffle internally.
+   * @note This method performs a shuffle internally.
    */
   def intersection(other: JavaPairRDD[K, V]): JavaPairRDD[K, V] =
     new JavaPairRDD[K, V](rdd.intersection(other.rdd))
@@ -223,9 +227,9 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
   /**
    * Generic function to combine the elements for each key using a custom set of aggregation
    * functions. Turns a JavaPairRDD[(K, V)] into a result of type JavaPairRDD[(K, C)], for a
-   * "combined type" C. Note that V and C can be different -- for example, one might group an
-   * RDD of type (Int, Int) into an RDD of type (Int, List[Int]). Users provide three
-   * functions:
+   * "combined type" C.
+   *
+   * Users provide three functions:
    *
    *  - `createCombiner`, which turns a V into a C (e.g., creates a one-element list)
    *  - `mergeValue`, to merge a V into a C (e.g., adds it to the end of a list)
@@ -234,6 +238,9 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
    * In addition, users can control the partitioning of the output RDD, the serializer that is use
    * for the shuffle, and whether to perform map-side aggregation (if a mapper can produce multiple
    * items with the same key).
+   *
+   * @note V and C can be different -- for example, one might group an RDD of type (Int, Int) into
+   * an RDD of type (Int, List[Int]).
    */
   def combineByKey[C](createCombiner: JFunction[V, C],
       mergeValue: JFunction2[C, V, C],
@@ -255,9 +262,9 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
   /**
    * Generic function to combine the elements for each key using a custom set of aggregation
    * functions. Turns a JavaPairRDD[(K, V)] into a result of type JavaPairRDD[(K, C)], for a
-   * "combined type" C. Note that V and C can be different -- for example, one might group an
-   * RDD of type (Int, Int) into an RDD of type (Int, List[Int]). Users provide three
-   * functions:
+   * "combined type" C.
+   *
+   * Users provide three functions:
    *
    *  - `createCombiner`, which turns a V into a C (e.g., creates a one-element list)
    *  - `mergeValue`, to merge a V into a C (e.g., adds it to the end of a list)
@@ -265,6 +272,9 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
    *
    * In addition, users can control the partitioning of the output RDD. This method automatically
    * uses map-side aggregation in shuffling the RDD.
+   *
+   * @note V and C can be different -- for example, one might group an RDD of type (Int, Int) into
+   * an RDD of type (Int, List[Int]).
    */
   def combineByKey[C](createCombiner: JFunction[V, C],
       mergeValue: JFunction2[C, V, C],
@@ -398,8 +408,8 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
    * Group the values for each key in the RDD into a single sequence. Allows controlling the
    * partitioning of the resulting key-value pair RDD by passing a Partitioner.
    *
-   * Note: If you are grouping in order to perform an aggregation (such as a sum or average) over
-   * each key, using [[JavaPairRDD.reduceByKey]] or [[JavaPairRDD.combineByKey]]
+   * @note If you are grouping in order to perform an aggregation (such as a sum or average) over
+   * each key, using `JavaPairRDD.reduceByKey` or `JavaPairRDD.combineByKey`
    * will provide much better performance.
    */
   def groupByKey(partitioner: Partitioner): JavaPairRDD[K, JIterable[V]] =
@@ -409,8 +419,8 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
    * Group the values for each key in the RDD into a single sequence. Hash-partitions the
    * resulting RDD with into `numPartitions` partitions.
    *
-   * Note: If you are grouping in order to perform an aggregation (such as a sum or average) over
-   * each key, using [[JavaPairRDD.reduceByKey]] or [[JavaPairRDD.combineByKey]]
+   * @note If you are grouping in order to perform an aggregation (such as a sum or average) over
+   * each key, using `JavaPairRDD.reduceByKey` or `JavaPairRDD.combineByKey`
    * will provide much better performance.
    */
   def groupByKey(numPartitions: Int): JavaPairRDD[K, JIterable[V]] =
@@ -448,13 +458,17 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
     fromRDD(rdd.subtractByKey(other))
   }
 
-  /** Return an RDD with the pairs from `this` whose keys are not in `other`. */
+  /**
+   * Return an RDD with the pairs from `this` whose keys are not in `other`.
+   */
   def subtractByKey[W](other: JavaPairRDD[K, W], numPartitions: Int): JavaPairRDD[K, V] = {
     implicit val ctag: ClassTag[W] = fakeClassTag
     fromRDD(rdd.subtractByKey(other, numPartitions))
   }
 
-  /** Return an RDD with the pairs from `this` whose keys are not in `other`. */
+  /**
+   * Return an RDD with the pairs from `this` whose keys are not in `other`.
+   */
   def subtractByKey[W](other: JavaPairRDD[K, W], p: Partitioner): JavaPairRDD[K, V] = {
     implicit val ctag: ClassTag[W] = fakeClassTag
     fromRDD(rdd.subtractByKey(other, p))
@@ -539,8 +553,8 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
    * Group the values for each key in the RDD into a single sequence. Hash-partitions the
    * resulting RDD with the existing partitioner/parallelism level.
    *
-   * Note: If you are grouping in order to perform an aggregation (such as a sum or average) over
-   * each key, using [[JavaPairRDD.reduceByKey]] or [[JavaPairRDD.combineByKey]]
+   * @note If you are grouping in order to perform an aggregation (such as a sum or average) over
+   * each key, using `JavaPairRDD.reduceByKey` or `JavaPairRDD.combineByKey`
    * will provide much better performance.
    */
   def groupByKey(): JavaPairRDD[K, JIterable[V]] =
@@ -662,8 +676,8 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
    * Pass each value in the key-value pair RDD through a flatMap function without changing the
    * keys; this also retains the original RDD's partitioning.
    */
-  def flatMapValues[U](f: JFunction[V, java.lang.Iterable[U]]): JavaPairRDD[K, U] = {
-    def fn: (V) => Iterable[U] = (x: V) => f.call(x).asScala
+  def flatMapValues[U](f: FlatMapFunction[V, U]): JavaPairRDD[K, U] = {
+    def fn: (V) => Iterator[U] = (x: V) => f.call(x).asScala
     implicit val ctag: ClassTag[U] = fakeClassTag
     fromRDD(rdd.flatMapValues(fn))
   }
@@ -778,7 +792,7 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
       keyClass: Class[_],
       valueClass: Class[_],
       outputFormatClass: Class[F],
-      conf: JobConf) {
+      conf: JobConf): Unit = {
     rdd.saveAsHadoopFile(path, keyClass, valueClass, outputFormatClass, conf)
   }
 
@@ -787,7 +801,7 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
       path: String,
       keyClass: Class[_],
       valueClass: Class[_],
-      outputFormatClass: Class[F]) {
+      outputFormatClass: Class[F]): Unit = {
     rdd.saveAsHadoopFile(path, keyClass, valueClass, outputFormatClass)
   }
 
@@ -797,7 +811,7 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
       keyClass: Class[_],
       valueClass: Class[_],
       outputFormatClass: Class[F],
-      codec: Class[_ <: CompressionCodec]) {
+      codec: Class[_ <: CompressionCodec]): Unit = {
     rdd.saveAsHadoopFile(path, keyClass, valueClass, outputFormatClass, codec)
   }
 
@@ -807,7 +821,7 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
       keyClass: Class[_],
       valueClass: Class[_],
       outputFormatClass: Class[F],
-      conf: Configuration) {
+      conf: Configuration): Unit = {
     rdd.saveAsNewAPIHadoopFile(path, keyClass, valueClass, outputFormatClass, conf)
   }
 
@@ -815,7 +829,7 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
    * Output the RDD to any Hadoop-supported storage system, using
    * a Configuration object for that storage system.
    */
-  def saveAsNewAPIHadoopDataset(conf: Configuration) {
+  def saveAsNewAPIHadoopDataset(conf: Configuration): Unit = {
     rdd.saveAsNewAPIHadoopDataset(conf)
   }
 
@@ -824,7 +838,7 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
       path: String,
       keyClass: Class[_],
       valueClass: Class[_],
-      outputFormatClass: Class[F]) {
+      outputFormatClass: Class[F]): Unit = {
     rdd.saveAsNewAPIHadoopFile(path, keyClass, valueClass, outputFormatClass)
   }
 
@@ -834,7 +848,7 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
    * (e.g. a table name to write to) in the same way as it would be configured for a Hadoop
    * MapReduce job.
    */
-  def saveAsHadoopDataset(conf: JobConf) {
+  def saveAsHadoopDataset(conf: JobConf): Unit = {
     rdd.saveAsHadoopDataset(conf)
   }
 
@@ -925,6 +939,34 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
   }
 
   /**
+   * Return a RDD containing only the elements in the inclusive range `lower` to `upper`.
+   * If the RDD has been partitioned using a `RangePartitioner`, then this operation can be
+   * performed efficiently by only scanning the partitions that might containt matching elements.
+   * Otherwise, a standard `filter` is applied to all partitions.
+   *
+   * @since 3.1.0
+   */
+  @Since("3.1.0")
+  def filterByRange(lower: K, upper: K): JavaPairRDD[K, V] = {
+    val comp = com.google.common.collect.Ordering.natural().asInstanceOf[Comparator[K]]
+    filterByRange(comp, lower, upper)
+  }
+
+  /**
+   * Return a RDD containing only the elements in the inclusive range `lower` to `upper`.
+   * If the RDD has been partitioned using a `RangePartitioner`, then this operation can be
+   * performed efficiently by only scanning the partitions that might containt matching elements.
+   * Otherwise, a standard `filter` is applied to all partitions.
+   *
+   * @since 3.1.0
+   */
+  @Since("3.1.0")
+  def filterByRange(comp: Comparator[K], lower: K, upper: K): JavaPairRDD[K, V] = {
+    implicit val ordering = comp // Allow implicit conversion of Comparator to Ordering.
+    fromRDD(new OrderedRDDFunctions[K, V, (K, V)](rdd).filterByRange(lower, upper))
+  }
+
+  /**
    * Return an RDD with the keys of each tuple.
    */
   def keys(): JavaRDD[K] = JavaRDD.fromRDD[K](rdd.map(_._1))
@@ -939,7 +981,7 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
    *
    * The algorithm used is based on streamlib's implementation of "HyperLogLog in Practice:
    * Algorithmic Engineering of a State of The Art Cardinality Estimation Algorithm", available
-   * <a href="http://dx.doi.org/10.1145/2452376.2452456">here</a>.
+   * <a href="https://doi.org/10.1145/2452376.2452456">here</a>.
    *
    * @param relativeSD Relative accuracy. Smaller values create counters that require more space.
    *                   It must be greater than 0.000017.
@@ -956,7 +998,7 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
    *
    * The algorithm used is based on streamlib's implementation of "HyperLogLog in Practice:
    * Algorithmic Engineering of a State of The Art Cardinality Estimation Algorithm", available
-   * <a href="http://dx.doi.org/10.1145/2452376.2452456">here</a>.
+   * <a href="https://doi.org/10.1145/2452376.2452456">here</a>.
    *
    * @param relativeSD Relative accuracy. Smaller values create counters that require more space.
    *                   It must be greater than 0.000017.
@@ -972,7 +1014,7 @@ class JavaPairRDD[K, V](val rdd: RDD[(K, V)])
    *
    * The algorithm used is based on streamlib's implementation of "HyperLogLog in Practice:
    * Algorithmic Engineering of a State of The Art Cardinality Estimation Algorithm", available
-   * <a href="http://dx.doi.org/10.1145/2452376.2452456">here</a>.
+   * <a href="https://doi.org/10.1145/2452376.2452456">here</a>.
    *
    * @param relativeSD Relative accuracy. Smaller values create counters that require more space.
    *                   It must be greater than 0.000017.

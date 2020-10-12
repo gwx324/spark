@@ -15,8 +15,6 @@
 # limitations under the License.
 #
 
-from __future__ import print_function
-
 from pyspark import SparkContext
 # $example on$
 from pyspark.mllib.feature import HashingTF, IDF
@@ -43,7 +41,7 @@ if __name__ == "__main__":
     # In such cases, the IDF for these terms is set to 0.
     # This feature can be used by passing the minDocFreq value to the IDF constructor.
     idfIgnore = IDF(minDocFreq=2).fit(tf)
-    tfidfIgnore = idf.transform(tf)
+    tfidfIgnore = idfIgnore.transform(tf)
     # $example off$
 
     print("tfidf:")

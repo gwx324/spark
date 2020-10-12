@@ -15,8 +15,6 @@
 # limitations under the License.
 #
 
-from __future__ import print_function
-
 # $example on$
 from numpy import array
 from math import sqrt
@@ -36,8 +34,7 @@ if __name__ == "__main__":
     parsedData = data.map(lambda line: array([float(x) for x in line.split(' ')]))
 
     # Build the model (cluster the data)
-    clusters = KMeans.train(parsedData, 2, maxIterations=10,
-                            runs=10, initializationMode="random")
+    clusters = KMeans.train(parsedData, 2, maxIterations=10, initializationMode="random")
 
     # Evaluate clustering by computing Within Set Sum of Squared Errors
     def error(point):
