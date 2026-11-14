@@ -18,23 +18,33 @@
 package org.apache.spark.ui.jobs
 
 import java.net.URLEncoder
-import java.util.Date
-import javax.servlet.http.HttpServletRequest
+import java.nio.charset.StandardCharsets.UTF_8
+import java.util.{Date, Locale}
 
-import scala.collection.JavaConverters._
-import scala.collection.mutable.{HashMap, ListBuffer}
+import scala.collection.mutable.ListBuffer
 import scala.xml._
 
-import org.apache.commons.lang3.StringEscapeUtils
+import jakarta.servlet.http.HttpServletRequest
+import org.apache.commons.text.StringEscapeUtils
 
 import org.apache.spark.JobExecutionStatus
-import org.apache.spark.scheduler.StageInfo
+import org.apache.spark.internal.config.SCHEDULER_MODE
+import org.apache.spark.internal.config.UI._
+import org.apache.spark.scheduler._
+import org.apache.spark.status.AppStatusStore
+import org.apache.spark.status.api.v1
 import org.apache.spark.ui._
-import org.apache.spark.ui.jobs.UIData.{ExecutorUIData, JobUIData, StageUIData}
 import org.apache.spark.util.Utils
 
 /** Page showing list of all ongoing and recently finished jobs */
-private[ui] class AllJobsPage(parent: JobsTab) extends WebUIPage("") {
+private[ui] class AllJobsPage(parent: JobsTab, store: AppStatusStore) extends WebUIPage("") {
+
+  import ApiHelper._
+
+  private val TIMELINE_ENABLED = parent.conf.get(UI_TIMELINE_ENABLED)
+  private val MAX_TIMELINE_JOBS = parent.conf.get(UI_TIMELINE_JOBS_MAXIMUM)
+  private val MAX_TIMELINE_EXECUTORS = parent.conf.get(UI_TIMELINE_EXECUTORS_MAXIMUM)
+
   private val JOBS_LEGEND =
     <div class="legend-area"><svg width="150px" height="85px">
       <rect class="succeeded-job-legend"
@@ -58,34 +68,23 @@ private[ui] class AllJobsPage(parent: JobsTab) extends WebUIPage("") {
       <text x="35px" y="42px">Removed</text>
     </svg></div>.toString.filter(_ != '\n')
 
-  private def getLastStageNameAndDescription(job: JobUIData): (String, String) = {
-    val lastStageInfo = Option(job.stageIds)
-      .filter(_.nonEmpty)
-      .flatMap { ids => parent.jobProgresslistener.stageIdToInfo.get(ids.max)}
-    val lastStageData = lastStageInfo.flatMap { s =>
-      parent.jobProgresslistener.stageIdToData.get((s.stageId, s.attemptId))
-    }
-    val name = lastStageInfo.map(_.name).getOrElse("(Unknown Stage Name)")
-    val description = lastStageData.flatMap(_.description).getOrElse("")
-    (name, description)
-  }
+  private def makeJobEvent(jobs: Seq[v1.JobData]): Seq[String] = {
+    val now = System.currentTimeMillis()
+    jobs.filter { job =>
+      job.status != JobExecutionStatus.UNKNOWN && job.submissionTime.isDefined
+    }.sortBy { j =>
+      (j.completionTime.map(_.getTime).getOrElse(now), j.submissionTime.get.getTime)
+    }.takeRight(MAX_TIMELINE_JOBS).map { job =>
+      val jobId = job.jobId
+      val status = job.status
+      val (_, lastStageDescription) = lastStageNameAndDescription(store, job)
+      val jobDescription = UIUtils.makeDescription(
+        job.description.getOrElse(lastStageDescription),
+        "",
+        plainText = true).text
 
-  private def makeJobEvent(jobUIDatas: Seq[JobUIData]): Seq[String] = {
-    jobUIDatas.filter { jobUIData =>
-      jobUIData.status != JobExecutionStatus.UNKNOWN && jobUIData.submissionTime.isDefined
-    }.map { jobUIData =>
-      val jobId = jobUIData.jobId
-      val status = jobUIData.status
-      val (jobName, jobDescription) = getLastStageNameAndDescription(jobUIData)
-      val displayJobDescription =
-        if (jobDescription.isEmpty) {
-          jobName
-        } else {
-          UIUtils.makeDescription(jobDescription, "", plainText = true).text
-        }
-      val submissionTime = jobUIData.submissionTime.get
-      val completionTimeOpt = jobUIData.completionTime
-      val completionTime = completionTimeOpt.getOrElse(System.currentTimeMillis())
+      val submissionTime = job.submissionTime.get.getTime()
+      val completionTime = job.completionTime.map(_.getTime()).getOrElse(now)
       val classNameByStatus = status match {
         case JobExecutionStatus.SUCCEEDED => "succeeded"
         case JobExecutionStatus.FAILED => "failed"
@@ -94,9 +93,10 @@ private[ui] class AllJobsPage(parent: JobsTab) extends WebUIPage("") {
       }
 
       // The timeline library treats contents as HTML, so we have to escape them. We need to add
-      // extra layers of escaping in order to embed this in a Javascript string literal.
-      val escapedDesc = Utility.escape(displayJobDescription)
-      val jsEscapedDesc = StringEscapeUtils.escapeEcmaScript(escapedDesc)
+      // extra layers of escaping in order to embed this in a JavaScript string literal.
+      val escapedDesc = Utility.escape(jobDescription)
+      val jsEscapedDescForTooltip = StringEscapeUtils.escapeEcmaScript(Utility.escape(escapedDesc))
+      val jsEscapedDescForLabel = StringEscapeUtils.escapeEcmaScript(escapedDesc)
       val jobEventJsonAsStr =
         s"""
            |{
@@ -105,8 +105,8 @@ private[ui] class AllJobsPage(parent: JobsTab) extends WebUIPage("") {
            |  'start': new Date(${submissionTime}),
            |  'end': new Date(${completionTime}),
            |  'content': '<div class="application-timeline-content"' +
-           |     'data-html="true" data-placement="top" data-toggle="tooltip"' +
-           |     'data-title="${jsEscapedDesc} (Job ${jobId})<br>' +
+           |     'data-bs-html="true" data-bs-toggle="tooltip"' +
+           |     'data-bs-title="${jsEscapedDescForTooltip} (Job ${jobId})<br>' +
            |     'Status: ${status}<br>' +
            |     'Submitted: ${UIUtils.formatDate(new Date(submissionTime))}' +
            |     '${
@@ -116,63 +116,66 @@ private[ui] class AllJobsPage(parent: JobsTab) extends WebUIPage("") {
                        ""
                      }
                   }">' +
-           |    '${jsEscapedDesc} (Job ${jobId})</div>'
+           |    '${jsEscapedDescForLabel} (Job ${jobId})</div>'
            |}
          """.stripMargin
       jobEventJsonAsStr
     }
   }
 
-  private def makeExecutorEvent(executorUIDatas: HashMap[String, ExecutorUIData]): Seq[String] = {
+  def makeExecutorEvent(executors: Seq[v1.ExecutorSummary]):
+      Seq[String] = {
     val events = ListBuffer[String]()
-    executorUIDatas.foreach {
-      case (executorId, event) =>
-        val addedEvent =
+    executors.sortBy { e =>
+      e.removeTime.map(_.getTime).getOrElse(e.addTime.getTime)
+    }.takeRight(MAX_TIMELINE_EXECUTORS).foreach { e =>
+      val addedEvent =
+        s"""
+           |{
+           |  'className': 'executor added',
+           |  'group': 'executors',
+           |  'start': new Date(${e.addTime.getTime()}),
+           |  'content': '<div class="executor-event-content"' +
+           |    'data-bs-toggle="tooltip"' +
+           |    'data-bs-title="Executor ${e.id}<br>' +
+           |    'Added at ${UIUtils.formatDate(e.addTime)}"' +
+           |    'data-bs-html="true">Executor ${e.id} added</div>'
+           |}
+         """.stripMargin
+      events += addedEvent
+
+      e.removeTime.foreach { removeTime =>
+        val removedEvent =
           s"""
              |{
-             |  'className': 'executor added',
+             |  'className': 'executor removed',
              |  'group': 'executors',
-             |  'start': new Date(${event.startTime}),
+             |  'start': new Date(${removeTime.getTime()}),
              |  'content': '<div class="executor-event-content"' +
-             |    'data-toggle="tooltip" data-placement="bottom"' +
-             |    'data-title="Executor ${executorId}<br>' +
-             |    'Added at ${UIUtils.formatDate(new Date(event.startTime))}"' +
-             |    'data-html="true">Executor ${executorId} added</div>'
+             |    'data-bs-toggle="tooltip"' +
+             |    'data-bs-title="Executor ${e.id}<br>' +
+             |    'Removed at ${UIUtils.formatDate(removeTime)}' +
+             |    '${
+                      e.removeReason.map { reason =>
+                        s"""<br>Reason: ${StringEscapeUtils.escapeEcmaScript(
+                          Utility.escape(Utility.escape(reason.replace("\n", " "))))}"""
+                      }.getOrElse("")
+                   }"' +
+             |    'data-bs-html="true">Executor ${e.id} removed</div>'
              |}
            """.stripMargin
-        events += addedEvent
-
-        if (event.finishTime.isDefined) {
-          val removedEvent =
-            s"""
-               |{
-               |  'className': 'executor removed',
-               |  'group': 'executors',
-               |  'start': new Date(${event.finishTime.get}),
-               |  'content': '<div class="executor-event-content"' +
-               |    'data-toggle="tooltip" data-placement="bottom"' +
-               |    'data-title="Executor ${executorId}<br>' +
-               |    'Removed at ${UIUtils.formatDate(new Date(event.finishTime.get))}' +
-               |    '${
-                        if (event.finishReason.isDefined) {
-                          s"""<br>Reason: ${event.finishReason.get.replace("\n", " ")}"""
-                        } else {
-                          ""
-                        }
-                     }"' +
-               |    'data-html="true">Executor ${executorId} removed</div>'
-               |}
-             """.stripMargin
-          events += removedEvent
-        }
+        events += removedEvent
+      }
     }
     events.toSeq
   }
 
   private def makeTimeline(
-      jobs: Seq[JobUIData],
-      executors: HashMap[String, ExecutorUIData],
+      jobs: Seq[v1.JobData],
+      executors: Seq[v1.ExecutorSummary],
       startTime: Long): Seq[Node] = {
+
+    if (!TIMELINE_ENABLED) return Seq.empty[Node]
 
     val jobEventJsonAsStrSeq = makeJobEvent(jobs)
     val executorEventJsonAsStrSeq = makeExecutorEvent(executors)
@@ -196,11 +199,33 @@ private[ui] class AllJobsPage(parent: JobsTab) extends WebUIPage("") {
 
     <span class="expand-application-timeline">
       <span class="expand-application-timeline-arrow arrow-closed"></span>
-      <a data-toggle="tooltip" title={ToolTips.JOB_TIMELINE} data-placement="right">
-        Event Timeline
-      </a>
+      {UIUtils.tooltipLink(<xml:group>Event Timeline</xml:group>, ToolTips.JOB_TIMELINE)}
     </span> ++
     <div id="application-timeline" class="collapsed">
+      {
+        if (MAX_TIMELINE_JOBS < jobs.size) {
+          <div>
+            <strong>
+              Only the most recent {MAX_TIMELINE_JOBS} submitted/completed jobs
+              (of {jobs.size} total) are shown.
+            </strong>
+          </div>
+        } else {
+          Seq.empty
+        }
+      }
+      {
+        if (MAX_TIMELINE_EXECUTORS < executors.size) {
+          <div>
+            <strong>
+              Only the most recent {MAX_TIMELINE_EXECUTORS} added/removed executors
+              (of {executors.size} total) are shown.
+            </strong>
+          </div>
+        } else {
+          Seq.empty
+        }
+      }
       <div class="control-panel">
         <div id="application-timeline-zoom-lock">
           <input type="checkbox"></input>
@@ -208,7 +233,7 @@ private[ui] class AllJobsPage(parent: JobsTab) extends WebUIPage("") {
         </div>
       </div>
     </div> ++
-    <script type="text/javascript">
+    <script type="text/javascript" nonce={CspNonce.get}>
       {Unparsed(s"drawApplicationTimeline(${groupJsonArrayAsStr}," +
       s"${eventArrayAsStr}, ${startTime}, ${UIUtils.getTimeZoneOffset()});")}
     </script>
@@ -216,61 +241,32 @@ private[ui] class AllJobsPage(parent: JobsTab) extends WebUIPage("") {
 
   private def jobsTable(
       request: HttpServletRequest,
+      tableHeaderId: String,
       jobTag: String,
-      jobs: Seq[JobUIData]): Seq[Node] = {
-    val allParameters = request.getParameterMap.asScala.toMap
-    val parameterOtherTable = allParameters.filterNot(_._1.startsWith(jobTag))
-      .map(para => para._1 + "=" + para._2(0))
+      jobs: Seq[v1.JobData],
+      killEnabled: Boolean): Seq[Node] = {
 
     val someJobHasJobGroup = jobs.exists(_.jobGroup.isDefined)
     val jobIdTitle = if (someJobHasJobGroup) "Job Id (Job Group)" else "Job Id"
-
-    val parameterJobPage = request.getParameter(jobTag + ".page")
-    val parameterJobSortColumn = request.getParameter(jobTag + ".sort")
-    val parameterJobSortDesc = request.getParameter(jobTag + ".desc")
-    val parameterJobPageSize = request.getParameter(jobTag + ".pageSize")
-    val parameterJobPrevPageSize = request.getParameter(jobTag + ".prevPageSize")
-
-    val jobPage = Option(parameterJobPage).map(_.toInt).getOrElse(1)
-    val jobSortColumn = Option(parameterJobSortColumn).map { sortColumn =>
-      UIUtils.decodeURLParameter(sortColumn)
-    }.getOrElse(jobIdTitle)
-    val jobSortDesc = Option(parameterJobSortDesc).map(_.toBoolean).getOrElse(
-      // New jobs should be shown above old jobs by default.
-      if (jobSortColumn == jobIdTitle) true else false
-    )
-    val jobPageSize = Option(parameterJobPageSize).map(_.toInt).getOrElse(100)
-    val jobPrevPageSize = Option(parameterJobPrevPageSize).map(_.toInt).getOrElse(jobPageSize)
-
-    val page: Int = {
-      // If the user has changed to a larger page size, then go to page 1 in order to avoid
-      // IndexOutOfBoundsException.
-      if (jobPageSize <= jobPrevPageSize) {
-        jobPage
-      } else {
-        1
-      }
-    }
-    val currentTime = System.currentTimeMillis()
+    val jobPage = Option(request.getParameter(jobTag + ".page")).map(_.toInt).getOrElse(1)
 
     try {
       new JobPagedTable(
+        request,
+        store,
         jobs,
+        tableHeaderId,
         jobTag,
-        UIUtils.prependBaseUri(parent.basePath),
+        UIUtils.prependBaseUri(request, parent.basePath),
         "jobs", // subPath
-        parameterOtherTable,
-        parent.jobProgresslistener.stageIdToInfo,
-        parent.jobProgresslistener.stageIdToData,
-        currentTime,
+        killEnabled,
         jobIdTitle,
-        pageSize = jobPageSize,
-        sortColumn = jobSortColumn,
-        desc = jobSortDesc
-      ).table(page)
+        parent.actionsViaGetEnabled,
+        parent.csrfToken
+      ).table(jobPage)
     } catch {
       case e @ (_ : IllegalArgumentException | _ : IndexOutOfBoundsException) =>
-        <div class="alert alert-error">
+        <div class="alert alert-danger">
           <p>Error while rendering job table:</p>
           <pre>
             {Utils.exceptionString(e)}
@@ -280,104 +276,206 @@ private[ui] class AllJobsPage(parent: JobsTab) extends WebUIPage("") {
   }
 
   def render(request: HttpServletRequest): Seq[Node] = {
-    val listener = parent.jobProgresslistener
-    listener.synchronized {
-      val startTime = listener.startTime
-      val endTime = listener.endTime
-      val activeJobs = listener.activeJobs.values.toSeq
-      val completedJobs = listener.completedJobs.reverse.toSeq
-      val failedJobs = listener.failedJobs.reverse.toSeq
+    val appInfo = store.applicationInfo()
+    val startDate = appInfo.attempts.head.startTime
+    val startTime = startDate.getTime()
+    val endTime = appInfo.attempts.head.endTime.getTime()
+    val exitCode = appInfo.attempts.head.exitCode
 
-      val activeJobsTable = jobsTable(request, "activeJob", activeJobs)
-      val completedJobsTable = jobsTable(request, "completedJob", completedJobs)
-      val failedJobsTable = jobsTable(request, "failedJob", failedJobs)
+    val activeJobs = new ListBuffer[v1.JobData]()
+    val completedJobs = new ListBuffer[v1.JobData]()
+    val failedJobs = new ListBuffer[v1.JobData]()
 
-      val shouldShowActiveJobs = activeJobs.nonEmpty
-      val shouldShowCompletedJobs = completedJobs.nonEmpty
-      val shouldShowFailedJobs = failedJobs.nonEmpty
-
-      val completedJobNumStr = if (completedJobs.size == listener.numCompletedJobs) {
-        s"${completedJobs.size}"
-      } else {
-        s"${listener.numCompletedJobs}, only showing ${completedJobs.size}"
+    store.jobsList(null).foreach { job =>
+      job.status match {
+        case JobExecutionStatus.SUCCEEDED =>
+          completedJobs += job
+        case JobExecutionStatus.FAILED =>
+          failedJobs += job
+        case _ =>
+          activeJobs += job
       }
-
-      val summary: NodeSeq =
-        <div>
-          <ul class="unstyled">
-            <li>
-              <strong>User:</strong>
-              {parent.getSparkUser}
-            </li>
-            <li>
-              <strong>Total Uptime:</strong>
-              {
-                if (endTime < 0 && parent.sc.isDefined) {
-                  UIUtils.formatDuration(System.currentTimeMillis() - startTime)
-                } else if (endTime > 0) {
-                  UIUtils.formatDuration(endTime - startTime)
-                }
-              }
-            </li>
-            <li>
-              <strong>Scheduling Mode: </strong>
-              {listener.schedulingMode.map(_.toString).getOrElse("Unknown")}
-            </li>
-            {
-              if (shouldShowActiveJobs) {
-                <li>
-                  <a href="#active"><strong>Active Jobs:</strong></a>
-                  {activeJobs.size}
-                </li>
-              }
-            }
-            {
-              if (shouldShowCompletedJobs) {
-                <li id="completed-summary">
-                  <a href="#completed"><strong>Completed Jobs:</strong></a>
-                  {completedJobNumStr}
-                </li>
-              }
-            }
-            {
-              if (shouldShowFailedJobs) {
-                <li>
-                  <a href="#failed"><strong>Failed Jobs:</strong></a>
-                  {listener.numFailedJobs}
-                </li>
-              }
-            }
-          </ul>
-        </div>
-
-      var content = summary
-      val executorListener = parent.executorListener
-      content ++= makeTimeline(activeJobs ++ completedJobs ++ failedJobs,
-          executorListener.executorIdToData, startTime)
-
-      if (shouldShowActiveJobs) {
-        content ++= <h4 id="active">Active Jobs ({activeJobs.size})</h4> ++
-          activeJobsTable
-      }
-      if (shouldShowCompletedJobs) {
-        content ++= <h4 id="completed">Completed Jobs ({completedJobNumStr})</h4> ++
-          completedJobsTable
-      }
-      if (shouldShowFailedJobs) {
-        content ++= <h4 id ="failed">Failed Jobs ({failedJobs.size})</h4> ++
-          failedJobsTable
-      }
-
-      val helpText = """A job is triggered by an action, like count() or saveAsTextFile().""" +
-        " Click on a job to see information about the stages of tasks inside it."
-
-      UIUtils.headerSparkPage("Spark Jobs", content, parent, helpText = Some(helpText))
     }
+
+    val activeJobsTable =
+      jobsTable(request, "active", "activeJob", activeJobs.toSeq, killEnabled = parent.killEnabled)
+    val completedJobsTable =
+      jobsTable(request, "completed", "completedJob", completedJobs.toSeq, killEnabled = false)
+    val failedJobsTable =
+      jobsTable(request, "failed", "failedJob", failedJobs.toSeq, killEnabled = false)
+
+    val shouldShowActiveJobs = activeJobs.nonEmpty
+    val shouldShowCompletedJobs = completedJobs.nonEmpty
+    val shouldShowFailedJobs = failedJobs.nonEmpty
+
+    val appSummary = store.appSummary()
+    val completedJobNumStr = if (completedJobs.size == appSummary.numCompletedJobs) {
+      s"${completedJobs.size}"
+    } else {
+      s"${appSummary.numCompletedJobs}, only showing ${completedJobs.size}"
+    }
+
+    // SPARK-33991 Avoid enumeration conversion error.
+    val schedulingMode = store.environmentInfo().sparkProperties.toMap
+      .get(SCHEDULER_MODE.key)
+      .map { mode => SchedulingMode.withName(mode.toUpperCase(Locale.ROOT)).toString }
+      .getOrElse("Unknown")
+
+    val summary: NodeSeq =
+      <div>
+        <ul class="list-unstyled">
+          <li>
+            <strong>User:</strong>
+            {parent.getSparkUser}
+          </li>
+          <li>
+            <strong>Started At:</strong>
+            {UIUtils.formatDate(startDate)}
+          </li>
+          <li>
+            <strong>Total Uptime:</strong>
+            {
+              if (endTime < 0 && parent.sc.isDefined) {
+                UIUtils.formatDuration(System.currentTimeMillis() - startTime)
+              } else if (endTime > 0) {
+                UIUtils.formatDuration(endTime - startTime)
+              }
+            }
+          </li>
+          {
+            exitCode match {
+              case Some(code) if code != 0 =>
+                <li>
+                  <strong>Exit Code:</strong>
+                  {code.toString}
+                </li>
+              case _ => <!-- -->
+            }
+          }
+          <li>
+            <strong>Scheduling Mode: </strong>
+            {schedulingMode}
+          </li>
+          {
+            if (parent.holdEnabled && parent.sc.exists(_.executorHoldSupported)) {
+              val basePathUri = UIUtils.prependBaseUri(request, parent.basePath)
+              val (status, action, confirm) = if (parent.sc.get.executorsHeld) {
+                val numDraining = parent.sc.get.getExecutorIds().size
+                val status = if (numDraining > 0) {
+                  s"Held (draining $numDraining executor${if (numDraining > 1) "s" else ""})"
+                } else {
+                  "Held"
+                }
+                (status, "resume", "Are you sure you want to resume this application?")
+              } else {
+                ("Running", "hold", "Are you sure you want to hold this application? All " +
+                  "executors will be decommissioned after finishing their running tasks.")
+              }
+              val label = action.capitalize
+              // Same form as the kill buttons; see UIUtils.actionFormMethod.
+              <li>
+                <strong>Application:</strong>
+                {status}
+                <form action={s"$basePathUri/jobs/$action/"}
+                      method={UIUtils.actionFormMethod(parent.actionsViaGetEnabled)}
+                      class="d-inline">
+                  <input type="hidden" name="csrfToken" value={parent.csrfToken}/>
+                  <button type="submit"
+                          data-confirm-message={confirm}
+                          class="btn btn-sm btn-outline-secondary confirm-link">{label}</button>
+                </form>
+                {parent.lastHoldRequestStatus.getOrElse("")}
+              </li>
+            }
+          }
+          {
+            if (shouldShowActiveJobs) {
+              <li>
+                <a href="#active"><strong>Active Jobs:</strong></a>
+                {activeJobs.size}
+              </li>
+            }
+          }
+          {
+            if (shouldShowCompletedJobs) {
+              <li id="completed-summary">
+                <a href="#completed"><strong>Completed Jobs:</strong></a>
+                {completedJobNumStr}
+              </li>
+            }
+          }
+          {
+            if (shouldShowFailedJobs) {
+              <li>
+                <a href="#failed"><strong>Failed Jobs:</strong></a>
+                {failedJobs.size}
+              </li>
+            }
+          }
+        </ul>
+      </div>
+
+    var content = summary
+    content ++= makeTimeline((activeJobs ++ completedJobs ++ failedJobs).toSeq,
+      store.executorList(false), startTime)
+
+    if (shouldShowActiveJobs) {
+      content ++=
+        <span id="active" class="collapse-table" data-bs-toggle="collapse"
+            data-bs-target="#aggregated-activeJobs"
+            aria-expanded="true" aria-controls="aggregated-activeJobs"
+            data-collapse-name="collapse-aggregated-activeJobs">
+          <h4>
+            <span class="collapse-table-arrow arrow-open"></span>
+            <a>Active Jobs ({activeJobs.size})</a>
+          </h4>
+        </span> ++
+        <div class="collapsible-table collapse show" id="aggregated-activeJobs">
+          {activeJobsTable}
+        </div>
+    }
+    if (shouldShowCompletedJobs) {
+      content ++=
+        <span id="completed" class="collapse-table" data-bs-toggle="collapse"
+            data-bs-target="#aggregated-completedJobs"
+            aria-expanded="true" aria-controls="aggregated-completedJobs"
+            data-collapse-name="collapse-aggregated-completedJobs">
+          <h4>
+            <span class="collapse-table-arrow arrow-open"></span>
+            <a>Completed Jobs ({completedJobNumStr})</a>
+          </h4>
+        </span> ++
+        <div class="collapsible-table collapse show" id="aggregated-completedJobs">
+          {completedJobsTable}
+        </div>
+    }
+    if (shouldShowFailedJobs) {
+      content ++=
+        <span id ="failed" class="collapse-table" data-bs-toggle="collapse"
+            data-bs-target="#aggregated-failedJobs"
+            aria-expanded="true" aria-controls="aggregated-failedJobs"
+            data-collapse-name="collapse-aggregated-failedJobs">
+          <h4>
+            <span class="collapse-table-arrow arrow-open"></span>
+            <a>Failed Jobs ({failedJobs.size})</a>
+          </h4>
+        </span> ++
+      <div class="collapsible-table collapse show" id="aggregated-failedJobs">
+        {failedJobsTable}
+      </div>
+    }
+
+    val helpText = """A job is triggered by an action, like count() or saveAsTextFile().""" +
+      " Click on a job to see information about the stages of tasks inside it."
+
+    UIUtils.headerSparkPage(request, "Spark Jobs", content, parent,
+      helpText = Some(helpText), useTimeline = true)
   }
+
 }
 
 private[ui] class JobTableRowData(
-    val jobData: JobUIData,
+    val jobData: v1.JobData,
     val lastStageName: String,
     val lastStageDescription: String,
     val duration: Long,
@@ -388,63 +486,45 @@ private[ui] class JobTableRowData(
     val detailUrl: String)
 
 private[ui] class JobDataSource(
-    jobs: Seq[JobUIData],
-    stageIdToInfo: HashMap[Int, StageInfo],
-    stageIdToData: HashMap[(Int, Int), StageUIData],
+    store: AppStatusStore,
+    jobs: Seq[v1.JobData],
     basePath: String,
-    currentTime: Long,
     pageSize: Int,
     sortColumn: String,
     desc: Boolean) extends PagedDataSource[JobTableRowData](pageSize) {
+
+  import ApiHelper._
 
   // Convert JobUIData to JobTableRowData which contains the final contents to show in the table
   // so that we can avoid creating duplicate contents during sorting the data
   private val data = jobs.map(jobRow).sorted(ordering(sortColumn, desc))
 
-  private var _slicedJobIds: Set[Int] = null
-
   override def dataSize: Int = data.size
 
-  override def sliceData(from: Int, to: Int): Seq[JobTableRowData] = {
-    val r = data.slice(from, to)
-    _slicedJobIds = r.map(_.jobData.jobId).toSet
-    r
-  }
+  override def sliceData(from: Int, to: Int): Seq[JobTableRowData] = data.slice(from, to)
 
-  private def getLastStageNameAndDescription(job: JobUIData): (String, String) = {
-    val lastStageInfo = Option(job.stageIds)
-      .filter(_.nonEmpty)
-      .flatMap { ids => stageIdToInfo.get(ids.max)}
-    val lastStageData = lastStageInfo.flatMap { s =>
-      stageIdToData.get((s.stageId, s.attemptId))
-    }
-    val name = lastStageInfo.map(_.name).getOrElse("(Unknown Stage Name)")
-    val description = lastStageData.flatMap(_.description).getOrElse("")
-    (name, description)
-  }
-
-  private def jobRow(jobData: JobUIData): JobTableRowData = {
-    val (lastStageName, lastStageDescription) = getLastStageNameAndDescription(jobData)
-    val duration: Option[Long] = {
-      jobData.submissionTime.map { start =>
-        val end = jobData.completionTime.getOrElse(System.currentTimeMillis())
-        end - start
-      }
-    }
-    val formattedDuration = duration.map(d => UIUtils.formatDuration(d)).getOrElse("Unknown")
+  private def jobRow(jobData: v1.JobData): JobTableRowData = {
+    val duration: Option[Long] = JobDataUtil.getDuration(jobData)
+    val formattedDuration = JobDataUtil.getFormattedDuration(jobData)
     val submissionTime = jobData.submissionTime
-    val formattedSubmissionTime = submissionTime.map(UIUtils.formatDate).getOrElse("Unknown")
-    val jobDescription = UIUtils.makeDescription(lastStageDescription, basePath, plainText = false)
+    val formattedSubmissionTime = JobDataUtil.getFormattedSubmissionTime(jobData)
+    val (lastStageName, lastStageDescription) = lastStageNameAndDescription(store, jobData)
 
-    val detailUrl = "%s/jobs/job?id=%s".format(basePath, jobData.jobId)
+    val jobDescription =
+      UIUtils.makeDescription(
+        jobData.description.getOrElse(lastStageDescription),
+        basePath,
+        plainText = false)
 
-    new JobTableRowData (
+    val detailUrl = "%s/jobs/job/?id=%s".format(basePath, jobData.jobId)
+
+    new JobTableRowData(
       jobData,
       lastStageName,
       lastStageDescription,
       duration.getOrElse(-1),
       formattedDuration,
-      submissionTime.getOrElse(-1),
+      submissionTime.map(_.getTime()).getOrElse(-1L),
       formattedSubmissionTime,
       jobDescription,
       detailUrl
@@ -455,23 +535,11 @@ private[ui] class JobDataSource(
    * Return Ordering according to sortColumn and desc
    */
   private def ordering(sortColumn: String, desc: Boolean): Ordering[JobTableRowData] = {
-    val ordering = sortColumn match {
-      case "Job Id" | "Job Id (Job Group)" => new Ordering[JobTableRowData] {
-        override def compare(x: JobTableRowData, y: JobTableRowData): Int =
-          Ordering.Int.compare(x.jobData.jobId, y.jobData.jobId)
-      }
-      case "Description" => new Ordering[JobTableRowData] {
-        override def compare(x: JobTableRowData, y: JobTableRowData): Int =
-          Ordering.String.compare(x.lastStageDescription, y.lastStageDescription)
-      }
-      case "Submitted" => new Ordering[JobTableRowData] {
-        override def compare(x: JobTableRowData, y: JobTableRowData): Int =
-          Ordering.Long.compare(x.submissionTime, y.submissionTime)
-      }
-      case "Duration" => new Ordering[JobTableRowData] {
-        override def compare(x: JobTableRowData, y: JobTableRowData): Int =
-          Ordering.Long.compare(x.duration, y.duration)
-      }
+    val ordering: Ordering[JobTableRowData] = sortColumn match {
+      case "Job Id" | "Job Id (Job Group)" => Ordering.by(_.jobData.jobId)
+      case "Description" => Ordering.by(x => (x.lastStageDescription, x.lastStageName))
+      case "Submitted" => Ordering.by(_.submissionTime)
+      case "Duration" => Ordering.by(_.duration)
       case "Stages: Succeeded/Total" | "Tasks (for all stages): Succeeded/Total" =>
         throw new IllegalArgumentException(s"Unsortable column: $sortColumn")
       case unknownColumn => throw new IllegalArgumentException(s"Unknown column: $unknownColumn")
@@ -484,121 +552,98 @@ private[ui] class JobDataSource(
   }
 
 }
+
 private[ui] class JobPagedTable(
-    data: Seq[JobUIData],
+    request: HttpServletRequest,
+    store: AppStatusStore,
+    data: Seq[v1.JobData],
+    tableHeaderId: String,
     jobTag: String,
     basePath: String,
     subPath: String,
-    parameterOtherTable: Iterable[String],
-    stageIdToInfo: HashMap[Int, StageInfo],
-    stageIdToData: HashMap[(Int, Int), StageUIData],
-    currentTime: Long,
+    killEnabled: Boolean,
     jobIdTitle: String,
-    pageSize: Int,
-    sortColumn: String,
-    desc: Boolean
+    actionsViaGetEnabled: Boolean,
+    csrfToken: String
   ) extends PagedTable[JobTableRowData] {
-  val parameterPath = UIUtils.prependBaseUri(basePath) + s"/$subPath/?" +
-    parameterOtherTable.mkString("&")
+
+  private val (sortColumn, desc, pageSize) = getTableParameters(request, jobTag, jobIdTitle)
+  private val parameterPath = basePath + s"/$subPath/?" + getParameterOtherTable(request, jobTag)
+  private val encodedSortColumn = URLEncoder.encode(sortColumn, UTF_8.name())
 
   override def tableId: String = jobTag + "-table"
 
   override def tableCssClass: String =
-    "table table-bordered table-condensed table-striped table-head-clickable"
+    "table table-bordered table-sm table-striped table-head-clickable table-cell-width-limited"
 
   override def pageSizeFormField: String = jobTag + ".pageSize"
-
-  override def prevPageSizeFormField: String = jobTag + ".prevPageSize"
 
   override def pageNumberFormField: String = jobTag + ".page"
 
   override val dataSource = new JobDataSource(
+    store,
     data,
-    stageIdToInfo,
-    stageIdToData,
     basePath,
-    currentTime,
     pageSize,
     sortColumn,
     desc)
 
   override def pageLink(page: Int): String = {
-    val encodedSortColumn = URLEncoder.encode(sortColumn, "UTF-8")
     parameterPath +
       s"&$pageNumberFormField=$page" +
       s"&$jobTag.sort=$encodedSortColumn" +
       s"&$jobTag.desc=$desc" +
-      s"&$pageSizeFormField=$pageSize"
+      s"&$pageSizeFormField=$pageSize" +
+      s"#$tableHeaderId"
   }
 
-  override def goButtonFormPath: String = {
-    val encodedSortColumn = URLEncoder.encode(sortColumn, "UTF-8")
-    s"$parameterPath&$jobTag.sort=$encodedSortColumn&$jobTag.desc=$desc"
-  }
+  override def goButtonFormPath: String =
+    s"$parameterPath&$jobTag.sort=$encodedSortColumn&$jobTag.desc=$desc#$tableHeaderId"
 
   override def headers: Seq[Node] = {
-    // Information for each header: title, cssClass, and sortable
-    val jobHeadersAndCssClasses: Seq[(String, String, Boolean)] =
+    // Information for each header: title, sortable, tooltip
+    val jobHeadersAndCssClasses: Seq[(String, Boolean, Option[String])] =
       Seq(
-        (jobIdTitle, "", true),
-        ("Description", "", true), ("Submitted", "", true), ("Duration", "", true),
-        ("Stages: Succeeded/Total", "", false),
-        ("Tasks (for all stages): Succeeded/Total", "", false)
+        (jobIdTitle, true, None),
+        ("Description", true, None),
+        ("Submitted", true, None),
+        ("Duration", true, Some("Elapsed time since the job was submitted " +
+          "until execution completion of all its stages.")),
+        ("Stages: Succeeded/Total", false, None),
+        ("Tasks (for all stages): Succeeded/Total", false, None)
       )
 
-    if (!jobHeadersAndCssClasses.filter(_._3).map(_._1).contains(sortColumn)) {
-      throw new IllegalArgumentException(s"Unknown column: $sortColumn")
-    }
+    isSortColumnValid(jobHeadersAndCssClasses, sortColumn)
 
-    val headerRow: Seq[Node] = {
-      jobHeadersAndCssClasses.map { case (header, cssClass, sortable) =>
-        if (header == sortColumn) {
-          val headerLink = Unparsed(
-            parameterPath +
-              s"&$jobTag.sort=${URLEncoder.encode(header, "UTF-8")}" +
-              s"&$jobTag.desc=${!desc}" +
-              s"&$jobTag.pageSize=$pageSize")
-          val arrow = if (desc) "&#x25BE;" else "&#x25B4;" // UP or DOWN
-
-          <th class={cssClass}>
-            <a href={headerLink}>
-              {header}<span>
-              &nbsp;{Unparsed(arrow)}
-            </span>
-            </a>
-          </th>
-        } else {
-          if (sortable) {
-            val headerLink = Unparsed(
-              parameterPath +
-                s"&$jobTag.sort=${URLEncoder.encode(header, "UTF-8")}" +
-                s"&$jobTag.pageSize=$pageSize")
-
-            <th class={cssClass}>
-              <a href={headerLink}>
-                {header}
-              </a>
-            </th>
-          } else {
-            <th class={cssClass}>
-              {header}
-            </th>
-          }
-        }
-      }
-    }
-    <thead>{headerRow}</thead>
+    headerRow(jobHeadersAndCssClasses, desc, pageSize, sortColumn, parameterPath,
+      jobTag, tableHeaderId)
   }
 
   override def row(jobTableRow: JobTableRowData): Seq[Node] = {
     val job = jobTableRow.jobData
+
+    val killLink = if (killEnabled) {
+      // The same form the master UI uses for killing applications and drivers; only the
+      // method follows spark.ui.actionsViaGetEnabled, see UIUtils.actionFormMethod.
+      <form action={s"$basePath/jobs/job/kill/"}
+            method={UIUtils.actionFormMethod(actionsViaGetEnabled)}
+            class="d-inline float-end">
+        <input type="hidden" name="id" value={job.jobId.toString}/>
+        <input type="hidden" name="csrfToken" value={csrfToken}/>
+        <button type="submit"
+                data-kill-message={s"Are you sure you want to kill job ${job.jobId} ?"}
+                class="btn btn-sm btn-outline-danger kill-link">Kill</button>
+      </form>
+    } else {
+      Seq.empty
+    }
 
     <tr id={"job-" + job.jobId}>
       <td>
         {job.jobId} {job.jobGroup.map(id => s"($id)").getOrElse("")}
       </td>
       <td>
-        {jobTableRow.jobDescription}
+        {jobTableRow.jobDescription} {killLink}
         <a href={jobTableRow.detailUrl} class="name-link">{jobTableRow.lastStageName}</a>
       </td>
       <td>
@@ -606,14 +651,15 @@ private[ui] class JobPagedTable(
       </td>
       <td>{jobTableRow.formattedDuration}</td>
       <td class="stage-progress-cell">
-        {job.completedStageIndices.size}/{job.stageIds.size - job.numSkippedStages}
+        {job.numCompletedStages}/{job.stageIds.size - job.numSkippedStages}
         {if (job.numFailedStages > 0) s"(${job.numFailedStages} failed)"}
         {if (job.numSkippedStages > 0) s"(${job.numSkippedStages} skipped)"}
       </td>
       <td class="progress-cell">
-        {UIUtils.makeProgressBar(started = job.numActiveTasks, completed = job.numCompletedTasks,
-        failed = job.numFailedTasks, skipped = job.numSkippedTasks, killed = job.numKilledTasks,
-        total = job.numTasks - job.numSkippedTasks)}
+        {UIUtils.makeProgressBar(started = job.numActiveTasks,
+        completed = job.numCompletedIndices,
+        failed = job.numFailedTasks, skipped = job.numSkippedTasks,
+        reasonToNumKilled = job.killedTasksSummary, total = job.numTasks - job.numSkippedTasks)}
       </td>
     </tr>
   }

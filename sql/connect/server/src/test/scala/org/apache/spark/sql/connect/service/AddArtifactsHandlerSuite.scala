@@ -1,0 +1,902 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.spark.sql.connect.service
+
+import java.io.{FileOutputStream, InputStream}
+import java.net.URI
+import java.nio.file.{Files, Path, Paths}
+import java.util.UUID
+import java.util.concurrent.{Callable, Executors, TimeUnit}
+import java.util.jar.{JarEntry, JarOutputStream}
+import java.util.zip.CRC32
+
+import scala.collection.mutable
+import scala.concurrent.Promise
+import scala.concurrent.duration._
+import scala.jdk.CollectionConverters._
+
+import com.google.protobuf.ByteString
+import com.google.rpc.ErrorInfo
+import io.grpc.Context
+import io.grpc.Status.Code
+import io.grpc.StatusRuntimeException
+import io.grpc.protobuf.StatusProto
+import io.grpc.stub.StreamObserver
+
+import org.apache.spark.{SparkConf, SparkRuntimeException}
+import org.apache.spark.connect.proto
+import org.apache.spark.connect.proto.{AddArtifactsRequest, AddArtifactsResponse}
+import org.apache.spark.sql.Artifact
+import org.apache.spark.sql.connect.ResourceHelper
+import org.apache.spark.sql.test.SharedSparkSession
+import org.apache.spark.util.{IvyTestUtils, MavenUtils, ThreadUtils, Utils}
+import org.apache.spark.util.MavenUtils.MavenCoordinate
+
+class AddArtifactsHandlerSuite extends SharedSparkSession with ResourceHelper {
+
+  private val CHUNK_SIZE: Int = 32 * 1024
+
+  private val sessionId = UUID.randomUUID.toString()
+  private val sessionKey = SessionKey("c1", sessionId)
+  private val ivySettingsDir = Utils.createTempDir(namePrefix = "connect-ivy-settings")
+  private val mavenCoordinate = MavenCoordinate("my.connect.driver", "mylib", "0.1")
+  private val mavenRepository = IvyTestUtils.createLocalRepositoryForTests(
+    mavenCoordinate,
+    dependencies = None,
+    rootDir = Some(ivySettingsDir.toPath.resolve("repository").toFile))
+  private val ivySettings = ivySettingsDir.toPath.resolve("ivysettings.xml")
+  Files.writeString(
+    ivySettings,
+    s"""<ivysettings>
+       |  <settings defaultResolver="connect"/>
+       |  <resolvers>
+       |    <ibiblio name="connect" m2compatible="true" root="${mavenRepository.toURI}"/>
+       |  </resolvers>
+       |</ivysettings>""".stripMargin)
+
+  override protected def sparkConf: SparkConf = {
+    super.sparkConf.set(MavenUtils.JAR_IVY_SETTING_PATH_KEY, ivySettings.toString)
+  }
+
+  override def beforeEach(): Unit = {
+    super.beforeEach()
+    SparkConnectService.sessionManager.invalidateAllSessions()
+    SparkConnectService.sessionManager.initializeBaseSession(() => spark.newSession())
+  }
+
+  override def afterAll(): Unit = {
+    try {
+      super.afterAll()
+    } finally {
+      Utils.deleteRecursively(ivySettingsDir)
+    }
+  }
+
+  class DummyStreamObserver(p: Promise[AddArtifactsResponse])
+      extends StreamObserver[AddArtifactsResponse] {
+    override def onNext(v: AddArtifactsResponse): Unit = p.success(v)
+    override def onError(throwable: Throwable): Unit = throw throwable
+    override def onCompleted(): Unit = {}
+  }
+
+  class TestAddArtifactsHandler(
+      responseObserver: StreamObserver[AddArtifactsResponse],
+      throwIfArtifactExists: Boolean = false,
+      resolvedMavenArtifacts: Map[URI, Seq[Artifact]] = Map.empty,
+      resolutionDelayMs: Long = 0L)
+      extends SparkConnectAddArtifactsHandler(responseObserver) {
+
+    // Stop the staged artifacts from being automatically deleted
+    override protected def cleanUpStagedArtifacts(): Unit = {}
+
+    private val finalArtifacts = mutable.Buffer.empty[String]
+    private val artifactChecksums: mutable.Map[String, Long] = mutable.Map.empty
+    private val artifactContents: mutable.Map[String, Array[Byte]] = mutable.Map.empty
+    private val resolutionTimeouts = mutable.Buffer.empty[(Int, Int)]
+
+    // Record the artifacts that are sent out for final processing.
+    override protected def addStagedArtifactToArtifactManager(artifact: StagedArtifact): Unit = {
+      // Throw if artifact already exists and has different checksum
+      // This mocks the behavior of ArtifactManager.addArtifact without comparing the entire file
+      if (throwIfArtifactExists
+        && finalArtifacts.contains(artifact.name)
+        && artifact.getCrc != artifactChecksums(artifact.name)) {
+        throw new SparkRuntimeException(
+          "ARTIFACT_ALREADY_EXISTS",
+          Map("normalizedRemoteRelativePath" -> artifact.name))
+      }
+
+      finalArtifacts.append(artifact.name)
+      artifactChecksums += (artifact.name -> artifact.getCrc)
+      artifactContents += (artifact.name -> Files.readAllBytes(artifact.stagedPath))
+    }
+
+    override protected def resolveMavenDependency(
+        uri: URI,
+        connectTimeoutMs: Int,
+        readTimeoutMs: Int,
+        isCancelled: () => Boolean): Seq[Artifact] = {
+      resolutionTimeouts += ((connectTimeoutMs, readTimeoutMs))
+      if (resolutionDelayMs > 0) {
+        Thread.sleep(resolutionDelayMs)
+      }
+      resolvedMavenArtifacts.getOrElse(
+        uri,
+        super.resolveMavenDependency(uri, connectTimeoutMs, readTimeoutMs, isCancelled))
+    }
+
+    def getFinalArtifacts: Seq[String] = finalArtifacts.toSeq
+    def getArtifactChecksum(name: String): Long = artifactChecksums(name)
+    def getArtifactContents(name: String): Array[Byte] = artifactContents(name)
+    def getResolutionTimeouts: Seq[(Int, Int)] = resolutionTimeouts.toSeq
+    def stagingDirectory: Path = this.stagingDir
+    def forceCleanUp(): Unit = super.cleanUpStagedArtifacts()
+  }
+
+  // Generate test artifacts and CRC files dynamically.
+  protected lazy val inputFilePath: Path = {
+    val dir = Utils.createTempDir().toPath.resolve("artifact-tests")
+    Files.createDirectories(dir)
+    val crc = dir.resolve("crc")
+    Files.createDirectories(crc)
+    // Generate test artifacts. The .class files and JAR entries are not valid Java
+    // class files -- they contain arbitrary bytes. The tests only verify byte-level
+    // transfer protocol (chunking, CRC), so valid class content is not required.
+    // smallClassFile.class -- minimal Java class
+    val small = "public class smallClassFile {}".getBytes
+    createClassFileAndCrc(dir, crc, "smallClassFile", small)
+    // smallClassFileDup.class -- same content
+    createClassFileAndCrc(dir, crc, "smallClassFileDup", small)
+    // smallJar.jar -- minimal JAR containing a dummy class
+    createSmallJar(dir, crc, "smallJar", small)
+    // largeJar.jar -- large JAR for multi-chunk transfer test (>32KB)
+    createLargeJar(dir, crc, "largeJar")
+    // Hello.class -- small dummy (only used for byte transfer)
+    createClassFileAndCrc(dir, crc, "Hello", small)
+    dir
+  }
+  protected lazy val crcPath: Path = inputFilePath.resolve("crc")
+
+  private def writeCrc(crcDir: Path, baseName: String, data: Array[Byte]): Unit = {
+    val chunkSize = CHUNK_SIZE
+    val crcs = data
+      .grouped(chunkSize)
+      .map { chunk =>
+        val c = new CRC32()
+        c.update(chunk)
+        c.getValue.toString
+      }
+      .toSeq
+    Files.writeString(crcDir.resolve(s"$baseName.txt"), crcs.mkString("\n"))
+  }
+
+  private def createClassFileAndCrc(
+      dir: Path,
+      crcDir: Path,
+      name: String,
+      content: Array[Byte]): Unit = {
+    val file = dir.resolve(s"$name.class")
+    Files.write(file, content)
+    writeCrc(crcDir, name, content)
+  }
+
+  private def createSmallJar(
+      dir: Path,
+      crcDir: Path,
+      name: String,
+      classContent: Array[Byte]): Unit = {
+    val jarFile = dir.resolve(s"$name.jar")
+    val jos = new JarOutputStream(new FileOutputStream(jarFile.toFile))
+    try {
+      jos.putNextEntry(new JarEntry("HelloWorld/Main.class"))
+      jos.write(classContent)
+    } finally { jos.close() }
+    writeCrc(crcDir, name, Files.readAllBytes(jarFile))
+  }
+
+  private def createLargeJar(dir: Path, crcDir: Path, name: String): Unit = {
+    val jarFile = dir.resolve(s"$name.jar")
+    val jos = new JarOutputStream(new FileOutputStream(jarFile.toFile))
+    try {
+      // Create enough entries to exceed 32KB (CHUNK_SIZE), using STORED to avoid compression
+      for (i <- 0 until 100) {
+        val data = new Array[Byte](4096)
+        java.util.Arrays.fill(data, i.toByte)
+        val entry = new JarEntry(s"pkg/Class$i.class")
+        entry.setMethod(java.util.zip.ZipEntry.STORED)
+        entry.setSize(data.length)
+        entry.setCompressedSize(data.length)
+        val crc = new CRC32()
+        crc.update(data)
+        entry.setCrc(crc.getValue)
+        jos.putNextEntry(entry)
+        jos.write(data)
+      }
+    } finally { jos.close() }
+    writeCrc(crcDir, name, Files.readAllBytes(jarFile))
+  }
+
+  private def readNextChunk(in: InputStream): ByteString = {
+    val buf = new Array[Byte](CHUNK_SIZE)
+    var bytesRead = 0
+    var count = 0
+    while (count != -1 && bytesRead < CHUNK_SIZE) {
+      count = in.read(buf, bytesRead, CHUNK_SIZE - bytesRead)
+      if (count != -1) {
+        bytesRead += count
+      }
+    }
+    if (bytesRead == 0) ByteString.empty()
+    else ByteString.copyFrom(buf, 0, bytesRead)
+  }
+
+  private def getDataChunks(filePath: Path): Seq[ByteString] = {
+    val in = Files.newInputStream(filePath)
+    var chunkData: ByteString = readNextChunk(in)
+    val dataChunks = mutable.ListBuffer.empty[ByteString]
+    while (chunkData != ByteString.empty()) {
+      dataChunks.append(chunkData)
+      chunkData = readNextChunk(in)
+    }
+    dataChunks.toSeq
+  }
+
+  private def getCrcValues(filePath: Path): Seq[Long] = {
+    val fileName = filePath.getFileName.toString
+    val crcFileName = fileName.split('.').head + ".txt"
+    Files
+      .readAllLines(crcPath.resolve(crcFileName))
+      .asScala
+      .map(_.toLong)
+      .toSeq
+  }
+
+  private def addSingleChunkArtifact(
+      handler: SparkConnectAddArtifactsHandler,
+      name: String,
+      artifactPath: Path): Unit = {
+    val dataChunks = getDataChunks(artifactPath)
+    assert(dataChunks.size == 1)
+    val bytes = dataChunks.head
+    val context = proto.UserContext
+      .newBuilder()
+      .setUserId("c1")
+      .build()
+    val fileNameNoExtension = artifactPath.getFileName.toString.split('.').head
+    val singleChunkArtifact = proto.AddArtifactsRequest.SingleChunkArtifact
+      .newBuilder()
+      .setName(name)
+      .setData(
+        proto.AddArtifactsRequest.ArtifactChunk
+          .newBuilder()
+          .setData(bytes)
+          .setCrc(getCrcValues(crcPath.resolve(fileNameNoExtension + ".txt")).head)
+          .build())
+      .build()
+
+    val singleChunkArtifactRequest = AddArtifactsRequest
+      .newBuilder()
+      .setSessionId(sessionId)
+      .setUserContext(context)
+      .setBatch(
+        proto.AddArtifactsRequest.Batch.newBuilder().addArtifacts(singleChunkArtifact).build())
+      .build()
+
+    handler.onNext(singleChunkArtifactRequest)
+  }
+
+  private def addSingleChunkArtifacts(
+      handler: SparkConnectAddArtifactsHandler,
+      names: Seq[String],
+      artifactPaths: Seq[Path]): Unit = {
+    names.zip(artifactPaths).foreach { case (name, path) =>
+      addSingleChunkArtifact(handler, name, path)
+    }
+  }
+
+  private def uploadedArtifactEntry(
+      name: String,
+      path: Path): proto.AddArtifactsRequest.ArtifactEntry = {
+    val bytes = ByteString.copyFrom(Files.readAllBytes(path))
+    val crc = new CRC32()
+    crc.update(bytes.toByteArray)
+    val artifact = proto.AddArtifactsRequest.SingleChunkArtifact
+      .newBuilder()
+      .setName(name)
+      .setData(
+        proto.AddArtifactsRequest.ArtifactChunk
+          .newBuilder()
+          .setData(bytes)
+          .setCrc(crc.getValue))
+    proto.AddArtifactsRequest.ArtifactEntry.newBuilder().setArtifact(artifact).build()
+  }
+
+  private def addChunkedArtifact(
+      handler: SparkConnectAddArtifactsHandler,
+      name: String,
+      artifactPath: Path): Unit = {
+    val dataChunks = getDataChunks(artifactPath)
+    val crcs = getCrcValues(artifactPath)
+    assert(dataChunks.size == crcs.size)
+    val artifactChunks = dataChunks.zip(crcs).map { case (chunk, crc) =>
+      proto.AddArtifactsRequest.ArtifactChunk.newBuilder().setData(chunk).setCrc(crc).build()
+    }
+
+    val context = proto.UserContext
+      .newBuilder()
+      .setUserId("c1")
+      .build()
+    val beginChunkedArtifact = proto.AddArtifactsRequest.BeginChunkedArtifact
+      .newBuilder()
+      .setName(name)
+      .setNumChunks(artifactChunks.size)
+      .setTotalBytes(Files.size(artifactPath))
+      .setInitialChunk(artifactChunks.head)
+      .build()
+
+    val requestBuilder = AddArtifactsRequest
+      .newBuilder()
+      .setSessionId(sessionId)
+      .setUserContext(context)
+      .setBeginChunk(beginChunkedArtifact)
+
+    handler.onNext(requestBuilder.build())
+    requestBuilder.clearBeginChunk()
+    artifactChunks.drop(1).foreach { dataChunk =>
+      requestBuilder.setChunk(dataChunk)
+      handler.onNext(requestBuilder.build())
+    }
+  }
+
+  test("single chunk artifact") {
+    val promise = Promise[AddArtifactsResponse]()
+    val handler = new TestAddArtifactsHandler(new DummyStreamObserver(promise))
+    try {
+      val name = "classes/smallClassFile.class"
+      val artifactPath = inputFilePath.resolve("smallClassFile.class")
+      addSingleChunkArtifact(handler, name, artifactPath)
+      handler.onCompleted()
+      val response = ThreadUtils.awaitResult(promise.future, 5.seconds)
+      val summaries = response.getArtifactsList.asScala.toSeq
+      assert(summaries.size == 1)
+      assert(summaries.head.getName == name)
+      assert(summaries.head.getIsCrcSuccessful)
+
+      val writtenFile = handler.stagingDirectory.resolve(name)
+      assert(writtenFile.toFile.exists())
+      val writtenBytes = ByteString.readFrom(Files.newInputStream(writtenFile))
+      val expectedBytes = ByteString.readFrom(Files.newInputStream(artifactPath))
+      assert(writtenBytes == expectedBytes)
+    } finally {
+      handler.forceCleanUp()
+    }
+  }
+
+  test("ordered entries resolve Maven dependencies before registration") {
+    val promise = Promise[AddArtifactsResponse]()
+    val ivyUri = URI.create("ivy://my.connect.lib:mylib:0.1")
+    val resolved = Artifact.newJarArtifact(
+      Paths.get("resolved.jar"),
+      new Artifact.LocalFile(inputFilePath.resolve("smallJar.jar")))
+    val handler = new TestAddArtifactsHandler(
+      new DummyStreamObserver(promise),
+      resolvedMavenArtifacts = Map(ivyUri -> Seq(resolved)))
+    try {
+      val request = AddArtifactsRequest
+        .newBuilder()
+        .setSessionId(sessionId)
+        .setUserContext(proto.UserContext.newBuilder().setUserId("c1"))
+        .setBatch(
+          proto.AddArtifactsRequest.Batch
+            .newBuilder()
+            .addEntries(uploadedArtifactEntry(
+              "classes/smallClassFile.class",
+              inputFilePath.resolve("smallClassFile.class")))
+            .addEntries(
+              proto.AddArtifactsRequest.ArtifactEntry
+                .newBuilder()
+                .setMavenDependency(proto.AddArtifactsRequest.MavenDependency
+                  .newBuilder()
+                  .setUri(ivyUri.toString)))
+            .addEntries(
+              uploadedArtifactEntry("jars/smallJar.jar", inputFilePath.resolve("smallJar.jar")))
+            .build())
+        .build()
+
+      handler.onNext(request)
+      assert(handler.getFinalArtifacts.isEmpty)
+      handler.onCompleted()
+
+      val response = ThreadUtils.awaitResult(promise.future, 5.seconds)
+      assert(
+        handler.getFinalArtifacts == Seq(
+          "classes/smallClassFile.class",
+          "jars/resolved.jar",
+          "jars/smallJar.jar"))
+      assert(response.getArtifactsList.asScala.map(_.getName) == handler.getFinalArtifacts)
+      val resolvedBytes = Files.readAllBytes(inputFilePath.resolve("smallJar.jar"))
+      val resolvedCrc = new CRC32()
+      resolvedCrc.update(resolvedBytes)
+      assert(handler.getArtifactContents("jars/resolved.jar").sameElements(resolvedBytes))
+      assert(handler.getArtifactChecksum("jars/resolved.jar") == resolvedCrc.getValue)
+      assert(response.getArtifacts(1).getIsCrcSuccessful)
+    } finally {
+      handler.forceCleanUp()
+    }
+  }
+
+  test("server-side Maven dependency uses the driver Ivy settings") {
+    val promise = Promise[AddArtifactsResponse]()
+    val handler = new TestAddArtifactsHandler(new DummyStreamObserver(promise))
+    try {
+      val request = AddArtifactsRequest
+        .newBuilder()
+        .setSessionId(sessionId)
+        .setUserContext(proto.UserContext.newBuilder().setUserId("c1"))
+        .setBatch(
+          proto.AddArtifactsRequest.Batch
+            .newBuilder()
+            .addEntries(
+              proto.AddArtifactsRequest.ArtifactEntry
+                .newBuilder()
+                .setMavenDependency(proto.AddArtifactsRequest.MavenDependency
+                  .newBuilder()
+                  .setUri(s"ivy://${mavenCoordinate.toString}"))))
+        .build()
+
+      handler.onNext(request)
+      handler.onCompleted()
+
+      val response = ThreadUtils.awaitResult(promise.future, 5.seconds)
+      val jarName =
+        s"jars/${mavenCoordinate.groupId}_${mavenCoordinate.artifactId}-" +
+          s"${mavenCoordinate.version}.jar"
+      assert(handler.getFinalArtifacts == Seq(jarName))
+      assert(response.getArtifactsCount == 1)
+      assert(response.getArtifacts(0).getName == jarName)
+      assert(response.getArtifacts(0).getIsCrcSuccessful)
+    } finally {
+      handler.forceCleanUp()
+    }
+  }
+
+  test("failing Maven dependency does not register a preceding upload") {
+    val error = Promise[Throwable]()
+    val observer = new StreamObserver[AddArtifactsResponse] {
+      override def onNext(value: AddArtifactsResponse): Unit = {}
+      override def onError(throwable: Throwable): Unit = error.success(throwable)
+      override def onCompleted(): Unit = {}
+    }
+    val handler = new TestAddArtifactsHandler(observer)
+    try {
+      val request = AddArtifactsRequest
+        .newBuilder()
+        .setSessionId(sessionId)
+        .setUserContext(proto.UserContext.newBuilder().setUserId("c1"))
+        .setBatch(
+          proto.AddArtifactsRequest.Batch
+            .newBuilder()
+            .addEntries(uploadedArtifactEntry(
+              "classes/smallClassFile.class",
+              inputFilePath.resolve("smallClassFile.class")))
+            .addEntries(
+              proto.AddArtifactsRequest.ArtifactEntry
+                .newBuilder()
+                .setMavenDependency(proto.AddArtifactsRequest.MavenDependency
+                  .newBuilder()
+                  .setUri("ivy://invalid-coordinate"))))
+        .build()
+
+      handler.onNext(request)
+      handler.onCompleted()
+
+      ThreadUtils.awaitResult(error.future, 5.seconds)
+      assert(handler.getFinalArtifacts.isEmpty)
+    } finally {
+      handler.forceCleanUp()
+    }
+  }
+
+  test("server-side Maven dependencies reject requested repositories") {
+    val error = Promise[Throwable]()
+    val observer = new StreamObserver[AddArtifactsResponse] {
+      override def onNext(value: AddArtifactsResponse): Unit = {}
+      override def onError(throwable: Throwable): Unit = error.success(throwable)
+      override def onCompleted(): Unit = {}
+    }
+    val handler = new TestAddArtifactsHandler(observer)
+    try {
+      val ivyUri = "ivy://my.connect.lib:mylib:0.1?repos=https://example.com/repository"
+      val request = AddArtifactsRequest
+        .newBuilder()
+        .setSessionId(sessionId)
+        .setUserContext(proto.UserContext.newBuilder().setUserId("c1"))
+        .setBatch(
+          proto.AddArtifactsRequest.Batch
+            .newBuilder()
+            .addEntries(
+              proto.AddArtifactsRequest.ArtifactEntry
+                .newBuilder()
+                .setMavenDependency(
+                  proto.AddArtifactsRequest.MavenDependency.newBuilder().setUri(ivyUri))))
+        .build()
+
+      handler.onNext(request)
+      handler.onCompleted()
+
+      val failure = ThreadUtils.awaitResult(error.future, 5.seconds)
+      assert(failure.getMessage.contains("do not allow repositories"))
+      assert(handler.getFinalArtifacts.isEmpty)
+    } finally {
+      handler.forceCleanUp()
+    }
+  }
+
+  test("server-side Maven dependencies share the remaining RPC deadline") {
+    val firstUri = URI.create("ivy://my.connect.first:mylib:0.1")
+    val secondUri = URI.create("ivy://my.connect.second:mylib:0.1")
+    val promise = Promise[AddArtifactsResponse]()
+    val scheduler = Executors.newSingleThreadScheduledExecutor()
+    val context = Context.current().withDeadlineAfter(5, TimeUnit.SECONDS, scheduler)
+    val handler = context.call(new Callable[TestAddArtifactsHandler] {
+      override def call(): TestAddArtifactsHandler = new TestAddArtifactsHandler(
+        new DummyStreamObserver(promise),
+        resolvedMavenArtifacts = Map(firstUri -> Nil, secondUri -> Nil),
+        resolutionDelayMs = 100L)
+    })
+    try {
+      val batch = proto.AddArtifactsRequest.Batch.newBuilder()
+      Seq(firstUri, secondUri).foreach { uri =>
+        batch.addEntries(
+          proto.AddArtifactsRequest.ArtifactEntry
+            .newBuilder()
+            .setMavenDependency(
+              proto.AddArtifactsRequest.MavenDependency.newBuilder().setUri(uri.toString)))
+      }
+      handler.onNext(
+        AddArtifactsRequest
+          .newBuilder()
+          .setSessionId(sessionId)
+          .setUserContext(proto.UserContext.newBuilder().setUserId("c1"))
+          .setBatch(batch)
+          .build())
+      handler.onCompleted()
+      ThreadUtils.awaitResult(promise.future, 5.seconds)
+
+      val timeouts = handler.getResolutionTimeouts
+      assert(timeouts.size == 2)
+      assert(timeouts(1)._1 < timeouts.head._1)
+      assert(timeouts(1)._2 < timeouts.head._2)
+    } finally {
+      context.cancel(null)
+      scheduler.shutdownNow()
+      handler.forceCleanUp()
+    }
+  }
+
+  test("Multi chunk artifact") {
+    val promise = Promise[AddArtifactsResponse]()
+    val handler = new TestAddArtifactsHandler(new DummyStreamObserver(promise))
+    try {
+      val name = "jars/largeJar.jar"
+      val artifactPath = inputFilePath.resolve("largeJar.jar")
+      addChunkedArtifact(handler, name, artifactPath)
+      handler.onCompleted()
+      val response = ThreadUtils.awaitResult(promise.future, 5.seconds)
+      val summaries = response.getArtifactsList.asScala.toSeq
+      assert(summaries.size == 1)
+      assert(summaries.head.getName == name)
+      assert(summaries.head.getIsCrcSuccessful)
+
+      val writtenFile = handler.stagingDirectory.resolve(name)
+      assert(writtenFile.toFile.exists())
+      val writtenBytes = ByteString.readFrom(Files.newInputStream(writtenFile))
+      val expectedByes = ByteString.readFrom(Files.newInputStream(artifactPath))
+      assert(writtenBytes == expectedByes)
+    } finally {
+      handler.forceCleanUp()
+    }
+  }
+
+  test("Mix of single-chunk and chunked artifacts") {
+    val promise = Promise[AddArtifactsResponse]()
+    val handler = new TestAddArtifactsHandler(new DummyStreamObserver(promise))
+    try {
+      val names = Seq(
+        "classes/smallClassFile.class",
+        "jars/largeJar.jar",
+        "classes/smallClassFileDup.class",
+        "jars/smallJar.jar")
+
+      val artifactPaths = Seq(
+        inputFilePath.resolve("smallClassFile.class"),
+        inputFilePath.resolve("largeJar.jar"),
+        inputFilePath.resolve("smallClassFileDup.class"),
+        inputFilePath.resolve("smallJar.jar"))
+
+      addSingleChunkArtifact(handler, names.head, artifactPaths.head)
+      addChunkedArtifact(handler, names(1), artifactPaths(1))
+      addSingleChunkArtifacts(handler, names.drop(2), artifactPaths.drop(2))
+      handler.onCompleted()
+      val response = ThreadUtils.awaitResult(promise.future, 5.seconds)
+      val summaries = response.getArtifactsList.asScala.toSeq
+      assert(summaries.size == 4)
+      summaries.zip(names).foreach { case (summary, name) =>
+        assert(summary.getName == name)
+        assert(summary.getIsCrcSuccessful)
+      }
+
+      val writtenFiles = names.map(name => handler.stagingDirectory.resolve(name))
+      writtenFiles.zip(artifactPaths).foreach { case (writtenFile, artifactPath) =>
+        assert(writtenFile.toFile.exists())
+        val writtenBytes = ByteString.readFrom(Files.newInputStream(writtenFile))
+        val expectedByes = ByteString.readFrom(Files.newInputStream(artifactPath))
+        assert(writtenBytes == expectedByes)
+      }
+    } finally {
+      handler.forceCleanUp()
+    }
+  }
+
+  test("Artifacts that fail CRC are not added to the artifact manager") {
+    val promise = Promise[AddArtifactsResponse]()
+    val handler = new TestAddArtifactsHandler(new DummyStreamObserver(promise))
+    try {
+      val name = "classes/smallClassFile.class"
+      val artifactPath = inputFilePath.resolve("smallClassFile.class")
+      val dataChunks = getDataChunks(artifactPath)
+      assert(dataChunks.size == 1)
+      val bytes = dataChunks.head
+      val context = proto.UserContext
+        .newBuilder()
+        .setUserId("c1")
+        .build()
+      val singleChunkArtifact = proto.AddArtifactsRequest.SingleChunkArtifact
+        .newBuilder()
+        .setName(name)
+        .setData(
+          proto.AddArtifactsRequest.ArtifactChunk
+            .newBuilder()
+            .setData(bytes)
+            // Set a dummy CRC value
+            .setCrc(12345)
+            .build())
+        .build()
+
+      val singleChunkArtifactRequest = AddArtifactsRequest
+        .newBuilder()
+        .setSessionId(sessionId)
+        .setUserContext(context)
+        .setBatch(
+          proto.AddArtifactsRequest.Batch.newBuilder().addArtifacts(singleChunkArtifact).build())
+        .build()
+
+      handler.onNext(singleChunkArtifactRequest)
+      handler.onCompleted()
+      val response = ThreadUtils.awaitResult(promise.future, 5.seconds)
+      val summaries = response.getArtifactsList.asScala.toSeq
+      assert(summaries.size == 1)
+      assert(summaries.head.getName == name)
+      assert(!summaries.head.getIsCrcSuccessful)
+
+      assert(handler.getFinalArtifacts.isEmpty)
+    } finally {
+      handler.forceCleanUp()
+    }
+  }
+
+  test("CRC failure does not reserve an artifact path") {
+    val promise = Promise[AddArtifactsResponse]()
+    val handler = new TestAddArtifactsHandler(new DummyStreamObserver(promise))
+    try {
+      val name = "classes/smallClassFile.class"
+      val bytes =
+        ByteString.copyFrom(Files.readAllBytes(inputFilePath.resolve("smallClassFile.class")))
+      val crc = new CRC32()
+      crc.update(bytes.toByteArray)
+      def entry(checksum: Long): proto.AddArtifactsRequest.ArtifactEntry = {
+        val artifact = proto.AddArtifactsRequest.SingleChunkArtifact
+          .newBuilder()
+          .setName(name)
+          .setData(
+            proto.AddArtifactsRequest.ArtifactChunk
+              .newBuilder()
+              .setData(bytes)
+              .setCrc(checksum))
+        proto.AddArtifactsRequest.ArtifactEntry.newBuilder().setArtifact(artifact).build()
+      }
+      val request = AddArtifactsRequest
+        .newBuilder()
+        .setSessionId(sessionId)
+        .setUserContext(proto.UserContext.newBuilder().setUserId("c1"))
+        .setBatch(
+          proto.AddArtifactsRequest.Batch
+            .newBuilder()
+            .addEntries(entry(crc.getValue + 1))
+            .addEntries(entry(crc.getValue)))
+        .build()
+
+      handler.onNext(request)
+      handler.onCompleted()
+
+      val summaries = ThreadUtils.awaitResult(promise.future, 5.seconds).getArtifactsList.asScala
+      assert(summaries.map(_.getIsCrcSuccessful) == Seq(false, true))
+      assert(handler.getFinalArtifacts == Seq(name))
+    } finally {
+      handler.forceCleanUp()
+    }
+  }
+
+  private def createDummyArtifactRequests(name: String): Seq[proto.AddArtifactsRequest] = {
+    val bytes = ByteString.EMPTY
+    val context = proto.UserContext
+      .newBuilder()
+      .setUserId("c1")
+      .build()
+
+    val singleChunkArtifact = proto.AddArtifactsRequest.SingleChunkArtifact
+      .newBuilder()
+      .setName(name)
+      .setData(
+        proto.AddArtifactsRequest.ArtifactChunk
+          .newBuilder()
+          .setData(bytes)
+          // Set a dummy CRC value
+          .setCrc(12345)
+          .build())
+      .build()
+
+    val singleChunkArtifactRequest = AddArtifactsRequest
+      .newBuilder()
+      .setSessionId(sessionId)
+      .setUserContext(context)
+      .setBatch(
+        proto.AddArtifactsRequest.Batch.newBuilder().addArtifacts(singleChunkArtifact).build())
+      .build()
+
+    val beginChunkedArtifact = proto.AddArtifactsRequest.BeginChunkedArtifact
+      .newBuilder()
+      .setName(name)
+      .setNumChunks(1)
+      .setTotalBytes(1)
+      .setInitialChunk(
+        proto.AddArtifactsRequest.ArtifactChunk.newBuilder().setData(bytes).setCrc(12345).build())
+      .build()
+
+    val beginChunkArtifactRequest = AddArtifactsRequest
+      .newBuilder()
+      .setSessionId(sessionId)
+      .setUserContext(context)
+      .setBeginChunk(beginChunkedArtifact)
+      .build()
+
+    Seq(singleChunkArtifactRequest, beginChunkArtifactRequest)
+  }
+
+  test("Artifacts names are not allowed to be absolute paths") {
+    val promise = Promise[AddArtifactsResponse]()
+    val handler = new TestAddArtifactsHandler(new DummyStreamObserver(promise))
+    try {
+      val name = "/absolute/path/"
+      val request = createDummyArtifactRequests(name)
+      request.foreach { req =>
+        val e = intercept[StatusRuntimeException] {
+          handler.onNext(req)
+        }
+        assert(e.getStatus.getCode == Code.INTERNAL)
+        assert(e.getMessage.contains("INVALID_ARTIFACT_PATH"))
+      }
+      handler.onCompleted()
+    } finally {
+      handler.forceCleanUp()
+    }
+  }
+
+  test("Artifact name/paths cannot reference parent/sibling/nephew directories") {
+    val promise = Promise[AddArtifactsResponse]()
+    val handler = new TestAddArtifactsHandler(new DummyStreamObserver(promise))
+    try {
+      val names = Seq("..", "../sibling", "../nephew/directory", "a/../../b", "x/../y/../..")
+      val request = names.flatMap(createDummyArtifactRequests)
+      request.foreach { req =>
+        val e = intercept[StatusRuntimeException] {
+          handler.onNext(req)
+        }
+        assert(e.getStatus.getCode == Code.INTERNAL)
+        assert(e.getMessage.contains("INVALID_ARTIFACT_PATH"))
+      }
+      handler.onCompleted()
+    } finally {
+      handler.forceCleanUp()
+    }
+  }
+
+  def addSingleChunkArtifact(
+      handler: SparkConnectAddArtifactsHandler,
+      sessionKey: SessionKey,
+      name: String,
+      artifactPath: Path): Unit = {
+    val dataChunks = getDataChunks(artifactPath)
+    assert(dataChunks.size == 1)
+    val bytes = dataChunks.head
+    val context = proto.UserContext
+      .newBuilder()
+      .setUserId(sessionKey.userId)
+      .build()
+    val fileNameNoExtension = artifactPath.getFileName.toString.split('.').head
+    val singleChunkArtifact = proto.AddArtifactsRequest.SingleChunkArtifact
+      .newBuilder()
+      .setName(name)
+      .setData(
+        proto.AddArtifactsRequest.ArtifactChunk
+          .newBuilder()
+          .setData(bytes)
+          .setCrc(getCrcValues(crcPath.resolve(fileNameNoExtension + ".txt")).head)
+          .build())
+      .build()
+
+    val singleChunkArtifactRequest = AddArtifactsRequest
+      .newBuilder()
+      .setSessionId(sessionKey.sessionId)
+      .setUserContext(context)
+      .setBatch(
+        proto.AddArtifactsRequest.Batch.newBuilder().addArtifacts(singleChunkArtifact).build())
+      .build()
+
+    handler.onNext(singleChunkArtifactRequest)
+  }
+
+  test("All artifacts are added, even if some fail") {
+    val promise = Promise[AddArtifactsResponse]()
+    val handler =
+      new TestAddArtifactsHandler(new DummyStreamObserver(promise), throwIfArtifactExists = true)
+    try {
+      val name1 = "jars/dummy1.jar"
+      val name2 = "jars/dummy2.jar"
+      val name3 = "jars/dummy3.jar"
+
+      val artifactPath1 = inputFilePath.resolve("smallClassFile.class")
+      val artifactPath2 = inputFilePath.resolve("smallJar.jar")
+
+      addSingleChunkArtifact(handler, sessionKey, name1, artifactPath1)
+      addSingleChunkArtifact(handler, sessionKey, name3, artifactPath1)
+
+      val e = intercept[StatusRuntimeException] {
+        addSingleChunkArtifact(handler, sessionKey, name1, artifactPath2)
+        addSingleChunkArtifact(handler, sessionKey, name2, artifactPath1)
+        addSingleChunkArtifact(handler, sessionKey, name3, artifactPath2)
+        handler.onCompleted()
+      }
+
+      // Both artifacts should be added, despite exception
+      assert(handler.getFinalArtifacts.contains(name1))
+      assert(handler.getFinalArtifacts.contains(name2))
+      assert(handler.getFinalArtifacts.contains(name3))
+
+      assert(e.getStatus.getCode == Code.INTERNAL)
+      val statusProto = StatusProto.fromThrowable(e)
+      assert(statusProto.getDetailsCount == 1)
+      val details = statusProto.getDetails(0)
+      val info = details.unpack(classOf[ErrorInfo])
+
+      assert(e.getMessage.contains("ARTIFACT_ALREADY_EXISTS"))
+      assert(info.getMetadataMap().get("messageParameters").contains(name1))
+    } finally {
+      handler.forceCleanUp()
+    }
+  }
+}

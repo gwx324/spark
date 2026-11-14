@@ -1,0 +1,212 @@
+# udf/worker -- Language-agnostic UDF Worker Framework
+
+Package structure for the UDF worker framework described in
+[SPIP SPARK-55278](https://issues.apache.org/jira/browse/SPARK-55278).
+
+## Overview
+
+Spark processes a UDF by obtaining a **WorkerDispatcher** from a worker
+specification. The dispatcher manages workers behind the scenes. From
+the dispatcher, Spark gets a **WorkerSession** -- one per UDF invocation --
+with an Iterator-to-Iterator `process` API that streams input batches
+through the worker and returns result batches.
+
+```
+UDFWorkerSpecification   -- how to create and configure workers
+    |
+    v
+WorkerDispatcher      -- manages workers, creates sessions
+    |
+    v
+WorkerSession         -- one UDF execution
+    |  1. session.init(Init proto)
+    |  2. val results = session.process(inputBatches)
+    |  3. session.close()
+```
+
+How workers are created depends on the dispatcher implementation. The
+framework currently provides **direct worker creation** (local OS
+processes) and is designed for future **indirect creation** (via a
+provisioning service or daemon).
+
+Spark selects its built-in implementation from the closed `worker`
+choice in `UDFWorkerSpecification`; `DirectWorker` selects local-process
+dispatch. The worker command, environment, capabilities, and connection
+belong in that specification. Spark does not load a user-supplied
+dispatcher class into the engine.
+
+## Sub-packages
+
+```
+udf/worker/
+├── proto/                        -- protobuf message classes only (protobuf-java)
+│   └── src/main/protobuf/org/apache/spark/udf/worker/
+│       worker_spec.proto         -- UDFWorkerSpecification protobuf
+│       udf_message.proto         -- UDF execution protocol messages (Init, UdfPayload, ...)
+│       udf_service.proto         -- UdfWorker gRPC service (Execute, Manage)
+│       common.proto              -- shared enums (UDFWorkerDataFormat, etc.)
+│
+├── core/                         -- abstract interfaces
+│     WorkerDispatcher.scala      -- creates sessions, manages worker lifecycle
+│     WorkerSession.scala         -- per-UDF init/process/cancel/close
+│     WorkerConnection.scala      -- transport channel abstraction
+│     WorkerSecurityScope.scala   -- security boundary for worker pooling
+│     │
+│     └── direct/                 -- "direct" creation: local OS processes
+│           DirectWorkerDispatcher.scala  -- spawns processes, env lifecycle
+│           DirectWorkerProcess.scala     -- process, connection, cleanup artifacts
+│           DirectWorkerSession.scala     -- session backed by a direct process
+│           UnixDomainSocketEndpointDirectory.scala -- private UDS path lifecycle
+│
+└── grpc/                         -- gRPC transport (gRPC runtime confined here)
+      DirectGrpcDispatcher.scala  -- launches direct workers over gRPC on UDS
+      GrpcWorkerChannel.scala     -- owns a Netty gRPC channel and event loop
+      GrpcWorkerSession.scala     -- one UDF execution over an Execute stream
+      UnixDomainSocketTransport.scala -- selects native epoll/kqueue transport
+      (generated)                 -- UdfWorkerGrpc stubs from the UDF worker service proto
+```
+
+The `core/` package defines abstract interfaces that are independent of how
+workers are created. The `core/direct/` sub-package implements "direct"
+worker creation where Spark spawns local OS processes. Future packages
+(e.g., `core/indirect/`) can implement alternative creation modes such as
+obtaining workers from a provisioning service or daemon.
+
+The `grpc/` module owns the concrete direct dispatcher, channel and session
+implementations, native Unix-domain-socket transport selection, gRPC service-stub
+generation (from the UDF worker service proto above), and the gRPC runtime dependencies.
+Keeping gRPC here means `proto/`, `core/`, and their consumers (`core`, `catalyst`,
+`sql/core`) carry no gRPC dependency on their classpath.
+
+## Wire protocol
+
+Each UDF execution uses a single bidirectional `Execute` gRPC stream.
+
+```
+Engine -> Worker:  Init -> PayloadChunk* -> (DataRequest)* -> Finish (Cancel)?
+                                                            | Cancel
+Worker -> Engine:          InitResponse  -> (DataResponse)* -> (ErrorResponse)? -> (FinishResponse | CancelResponse)
+```
+
+See `udf/worker/proto/src/main/protobuf/org/apache/spark/udf/worker/udf_message.proto`
+for the complete message definitions, ordering invariants, and error contract, and
+`udf/worker/proto/src/main/protobuf/org/apache/spark/udf/worker/udf_service.proto`
+for the gRPC service.
+
+### Direct worker creation
+
+`DirectWorkerDispatcher` spawns worker processes locally. On the first
+session, it runs the optional environment lifecycle callables from the
+`UDFWorkerSpecification`:
+
+- **`environmentVerification`** -- checks if the environment is ready
+  (exit 0 = ready). When it succeeds, installation is skipped.
+- **`installation`** -- prepares the environment (installs runtime,
+  dependencies, worker binaries). Only runs when verification is absent
+  or fails.
+- **`environmentCleanup`** -- runs after the dispatcher is closed or on
+  JVM shutdown to clean up temporary resources.
+
+Environment setup runs **once per dispatcher** (not per session).
+Workers are terminated via SIGTERM/SIGKILL when the dispatcher is closed.
+
+## Basic usage (Scala)
+
+```scala
+import org.apache.spark.udf.worker.{
+  DirectWorker, Init, ProcessCallable, UdfPayload,
+  UDFProtoCommunicationPattern, UDFWorkerDataFormat, UDFWorkerProperties,
+  UDFWorkerSpecification, UnixDomainSocket, WorkerCapabilities,
+  WorkerConnectionSpec, WorkerEnvironment}
+import org.apache.spark.udf.worker.core._
+import org.apache.spark.udf.worker.grpc.DirectGrpcDispatcher
+import com.google.protobuf.ByteString
+
+// 1. Define a worker spec (direct creation mode).
+val spec = UDFWorkerSpecification.newBuilder()
+  .setEnvironment(WorkerEnvironment.newBuilder()
+    .setEnvironmentVerification(ProcessCallable.newBuilder()
+      .addCommand("python").addCommand("-c").addCommand("import my_udf_worker").build())
+    .setInstallation(ProcessCallable.newBuilder()
+      .addCommand("pip").addCommand("install").addCommand("my_udf_worker").build())
+    .build())
+  .setCapabilities(WorkerCapabilities.newBuilder()
+    .addSupportedDataFormats(UDFWorkerDataFormat.ARROW)
+    .addSupportedCommunicationPatterns(
+      UDFProtoCommunicationPattern.BIDIRECTIONAL_STREAMING)
+    .build())
+  .setDirect(DirectWorker.newBuilder()
+    .setRunner(ProcessCallable.newBuilder()
+      .addCommand("python").addCommand("-m").addCommand("my_udf_worker").build())
+    .setProperties(UDFWorkerProperties.newBuilder()
+      .setConnection(WorkerConnectionSpec.newBuilder()
+        .setUnixDomainSocket(UnixDomainSocket.getDefaultInstance).build())
+      .build())
+    .build())
+  .build()
+
+// 2. Create a dispatcher that launches workers and connects over gRPC on UDS.
+val dispatcher: WorkerDispatcher = new DirectGrpcDispatcher(spec)
+
+// 3. Create a session for one UDF execution.
+val session = dispatcher.createSession(securityScope = None)
+try {
+  // 4. Initialize with the serialized function and schemas.
+  session.init(Init.newBuilder()
+    .setProtocolVersion(1)
+    .setUdf(UdfPayload.newBuilder()
+      .setPayload(ByteString.copyFrom(serializedFunction))
+      .setFormat(payloadFormat)   // worker-recognised tag
+      .build())
+    .setDataFormat(UDFWorkerDataFormat.ARROW)
+    .setInputSchema(ByteString.copyFrom(arrowInputSchema))
+    .setOutputSchema(ByteString.copyFrom(arrowOutputSchema))
+    .build())
+
+  // 5. Process data -- Iterator in, Iterator out.
+  val results: Iterator[Array[Byte]] =
+    session.process(inputBatches)
+
+  // Consume results lazily.
+  results.foreach(processResultBatch)
+} finally {
+  session.close()
+}
+
+// 6. Shut down all workers.
+dispatcher.close()
+```
+
+## Build
+
+SBT:
+```
+build/sbt "udf-worker-proto/compile" "udf-worker-core/compile" "udf-worker-grpc/compile"
+```
+
+Maven:
+```
+build/mvn compile -pl udf/worker/proto,udf/worker/core,udf/worker/grpc -am
+```
+
+## Test
+
+SBT:
+```
+build/sbt "udf-worker-core/test" "udf-worker-grpc/test"
+```
+
+## Current status
+
+This is the **first MVP** providing the core abstraction layer, direct worker
+creation, and a gRPC-over-UDS dispatcher and session implementation.
+The following are left as TODOs:
+
+- **Connection pooling** -- reuse workers across sessions
+- **Security scope isolation** -- partition pools by `WorkerSecurityScope`
+- **Indirect worker creation** -- obtain workers from a service or daemon
+
+## Design references
+
+* [SPIP Language-agnostic UDF Protocol for Spark](https://docs.google.com/document/d/19Whzq127QxVt2Luk0EClgaDtcpBsFUp67NcVdKKyPF8/edit?tab=t.0)
+* [SPIP Language-agnostic UDF Protocol for Spark -- Worker Specification](https://docs.google.com/document/d/1Dx9NqHRNuUpatH9DYoFF9cmvUl2fqHT4Rjbyw4EGLHs/edit?tab=t.0#heading=h.4h01j4b8rjzv)

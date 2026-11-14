@@ -22,20 +22,21 @@ import java.nio.ByteBuffer;
 import java.nio.channels.WritableByteChannel;
 import javax.annotation.Nullable;
 
-import com.google.common.base.Preconditions;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.FileRegion;
-import io.netty.util.AbstractReferenceCounted;
 import io.netty.util.ReferenceCountUtil;
 
 import org.apache.spark.network.buffer.ManagedBuffer;
+import org.apache.spark.network.util.AbstractFileRegion;
+import org.apache.spark.network.util.JavaUtils;
 
 /**
  * A wrapper message that holds two separate pieces (a header and a body).
  *
  * The header must be a ByteBuf, while the body can be a ByteBuf or a FileRegion.
  */
-class MessageWithHeader extends AbstractReferenceCounted implements FileRegion {
+
+public class MessageWithHeader extends AbstractFileRegion {
 
   @Nullable private final ManagedBuffer managedBuffer;
   private final ByteBuf header;
@@ -47,7 +48,7 @@ class MessageWithHeader extends AbstractReferenceCounted implements FileRegion {
   /**
    * When the write buffer size is larger than this limit, I/O will be done in chunks of this size.
    * The size should not be too large as it will waste underlying memory copy. e.g. If network
-   * avaliable buffer is smaller than this limit, the data cannot be sent within one single write
+   * available buffer is smaller than this limit, the data cannot be sent within one single write
    * operation while it still will make memory copy with this size.
    */
   private static final int NIO_BUFFER_LIMIT = 256 * 1024;
@@ -71,7 +72,7 @@ class MessageWithHeader extends AbstractReferenceCounted implements FileRegion {
       ByteBuf header,
       Object body,
       long bodyLength) {
-    Preconditions.checkArgument(body instanceof ByteBuf || body instanceof FileRegion,
+    JavaUtils.checkArgument(body instanceof ByteBuf || body instanceof FileRegion,
       "Body must be a ByteBuf or a FileRegion.");
     this.managedBuffer = managedBuffer;
     this.header = header;
@@ -91,7 +92,7 @@ class MessageWithHeader extends AbstractReferenceCounted implements FileRegion {
   }
 
   @Override
-  public long transfered() {
+  public long transferred() {
     return totalBytesTransferred;
   }
 
@@ -100,11 +101,11 @@ class MessageWithHeader extends AbstractReferenceCounted implements FileRegion {
    * transferTo invocations in order to transfer a single MessageWithHeader to avoid busy waiting.
    *
    * The contract is that the caller will ensure position is properly set to the total number
-   * of bytes transferred so far (i.e. value returned by transfered()).
+   * of bytes transferred so far (i.e. value returned by transferred()).
    */
   @Override
   public long transferTo(final WritableByteChannel target, final long position) throws IOException {
-    Preconditions.checkArgument(position == totalBytesTransferred, "Invalid position.");
+    JavaUtils.checkArgument(position == totalBytesTransferred, "Invalid position.");
     // Bytes written for header in this call.
     long writtenHeader = 0;
     if (header.readableBytes() > 0) {
@@ -117,10 +118,10 @@ class MessageWithHeader extends AbstractReferenceCounted implements FileRegion {
 
     // Bytes written for body in this call.
     long writtenBody = 0;
-    if (body instanceof FileRegion) {
-      writtenBody = ((FileRegion) body).transferTo(target, totalBytesTransferred - headerLength);
-    } else if (body instanceof ByteBuf) {
-      writtenBody = copyByteBuf((ByteBuf) body, target);
+    if (body instanceof FileRegion fileRegion) {
+      writtenBody = fileRegion.transferTo(target, totalBytesTransferred - headerLength);
+    } else if (body instanceof ByteBuf byteBuf) {
+      writtenBody = copyByteBuf(byteBuf, target);
     }
     totalBytesTransferred += writtenBody;
 
@@ -137,27 +138,67 @@ class MessageWithHeader extends AbstractReferenceCounted implements FileRegion {
   }
 
   private int copyByteBuf(ByteBuf buf, WritableByteChannel target) throws IOException {
-    ByteBuffer buffer = buf.nioBuffer();
-    int written = (buffer.remaining() <= NIO_BUFFER_LIMIT) ?
-      target.write(buffer) : writeNioBuffer(target, buffer);
+    // SPARK-24578: cap the sub-region's size of returned nio buffer to improve the performance
+    // for the case that the passed-in buffer has too many components.
+    int length = Math.min(buf.readableBytes(), NIO_BUFFER_LIMIT);
+    // If the ByteBuf holds more than one ByteBuffer we should better call nioBuffers(...)
+    // to eliminate extra memory copies.
+    int written = 0;
+    if (buf.nioBufferCount() == 1) {
+      ByteBuffer buffer = buf.nioBuffer(buf.readerIndex(), length);
+      written = target.write(buffer);
+    } else {
+      ByteBuffer[] buffers = buf.nioBuffers(buf.readerIndex(), length);
+      for (ByteBuffer buffer: buffers) {
+        int remaining = buffer.remaining();
+        int w = target.write(buffer);
+        written += w;
+        if (w < remaining) {
+          // Could not write all, we need to break now.
+          break;
+        }
+      }
+    }
     buf.skipBytes(written);
     return written;
   }
 
-  private int writeNioBuffer(
-      WritableByteChannel writeCh,
-      ByteBuffer buf) throws IOException {
-    int originalLimit = buf.limit();
-    int ret = 0;
-
-    try {
-      int ioSize = Math.min(buf.remaining(), NIO_BUFFER_LIMIT);
-      buf.limit(buf.position() + ioSize);
-      ret = writeCh.write(buf);
-    } finally {
-      buf.limit(originalLimit);
-    }
-
-    return ret;
+  @Override
+  public MessageWithHeader touch(Object o) {
+    super.touch(o);
+    header.touch(o);
+    ReferenceCountUtil.touch(body, o);
+    return this;
   }
+
+  @Override
+  public MessageWithHeader retain(int increment) {
+    super.retain(increment);
+    header.retain(increment);
+    ReferenceCountUtil.retain(body, increment);
+    if (managedBuffer != null) {
+      for (int i = 0; i < increment; i++) {
+        managedBuffer.retain();
+      }
+    }
+    return this;
+  }
+
+  @Override
+  public boolean release(int decrement) {
+    header.release(decrement);
+    ReferenceCountUtil.release(body, decrement);
+    if (managedBuffer != null) {
+      for (int i = 0; i < decrement; i++) {
+        managedBuffer.release();
+      }
+    }
+    return super.release(decrement);
+  }
+
+  @Override
+  public String toString() {
+    return "MessageWithHeader [headerLength: " + headerLength + ", bodyLength: " + bodyLength + "]";
+  }
+
 }

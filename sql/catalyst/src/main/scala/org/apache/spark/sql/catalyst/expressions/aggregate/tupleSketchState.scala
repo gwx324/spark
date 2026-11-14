@@ -1,0 +1,78 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.catalyst.expressions.aggregate
+
+import org.apache.datasketches.tuple.{Intersection, Sketch, Sketches, Summary, Union, UpdatableSketch, UpdatableSummary}
+
+/**
+ * Sealed trait representing the internal state of tuple sketch aggregation operations.
+ * All implementations must be defined in this file to maintain exhaustiveness checking.
+ */
+sealed trait TupleSketchState[S <: Summary] {
+  def serialize(): Array[Byte]
+  def eval(): Array[Byte]
+}
+
+case class UpdatableTupleSketchBuffer[U, S <: UpdatableSummary[U]](sketch: UpdatableSketch[U, S])
+    extends TupleSketchState[S] {
+  override def serialize(): Array[Byte] = trimmedSketch.toByteArray
+  override def eval(): Array[Byte] = trimmedSketch.toByteArray
+
+  /** Returns compact form of the sketch, needed for merge operations that require Sketch type. */
+  def compactSketch: Sketch[S] = sketch.compact
+
+  /**
+   * Returns the compact form trimmed to the nominal number of entries, as `Union.getResult` does,
+   * so that the result does not depend on the plan or on the order of the input rows.
+   */
+  private def trimmedSketch: Sketch[S] = {
+    sketch.trim()
+    sketch.compact
+  }
+}
+
+case class UnionTupleAggregationBuffer[S <: Summary](union: Union[S])
+    extends TupleSketchState[S] {
+  override def serialize(): Array[Byte] = union.getResult.toByteArray
+  override def eval(): Array[Byte] = union.getResult.toByteArray
+}
+
+case class IntersectionTupleAggregationBuffer[S <: Summary](intersection: Intersection[S])
+    extends TupleSketchState[S] {
+  override def serialize(): Array[Byte] = {
+    // An untouched intersection represents no contribution, not an empty sketch.
+    if (intersection.hasResult()) {
+      intersection.getResult.toByteArray
+    } else {
+      Array.emptyByteArray
+    }
+  }
+
+  override def eval(): Array[Byte] = {
+    if (intersection.hasResult()) {
+      intersection.getResult.toByteArray
+    } else {
+      Sketches.createEmptySketch[S]().toByteArray
+    }
+  }
+}
+
+case class FinalizedTupleSketch[S <: Summary](sketch: Sketch[S]) extends TupleSketchState[S] {
+  override def serialize(): Array[Byte] = sketch.toByteArray
+  override def eval(): Array[Byte] = sketch.toByteArray
+}

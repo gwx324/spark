@@ -19,6 +19,9 @@ package org.apache.spark.scheduler
 
 import java.util.Properties
 
+import org.apache.spark.internal.LogKeys.{STAGE_ATTEMPT_ID, STAGE_ID}
+import org.apache.spark.internal.MessageWithContext
+
 /**
  * A set of tasks submitted together to the low-level TaskScheduler, usually representing
  * missing partitions of a particular stage.
@@ -28,8 +31,24 @@ private[spark] class TaskSet(
     val stageId: Int,
     val stageAttemptId: Int,
     val priority: Int,
-    val properties: Properties) {
-  val id: String = stageId + "." + stageAttemptId
+    val properties: Properties,
+    val resourceProfileId: Int,
+    val shuffleId: Option[Int],
+    // True if this stage is a member of a pipelined group (connected to another stage by a
+    // PipelinedShuffleDependency). Such a stage's transient shuffle output cannot be re-read in
+    // isolation, so any task failure must fail the whole group rather than be retried per-task;
+    // the TaskSetManager uses this to fail fast (maxTaskFailures = 1) and to count every failure,
+    // including otherwise-uncounted ones like executor loss. Defaults to false.
+    val isPipelined: Boolean = false) {
+  val id: String = s"$stageId.$stageAttemptId"
 
   override def toString: String = "TaskSet " + id
+
+  // Identifier used in the structured logging framework.
+  lazy val logId: MessageWithContext = {
+    val hashMap = new java.util.HashMap[String, String]()
+    hashMap.put(STAGE_ID.name, stageId.toString)
+    hashMap.put(STAGE_ATTEMPT_ID.name, stageAttemptId.toString)
+    MessageWithContext(id, hashMap)
+  }
 }

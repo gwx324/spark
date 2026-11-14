@@ -17,10 +17,17 @@
 
 package org.apache.spark.sql.execution
 
+import scala.util.control.NonFatal
+
 import org.apache.spark.annotation.DeveloperApi
+import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.catalyst.plans.logical.{EmptyRelation, LogicalPlan}
+import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, QueryStageExec}
+import org.apache.spark.sql.execution.adaptive.LogicalQueryStage
+import org.apache.spark.sql.execution.columnar.InMemoryTableScanExec
 import org.apache.spark.sql.execution.exchange.ReusedExchangeExec
 import org.apache.spark.sql.execution.metric.SQLMetricInfo
-import org.apache.spark.util.Utils
+import org.apache.spark.sql.internal.SQLConf
 
 /**
  * :: DeveloperApi ::
@@ -49,16 +56,83 @@ class SparkPlanInfo(
 
 private[execution] object SparkPlanInfo {
 
+  private def fromLogicalPlan(plan: LogicalPlan): SparkPlanInfo = {
+    val childrenInfo = plan match {
+      case LogicalQueryStage(_, physical) => Seq(fromSparkPlan(physical))
+      case EmptyRelation(logical) => Seq(fromLogicalPlan(logical))
+      case _ => (plan.children ++ plan.subqueries).map(fromLogicalPlan)
+    }
+    new SparkPlanInfo(
+      plan.nodeName,
+      plan.simpleString(SQLConf.get.maxToStringFields),
+      childrenInfo,
+      Map[String, String](),
+      Seq.empty)
+  }
+
   def fromSparkPlan(plan: SparkPlan): SparkPlanInfo = {
     val children = plan match {
       case ReusedExchangeExec(_, child) => child :: Nil
+      case ReusedSubqueryExec(child) => child :: Nil
+      case a: AdaptiveSparkPlanExec => a.executedPlan :: Nil
+      case stage: QueryStageExec => stage.plan :: Nil
+      case inMemTab: InMemoryTableScanExec => inMemTab.relation.cachedPlan :: Nil
+      case rddScan: RDDScanExec => sparkPlanInfosFromRDD(rddScan.rdd)
+      case EmptyRelationExec(logical) => (logical :: Nil)
       case _ => plan.children ++ plan.subqueries
     }
     val metrics = plan.metrics.toSeq.map { case (key, metric) =>
       new SQLMetricInfo(metric.name.getOrElse(key), metric.id, metric.metricType)
     }
 
-    new SparkPlanInfo(plan.nodeName, plan.simpleString, children.map(fromSparkPlan),
-      plan.metadata, metrics)
+    // dump the file scan metadata (e.g file path) to event log
+    val metadata = plan match {
+      case fileScan: FileSourceScanLike => fileScan.metadata
+      case _ => Map[String, String]()
+    }
+    val childrenInfo = children.flatMap {
+      case child: SparkPlan =>
+        Some(fromSparkPlan(child))
+      case child: LogicalPlan =>
+        Some(fromLogicalPlan(child))
+      case child: SparkPlanInfo =>
+        Some(child)
+      case _ => None
+    }
+    new SparkPlanInfo(
+      plan.nodeName,
+      plan.simpleString(SQLConf.get.maxToStringFields),
+      childrenInfo,
+      metadata,
+      metrics)
+  }
+
+  final lazy val EMPTY: SparkPlanInfo = new SparkPlanInfo("", "", Nil, Map.empty, Nil)
+
+  private def sparkPlanInfosFromRDD(rdd: RDD[_]): Seq[SparkPlanInfo] = {
+    // Walk only driver-side RDD dependency metadata. Dedupe by RDD id so shared lineage does not
+    // duplicate the same internal SQL plan under a single RDDScanExec.
+    val visitedRDDs = scala.collection.mutable.HashSet.empty[Int]
+    val rddsToVisit = scala.collection.mutable.Queue.empty[RDD[_]]
+    val planInfos = scala.collection.mutable.ArrayBuffer.empty[SparkPlanInfo]
+
+    rddsToVisit.enqueue(rdd)
+    while (rddsToVisit.nonEmpty) {
+      val current = rddsToVisit.dequeue()
+      if (visitedRDDs.add(current.id)) {
+        current match {
+          case sqlRDD: SQLExecutionRDD if sqlRDD.sparkPlanInfo != EMPTY =>
+            planInfos += sqlRDD.sparkPlanInfo
+          case _ =>
+            try {
+              current.dependencies.foreach(dep => rddsToVisit.enqueue(dep.rdd))
+            } catch {
+              case NonFatal(_) =>
+            }
+          }
+      }
+    }
+
+    planInfos.toSeq
   }
 }

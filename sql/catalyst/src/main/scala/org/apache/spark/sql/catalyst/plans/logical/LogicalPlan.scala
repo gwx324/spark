@@ -17,81 +17,83 @@
 
 package org.apache.spark.sql.catalyst.plans.logical
 
+import scala.collection.mutable
+
+import org.apache.spark.SparkUnsupportedOperationException
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.analysis._
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.plans.QueryPlan
-import org.apache.spark.sql.catalyst.trees.CurrentOrigin
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.catalyst.plans.{AliasAwareQueryOutputOrdering, QueryPlan}
+import org.apache.spark.sql.catalyst.plans.logical.statsEstimation.LogicalPlanStats
+import org.apache.spark.sql.catalyst.trees.{BinaryLike, LeafLike, TreeNodeTag, UnaryLike}
+import org.apache.spark.sql.catalyst.trees.TreePattern.{LOGICAL_QUERY_STAGE, TreePattern}
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
+import org.apache.spark.sql.catalyst.util.MetadataColumnHelper
+import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryExecutionErrors}
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.types.{DataType, StructType}
 
 
-abstract class LogicalPlan extends QueryPlan[LogicalPlan] with Logging {
-
-  private var _analyzed: Boolean = false
+abstract class LogicalPlan
+  extends QueryPlan[LogicalPlan]
+  with AnalysisHelper
+  with LogicalPlanStats
+  with LogicalPlanDistinctKeys
+  with QueryPlanConstraints
+  with Logging {
 
   /**
-   * Marks this plan as already analyzed.  This should only be called by CheckAnalysis.
+   * Metadata fields that can be projected from this node.
+   * Should be overridden if the plan does not propagate its children's output.
    */
-  private[catalyst] def setAnalyzed(): Unit = { _analyzed = true }
+  def metadataOutput: Seq[Attribute] = children.flatMap(_.metadataOutput)
 
   /**
-   * Returns true if this node and its children have already been gone through analysis and
-   * verification.  Note that this is only an optimization used to avoid analyzing trees that
-   * have already been analyzed, and can be reset by transformations.
-   */
-  def analyzed: Boolean = _analyzed
-
-  /** Returns true if this subtree contains any streaming data sources. */
-  def isStreaming: Boolean = children.exists(_.isStreaming == true)
-
-  /**
-   * Returns a copy of this node where `rule` has been recursively applied first to all of its
-   * children and then itself (post-order). When `rule` does not apply to a given node, it is left
-   * unchanged.  This function is similar to `transformUp`, but skips sub-trees that have already
-   * been marked as analyzed.
+   * Searches for a metadata attribute by its logical name.
    *
-   * @param rule the function use to transform this nodes children
+   * The search works in spite of conflicts with column names in the data schema.
    */
-  def resolveOperators(rule: PartialFunction[LogicalPlan, LogicalPlan]): LogicalPlan = {
-    if (!analyzed) {
-      val afterRuleOnChildren = transformChildren(rule, (t, r) => t.resolveOperators(r))
-      if (this fastEquals afterRuleOnChildren) {
-        CurrentOrigin.withOrigin(origin) {
-          rule.applyOrElse(this, identity[LogicalPlan])
-        }
-      } else {
-        CurrentOrigin.withOrigin(origin) {
-          rule.applyOrElse(afterRuleOnChildren, identity[LogicalPlan])
-        }
+  def getMetadataAttributeByNameOpt(name: String): Option[AttributeReference] = {
+    // NOTE: An already-referenced column might appear in `output` instead of `metadataOutput`.
+    (metadataOutput ++ output).collectFirst {
+      case MetadataAttributeWithLogicalName(attr, logicalName)
+          if conf.resolver(name, logicalName) => attr
+    }
+  }
+
+  /**
+   * Returns the metadata attribute having the specified logical name.
+   *
+   * Throws [[AnalysisException]] if no such metadata attribute exists.
+   */
+  def getMetadataAttributeByName(name: String): AttributeReference = {
+    getMetadataAttributeByNameOpt(name).getOrElse {
+      val availableMetadataColumns = (metadataOutput ++ output).collect {
+        case MetadataAttributeWithLogicalName(_, logicalName) => logicalName
       }
-    } else {
-      this
+      throw QueryCompilationErrors.unresolvedAttributeError(
+        "UNRESOLVED_COLUMN", name, availableMetadataColumns.distinct, origin)
     }
   }
 
-  /**
-   * Recursively transforms the expressions of a tree, skipping nodes that have already
-   * been analyzed.
-   */
-  def resolveExpressions(r: PartialFunction[Expression, Expression]): LogicalPlan = {
-    this resolveOperators  {
-      case p => p.transformExpressions(r)
-    }
-  }
+  /** Returns true if this subtree has data from a streaming data source. */
+  def isStreaming: Boolean = _isStreaming
+  private[this] lazy val _isStreaming = children.exists(_.isStreaming)
 
   /**
-   * Computes [[Statistics]] for this plan. The default implementation assumes the output
-   * cardinality is the product of all child plan's cardinality, i.e. applies in the case
-   * of cartesian joins.
-   *
-   * [[LeafNode]]s must override this.
+   * Whether this node is a stateful operator -- i.e. one that becomes an operator
+   * that leverage state store to maintain state across microbatches.
    */
-  def statistics: Statistics = {
-    if (children.isEmpty) {
-      throw new UnsupportedOperationException(s"LeafNode $nodeName must implement statistics.")
-    }
-    Statistics(sizeInBytes = children.map(_.statistics.sizeInBytes).product)
+  def isStateful: Boolean = false
+
+  /** Whether this plan or any of its descendants is a stateful operator ([[isStateful]]). */
+  def containsStatefulOperator: Boolean = _containsStatefulOperator
+  private[this] lazy val _containsStatefulOperator =
+    isStateful || children.exists(_.containsStatefulOperator)
+
+  override def verboseStringWithSuffix(maxFields: Int): String = {
+    super.verboseString(maxFields) + statsCache.map(", " + _.toString).getOrElse("")
   }
 
   /**
@@ -103,6 +105,11 @@ abstract class LogicalPlan extends QueryPlan[LogicalPlan] with Logging {
   def maxRows: Option[Long] = None
 
   /**
+   * Returns the maximum number of rows this plan may compute on each partition.
+   */
+  def maxRowsPerPartition: Option[Long] = maxRows
+
+  /**
    * Returns true if this expression and all its children have been resolved to a specific schema
    * and false if it still contains any unresolved placeholders. Implementations of LogicalPlan
    * can override this (e.g.
@@ -111,14 +118,25 @@ abstract class LogicalPlan extends QueryPlan[LogicalPlan] with Logging {
    */
   lazy val resolved: Boolean = expressions.forall(_.resolved) && childrenResolved
 
-  override protected def statePrefix = if (!resolved) "'" else super.statePrefix
+  override protected def statePrefix = {
+    if (!resolved) {
+      "'"
+    } else {
+      val prefixFromSuper = super.statePrefix
+      // Ancestor class could mark something on the prefix, including 'invalid'. Add a marker for
+      // `streaming` only when there is no marker from ancestor class.
+      if (prefixFromSuper.isEmpty && isStreaming) {
+        "~"
+      } else {
+        prefixFromSuper
+      }
+    }
+  }
 
   /**
    * Returns true if all its children of this query plan have been resolved.
    */
   def childrenResolved: Boolean = children.forall(_.resolved)
-
-  override lazy val canonicalized: LogicalPlan = EliminateSubqueryAliases(this)
 
   /**
    * Resolves a given schema to concrete [[Attribute]] references in this query plan. This function
@@ -128,24 +146,35 @@ abstract class LogicalPlan extends QueryPlan[LogicalPlan] with Logging {
   def resolve(schema: StructType, resolver: Resolver): Seq[Attribute] = {
     schema.map { field =>
       resolve(field.name :: Nil, resolver).map {
-        case a: AttributeReference => a
-        case other => sys.error(s"can not handle nested schema yet...  plan $this")
+        case a: AttributeReference =>
+          // Keep the metadata in given schema.
+          a.withMetadata(field.metadata)
+        case _ => throw QueryExecutionErrors.resolveCannotHandleNestedSchema(this)
       }.getOrElse {
-        throw new AnalysisException(
-          s"Unable to resolve ${field.name} given [${output.map(_.name).mkString(", ")}]")
+        throw QueryCompilationErrors.cannotResolveAttributeError(
+          field.name, output.map(_.name).mkString(", "))
       }
     }
   }
 
+  private[this] lazy val childAttributes = AttributeSeq.fromNormalOutput(children.flatMap(_.output))
+
+  private[this] lazy val childMetadataAttributes = AttributeSeq(children.flatMap(_.metadataOutput))
+
+  private[this] lazy val outputAttributes = AttributeSeq.fromNormalOutput(output)
+
+  private[this] lazy val outputMetadataAttributes = AttributeSeq(metadataOutput)
+
   /**
    * Optionally resolves the given strings to a [[NamedExpression]] using the input from all child
    * nodes of this LogicalPlan. The attribute is expressed as
-   * as string in the following form: `[scope].AttributeName.[nested].[fields]...`.
+   * string in the following form: `[scope].AttributeName.[nested].[fields]...`.
    */
   def resolveChildren(
       nameParts: Seq[String],
       resolver: Resolver): Option[NamedExpression] =
-    resolve(nameParts, children.flatMap(_.output), resolver)
+    childAttributes.resolve(nameParts, resolver)
+      .orElse(childMetadataAttributes.resolve(nameParts, resolver))
 
   /**
    * Optionally resolves the given strings to a [[NamedExpression]] based on the output of this
@@ -155,7 +184,8 @@ abstract class LogicalPlan extends QueryPlan[LogicalPlan] with Logging {
   def resolve(
       nameParts: Seq[String],
       resolver: Resolver): Option[NamedExpression] =
-    resolve(nameParts, output, resolver)
+    outputAttributes.resolve(nameParts, resolver)
+      .orElse(outputMetadataAttributes.resolve(nameParts, resolver))
 
   /**
    * Given an attribute name, split it to name parts by dot, but
@@ -165,170 +195,421 @@ abstract class LogicalPlan extends QueryPlan[LogicalPlan] with Logging {
   def resolveQuoted(
       name: String,
       resolver: Resolver): Option[NamedExpression] = {
-    resolve(UnresolvedAttribute.parseAttributeName(name), output, resolver)
-  }
-
-  /**
-   * Resolve the given `name` string against the given attribute, returning either 0 or 1 match.
-   *
-   * This assumes `name` has multiple parts, where the 1st part is a qualifier
-   * (i.e. table name, alias, or subquery alias).
-   * See the comment above `candidates` variable in resolve() for semantics the returned data.
-   */
-  private def resolveAsTableColumn(
-      nameParts: Seq[String],
-      resolver: Resolver,
-      attribute: Attribute): Option[(Attribute, List[String])] = {
-    assert(nameParts.length > 1)
-    if (attribute.qualifier.exists(resolver(_, nameParts.head))) {
-      // At least one qualifier matches. See if remaining parts match.
-      val remainingParts = nameParts.tail
-      resolveAsColumn(remainingParts, resolver, attribute)
-    } else {
-      None
-    }
-  }
-
-  /**
-   * Resolve the given `name` string against the given attribute, returning either 0 or 1 match.
-   *
-   * Different from resolveAsTableColumn, this assumes `name` does NOT start with a qualifier.
-   * See the comment above `candidates` variable in resolve() for semantics the returned data.
-   */
-  private def resolveAsColumn(
-      nameParts: Seq[String],
-      resolver: Resolver,
-      attribute: Attribute): Option[(Attribute, List[String])] = {
-    if (!attribute.isGenerated && resolver(attribute.name, nameParts.head)) {
-      Option((attribute.withName(nameParts.head), nameParts.tail.toList))
-    } else {
-      None
-    }
-  }
-
-  /** Performs attribute resolution given a name and a sequence of possible attributes. */
-  protected def resolve(
-      nameParts: Seq[String],
-      input: Seq[Attribute],
-      resolver: Resolver): Option[NamedExpression] = {
-
-    // A sequence of possible candidate matches.
-    // Each candidate is a tuple. The first element is a resolved attribute, followed by a list
-    // of parts that are to be resolved.
-    // For example, consider an example where "a" is the table name, "b" is the column name,
-    // and "c" is the struct field name, i.e. "a.b.c". In this case, Attribute will be "a.b",
-    // and the second element will be List("c").
-    var candidates: Seq[(Attribute, List[String])] = {
-      // If the name has 2 or more parts, try to resolve it as `table.column` first.
-      if (nameParts.length > 1) {
-        input.flatMap { option =>
-          resolveAsTableColumn(nameParts, resolver, option)
-        }
-      } else {
-        Seq.empty
-      }
-    }
-
-    // If none of attributes match `table.column` pattern, we try to resolve it as a column.
-    if (candidates.isEmpty) {
-      candidates = input.flatMap { candidate =>
-        resolveAsColumn(nameParts, resolver, candidate)
-      }
-    }
-
-    def name = UnresolvedAttribute(nameParts).name
-
-    candidates.distinct match {
-      // One match, no nested fields, use it.
-      case Seq((a, Nil)) => Some(a)
-
-      // One match, but we also need to extract the requested nested field.
-      case Seq((a, nestedFields)) =>
-        // The foldLeft adds ExtractValues for every remaining parts of the identifier,
-        // and aliased it with the last part of the name.
-        // For example, consider "a.b.c", where "a" is resolved to an existing attribute.
-        // Then this will add ExtractValue("c", ExtractValue("b", a)), and alias the final
-        // expression as "c".
-        val fieldExprs = nestedFields.foldLeft(a: Expression)((expr, fieldName) =>
-          ExtractValue(expr, Literal(fieldName), resolver))
-        Some(Alias(fieldExprs, nestedFields.last)())
-
-      // No matches.
-      case Seq() =>
-        logTrace(s"Could not find $name in ${input.mkString(", ")}")
-        None
-
-      // More than one match.
-      case ambiguousReferences =>
-        val referenceNames = ambiguousReferences.map(_._1).mkString(", ")
-        throw new AnalysisException(
-          s"Reference '$name' is ambiguous, could be: $referenceNames.")
-    }
+    resolve(UnresolvedAttribute.parseAttributeName(name), resolver)
   }
 
   /**
    * Refreshes (or invalidates) any metadata/data cached in the plan recursively.
    */
   def refresh(): Unit = children.foreach(_.refresh())
+
+  /**
+   * Returns true iff `other`'s output is semantically the same, i.e.:
+   *  - it contains the same number of `Attribute`s;
+   *  - references are the same;
+   *  - the order is equal too.
+   */
+  def sameOutput(other: LogicalPlan): Boolean = {
+    val thisOutput = this.output
+    val otherOutput = other.output
+    thisOutput.length == otherOutput.length && thisOutput.zip(otherOutput).forall {
+      case (a1, a2) => a1.semanticEquals(a2)
+    }
+  }
+}
+
+object LogicalPlan {
+  // A dedicated tag for Spark Connect.
+  // If an expression (only support UnresolvedAttribute for now) was attached by this tag,
+  // the analyzer will:
+  //    1, extract the plan id;
+  //    2, top-down traverse the query plan to find the node that was attached by the same tag.
+  //    and fails the whole analysis if can not find it;
+  //    3, resolve this expression with the matching node. If any error occurs, analyzer fallbacks
+  //    to the old code path.
+  private[spark] val PLAN_ID_TAG = TreeNodeTag[Long]("plan_id")
+  private[spark] val IS_METADATA_COL = TreeNodeTag[Unit]("is_metadata_col")
 }
 
 /**
  * A logical plan node with no children.
  */
-abstract class LeafNode extends LogicalPlan {
-  override def children: Seq[LogicalPlan] = Nil
+trait LeafNode extends LogicalPlan with LeafLike[LogicalPlan] {
   override def producedAttributes: AttributeSet = outputSet
+
+  /** Leaf nodes that can survive analysis must define their own statistics. */
+  def computeStats(): Statistics =
+    throw new SparkUnsupportedOperationException("_LEGACY_ERROR_TEMP_3114")
+}
+
+/**
+ * A single observation of a fully materialized leaf's current cache generation.
+ */
+private[sql] case class MaterializedLeafMetadata(
+    rowCount: BigInt,
+    sizeInBytes: BigInt,
+    isOutputRepeatable: Boolean,
+    isDurable: Boolean) {
+  def statsAvailable: Boolean = isOutputRepeatable && isDurable
+}
+
+/**
+ * A leaf node that exposes materialization metadata used by
+ * [[org.apache.spark.sql.catalyst.optimizer.InjectRuntimeFilter]] to determine whether its output
+ * can be scanned again safely and profitably to build a runtime filter.
+ */
+private[sql] trait MaterializedLeafNode extends LeafNode {
+  /** A complete, generation-consistent snapshot, if the leaf is fully materialized. */
+  def materializedMetadata: Option[MaterializedLeafMetadata]
+
+  /** Cheap prerequisite for reading potentially usable materialization metadata. */
+  def mayHaveUsableMaterializedStats: Boolean
+
+  /**
+   * Whether the current materialized output has complete, accurate statistics and durable storage
+   * for another scan. This excludes memory-only storage levels, whose blocks may be discarded
+   * under memory pressure and recomputed.
+   */
+  def statsAvailable: Boolean =
+    mayHaveUsableMaterializedStats && materializedMetadata.exists(_.statsAvailable)
+
+  /** Whether scanning the materialized output again returns the same rows. */
+  def isOutputRepeatable: Boolean = materializedMetadata.exists(_.isOutputRepeatable)
+
+  /** Whether the original plan contains a predicate that is likely to be selective. */
+  def hasSelectivePredicate: Boolean
+}
+
+/**
+ * A abstract class for LogicalQueryStage that is visible in logical rewrites.
+ */
+abstract class LogicalQueryStage extends LeafNode {
+  override protected val nodePatterns: Seq[TreePattern] = Seq(LOGICAL_QUERY_STAGE)
+
+  /**
+   * Returns the logical plan that is included in this query stage
+   */
+  def logicalPlan: LogicalPlan
+
+  /**
+   * Returns the physical plan.
+   */
+  def physicalPlan: QueryPlan[_]
+
+  /**
+   * Return true if the physical stage is materialized
+   */
+  def isMaterialized: Boolean
+
+  /**
+   * Return true if the physical plan corresponds directly to a stage
+   */
+  def isDirectStage: Boolean
 }
 
 /**
  * A logical plan node with single child.
  */
-abstract class UnaryNode extends LogicalPlan {
-  def child: LogicalPlan
-
-  override def children: Seq[LogicalPlan] = child :: Nil
-
+trait UnaryNode extends LogicalPlan with UnaryLike[LogicalPlan] {
   /**
-   * Generates an additional set of aliased constraints by replacing the original constraint
-   * expressions with the corresponding alias
+   * Generates all valid constraints including an set of aliased constraints by replacing the
+   * original constraint expressions with the corresponding alias
    */
-  protected def getAliasedConstraints(projectList: Seq[NamedExpression]): Set[Expression] = {
-    projectList.flatMap {
-      case a @ Alias(e, _) =>
-        child.constraints.map(_ transform {
+  protected def getAllValidConstraints(projectList: Seq[NamedExpression]): ExpressionSet = {
+    var allConstraints = child.constraints
+    projectList.foreach {
+      case a @ Alias(l: Literal, _) =>
+        allConstraints += EqualNullSafe(a.toAttribute, l)
+      case a @ Alias(e, _) if e.deterministic =>
+        // For every alias in `projectList`, replace the reference in constraints by its attribute.
+        allConstraints ++= allConstraints.map(_ transform {
           case expr: Expression if expr.semanticEquals(e) =>
             a.toAttribute
-        }).union(Set(EqualNullSafe(e, a.toAttribute)))
-      case _ =>
-        Set.empty[Expression]
-    }.toSet
-  }
-
-  override protected def validConstraints: Set[Expression] = child.constraints
-
-  override def statistics: Statistics = {
-    // There should be some overhead in Row object, the size should not be zero when there is
-    // no columns, this help to prevent divide-by-zero error.
-    val childRowSize = child.output.map(_.dataType.defaultSize).sum + 8
-    val outputRowSize = output.map(_.dataType.defaultSize).sum + 8
-    // Assume there will be the same number of rows as child has.
-    var sizeInBytes = (child.statistics.sizeInBytes * outputRowSize) / childRowSize
-    if (sizeInBytes == 0) {
-      // sizeInBytes can't be zero, or sizeInBytes of BinaryNode will also be zero
-      // (product of children).
-      sizeInBytes = 1
+        })
+        allConstraints += EqualNullSafe(e, a.toAttribute)
+      case _ => // Don't change.
     }
 
-    child.statistics.copy(sizeInBytes = sizeInBytes)
+    allConstraints
   }
+
+  override protected lazy val validConstraints: ExpressionSet = child.constraints
 }
 
 /**
  * A logical plan node with a left and right child.
  */
-abstract class BinaryNode extends LogicalPlan {
-  def left: LogicalPlan
-  def right: LogicalPlan
+trait BinaryNode extends LogicalPlan with BinaryLike[LogicalPlan]
 
-  override def children: Seq[LogicalPlan] = Seq(left, right)
+trait OrderPreservingUnaryNode extends UnaryNode
+  with AliasAwareQueryOutputOrdering[LogicalPlan] {
+  override protected def outputExpressions: Seq[NamedExpression] = child.output
+  override protected def orderingExpressions: Seq[SortOrder] = child.outputOrdering
+}
+
+object LogicalPlanIntegrity {
+
+  def canGetOutputAttrs(p: LogicalPlan): Boolean = {
+    p.resolved && !p.expressions.exists { e =>
+      e.exists {
+        // We cannot call `output` in plans with a `ScalarSubquery` expr having no column,
+        // so, we filter out them in advance.
+        case s: ScalarSubquery => s.plan.schema.fields.isEmpty
+        case _ => false
+      }
+    }
+  }
+
+  /**
+   * Since some logical plans (e.g., `Union`) can build `AttributeReference`s in their `output`,
+   * this method checks if the same `ExprId` refers to attributes having the same data type
+   * in plan output. Returns the error message if the check does not pass.
+   */
+  def hasUniqueExprIdsForOutput(plan: LogicalPlan): Option[String] = {
+    // SPARK-48771: rewritten using mutable collections to improve this function's performance and
+    // avoid unnecessary traversals of the query plan.
+    val exprIds = mutable.HashMap.empty[ExprId, mutable.HashSet[DataType]]
+    val ignoredExprIds = mutable.HashSet.empty[ExprId]
+
+    plan.foreach {
+      // NOTE: `Union` currently reuses input `ExprId`s for output references, but we cannot
+      // simply modify the code for assigning new `ExprId`s in `Union#output` because
+      // the modification will make breaking changes (See SPARK-32741(#29585)).
+      // So, this check just ignores the `exprId`s of `Union` output.
+      case u: Union if u.resolved =>
+        u.output.foreach(ignoredExprIds += _.exprId)
+      case p if canGetOutputAttrs(p) =>
+        p.output.foreach { a =>
+          // NOTE: we still need to filter resolved expressions here because the output of
+          // some resolved logical plans can have unresolved references,
+          // e.g., outer references in `ExistenceJoin`.
+          if (a.resolved) {
+            val prevTypes = exprIds.getOrElseUpdate(a.exprId, mutable.HashSet.empty[DataType])
+            prevTypes += a.dataType.asNullable
+          }
+        }
+      case _ =>
+    }
+
+    exprIds.collectFirst {
+      case (exprId, types) if types.size > 1 && !ignoredExprIds.contains(exprId) =>
+        s"Multiple attributes have the same expression ID ${exprId.id} but different data types: " +
+          types.map(_.sql).mkString(", ") + ". The plan tree:\n" + plan.treeString
+    }
+  }
+
+  /**
+   * This method checks if reference `ExprId`s are not reused when assigning a new `ExprId`.
+   * For example, it returns false if plan transformers create an alias having the same `ExprId`
+   * with one of reference attributes, e.g., `a#1 + 1 AS a#1`. Returns the error message if the
+   * check does not pass.
+   */
+  def checkIfSameExprIdNotReused(plan: LogicalPlan): Option[String] = {
+    plan.collectFirst { case p if p.resolved =>
+      p.expressions.collectFirst {
+        // Even if a plan is resolved, `a.references` can return unresolved references,
+        // e.g., in `Grouping`/`GroupingID`, so we need to filter out them and
+        // check if the same `exprId` in `Alias` does not exist among reference `exprId`s.
+        case a: Alias if a.references.filter(_.resolved).map(_.exprId).exists(_ == a.exprId) =>
+          "An alias reuses the same expression ID as previously present in an attribute, " +
+            s"which is invalid: ${a.sql}. The plan tree:\n" + plan.treeString
+      }
+    }.flatten
+  }
+
+  /**
+   * This method checks if the same `ExprId` refers to an unique attribute in a plan tree.
+   * Some plan transformers (e.g., `RemoveNoopOperators`) rewrite logical
+   * plans based on this assumption. Returns the error message if the check does not pass.
+   */
+  def validateExprIdUniqueness(plan: LogicalPlan): Option[String] = {
+    LogicalPlanIntegrity.checkIfSameExprIdNotReused(plan).orElse(
+      LogicalPlanIntegrity.hasUniqueExprIdsForOutput(plan))
+  }
+
+  /**
+   * This method validates there are no dangling attribute references.
+   * Returns an error message if the check does not pass, or None if it does pass.
+   */
+  def validateNoDanglingReferences(plan: LogicalPlan): Option[String] = {
+    plan.collectFirst {
+      // DML commands and multi instance relations (like InMemoryRelation caches)
+      // have different output semantics than typical queries.
+      case _: Command => None
+      case _: MultiInstanceRelation => None
+      case n if canGetOutputAttrs(n) =>
+        if (n.missingInput.nonEmpty) {
+          Some(s"Aliases ${ n.missingInput.mkString(", ")} are dangling " +
+            s"in the references for plan:\n ${n.treeString}")
+        } else {
+          None
+        }
+    }.flatten
+  }
+
+  /**
+   * Validate that the aggregation expressions in Aggregate plans are valid.
+   * Returns an error message if the check fails, or None if it succeeds.
+   */
+  def validateAggregateExpressions(plan: LogicalPlan): Option[String] = {
+    plan.collectFirst {
+      case a: Aggregate =>
+        try {
+          ExprUtils.assertValidAggregation(a)
+          None
+        } catch {
+          case e: AnalysisException =>
+            Some(s"Aggregate: ${a.toString} is not a valid aggregate expression: " +
+            s"${e.getSimpleMessage}")
+        }
+    }.flatten
+  }
+
+  def validateSchemaOutput(previousPlan: LogicalPlan, currentPlan: LogicalPlan): Option[String] = {
+    if (!DataTypeUtils.equalsIgnoreNullability(previousPlan.schema, currentPlan.schema)) {
+      Some(s"The plan output schema has changed from ${previousPlan.schema.sql} to " +
+        currentPlan.schema.sql + s". The previous plan: ${previousPlan.treeString}\nThe new " +
+        "plan:\n" + currentPlan.treeString)
+    } else {
+      None
+    }
+  }
+
+  /**
+   * This method validates that no operator references one of its child's output attributes with a
+   * narrower nullability than the child produces -- declaring the attribute non-nullable while the
+   * child produces it as nullable. Such a mismatch (for example, an outer-join-widened column that
+   * a synthesized operator references with its original non-nullable metadata) is a latent
+   * plan-integrity defect: the rows are unchanged, so result-equivalence reasoning and
+   * `validateSchemaOutput` (which compares types `asNullable`) both miss it, yet a later
+   * optimization that trusts the non-nullable declaration may drop a null check and produce wrong
+   * results. Declaring a reference *wider* (nullable over a non-nullable child) is safe and is not
+   * flagged. References whose `ExprId` is not produced by any child (e.g. outer references) are
+   * ignored.
+   *
+   * Scope limitations:
+   *  - Only top-level `AttributeReference.nullable` is compared. Nested nullability (struct
+   *    fields, array elements, map values) is not validated, so a child producing
+   *    `struct<a: long /* nullable */>` referenced as `struct<a: long /* non-null */>` keeps the
+   *    same top-level `nullable` and passes. This mirrors `validateSchemaOutput`, which compares
+   *    types `asNullable`.
+   *  - The check is strictly local: it compares a parent operator against its immediate children
+   *    over `p.expressions`. A narrowing introduced at a pure pass-through boundary (an operator
+   *    that narrows an attribute it only forwards via `output`, without re-referencing it in
+   *    `expressions`) is not flagged at that node, and the parent then treats the already-narrowed
+   *    value as the child's truth. The targeted SPARK-56395 shape is caught because the synthesized
+   *    references appear in `expressions`.
+   *  - Subquery plans are not reached by `plan.collect` (they live inside expressions, not as
+   *    children), so narrowing inside a subquery is not validated.
+   *
+   * The check is disabled unless `spark.sql.planChangeValidation.nullability` is set, because not
+   * all rules maintain precise nullability today; it is intended to be enabled by targeted suites.
+   * Returns the error message if the check does not pass, or None otherwise.
+   */
+  def validateNullability(plan: LogicalPlan): Option[String] = {
+    if (!SQLConf.get.getConf(SQLConf.PLAN_CHANGE_VALIDATION_NULLABILITY)) {
+      return None
+    }
+    plan.collect {
+      case p if p.childrenResolved =>
+        val childNullable = p.children.flatMap(_.output).groupBy(_.exprId).map {
+          // If multiple child attributes share an ExprId, treat the column as nullable if any is.
+          case (exprId, attrs) => exprId -> attrs.exists(_.nullable)
+        }
+        p.expressions.flatMap(_.collect {
+          case ref: AttributeReference
+              if !ref.nullable && childNullable.getOrElse(ref.exprId, false) =>
+            s"${p.nodeName} references ${ref.name}#${ref.exprId.id} as non-nullable but its " +
+              "child produces it as nullable"
+        })
+    }.flatten.headOption.map { mismatch =>
+      "The plan declares an attribute non-nullable while its child produces it as nullable, " +
+        s"which is a plan-integrity defect: $mismatch. The plan:\n${plan.treeString}"
+    }
+  }
+
+  /**
+   * Validate the structural integrity of an optimized plan.
+   * For example, we can check after the execution of each rule that each plan:
+   * - is still resolved
+   * - only host special expressions in supported operators
+   * - has globally-unique attribute IDs
+   * - has the same result schema as the previous plan
+   * - has no dangling attribute references
+   * - has valid aggregate expressions
+   * - references each child output attribute with consistent (or wider) nullability
+   *   (only when `spark.sql.planChangeValidation.nullability` is enabled)
+   * If `lightweight` is true, we only run the first check above.
+   *
+   * Note that these checks run only during plan-change validation around the optimizer, so defects
+   * introduced during analysis (rather than optimization) are not caught here.
+   */
+  def validateOptimizedPlan(
+      previousPlan: LogicalPlan,
+      currentPlan: LogicalPlan,
+      lightweight: Boolean): Option[String] = {
+    // Lightweight validation logic. If `lightweight` is true, we only run this validation.
+    if (lightweight) {
+      val validation = if (previousPlan.resolved && !currentPlan.resolved) {
+        Some("The plan was previously resolved and now became unresolved.")
+      } else {
+        None
+      }
+      return validation
+    }
+
+    // Full validation logic.
+    var validation = if (!currentPlan.resolved) {
+      Some("The plan becomes unresolved: " + currentPlan.treeString + "\nThe previous plan: " +
+        previousPlan.treeString)
+    } else if (currentPlan.exists(PlanHelper.specialExpressionsInUnsupportedOperator(_).nonEmpty)) {
+      Some("Special expressions are placed in the wrong plan: " + currentPlan.treeString)
+    } else {
+      None
+    }
+    validation = validation
+      .orElse(LogicalPlanIntegrity.validateExprIdUniqueness(currentPlan))
+      .orElse(LogicalPlanIntegrity.validateSchemaOutput(previousPlan, currentPlan))
+      .orElse(LogicalPlanIntegrity.validateNoDanglingReferences(currentPlan))
+      .orElse(LogicalPlanIntegrity.validateAggregateExpressions(currentPlan))
+      .orElse(LogicalPlanIntegrity.validateNullability(currentPlan))
+      .map(err => s"${err}\nPrevious schema:${previousPlan.output.mkString(", ")}" +
+        s"\nPrevious plan: ${previousPlan.treeString}")
+    validation
+  }
+}
+
+/**
+ * A logical plan node that can generate metadata columns
+ */
+trait ExposesMetadataColumns extends LogicalPlan {
+  protected def metadataOutputWithOutConflicts(
+      metadataOutput: Seq[AttributeReference],
+      renameOnConflict: Boolean = true): Seq[AttributeReference] = {
+    // If `metadataColFromOutput` is not empty that means `AddMetadataColumns` merged
+    // metadata output into output. We should still return an available metadata output
+    // so that the rule `ResolveReferences` can resolve metadata column correctly.
+    val metadataColFromOutput = output.filter(_.isMetadataCol)
+    if (metadataColFromOutput.isEmpty) {
+      val resolve = conf.resolver
+      val outputNames = outputSet.map(_.name)
+
+      def isOutputColumn(colName: String): Boolean = outputNames.exists(resolve(colName, _))
+
+      @scala.annotation.tailrec
+      def makeUnique(name: String): String =
+        if (isOutputColumn(name)) makeUnique(s"_$name") else name
+
+      // If allowed to, resolve any name conflicts between metadata and output columns by renaming
+      // the conflicting metadata columns; otherwise, suppress them.
+      metadataOutput.collect {
+        case attr if !isOutputColumn(attr.name) => attr
+        case attr if renameOnConflict => attr.withName(makeUnique(attr.name))
+      }
+    } else {
+      metadataColFromOutput.asInstanceOf[Seq[AttributeReference]]
+    }
+  }
+
+  def withMetadataColumns(): LogicalPlan
 }

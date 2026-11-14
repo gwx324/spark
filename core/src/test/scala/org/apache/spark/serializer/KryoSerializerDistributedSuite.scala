@@ -20,6 +20,7 @@ package org.apache.spark.serializer
 import com.esotericsoftware.kryo.Kryo
 
 import org.apache.spark._
+import org.apache.spark.internal.config
 import org.apache.spark.serializer.KryoDistributedTest._
 import org.apache.spark.util.Utils
 
@@ -27,9 +28,10 @@ class KryoSerializerDistributedSuite extends SparkFunSuite with LocalSparkContex
 
   test("kryo objects are serialised consistently in different processes") {
     val conf = new SparkConf(false)
-      .set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
-      .set("spark.kryo.registrator", classOf[AppJarRegistrator].getName)
-      .set("spark.task.maxFailures", "1")
+      .set(config.SERIALIZER, "org.apache.spark.serializer.KryoSerializer")
+      .set(config.Kryo.KRYO_USER_REGISTRATORS, Seq(classOf[AppJarRegistrator].getName))
+      .set(config.TASK_MAX_FAILURES, 1)
+      .set(config.EXCLUDE_ON_FAILURE_ENABLED, false)
 
     val jar = TestUtils.createJarWithClasses(List(AppJarRegistrator.customClassName))
     conf.setJars(List(jar.getPath))
@@ -46,7 +48,7 @@ class KryoSerializerDistributedSuite extends SparkFunSuite with LocalSparkContex
     val shuffledRDD = cachedRDD.map { case (i, o) => (i * i * i - 10 * i * i, o)}
 
     // Join the two RDDs, and force evaluation
-    assert(shuffledRDD.join(cachedRDD).collect().size == 1)
+    assert(shuffledRDD.join(cachedRDD).collect().length == 1)
   }
 }
 
@@ -54,11 +56,9 @@ object KryoDistributedTest {
   class MyCustomClass
 
   class AppJarRegistrator extends KryoRegistrator {
-    override def registerClasses(k: Kryo) {
-      val classLoader = Thread.currentThread.getContextClassLoader
-      // scalastyle:off classforname
-      k.register(Class.forName(AppJarRegistrator.customClassName, true, classLoader))
-      // scalastyle:on classforname
+    override def registerClasses(k: Kryo): Unit = {
+      k.register(Utils.classForName(AppJarRegistrator.customClassName,
+        noSparkClassLoader = true))
     }
   }
 

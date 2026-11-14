@@ -17,9 +17,10 @@
 
 package org.apache.spark.scheduler
 
-import org.apache.spark.ShuffleDependency
-import org.apache.spark.rdd.RDD
-import org.apache.spark.storage.BlockManagerId
+import scala.collection.mutable.HashSet
+
+import org.apache.spark.{MapOutputTrackerMaster, PipelinedShuffleDependency, ShuffleDependency}
+import org.apache.spark.rdd.{DeterministicLevel, RDD}
 import org.apache.spark.util.CallSite
 
 /**
@@ -40,19 +41,50 @@ private[spark] class ShuffleMapStage(
     parents: List[Stage],
     firstJobId: Int,
     callSite: CallSite,
-    val shuffleDep: ShuffleDependency[_, _, _])
-  extends Stage(id, rdd, numTasks, parents, firstJobId, callSite) {
+    val shuffleDep: ShuffleDependency[_, _, _],
+    mapOutputTrackerMaster: MapOutputTrackerMaster,
+    resourceProfileId: Int)
+  extends Stage(id, rdd, numTasks, parents, firstJobId, callSite, resourceProfileId) {
 
   private[this] var _mapStageJobs: List[ActiveJob] = Nil
 
-  private[this] var _numAvailableOutputs: Int = 0
+  /**
+   * Partitions that either haven't yet been computed, or that were computed on an executor
+   * that has since been lost, so should be re-computed.  This variable is used by the
+   * DAGScheduler to determine when a stage has completed. Task successes in both the active
+   * attempt for the stage or in earlier attempts for this stage can cause partition ids to get
+   * removed from pendingPartitions. As a result, this variable may be inconsistent with the pending
+   * tasks in the TaskSetManager for the active attempt for the stage (the partitions stored here
+   * will always be a subset of the partitions that the TaskSetManager thinks are pending).
+   */
+  val pendingPartitions = new HashSet[Int]
+
+  /** Whether this stage produces a pipelined (incrementally-readable) shuffle. */
+  val isPipelined: Boolean = shuffleDep.isInstanceOf[PipelinedShuffleDependency[_, _, _]]
 
   /**
-   * List of [[MapStatus]] for each partition. The index of the array is the map partition id,
-   * and each value in the array is the list of possible [[MapStatus]] for a partition
-   * (a single task might run multiple times).
+   * Availability tracking for a pipelined shuffle. A pipelined shuffle produces no durable,
+   * addressable map output and is NOT registered with the `MapOutputTracker` at all --
+   * `createShuffleMapStage` registers it only with the `StreamingShuffleOutputTracker` (the two
+   * trackers are split by dependency type, with no overlap). Its map-stage availability therefore
+   * cannot be read from the `MapOutputTracker`; instead we track completed partitions here,
+   * monotonically: a partition is added when its map task succeeds and is NEVER removed on
+   * executor/host loss.
+   *
+   * This is the crux of avoiding the streaming-writer resubmit hang: if a pipelined shuffle's
+   * availability were read from the `MapOutputTracker`, losing an executor that held a completed
+   * (already-consumed) pipelined output would strip it there, flip `isAvailable` to false, and make
+   * the DAGScheduler resubmit the producer -- whose streaming writer then blocks forever waiting
+   * for termination acks from reducers that already finished. Keeping availability local and
+   * monotonic means executor loss never triggers such a resubmit; a genuine mid-group failure is
+   * handled group-atomically instead. Unused (and empty) for a non-pipelined stage.
    */
-  private[this] val outputLocs = Array.fill[List[MapStatus]](numPartitions)(Nil)
+  private[this] val pipelinedCompletedPartitions = new HashSet[Int]
+
+  /** Record a successful map task's partition as completed (pipelined stages only). */
+  private[scheduler] def addPipelinedCompletedPartition(partitionId: Int): Unit = {
+    pipelinedCompletedPartitions += partitionId
+  }
 
   override def toString: String = "ShuffleMapStage " + id
 
@@ -75,69 +107,43 @@ private[spark] class ShuffleMapStage(
   /**
    * Number of partitions that have shuffle outputs.
    * When this reaches [[numPartitions]], this map stage is ready.
-   * This should be kept consistent as `outputLocs.filter(!_.isEmpty).size`.
    */
-  def numAvailableOutputs: Int = _numAvailableOutputs
+  def numAvailableOutputs: Int = {
+    // A pipelined shuffle is not registered with the MapOutputTracker at all (see
+    // pipelinedCompletedPartitions); read its locally-tracked, monotonic completed set instead.
+    if (isPipelined) pipelinedCompletedPartitions.size
+    else mapOutputTrackerMaster.getNumAvailableOutputs(shuffleDep.shuffleId)
+  }
 
   /**
    * Returns true if the map stage is ready, i.e. all partitions have shuffle outputs.
-   * This should be the same as `outputLocs.contains(Nil)`.
    */
-  def isAvailable: Boolean = _numAvailableOutputs == numPartitions
+  def isAvailable: Boolean = numAvailableOutputs == numPartitions
 
   /** Returns the sequence of partition ids that are missing (i.e. needs to be computed). */
   override def findMissingPartitions(): Seq[Int] = {
-    val missing = (0 until numPartitions).filter(id => outputLocs(id).isEmpty)
-    assert(missing.size == numPartitions - _numAvailableOutputs,
-      s"${missing.size} missing, expected ${numPartitions - _numAvailableOutputs}")
-    missing
-  }
-
-  def addOutputLoc(partition: Int, status: MapStatus): Unit = {
-    val prevList = outputLocs(partition)
-    outputLocs(partition) = status :: prevList
-    if (prevList == Nil) {
-      _numAvailableOutputs += 1
-    }
-  }
-
-  def removeOutputLoc(partition: Int, bmAddress: BlockManagerId): Unit = {
-    val prevList = outputLocs(partition)
-    val newList = prevList.filterNot(_.location == bmAddress)
-    outputLocs(partition) = newList
-    if (prevList != Nil && newList == Nil) {
-      _numAvailableOutputs -= 1
+    if (isPipelined) {
+      (0 until numPartitions).filterNot(pipelinedCompletedPartitions.contains)
+    } else {
+      mapOutputTrackerMaster
+        .findMissingPartitions(shuffleDep.shuffleId)
+        .getOrElse(0 until numPartitions)
     }
   }
 
   /**
-   * Returns an array of [[MapStatus]] (index by partition id). For each partition, the returned
-   * value contains only one (i.e. the first) [[MapStatus]]. If there is no entry for the partition,
-   * that position is filled with null.
+   * Whether the stage is statically declared as indeterminate based on the RDD's
+   * outputDeterministicLevel property. This is known at RDD creation time.
    */
-  def outputLocInMapOutputTrackerFormat(): Array[MapStatus] = {
-    outputLocs.map(_.headOption.orNull)
+  def isStaticallyIndeterminate: Boolean = {
+    rdd.outputDeterministicLevel == DeterministicLevel.INDETERMINATE
   }
 
   /**
-   * Removes all shuffle outputs associated with this executor. Note that this will also remove
-   * outputs which are served by an external shuffle server (if one exists), as they are still
-   * registered with this execId.
+   * Whether the stage has been detected as indeterminate at runtime via checksum mismatch.
+   * This means different stage attempts have produced different data for the same partition.
    */
-  def removeOutputsOnExecutor(execId: String): Unit = {
-    var becameUnavailable = false
-    for (partition <- 0 until numPartitions) {
-      val prevList = outputLocs(partition)
-      val newList = prevList.filterNot(_.location.executorId == execId)
-      outputLocs(partition) = newList
-      if (prevList != Nil && newList == Nil) {
-        becameUnavailable = true
-        _numAvailableOutputs -= 1
-      }
-    }
-    if (becameUnavailable) {
-      logInfo("%s is now unavailable on executor %s (%d/%d, %s)".format(
-        this, execId, _numAvailableOutputs, numPartitions, isAvailable))
-    }
+  def isRuntimeIndeterminate: Boolean = {
+    !rdd.isReliablyCheckpointed && isChecksumMismatched
   }
 }

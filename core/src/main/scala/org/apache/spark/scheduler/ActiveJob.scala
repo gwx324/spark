@@ -19,6 +19,7 @@ package org.apache.spark.scheduler
 
 import java.util.Properties
 
+import org.apache.spark.JobArtifactSet
 import org.apache.spark.util.CallSite
 
 /**
@@ -38,6 +39,7 @@ import org.apache.spark.util.CallSite
  *   ShuffleMapStage for submitMapStage).
  * @param callSite Where this job was initiated in the user's program (shown on UI).
  * @param listener A listener to notify if tasks in this job finish or the job fails.
+ * @param artifacts A set of artifacts that this job has may use.
  * @param properties Scheduling properties attached to the job, such as fair scheduler pool name.
  */
 private[spark] class ActiveJob(
@@ -45,7 +47,15 @@ private[spark] class ActiveJob(
     val finalStage: Stage,
     val callSite: CallSite,
     val listener: JobListener,
-    val properties: Properties) {
+    val artifacts: JobArtifactSet,
+    val properties: Properties,
+    // Whether this job's RDD graph uses a `PipelinedShuffleDependency`. Every pipelined-group
+    // scheduling path -- co-scheduling, deferral, and the per-submit `TaskSet.isPipelined` tag --
+    // is inert for a job without one, so this flag lets those paths short-circuit the
+    // group-membership graph walk for the common regular job at no cost. Defaults to false; the
+    // result-job path (handleJobSubmitted) passes the value it computed up front, and the
+    // map-stage-job path (which rejects pipelined dependencies) leaves it false.
+    val hasPipelinedDependency: Boolean = false) {
 
   /**
    * Number of partitions we need to compute for this job. Note that result stages may not need
@@ -53,7 +63,7 @@ private[spark] class ActiveJob(
    */
   val numPartitions = finalStage match {
     case r: ResultStage => r.partitions.length
-    case m: ShuffleMapStage => m.rdd.partitions.length
+    case m: ShuffleMapStage => m.numPartitions
   }
 
   /** Which partitions of the stage have finished */

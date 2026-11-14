@@ -20,21 +20,27 @@ package org.apache.spark.mllib.util
 import scala.annotation.varargs
 import scala.reflect.ClassTag
 
-import org.apache.spark.SparkContext
+import org.apache.spark.{SparkContext, SparkException}
 import org.apache.spark.annotation.Since
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.LogKeys.OPTIMIZER_CLASS_NAME
 import org.apache.spark.ml.linalg.{MatrixUDT => MLMatrixUDT, VectorUDT => MLVectorUDT}
+import org.apache.spark.ml.util.Instrumentation
 import org.apache.spark.mllib.linalg._
 import org.apache.spark.mllib.linalg.BLAS.dot
 import org.apache.spark.mllib.regression.LabeledPoint
 import org.apache.spark.rdd.{PartitionwiseSampledRDD, RDD}
-import org.apache.spark.sql.{DataFrame, Dataset}
-import org.apache.spark.sql.functions.{col, udf}
+import org.apache.spark.sql.{DataFrame, Dataset, Row, SparkSession}
+import org.apache.spark.sql.execution.datasources.DataSource
+import org.apache.spark.sql.execution.datasources.text.TextFileFormat
+import org.apache.spark.sql.functions.{col, length, lit, not, printf, raise_error, trim,
+  unwrap_udt, when, wrap_udt}
 import org.apache.spark.storage.StorageLevel
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.random.BernoulliCellSampler
 
 /**
- * Helper methods to load, save and pre-process data used in ML Lib.
+ * Helper methods to load, save and pre-process data used in MLLib.
  */
 @Since("0.8.0")
 object MLUtils extends Logging {
@@ -102,6 +108,28 @@ object MLUtils extends Logging {
       .map(parseLibSVMRecord)
   }
 
+  private[spark] def parseLibSVMFile(
+      sparkSession: SparkSession,
+      paths: Seq[String],
+      options: Map[String, String]): RDD[(Double, Array[Int], Array[Double])] = {
+    val lines = sparkSession.baseRelationToDataFrame(
+      DataSource.apply(
+        sparkSession,
+        paths = paths,
+        className = classOf[TextFileFormat].getName,
+        options = options ++ Map(DataSource.GLOB_PATHS_KEY -> "false")
+      ).resolveRelation(checkFilesExist = false))
+      .select("value")
+
+    import lines.sparkSession.implicits._
+
+    lines.select(trim($"value").as("line"))
+      .filter(not((length($"line") === 0).or($"line".startsWith("#"))))
+      .as[String]
+      .rdd
+      .map(MLUtils.parseLibSVMRecord)
+  }
+
   private[spark] def parseLibSVMRecord(line: String): (Double, Array[Int], Array[Double]) = {
     val items = line.split(' ')
     val label = items.head.toDouble
@@ -119,11 +147,11 @@ object MLUtils extends Logging {
     while (i < indicesLength) {
       val current = indices(i)
       require(current > previous, s"indices should be one-based and in ascending order;"
-        + " found current=$current, previous=$previous; line=\"$line\"")
+        + s""" found current=$current, previous=$previous; line="$line"""")
       previous = current
       i += 1
     }
-    (label, indices.toArray, values.toArray)
+    (label, indices, values)
   }
 
   /**
@@ -149,10 +177,10 @@ object MLUtils extends Logging {
    * Save labeled data in LIBSVM format.
    * @param data an RDD of LabeledPoint to be saved
    * @param dir directory to save the data
-   * @see [[org.apache.spark.mllib.util.MLUtils#loadLibSVMFile]]
+   * @see `org.apache.spark.mllib.util.MLUtils.loadLibSVMFile`
    */
   @Since("1.0.0")
-  def saveAsLibSVMFile(data: RDD[LabeledPoint], dir: String) {
+  def saveAsLibSVMFile(data: RDD[LabeledPoint], dir: String): Unit = {
     // TODO: allow to specify label precision and feature precision.
     val dataStr = data.map { case LabeledPoint(label, features) =>
       val sb = new StringBuilder(label.toString)
@@ -213,7 +241,7 @@ object MLUtils extends Logging {
   }
 
   /**
-   * Version of [[kFold()]] taking a Long seed.
+   * Version of `kFold()` taking a Long seed.
    */
   @Since("2.0.0")
   def kFold[T: ClassTag](rdd: RDD[T], numFolds: Int, seed: Long): Array[(RDD[T], RDD[T])] = {
@@ -223,6 +251,39 @@ object MLUtils extends Logging {
         complement = false)
       val validation = new PartitionwiseSampledRDD(rdd, sampler, true, seed)
       val training = new PartitionwiseSampledRDD(rdd, sampler.cloneComplement(), true, seed)
+      (training, validation)
+    }.toArray
+  }
+
+  /**
+   * Version of `kFold()` taking a fold column name.
+   */
+  @Since("3.1.0")
+  def kFold(df: DataFrame, numFolds: Int, foldColName: String): Array[(RDD[Row], RDD[Row])] = {
+    val checked = df.withColumn(
+      foldColName,
+      when((lit(0) <= col(foldColName)) && (col(foldColName) < lit(numFolds)), col(foldColName))
+        .otherwise(
+          raise_error(
+            printf(
+              lit(s"Fold number must be in range [0, $numFolds), but got %s."), col(foldColName))
+          )
+        )
+    )
+
+    (0 until numFolds).map { fold =>
+      val training = checked
+        .filter(col(foldColName) =!= fold)
+        .drop(foldColName).rdd
+      val validation = checked
+        .filter(col(foldColName) === fold)
+        .drop(foldColName).rdd
+      if (training.isEmpty()) {
+        throw new SparkException(s"The training data at fold $fold is empty.")
+      }
+      if (validation.isEmpty()) {
+        throw new SparkException(s"The validation data at fold $fold is empty.")
+      }
       (training, validation)
     }.toArray
   }
@@ -260,15 +321,15 @@ object MLUtils extends Logging {
    * Converts vector columns in an input Dataset from the [[org.apache.spark.mllib.linalg.Vector]]
    * type to the new [[org.apache.spark.ml.linalg.Vector]] type under the `spark.ml` package.
    * @param dataset input dataset
-   * @param cols a list of vector columns to be converted. New vector columns will be ignored. If
-   *             unspecified, all old vector columns will be converted except nested ones.
-   * @return the input [[DataFrame]] with old vector columns converted to the new vector type
+   * @param cols a list of vector columns to be converted. If unspecified, all old vector columns
+   *             will be converted except nested ones.
+   * @return the input `DataFrame` with old vector columns converted to the new vector type
    */
   @Since("2.0.0")
   @varargs
   def convertVectorColumnsToML(dataset: Dataset[_], cols: String*): DataFrame = {
     val schema = dataset.schema
-    val colSet = if (cols.nonEmpty) {
+    val colNames = if (cols.nonEmpty) {
       cols.flatMap { c =>
         val dataType = schema(c).dataType
         if (dataType.getClass == classOf[VectorUDT]) {
@@ -279,48 +340,38 @@ object MLUtils extends Logging {
             s"Column $c must be old Vector type to be converted to new type but got $dataType.")
           None
         }
-      }.toSet
+      }
     } else {
       schema.fields
         .filter(_.dataType.getClass == classOf[VectorUDT])
         .map(_.name)
-        .toSet
+        .toImmutableArraySeq
     }
 
-    if (colSet.isEmpty) {
+    if (colNames.isEmpty) {
       return dataset.toDF()
     }
 
-    logWarning("Vector column conversion has serialization overhead. " +
-      "Please migrate your datasets and workflows to use the spark.ml package.")
-
-    // TODO: This implementation has performance issues due to unnecessary serialization.
-    // TODO: It is better (but trickier) if we can cast the old vector type to new type directly.
-    val convertToML = udf { v: Vector => v.asML }
-    val exprs = schema.fields.map { field =>
-      val c = field.name
-      if (colSet.contains(c)) {
-        convertToML(col(c)).as(c, field.metadata)
-      } else {
-        col(c)
-      }
-    }
-    dataset.select(exprs: _*)
+    val fields = colNames.map(schema(_))
+    dataset.withColumns(
+      fields.map(_.name),
+      fields.map(field => wrap_udt(unwrap_udt(col(field.name)), new MLVectorUDT)),
+      fields.map(_.metadata))
   }
 
   /**
    * Converts vector columns in an input Dataset to the [[org.apache.spark.mllib.linalg.Vector]]
    * type from the new [[org.apache.spark.ml.linalg.Vector]] type under the `spark.ml` package.
    * @param dataset input dataset
-   * @param cols a list of vector columns to be converted. Old vector columns will be ignored. If
-   *             unspecified, all new vector columns will be converted except nested ones.
-   * @return the input [[DataFrame]] with new vector columns converted to the old vector type
+   * @param cols a list of vector columns to be converted. If unspecified, all new vector columns
+   *             will be converted except nested ones.
+   * @return the input `DataFrame` with new vector columns converted to the old vector type
    */
   @Since("2.0.0")
   @varargs
   def convertVectorColumnsFromML(dataset: Dataset[_], cols: String*): DataFrame = {
     val schema = dataset.schema
-    val colSet = if (cols.nonEmpty) {
+    val colNames = if (cols.nonEmpty) {
       cols.flatMap { c =>
         val dataType = schema(c).dataType
         if (dataType.getClass == classOf[MLVectorUDT]) {
@@ -331,48 +382,38 @@ object MLUtils extends Logging {
             s"Column $c must be new Vector type to be converted to old type but got $dataType.")
           None
         }
-      }.toSet
+      }
     } else {
       schema.fields
         .filter(_.dataType.getClass == classOf[MLVectorUDT])
         .map(_.name)
-        .toSet
+        .toImmutableArraySeq
     }
 
-    if (colSet.isEmpty) {
+    if (colNames.isEmpty) {
       return dataset.toDF()
     }
 
-    logWarning("Vector column conversion has serialization overhead. " +
-      "Please migrate your datasets and workflows to use the spark.ml package.")
-
-    // TODO: This implementation has performance issues due to unnecessary serialization.
-    // TODO: It is better (but trickier) if we can cast the new vector type to old type directly.
-    val convertFromML = udf { Vectors.fromML _ }
-    val exprs = schema.fields.map { field =>
-      val c = field.name
-      if (colSet.contains(c)) {
-        convertFromML(col(c)).as(c, field.metadata)
-      } else {
-        col(c)
-      }
-    }
-    dataset.select(exprs: _*)
+    val fields = colNames.map(schema(_))
+    dataset.withColumns(
+      fields.map(_.name),
+      fields.map(field => wrap_udt(unwrap_udt(col(field.name)), new VectorUDT)),
+      fields.map(_.metadata))
   }
 
   /**
    * Converts Matrix columns in an input Dataset from the [[org.apache.spark.mllib.linalg.Matrix]]
    * type to the new [[org.apache.spark.ml.linalg.Matrix]] type under the `spark.ml` package.
    * @param dataset input dataset
-   * @param cols a list of matrix columns to be converted. New matrix columns will be ignored. If
-   *             unspecified, all old matrix columns will be converted except nested ones.
-   * @return the input [[DataFrame]] with old matrix columns converted to the new matrix type
+   * @param cols a list of matrix columns to be converted. If unspecified, all old matrix columns
+   *             will be converted except nested ones.
+   * @return the input `DataFrame` with old matrix columns converted to the new matrix type
    */
   @Since("2.0.0")
   @varargs
   def convertMatrixColumnsToML(dataset: Dataset[_], cols: String*): DataFrame = {
     val schema = dataset.schema
-    val colSet = if (cols.nonEmpty) {
+    val colNames = if (cols.nonEmpty) {
       cols.flatMap { c =>
         val dataType = schema(c).dataType
         if (dataType.getClass == classOf[MatrixUDT]) {
@@ -383,46 +424,38 @@ object MLUtils extends Logging {
             s"Column $c must be old Matrix type to be converted to new type but got $dataType.")
           None
         }
-      }.toSet
+      }
     } else {
       schema.fields
         .filter(_.dataType.getClass == classOf[MatrixUDT])
         .map(_.name)
-        .toSet
+        .toImmutableArraySeq
     }
 
-    if (colSet.isEmpty) {
+    if (colNames.isEmpty) {
       return dataset.toDF()
     }
 
-    logWarning("Matrix column conversion has serialization overhead. " +
-      "Please migrate your datasets and workflows to use the spark.ml package.")
-
-    val convertToML = udf { v: Matrix => v.asML }
-    val exprs = schema.fields.map { field =>
-      val c = field.name
-      if (colSet.contains(c)) {
-        convertToML(col(c)).as(c, field.metadata)
-      } else {
-        col(c)
-      }
-    }
-    dataset.select(exprs: _*)
+    val fields = colNames.map(schema(_))
+    dataset.withColumns(
+      fields.map(_.name),
+      fields.map(field => wrap_udt(unwrap_udt(col(field.name)), new MLMatrixUDT)),
+      fields.map(_.metadata))
   }
 
   /**
    * Converts matrix columns in an input Dataset to the [[org.apache.spark.mllib.linalg.Matrix]]
    * type from the new [[org.apache.spark.ml.linalg.Matrix]] type under the `spark.ml` package.
    * @param dataset input dataset
-   * @param cols a list of matrix columns to be converted. Old matrix columns will be ignored. If
-   *             unspecified, all new matrix columns will be converted except nested ones.
-   * @return the input [[DataFrame]] with new matrix columns converted to the old matrix type
+   * @param cols a list of matrix columns to be converted. If unspecified, all new matrix columns
+   *             will be converted except nested ones.
+   * @return the input `DataFrame` with new matrix columns converted to the old matrix type
    */
   @Since("2.0.0")
   @varargs
   def convertMatrixColumnsFromML(dataset: Dataset[_], cols: String*): DataFrame = {
     val schema = dataset.schema
-    val colSet = if (cols.nonEmpty) {
+    val colNames = if (cols.nonEmpty) {
       cols.flatMap { c =>
         val dataType = schema(c).dataType
         if (dataType.getClass == classOf[MLMatrixUDT]) {
@@ -433,33 +466,24 @@ object MLUtils extends Logging {
             s"Column $c must be new Matrix type to be converted to old type but got $dataType.")
           None
         }
-      }.toSet
+      }
     } else {
       schema.fields
         .filter(_.dataType.getClass == classOf[MLMatrixUDT])
         .map(_.name)
-        .toSet
+        .toImmutableArraySeq
     }
 
-    if (colSet.isEmpty) {
+    if (colNames.isEmpty) {
       return dataset.toDF()
     }
 
-    logWarning("Matrix column conversion has serialization overhead. " +
-      "Please migrate your datasets and workflows to use the spark.ml package.")
-
-    val convertFromML = udf { Matrices.fromML _ }
-    val exprs = schema.fields.map { field =>
-      val c = field.name
-      if (colSet.contains(c)) {
-        convertFromML(col(c)).as(c, field.metadata)
-      } else {
-        col(c)
-      }
-    }
-    dataset.select(exprs: _*)
+    val fields = colNames.map(schema(_))
+    dataset.withColumns(
+      fields.map(_.name),
+      fields.map(field => wrap_udt(unwrap_udt(col(field.name)), new MatrixUDT)),
+      fields.map(_.metadata))
   }
-
 
   /**
    * Returns the squared Euclidean distance between two vectors. The following formula will be used
@@ -483,10 +507,10 @@ object MLUtils extends Logging {
       norm2: Double,
       precision: Double = 1e-6): Double = {
     val n = v1.size
-    require(v2.size == n)
-    require(norm1 >= 0.0 && norm2 >= 0.0)
-    val sumSquaredNorm = norm1 * norm1 + norm2 * norm2
-    val normDiff = norm1 - norm2
+    require(v2.size == n,
+      s"Both vectors should have same length, found v1 is $n while v2 is ${v2.size}")
+    require(norm1 >= 0.0 && norm2 >= 0.0,
+      s"Both norms should be greater or equal to 0.0, found norm1=$norm1, norm2=$norm2")
     var sqDist = 0.0
     /*
      * The relative error is
@@ -500,19 +524,23 @@ object MLUtils extends Logging {
      * The bound doesn't need the inner product, so we can use it as a sufficient condition to
      * check quickly whether the inner product approach is accurate.
      */
-    val precisionBound1 = 2.0 * EPSILON * sumSquaredNorm / (normDiff * normDiff + EPSILON)
-    if (precisionBound1 < precision) {
-      sqDist = sumSquaredNorm - 2.0 * dot(v1, v2)
-    } else if (v1.isInstanceOf[SparseVector] || v2.isInstanceOf[SparseVector]) {
-      val dotValue = dot(v1, v2)
-      sqDist = math.max(sumSquaredNorm - 2.0 * dotValue, 0.0)
-      val precisionBound2 = EPSILON * (sumSquaredNorm + 2.0 * math.abs(dotValue)) /
-        (sqDist + EPSILON)
-      if (precisionBound2 > precision) {
-        sqDist = Vectors.sqdist(v1, v2)
-      }
-    } else {
+    if (v1.isInstanceOf[DenseVector] && v2.isInstanceOf[DenseVector]) {
       sqDist = Vectors.sqdist(v1, v2)
+    } else {
+      val sumSquaredNorm = norm1 * norm1 + norm2 * norm2
+      val normDiff = norm1 - norm2
+      val precisionBound1 = 2.0 * EPSILON * sumSquaredNorm / (normDiff * normDiff + EPSILON)
+      if (precisionBound1 < precision) {
+        sqDist = sumSquaredNorm - 2.0 * dot(v1, v2)
+      } else {
+        val dotValue = dot(v1, v2)
+        sqDist = math.max(sumSquaredNorm - 2.0 * dotValue, 0.0)
+        val precisionBound2 = EPSILON * (sumSquaredNorm + 2.0 * math.abs(dotValue)) /
+          (sqDist + EPSILON)
+        if (precisionBound2 > precision) {
+          sqDist = Vectors.sqdist(v1, v2)
+        }
+      }
     }
     sqDist
   }
@@ -530,5 +558,11 @@ object MLUtils extends Logging {
     } else {
       math.log1p(math.exp(x))
     }
+  }
+
+  def optimizerFailed(instr: Instrumentation, optimizerClass: Class[_]): Unit = {
+    val msg = log"${MDC(OPTIMIZER_CLASS_NAME, optimizerClass.getName)} failed."
+    instr.logError(msg)
+    throw new SparkException(msg.message)
   }
 }

@@ -19,12 +19,13 @@ package org.apache.spark.network.shuffle;
 
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.Map;
 
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 
-import static org.junit.Assert.*;
+import static org.junit.jupiter.api.Assertions.*;
 
 import org.apache.spark.network.TestUtils;
 import org.apache.spark.network.TransportContext;
@@ -33,69 +34,86 @@ import org.apache.spark.network.sasl.SecretKeyHolder;
 import org.apache.spark.network.server.TransportServer;
 import org.apache.spark.network.server.TransportServerBootstrap;
 import org.apache.spark.network.shuffle.protocol.ExecutorShuffleInfo;
-import org.apache.spark.network.util.SystemPropertyConfigProvider;
+import org.apache.spark.network.util.MapConfigProvider;
 import org.apache.spark.network.util.TransportConf;
 
 public class ExternalShuffleSecuritySuite {
 
-  TransportConf conf = new TransportConf("shuffle", new SystemPropertyConfigProvider());
+  TransportConf conf = createTransportConf(false);
   TransportServer server;
+  TransportContext transportContext;
 
-  @Before
-  public void beforeEach() throws IOException {
-    TransportContext context =
-      new TransportContext(conf, new ExternalShuffleBlockHandler(conf, null));
-    TransportServerBootstrap bootstrap = new SaslServerBootstrap(conf,
-        new TestSecretKeyHolder("my-app-id", "secret"));
-    this.server = context.createServer(Arrays.asList(bootstrap));
+  protected TransportConf createTransportConf(boolean encrypt) {
+    if (encrypt) {
+      return new TransportConf("shuffle", new MapConfigProvider(
+        Map.of("spark.authenticate.enableSaslEncryption", "true")));
+    } else {
+      return new TransportConf("shuffle", MapConfigProvider.EMPTY);
+    }
   }
 
-  @After
+  @BeforeEach
+  public void beforeEach() throws IOException {
+    transportContext = new TransportContext(conf, new ExternalBlockHandler(conf, null));
+    TransportServerBootstrap bootstrap = new SaslServerBootstrap(conf,
+        new TestSecretKeyHolder("my-app-id", "secret"));
+    this.server = transportContext.createServer(Arrays.asList(bootstrap));
+  }
+
+  @AfterEach
   public void afterEach() {
     if (server != null) {
       server.close();
       server = null;
     }
+    if (transportContext != null) {
+      transportContext.close();
+      transportContext = null;
+    }
   }
 
   @Test
-  public void testValid() throws IOException {
+  public void testValid() throws IOException, InterruptedException {
     validate("my-app-id", "secret", false);
   }
 
   @Test
   public void testBadAppId() {
-    try {
-      validate("wrong-app-id", "secret", false);
-    } catch (Exception e) {
-      assertTrue(e.getMessage(), e.getMessage().contains("Wrong appId!"));
-    }
+    Exception e = assertThrows(Exception.class,
+      () -> validate("wrong-app-id", "secret", false));
+    assertTrue(e.getMessage().contains("Wrong appId!"), e.getMessage());
   }
 
   @Test
   public void testBadSecret() {
-    try {
-      validate("my-app-id", "bad-secret", false);
-    } catch (Exception e) {
-      assertTrue(e.getMessage(), e.getMessage().contains("Mismatched response"));
-    }
+    Exception e = assertThrows(Exception.class,
+      () -> validate("my-app-id", "bad-secret", false));
+    assertTrue(e.getMessage().contains("Mismatched response"), e.getMessage());
   }
 
   @Test
-  public void testEncryption() throws IOException {
+  public void testEncryption() throws IOException, InterruptedException {
     validate("my-app-id", "secret", true);
   }
 
-  /** Creates an ExternalShuffleClient and attempts to register with the server. */
-  private void validate(String appId, String secretKey, boolean encrypt) throws IOException {
-    ExternalShuffleClient client =
-      new ExternalShuffleClient(conf, new TestSecretKeyHolder(appId, secretKey), true, encrypt);
-    client.init(appId);
-    // Registration either succeeds or throws an exception.
-    client.registerWithShuffleServer(TestUtils.getLocalHost(), server.getPort(), "exec0",
-      new ExecutorShuffleInfo(new String[0], 0,
-        "org.apache.spark.shuffle.sort.SortShuffleManager"));
-    client.close();
+  /** Creates an ExternalBlockStoreClient and attempts to register with the server. */
+  private void validate(String appId, String secretKey, boolean encrypt)
+        throws IOException, InterruptedException {
+    TransportConf testConf = conf;
+    if (encrypt) {
+      testConf = createTransportConf(encrypt);
+    }
+
+    try (ExternalBlockStoreClient client =
+        new ExternalBlockStoreClient(
+          testConf, new TestSecretKeyHolder(appId, secretKey), true, 5000)) {
+      client.init(appId);
+      // Registration either succeeds or throws an exception.
+      client.registerWithShuffleServer(TestUtils.getLocalHost(), server.getPort(), "exec0",
+        new ExecutorShuffleInfo(
+          new String[0], 0, "org.apache.spark.shuffle.sort.SortShuffleManager")
+      );
+    }
   }
 
   /** Provides a secret key holder which always returns the given secret key, for a single appId. */

@@ -18,6 +18,7 @@
 package org.apache.spark.scheduler.cluster
 
 import org.apache.spark.rpc.{RpcAddress, RpcEndpointRef}
+import org.apache.spark.scheduler.ExecutorResourceInfo
 
 /**
  * Grouping of data for an executor used by CoarseGrainedSchedulerBackend.
@@ -25,14 +26,27 @@ import org.apache.spark.rpc.{RpcAddress, RpcEndpointRef}
  * @param executorEndpoint The RpcEndpointRef representing this executor
  * @param executorAddress The network address of this executor
  * @param executorHost The hostname that this executor is running on
- * @param freeCores  The current number of cores available for work on the executor
+ * @param freeCores  The current number of cores available for work on the executor, in the
+ *                   internal exact BigDecimal representation so it can be fractional (e.g. when
+ *                   `spark.task.cpus` is set to a fractional value like 0.2, multiple tasks can
+ *                   share a single core).
  * @param totalCores The total number of cores available to the executor
+ * @param resourcesInfo The information of the currently available resources on the executor
+ * @param resourceProfileId The id of the ResourceProfile being used by this executor
+ * @param registrationTs The registration timestamp of this executor
+ * @param requestTs What time this executor was most likely requested at
  */
 private[cluster] class ExecutorData(
-   val executorEndpoint: RpcEndpointRef,
-   val executorAddress: RpcAddress,
-   override val executorHost: String,
-   var freeCores: Int,
-   override val totalCores: Int,
-   override val logUrlMap: Map[String, String]
-) extends ExecutorInfo(executorHost, totalCores, logUrlMap)
+    val executorEndpoint: RpcEndpointRef,
+    val executorAddress: RpcAddress,
+    override val executorHost: String,
+    var freeCores: BigDecimal,
+    override val totalCores: Int,
+    override val logUrlMap: Map[String, String],
+    override val attributes: Map[String, String],
+    override val resourcesInfo: Map[String, ExecutorResourceInfo],
+    override val resourceProfileId: Int,
+    val registrationTs: Long,
+    val requestTs: Option[Long]
+) extends ExecutorInfo(executorHost, totalCores, logUrlMap, attributes,
+  resourcesInfo, resourceProfileId, Some(registrationTs), requestTs)

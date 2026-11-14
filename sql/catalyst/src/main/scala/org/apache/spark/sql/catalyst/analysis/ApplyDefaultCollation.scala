@@ -1,0 +1,497 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.catalyst.analysis
+
+import scala.util.control.NonFatal
+
+import org.apache.spark.SparkException
+import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Cast, DefaultStringProducingExpression, Expression, Literal, SubqueryExpression}
+import org.apache.spark.sql.catalyst.plans.logical.{AddColumns, AlterColumns, AlterColumnSpec, AlterViewAs, ColumnDefinition, CreateTable, CreateTableAsSelect, CreateTempView, CreateUserDefinedFunction, CreateView, LogicalPlan, QualifiedColType, ReplaceColumns, ReplaceTable, ReplaceTableAsSelect, TableSpec, V2CreateTablePlan}
+import org.apache.spark.sql.catalyst.rules.Rule
+import org.apache.spark.sql.catalyst.trees.CurrentOrigin
+import org.apache.spark.sql.catalyst.types.DataTypeUtils.{areSameBaseType, isDefaultStringCharOrVarcharType, replaceDefaultStringCharAndVarcharTypes}
+import org.apache.spark.sql.catalyst.util.CharVarcharUtils
+import org.apache.spark.sql.connector.catalog.{SupportsNamespaces, TableCatalog}
+import org.apache.spark.sql.types.{DataType, StringHelper, StringType}
+
+/**
+ * Resolves string/char/varchar types in logical plans by assigning them the appropriate collation.
+ * The collation is inherited from the relevant object in the hierarchy (e.g., table/view ->
+ * schema). This rule is primarily applied to DDL commands, but it can also be triggered
+ * in other scenarios. For example, when querying a view, its query is re-resolved each time, and
+ * that query can take various forms.
+ */
+object ApplyDefaultCollation extends Rule[LogicalPlan] {
+  def apply(plan: LogicalPlan): LogicalPlan = {
+    val preprocessedPlan = resolveDefaultCollation(pruneRedundantAlterColumnTypes(plan))
+
+    fetchDefaultCollation(preprocessedPlan) match {
+      case Some(collation) =>
+        val transformedPlan = transform(preprocessedPlan, collation)
+        if (preprocessedPlan fastEquals transformedPlan) {
+          preprocessedPlan
+        } else {
+          // Call CollationTypeCasts immediately to avoid cycle between ApplyDefaultCollation,
+          // ExtractWindowExpressions and CollationTypeCasts.
+          //
+          // Example: CREATE TABLE t (c1 STRING, c2 STRING);  -- c1 is UTF8_BINARY
+          //          CREATE TABLE t2 DEFAULT COLLATION UTF8_LCASE AS
+          //            SELECT c1 = 'HELLO', ROW_NUMBER() OVER (PARTITION BY c1 ORDER BY c2) FROM t;
+          //
+          // Analyzer runs rules in batches sequentially, and the rule order is:
+          // ApplyDefaultCollation -> ExtractWindowExpressions -> CollationTypeCasts.
+          //
+          // Iteration 1:
+          //  - ApplyDefaultCollation applies UTF8_LCASE collation to the literal 'HELLO'.
+          //    Expression EqualTo (c1 = 'HELLO') is not resolved after this because c1 and the
+          //    literal have different types.
+          //  - ExtractWindowExpressions tries to extract the window expressions, but it can't
+          //    because it expects the whole projectList to be resolved (both EqualTo and
+          //    ROW_NUMBER()). EqualTo is not resolved, so it can't apply the rule.
+          //  - CollationTypeCasts applies coercion rules, changing the type of the literal to
+          //    the default StringType again (because that's the type of the column). Now
+          //    EqualTo is resolved.
+          //
+          // Iteration 2:
+          //  - ApplyDefaultCollation again applies UTF8_LCASE collation to the literal, because
+          //    its type is default StringType again.
+          //  - ExtractWindowExpressions again can't extract the window expressions for the same
+          //    reason as before.
+          //  - CollationTypeCasts applies the same coercion rules again, changing the type of
+          //    the literal back to the default StringType.
+          //
+          // This cycle continues, and the plan never gets resolved. By calling CollationTypeCasts
+          // right after this rule, we ensure that other rules like ExtractWindowExpressions that
+          // expect resolved expressions can be applied.
+          CollationTypeCasts(transformedPlan)
+        }
+      case None => preprocessedPlan
+    }
+  }
+
+  /**
+   * Returns true if any of the given expressions needs resolution, i.e., if it contains
+   * a default string/char/varchar type to which a collation can be applied.
+   */
+  def needsResolution(expressions: Seq[Expression]): Boolean = {
+    expressions.exists(needsResolution)
+  }
+
+  /**
+   * Returns true if the given expression needs resolution, i.e., if it contains a default
+   * string/char/varchar type to which a collation can be applied.
+   */
+  def needsResolution(expression: Expression): Boolean = {
+    transformExpression.isDefinedAt(expression)
+  }
+
+  /** Returns the default collation that should be applied to the plan
+   * if specified; otherwise, returns None.
+   */
+  private def fetchDefaultCollation(plan: LogicalPlan): Option[String] = {
+    plan match {
+      case CreateTable(_: ResolvedIdentifier, _, _, tableSpec: TableSpec, _, _, _) =>
+        tableSpec.collation
+
+      case CreateTableAsSelect(
+          _: ResolvedIdentifier, _, _, tableSpec: TableSpec, _, _, _, _, _) =>
+        tableSpec.collation
+
+      case ReplaceTableAsSelect(
+          _: ResolvedIdentifier, _, _, tableSpec: TableSpec, _, _, _, _, _) =>
+        tableSpec.collation
+
+      // CreateView also handles CREATE OR REPLACE VIEW
+      case createView: CreateView =>
+        createView.collation
+
+      case ReplaceTable(_: ResolvedIdentifier, _, _, tableSpec: TableSpec, _, _, _) =>
+        tableSpec.collation
+
+      // Temporary views are created via CreateViewCommand, which we can't import here.
+      // Instead, we use the CreateTempView trait to access the collation.
+      case createTempView: CreateTempView =>
+        createTempView.collation
+
+      // In `transform` we handle these 3 ALTER TABLE commands.
+      case cmd: AddColumns => getCollationFromTableProps(cmd.table)
+      case cmd: ReplaceColumns => getCollationFromTableProps(cmd.table)
+      case cmd: AlterColumns => getCollationFromTableProps(cmd.table)
+
+      case alterViewAs: AlterViewAs =>
+        alterViewAs.child match {
+          case resolvedPersistentView: ResolvedPersistentView =>
+            Option(resolvedPersistentView.info.properties.get(TableCatalog.PROP_COLLATION))
+          case resolvedTempView: ResolvedTempView =>
+            resolvedTempView.metadata.collation
+          case _ => None
+        }
+
+      // Check if view has default collation
+      case _ if AnalysisContext.get.collation.isDefined =>
+        AnalysisContext.get.collation
+
+      case _ => None
+    }
+  }
+
+  private def getCollationFromTableProps(t: LogicalPlan): Option[String] = {
+    t match {
+      case resolvedTbl: ResolvedTable
+          if resolvedTbl.table.properties.containsKey(TableCatalog.PROP_COLLATION) =>
+        Some(resolvedTbl.table.properties.get(TableCatalog.PROP_COLLATION))
+      case _ => None
+    }
+  }
+
+  /**
+   * Determines the default collation for an object in the following order:
+   * 1. Use the object's explicitly defined default collation, if available.
+   * 2. Otherwise, use the default collation defined by the object's schema.
+   * 3. If not defined in the schema, use the default collation from the object's catalog.
+   *
+   * If none of these collations are specified, None will be persisted as the default collation,
+   * which means the system default collation `UTF8_BINARY` will be used and the plan will not be
+   * changed.
+   * This function applies to DDL commands. An object's default collation is persisted at the moment
+   * of its creation, and altering the schema or catalog collation will not affect existing objects.
+   */
+  def resolveDefaultCollation(plan: LogicalPlan): LogicalPlan = {
+    try {
+      plan match {
+        case createTable@CreateTable(ResolvedIdentifier(
+        catalog: SupportsNamespaces, identifier), _, _, tableSpec: TableSpec, _, _, _)
+          if tableSpec.collation.isEmpty =>
+          createTable.copy(tableSpec = tableSpec.copy(
+            collation = getCollationFromSchemaMetadata(catalog, identifier.namespace())))
+
+        case createTableAsSelect@CreateTableAsSelect(ResolvedIdentifier(
+        catalog: SupportsNamespaces, identifier), _, _, tableSpec: TableSpec, _, _, _, _, _)
+          if tableSpec.collation.isEmpty =>
+          createTableAsSelect.copy(tableSpec = tableSpec.copy(
+            collation = getCollationFromSchemaMetadata(catalog, identifier.namespace())))
+
+        case replaceTableAsSelect@ReplaceTableAsSelect(ResolvedIdentifier(
+        catalog: SupportsNamespaces, identifier), _, _, tableSpec: TableSpec, _, _, _, _, _)
+          if tableSpec.collation.isEmpty =>
+          replaceTableAsSelect.copy(tableSpec = tableSpec.copy(
+            collation = getCollationFromSchemaMetadata(catalog, identifier.namespace())))
+
+        case replaceTable@ReplaceTable(ResolvedIdentifier(
+        catalog: SupportsNamespaces, identifier), _, _, tableSpec: TableSpec, _, _, _)
+          if tableSpec.collation.isEmpty =>
+          replaceTable.copy(tableSpec = tableSpec.copy(
+            collation = getCollationFromSchemaMetadata(catalog, identifier.namespace())))
+
+        case createView: CreateView =>
+          resolveCreateViewCollation(createView)
+
+        case createUserDefinedFunction@CreateUserDefinedFunction(
+        ResolvedIdentifier(catalog: SupportsNamespaces, identifier),
+        _, _, _, _, _, collation, _, _, _, _, _, _) if collation.isEmpty =>
+          val newCreateUserDefinedFunction =
+            CurrentOrigin.withOrigin(createUserDefinedFunction.origin) {
+              createUserDefinedFunction.copy(
+                collation = getCollationFromSchemaMetadata(catalog, identifier.namespace()))
+            }
+          newCreateUserDefinedFunction.copyTagsFrom(createUserDefinedFunction)
+          newCreateUserDefinedFunction
+
+        case other =>
+          other
+      }
+    } catch {
+      case NonFatal(_) =>
+        plan
+    }
+  }
+
+  /**
+   * Fills an unspecified view collation from the target schema, preserving origin and tags.
+   * Returns the original command if the target is unresolved or metadata lookup fails.
+   */
+  def resolveCreateViewCollation(createView: CreateView): CreateView = {
+    try {
+      createView.child match {
+        case ResolvedIdentifier(catalog: SupportsNamespaces, identifier)
+            if createView.collation.isEmpty =>
+          val newCreateView = CurrentOrigin.withOrigin(createView.origin) {
+            createView.copy(
+              collation = getCollationFromSchemaMetadata(catalog, identifier.namespace()))
+          }
+          newCreateView.copyTagsFrom(createView)
+          newCreateView
+        case _ =>
+          createView
+      }
+    } catch {
+      case NonFatal(_) =>
+        createView
+    }
+  }
+
+  /**
+   * Retrieves the schema's default collation from the metadata of the given catalog and schema
+   * name. Returns None if the default collation is not specified for the schema.
+   */
+  private def getCollationFromSchemaMetadata(
+      catalog: SupportsNamespaces, schemaName: Array[String]): Option[String] = {
+    val metadata = catalog.loadNamespaceMetadata(schemaName)
+    Option(metadata.get(TableCatalog.PROP_COLLATION))
+  }
+
+  private def isCreateOrAlterPlan(plan: LogicalPlan): Boolean = plan match {
+    // For CREATE TABLE, only v2 CREATE TABLE command is supported.
+    case _: V2CreateTablePlan | _: ReplaceTable | _: CreateView | _: AlterViewAs |
+         _: CreateTempView => true
+    case _ => false
+  }
+
+  private def transform(plan: LogicalPlan, collation: String): LogicalPlan = {
+    plan resolveOperators {
+      // The ResolvedIdentifier child of CreateTable/ReplaceTable exposes the resolved table
+      // columns as output attributes. Re-point any default string/char/varchar typed ones to the
+      // default collation so the resolved schema stays consistent with the column definitions.
+      // Matched before the generic case below so it is not routed through transformPlan, which
+      // does not rewrite bare output attributes.
+      case ri: ResolvedIdentifier
+          if ri.output.exists(a => hasDefaultStringCharOrVarcharType(a.dataType)) =>
+        ri.copy(output = ri.output.map {
+          case a if hasDefaultStringCharOrVarcharType(a.dataType) =>
+            a.withDataType(replaceDefaultStringCharAndVarcharTypes(a.dataType, collation))
+          case a => a
+        })
+
+      case p if isCreateOrAlterPlan(p) || AnalysisContext.get.collation.isDefined =>
+        transformPlan(p, collation)
+
+      case addCols: AddColumns =>
+        addCols.copy(columnsToAdd = replaceColumnTypes(addCols.columnsToAdd, collation))
+
+      case replaceCols: ReplaceColumns =>
+        replaceCols.copy(columnsToAdd = replaceColumnTypes(replaceCols.columnsToAdd, collation))
+
+      case a @ AlterColumns(ResolvedTable(_, _, _, _), specs: Seq[AlterColumnSpec], _) =>
+        val newSpecs = specs.map {
+          case spec if shouldApplyDefaultCollationToAlterColumn(spec) =>
+            spec.copy(newDataType =
+              Some(replaceDefaultStringCharAndVarcharTypes(spec.newDataType.get, collation)))
+          case col => col
+        }
+        a.copy(specs = newSpecs)
+    }
+  }
+
+  /**
+   * The column type should not be changed if the original column type is [[StringType]],
+   * [[CharType]], or [[VarcharType]], and the new type is the default instance of the same type
+   * (i.e., [[StringType]], [[CharType]], or [[VarcharType]] without an explicit collation).
+   *
+   * Query Example:
+   * {{{
+   *   CREATE TABLE t (c1 STRING COLLATE UNICODE)
+   *   ALTER TABLE t ALTER COLUMN c1 TYPE STRING -- c1 will remain STRING COLLATE UNICODE
+   * }}}
+   */
+  private def pruneRedundantAlterColumnTypes(plan: LogicalPlan): LogicalPlan = {
+    plan match {
+      case alterColumns@AlterColumns(
+      ResolvedTable(_, _, _, _), specs: Seq[AlterColumnSpec], _) =>
+        val resolvedSpecs = specs.map { spec =>
+          if (isAlterColumnNOP(spec)) {
+            spec.copy(newDataType = None)
+          } else {
+            spec
+          }
+        }
+        val newAlterColumns = CurrentOrigin.withOrigin(alterColumns.origin) {
+          alterColumns.copy(specs = resolvedSpecs)
+        }
+        newAlterColumns.copyTagsFrom(alterColumns)
+        newAlterColumns
+      case _ =>
+        plan
+    }
+  }
+
+  private def isAlterColumnNOP(spec: AlterColumnSpec): Boolean = {
+    val colType = getFieldType(spec.column)
+    spec.newDataType.isDefined &&
+      colType.isInstanceOf[StringType] &&
+      isDefaultStringCharOrVarcharType(spec.newDataType.get) &&
+      StringHelper.removeCollation(colType.asInstanceOf[StringType]) ==
+        StringHelper.removeCollation(spec.newDataType.get.asInstanceOf[StringType])
+  }
+
+  private def shouldApplyDefaultCollationToAlterColumn(
+      alterColumnSpec: AlterColumnSpec): Boolean = {
+    val colType = getFieldType(alterColumnSpec.column)
+    alterColumnSpec.newDataType.isDefined &&
+      isDefaultStringCharOrVarcharType(alterColumnSpec.newDataType.get) && (
+        !colType.isInstanceOf[StringType] ||
+        !areSameBaseType(colType.asInstanceOf[StringType],
+          alterColumnSpec.newDataType.get.asInstanceOf[StringType])
+      )
+  }
+
+  /**
+   * Return field's type.
+   */
+  private def getFieldType(fieldName: FieldName): DataType = {
+    fieldName match {
+      case ResolvedFieldName(_, field) =>
+        CharVarcharUtils.getRawType(field.metadata).getOrElse(field.dataType)
+      case UnresolvedFieldName(name) =>
+        throw SparkException.internalError(s"Unexpected UnresolvedFieldName: $name")
+    }
+  }
+
+  /**
+   * Transforms the given plan, by transforming all expressions in its operators to use the given
+   * new type instead of the default string type.
+   */
+  private def transformPlan(plan: LogicalPlan, collation: String): LogicalPlan = {
+    val transformedPlan = plan resolveExpressionsUp { case expression =>
+      transformExpression
+        .andThen(_.apply(collation))
+        .applyOrElse(expression, identity[Expression])
+    }
+
+    castDefaultStringExpressions(transformedPlan, StringType(collation))
+  }
+
+  /**
+   * Transforms the given expression, by changing all default string/char/varchar types with
+   * collated types.
+   */
+  private def transformExpression: PartialFunction[Expression, String => Expression] = {
+    case columnDef: ColumnDefinition
+        if hasDefaultStringCharOrVarcharType(columnDef.dataType) ||
+          generationExpressionNeedsCollation(columnDef) =>
+      collation =>
+        // Re-point any default string/char/varchar typed references inside the generation
+        // expression to the default collation, matching the collation applied to the columns
+        // they reference. Other nodes (e.g. literals and casts) are handled by the dedicated
+        // cases below as part of the bottom-up traversal.
+        val newGenExpr = columnDef.generationExpression.map { genExpr =>
+          val newChild = genExpr.child.transform {
+            case a: AttributeReference if hasDefaultStringCharOrVarcharType(a.dataType) =>
+              a.withDataType(replaceDefaultStringCharAndVarcharTypes(a.dataType, collation))
+          }
+          if (newChild eq genExpr.child) genExpr else genExpr.copy(child = newChild)
+        }
+        columnDef.copy(
+          dataType = replaceDefaultStringCharAndVarcharTypes(columnDef.dataType, collation),
+          generationExpression = newGenExpr)
+
+    case cast: Cast if hasDefaultStringCharOrVarcharType(cast.dataType) &&
+      cast.containsTag(Cast.USER_SPECIFIED_CAST) =>
+      collation => cast.copy(dataType =
+        replaceDefaultStringCharAndVarcharTypes(cast.dataType, collation))
+
+    case Literal(value, dt) if hasDefaultStringCharOrVarcharType(dt) =>
+      collation => Literal(value, replaceDefaultStringCharAndVarcharTypes(dt, collation))
+
+    case subquery: SubqueryExpression =>
+      val plan = subquery.plan
+      collation =>
+        val newPlan = plan resolveExpressionsUp { case expression =>
+          transformExpression
+            .andThen(_.apply(collation))
+            .applyOrElse(expression, identity[Expression])
+        }
+        subquery.withNewPlan(newPlan)
+  }
+
+  /**
+   * Returns true if the column's generation expression references a default string/char/varchar
+   * type.
+   */
+  private def generationExpressionNeedsCollation(columnDef: ColumnDefinition): Boolean = {
+    columnDef.generationExpression.exists { genExpr =>
+      // Only inspect AttributeReferences, avoiding calling dataType on unresolved nodes.
+      genExpr.child.exists {
+        case a: AttributeReference => hasDefaultStringCharOrVarcharType(a.dataType)
+        case _ => false
+      }
+    }
+  }
+
+  /**
+   * Casts [[DefaultStringProducingExpression]] in the plan to the `newType`.
+   */
+  private def castDefaultStringExpressions(plan: LogicalPlan, newType: StringType): LogicalPlan = {
+    if (newType == StringType) return plan
+
+    def inner(ex: Expression): Expression = ex match {
+      // Skip if we already added a cast in the previous pass. `copy` drops tags. Do not restore
+      // USER_SPECIFIED_CAST, which would change auto-generated column names; mark a user cast with
+      // RECOLORED_USER_CAST instead.
+      case cast @ Cast(e: DefaultStringProducingExpression, dt, _, _) if newType == dt =>
+        val rebuilt = cast.copy(child = e.withNewChildren(e.children.map(inner)))
+        if (cast.containsTag(Cast.USER_SPECIFIED_CAST) ||
+            cast.containsTag(Cast.RECOLORED_USER_CAST)) {
+          rebuilt.setTagValue(Cast.RECOLORED_USER_CAST, ())
+        }
+        rebuilt
+
+      // Add cast on top of [[DefaultStringProducingExpression]], unless it carries an explicitly
+      // collated string type -- e.g. `JSON_ARRAY(... RETURNING STRING COLLATE UTF8_BINARY)`, a
+      // distinct instance the user chose deliberately (even for the default UTF8_BINARY) that the
+      // object/view default must not override. A plain `RETURNING STRING` is the companion (see
+      // `hasExplicitStringCollation`), indistinguishable from omission, and correctly recolored.
+      case e: DefaultStringProducingExpression if !hasExplicitStringCollation(e.dataType) =>
+        Cast(e.withNewChildren(e.children.map(inner)), newType)
+
+      case other =>
+        other.withNewChildren(other.children.map(inner))
+    }
+
+    plan resolveOperators { case operator =>
+      operator.mapExpressions(inner)
+    }
+  }
+
+  private def hasDefaultStringCharOrVarcharType(dataType: DataType): Boolean =
+    dataType.existsRecursively(isDefaultStringCharOrVarcharType)
+
+  /**
+   * A [[StringType]] written with an explicit `COLLATE` clause -- a distinct instance rather than
+   * the `StringType` companion, told apart by reference identity (matching the single-pass
+   * resolver's `DefaultCollationTypeCoercion`), even for the default UTF8_BINARY. Only the explicit
+   * `COLLATE` form is distinct: `DataTypeAstBuilder` returns the companion for a plain `STRING`, so
+   * a plain `RETURNING STRING` is indistinguishable from omission and recolored like it. An
+   * explicit collation is a deliberate choice the object/view default must not overwrite.
+   */
+  private def hasExplicitStringCollation(dataType: DataType): Boolean = dataType match {
+    case st: StringType => !st.eq(StringType)
+    case _ => false
+  }
+
+  private def replaceColumnTypes(
+      colTypes: Seq[QualifiedColType],
+      collation: String): Seq[QualifiedColType] = {
+    colTypes.map {
+      case colWithDefault if hasDefaultStringCharOrVarcharType(colWithDefault.dataType) =>
+        val replaced = replaceDefaultStringCharAndVarcharTypes(colWithDefault.dataType, collation)
+        colWithDefault.copy(dataType = replaced)
+
+      case col => col
+    }
+  }
+}

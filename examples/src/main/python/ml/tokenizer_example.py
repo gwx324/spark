@@ -15,14 +15,13 @@
 # limitations under the License.
 #
 
-from __future__ import print_function
-
 # $example on$
-from pyspark.ml.feature import Tokenizer, RegexTokenizer
-from pyspark.sql.functions import col, udf
-from pyspark.sql.types import IntegerType
+from pyspark.ml.feature import RegexTokenizer, Tokenizer
+
 # $example off$
 from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, udf
+from pyspark.sql.types import IntegerType
 
 if __name__ == "__main__":
     spark = SparkSession\

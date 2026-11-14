@@ -26,7 +26,7 @@ import scala.util.Random
 
 import org.scalatest.concurrent.Eventually._
 
-import org.apache.spark.SparkFunSuite
+import org.apache.spark.{SparkException, SparkFunSuite, SparkThrowable}
 
 class ThreadUtilsSuite extends SparkFunSuite {
 
@@ -71,11 +71,9 @@ class ThreadUtilsSuite extends SparkFunSuite {
       keepAliveSeconds = 2)
     try {
       for (_ <- 1 to maxThreadNumber) {
-        cachedThreadPool.execute(new Runnable {
-          override def run(): Unit = {
-            startThreadsLatch.countDown()
-            latch.await(10, TimeUnit.SECONDS)
-          }
+        cachedThreadPool.execute(() => {
+          startThreadsLatch.countDown()
+          latch.await(10, TimeUnit.SECONDS)
         })
       }
       startThreadsLatch.await(10, TimeUnit.SECONDS)
@@ -84,11 +82,7 @@ class ThreadUtilsSuite extends SparkFunSuite {
 
       // Submit a new task and it should be put into the queue since the thread number reaches the
       // limitation
-      cachedThreadPool.execute(new Runnable {
-        override def run(): Unit = {
-          latch.await(10, TimeUnit.SECONDS)
-        }
-      })
+      cachedThreadPool.execute(() => latch.await(10, TimeUnit.SECONDS))
 
       assert(cachedThreadPool.getActiveCount === maxThreadNumber)
       assert(cachedThreadPool.getQueue.size === 1)
@@ -104,6 +98,145 @@ class ThreadUtilsSuite extends SparkFunSuite {
     }
   }
 
+  test("newDaemonBlockingThreadPoolExecutorService") {
+    val nThread = 3
+    val workQueueSize = 5
+    val submithreadsLatch = new CountDownLatch(nThread + workQueueSize + 1)
+    val latch = new CountDownLatch(1)
+    val blockingPool = ThreadUtils.newDaemonBlockingThreadPoolExecutorService(
+      nThread, workQueueSize, "ThreadUtilsSuite-newDaemonBlockingThreadPoolExecutorService")
+
+    try {
+      val submitThread = new Thread(() => {
+        (0 until nThread + workQueueSize + 1).foreach { i =>
+          blockingPool.execute(() => {
+            latch.await(10, TimeUnit.SECONDS)
+          })
+          submithreadsLatch.countDown()
+        }
+      })
+      submitThread.setDaemon(true)
+      submitThread.start()
+
+      // the last one task submission will be blocked until previous tasks completed
+      eventually(timeout(10.seconds)) {
+        assert(submithreadsLatch.getCount === 1L)
+      }
+      latch.countDown()
+      eventually(timeout(10.seconds)) {
+        assert(submithreadsLatch.getCount === 0L)
+        assert(!submitThread.isAlive)
+      }
+    } finally {
+      blockingPool.shutdownNow()
+    }
+  }
+
+  test("SPARK-60466: shutdown interrupts running tasks and drops queued tasks after the " +
+      "grace period") {
+    val executor = ThreadUtils.newDaemonSingleThreadExecutor("ThreadUtilsSuite-shutdown")
+    try {
+      val started = new CountDownLatch(1)
+      val interrupted = new CountDownLatch(1)
+      @volatile var queuedTaskRan = false
+      executor.execute(() => {
+        started.countDown()
+        try {
+          new CountDownLatch(1).await()
+        } catch {
+          case _: InterruptedException => interrupted.countDown()
+        }
+      })
+      executor.execute(() => queuedTaskRan = true)
+      assert(started.await(10, TimeUnit.SECONDS))
+
+      ThreadUtils.shutdown(executor, 100.milliseconds)
+      assert(interrupted.await(10, TimeUnit.SECONDS))
+      eventually(timeout(10.seconds)) {
+        assert(executor.isTerminated)
+      }
+      assert(!queuedTaskRan)
+    } finally {
+      executor.shutdownNow()
+    }
+  }
+
+  test("SPARK-60466: shutdown drops pending delayed tasks after the grace period") {
+    val executor =
+      ThreadUtils.newDaemonSingleThreadScheduledExecutor("ThreadUtilsSuite-shutdown-delayed")
+    try {
+      // A scheduled executor still runs its delayed tasks after shutdown() by default, so only
+      // shutdownNow() can terminate it before the delay elapses.
+      executor.schedule(new Runnable {
+        override def run(): Unit = {}
+      }, 1, TimeUnit.HOURS)
+
+      ThreadUtils.shutdown(executor, 100.milliseconds)
+      eventually(timeout(10.seconds)) {
+        assert(executor.isTerminated)
+      }
+    } finally {
+      executor.shutdownNow()
+    }
+  }
+
+  test("SPARK-60466: shutdown waits for tasks that finish within the grace period") {
+    val executor = ThreadUtils.newDaemonSingleThreadExecutor("ThreadUtilsSuite-shutdown-graceful")
+    try {
+      @volatile var interrupted = false
+      @volatile var queuedTaskRan = false
+      executor.execute(() => {
+        try {
+          Thread.sleep(500)
+        } catch {
+          case _: InterruptedException => interrupted = true
+        }
+      })
+      executor.execute(() => queuedTaskRan = true)
+
+      ThreadUtils.shutdown(executor, 1.minute)
+      assert(executor.isTerminated)
+      assert(!interrupted)
+      assert(queuedTaskRan)
+    } finally {
+      executor.shutdownNow()
+    }
+  }
+
+  test("SPARK-60466: shutdown forces termination when the calling thread is interrupted") {
+    val executor =
+      ThreadUtils.newDaemonSingleThreadExecutor("ThreadUtilsSuite-shutdown-interrupted")
+    try {
+      val started = new CountDownLatch(1)
+      val interrupted = new CountDownLatch(1)
+      executor.execute(() => {
+        started.countDown()
+        try {
+          new CountDownLatch(1).await()
+        } catch {
+          case _: InterruptedException => interrupted.countDown()
+        }
+      })
+      assert(started.await(10, TimeUnit.SECONDS))
+
+      Thread.currentThread().interrupt()
+      try {
+        intercept[InterruptedException] {
+          ThreadUtils.shutdown(executor, 1.minute)
+        }
+      } finally {
+        // Do not leak the interrupt status to the following tests.
+        Thread.interrupted()
+      }
+      assert(interrupted.await(10, TimeUnit.SECONDS))
+      eventually(timeout(10.seconds)) {
+        assert(executor.isTerminated)
+      }
+    } finally {
+      executor.shutdownNow()
+    }
+  }
+
   test("sameThread") {
     val callerThreadName = Thread.currentThread().getName()
     val f = Future {
@@ -116,7 +249,7 @@ class ThreadUtilsSuite extends SparkFunSuite {
   test("runInNewThread") {
     import ThreadUtils._
     assert(runInNewThread("thread-name") { Thread.currentThread().getName } === "thread-name")
-    assert(runInNewThread("thread-name") { Thread.currentThread().isDaemon } === true)
+    assert(runInNewThread("thread-name") { Thread.currentThread().isDaemon })
     assert(
       runInNewThread("thread-name", isDaemon = false) { Thread.currentThread().isDaemon } === false
     )
@@ -124,13 +257,167 @@ class ThreadUtilsSuite extends SparkFunSuite {
     val exception = intercept[IllegalArgumentException] {
       runInNewThread("thread-name") { throw new IllegalArgumentException(uniqueExceptionMessage) }
     }
-    assert(exception.asInstanceOf[IllegalArgumentException].getMessage === uniqueExceptionMessage)
-    assert(exception.getStackTrace.mkString("\n").contains(
-      "... run in separate thread using org.apache.spark.util.ThreadUtils ...") === true,
+    assert(exception.getMessage === uniqueExceptionMessage)
+    val stacktrace = exception.getStackTrace.mkString("\n")
+    assert(stacktrace.contains(
+      "... run in separate thread using org.apache.spark.util.ThreadUtils ..."),
       "stack trace does not contain expected place holder"
     )
-    assert(exception.getStackTrace.mkString("\n").contains("ThreadUtils.scala") === false,
+    assert(!stacktrace.contains("ThreadUtils.scala"),
       "stack trace contains unexpected references to ThreadUtils"
     )
+  }
+
+  test("SPARK-47833: wrapCallerStacktrace") {
+    var runnerThreadName: String = null
+    var exception: Throwable = null
+    val t = new Thread() {
+      override def run(): Unit = {
+        runnerThreadName = Thread.currentThread().getName
+        internalMethod()
+      }
+      private def internalMethod(): Unit = {
+        throw new RuntimeException(s"Error occurred on $runnerThreadName")
+      }
+    }
+    t.setDaemon(true)
+    t.setUncaughtExceptionHandler { case (_, e) => exception = e }
+    t.start()
+    t.join()
+
+    ThreadUtils.wrapCallerStacktrace(exception, s"run in separate thread: $runnerThreadName")
+
+    val stacktrace = exception.getStackTrace.mkString("\n")
+    assert(stacktrace.contains("internalMethod"),
+      "stack trace does not contain real exception stack trace"
+    )
+    assert(stacktrace.contains(s"... run in separate thread: $runnerThreadName ..."),
+      "stack trace does not contain expected place holder"
+    )
+    assert(stacktrace.contains("org.scalatest.Suite.run"),
+      "stack trace does not contain caller stack trace"
+    )
+    assert(!stacktrace.contains("ThreadUtils.scala"),
+      "stack trace contains unexpected references to ThreadUtils"
+    )
+  }
+
+  test("parmap should be interruptible") {
+    val t = new Thread() {
+      setDaemon(true)
+
+      override def run(): Unit = {
+        try {
+          // "par" is uninterruptible. The following will keep running even if the thread is
+          // interrupted. We should prefer to use "ThreadUtils.parmap".
+          //
+          // (1 to 10).par.flatMap { i =>
+          //   Thread.sleep(100000)
+          //   1 to i
+          // }
+          //
+          ThreadUtils.parmap(1 to 10, "test", 2) { i =>
+            Thread.sleep(100000)
+            1 to i
+          }.flatten
+        } catch {
+          case _: InterruptedException => // excepted
+        }
+      }
+    }
+    t.start()
+    eventually(timeout(10.seconds)) {
+      assert(t.isAlive)
+    }
+    t.interrupt()
+    eventually(timeout(10.seconds)) {
+      assert(!t.isAlive)
+    }
+  }
+
+  test("awaitResult preserves SparkThrowable when flag is true") {
+    import java.io.IOException
+
+    val sparkThrowableEx = new RuntimeException("structured error") with SparkThrowable {
+      override def getCondition: String = "TEST_ERROR_CLASS"
+      override def getMessageParameters: java.util.Map[String, String] =
+        java.util.Collections.emptyMap()
+    }
+
+    // With preserveSparkThrowable=true, SparkThrowable is re-thrown directly.
+    val f1 = Future {
+      throw sparkThrowableEx
+    }(ThreadUtils.sameThread)
+    val caught1 = intercept[RuntimeException] {
+      ThreadUtils.awaitResult(f1, 1.seconds, preserveSparkThrowable = true)
+    }
+    assert(caught1.isInstanceOf[SparkThrowable])
+    assert(caught1.asInstanceOf[SparkThrowable].getCondition == "TEST_ERROR_CLASS")
+    assert(caught1.getSuppressed.nonEmpty)
+
+    // With preserveSparkThrowable=false (default), SparkThrowable is wrapped in SparkException.
+    val f2 = Future {
+      throw sparkThrowableEx
+    }(ThreadUtils.sameThread)
+    val caught2 = intercept[SparkException] {
+      ThreadUtils.awaitResult(f2, 1.seconds)
+    }
+    assert(caught2.getCause.isInstanceOf[SparkThrowable])
+
+    // Plain exceptions are always wrapped regardless of the flag.
+    val plainEx = new IOException("plain error")
+    val f3 = Future {
+      throw plainEx
+    }(ThreadUtils.sameThread)
+    val caught3 = intercept[SparkException] {
+      ThreadUtils.awaitResult(f3, 1.seconds, preserveSparkThrowable = true)
+    }
+    assert(caught3.getCause eq plainEx)
+  }
+
+  test("awaitResult (JFuture) preserves SparkThrowable when flag is true") {
+    val sparkThrowableEx = new RuntimeException("structured error") with SparkThrowable {
+      override def getCondition: String = "TEST_ERROR_CLASS"
+      override def getMessageParameters: java.util.Map[String, String] =
+        java.util.Collections.emptyMap()
+    }
+
+    // scalastyle:off sparkThreadPools
+    val jfuture = new java.util.concurrent.CompletableFuture[String]()
+    // scalastyle:on sparkThreadPools
+    jfuture.completeExceptionally(sparkThrowableEx)
+
+    val caught = intercept[RuntimeException] {
+      ThreadUtils.awaitResult(jfuture, 10.seconds, preserveSparkThrowable = true)
+    }
+    assert(caught.isInstanceOf[SparkThrowable])
+    assert(caught.asInstanceOf[SparkThrowable].getCondition == "TEST_ERROR_CLASS")
+    assert(caught.getSuppressed.nonEmpty)
+  }
+
+  test("parmap preserves SparkThrowable when flag is true") {
+    val sparkThrowableEx = new RuntimeException("structured error") with SparkThrowable {
+      override def getCondition: String = "TEST_ERROR_CLASS"
+      override def getMessageParameters: java.util.Map[String, String] =
+        java.util.Collections.emptyMap()
+    }
+
+    // With preserveSparkThrowable=true, the original SparkThrowable is re-thrown.
+    val caught1 = intercept[RuntimeException] {
+      ThreadUtils.parmap(Seq(1), "test", 1, preserveSparkThrowable = true) { _ =>
+        throw sparkThrowableEx
+      }
+    }
+    assert(caught1.isInstanceOf[SparkThrowable])
+    assert(caught1.asInstanceOf[SparkThrowable].getCondition == "TEST_ERROR_CLASS")
+    assert(caught1.getSuppressed.nonEmpty)
+
+    // With preserveSparkThrowable=false, it is wrapped in SparkException.
+    val caught2 = intercept[SparkException] {
+      ThreadUtils.parmap(Seq(1), "test", 1, preserveSparkThrowable = false) { _ =>
+        throw sparkThrowableEx
+      }
+    }
+    assert(caught2.getCause.isInstanceOf[SparkThrowable])
   }
 }

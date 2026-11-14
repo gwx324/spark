@@ -17,9 +17,13 @@
 
 package test.org.apache.spark;
 
+import java.util.Map;
+
 import org.apache.spark.TaskContext;
+import org.apache.spark.resource.ResourceInformation;
 import org.apache.spark.util.TaskCompletionListener;
 import org.apache.spark.util.TaskFailureListener;
+import org.apache.spark.util.TaskInterruptListener;
 
 /**
  * Something to make sure that TaskContext can be used in Java.
@@ -34,11 +38,19 @@ public class JavaTaskContextCompileCheck {
 
     tc.addTaskCompletionListener(new JavaTaskCompletionListenerImpl());
     tc.addTaskFailureListener(new JavaTaskFailureListenerImpl());
+    tc.addTaskInterruptListener(new JavaTaskInterruptListenerImpl());
 
     tc.attemptNumber();
     tc.partitionId();
     tc.stageId();
+    tc.stageAttemptNumber();
     tc.taskAttemptId();
+    // this returns a scala Map, so make sure the JMap version give a java type back
+    tc.resources();
+    Map<String, ResourceInformation> resources = tc.resourcesJMap();
+    tc.taskMetrics();
+    tc.taskMemoryManager();
+    tc.getLocalProperties();
   }
 
   /**
@@ -51,6 +63,7 @@ public class JavaTaskContextCompileCheck {
       context.isCompleted();
       context.isInterrupted();
       context.stageId();
+      context.stageAttemptNumber();
       context.partitionId();
       context.addTaskCompletionListener(this);
     }
@@ -63,6 +76,12 @@ public class JavaTaskContextCompileCheck {
   static class JavaTaskFailureListenerImpl implements TaskFailureListener {
     @Override
     public void onTaskFailure(TaskContext context, Throwable error) {
+    }
+  }
+
+  static class JavaTaskInterruptListenerImpl implements TaskInterruptListener {
+    @Override
+    public void onTaskInterrupted(TaskContext context, String reason) {
     }
   }
 

@@ -1,151 +1,306 @@
 /*
-* Licensed to the Apache Software Foundation (ASF) under one or more
-* contributor license agreements.  See the NOTICE file distributed with
-* this work for additional information regarding copyright ownership.
-* The ASF licenses this file to You under the Apache License, Version 2.0
-* (the "License"); you may not use this file except in compliance with
-* the License.  You may obtain a copy of the License at
-*
-*    http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
-*/
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package org.apache.spark.sql.execution.python
 
-import scala.collection.JavaConverters._
-import scala.collection.mutable.ArrayBuffer
+import java.io.ByteArrayOutputStream
+
+import scala.jdk.CollectionConverters._
 
 import net.razorvine.pickle.{Pickler, Unpickler}
 
-import org.apache.spark.TaskContext
-import org.apache.spark.api.python.{ChainedPythonFunctions, PythonRunner}
-import org.apache.spark.rdd.RDD
+import org.apache.spark.{JobArtifactSet, TaskContext}
+import org.apache.spark.api.python.{ChainedPythonFunctions, PythonEvalType}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.execution.SparkPlan
-import org.apache.spark.sql.types.{DataType, StructField, StructType}
-
+import org.apache.spark.sql.execution.metric.SQLMetric
+import org.apache.spark.sql.execution.python.EvalPythonExec.ArgumentMetadata
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.types.{BinaryType, DataType, StringType, StructField, StructType}
 
 /**
- * A physical plan that evaluates a [[PythonUDF]], one partition of tuples at a time.
- *
- * Python evaluation works by sending the necessary (projected) input data via a socket to an
- * external Python process, and combine the result from the Python process with the original row.
- *
- * For each row we send to Python, we also put it in a queue. For each output row from Python,
- * we drain the queue to find the original input row. Note that if the Python process is way too
- * slow, this could lead to the queue growing unbounded and eventually run out of memory.
+ * A physical plan that evaluates a [[PythonUDF]]
  */
-case class BatchEvalPythonExec(udfs: Seq[PythonUDF], output: Seq[Attribute], child: SparkPlan)
-  extends SparkPlan {
+case class BatchEvalPythonExec(
+    udfs: Seq[PythonUDF],
+    requiredChildOutput: Seq[Attribute],
+    resultAttrs: Seq[Attribute],
+    child: SparkPlan)
+  extends EvalPythonExec with PythonPickleBatchMetrics {
 
-  def children: Seq[SparkPlan] = child :: Nil
-
-  override def producedAttributes: AttributeSet = AttributeSet(output.drop(child.output.length))
-
-  private def collectFunctions(udf: PythonUDF): (ChainedPythonFunctions, Seq[Expression]) = {
-    udf.children match {
-      case Seq(u: PythonUDF) =>
-        val (chained, children) = collectFunctions(u)
-        (ChainedPythonFunctions(chained.funcs ++ Seq(udf.func)), children)
-      case children =>
-        // There should not be any other UDFs, or the children can't be evaluated directly.
-        assert(children.forall(_.find(_.isInstanceOf[PythonUDF]).isEmpty))
-        (ChainedPythonFunctions(Seq(udf.func)), udf.children)
+  private[this] val jobArtifactUUID = JobArtifactSet.getCurrentJobArtifactState.map(_.uuid)
+  private[this] val sessionUUID = {
+    Option(session).collect {
+      case session if session.sessionState.conf.pythonWorkerLoggingEnabled =>
+        session.sessionUUID
     }
   }
 
-  protected override def doExecute(): RDD[InternalRow] = {
-    val inputRDD = child.execute().map(_.copy())
-    val bufferSize = inputRDD.conf.getInt("spark.buffer.size", 65536)
-    val reuseWorker = inputRDD.conf.getBoolean("spark.python.worker.reuse", defaultValue = true)
+  override protected def evaluatorFactory: EvalPythonEvaluatorFactory = {
+    val batchSize = conf.getConf(SQLConf.PYTHON_UDF_MAX_RECORDS_PER_BATCH)
+    val maxBytesPerBatch = conf.getConf(SQLConf.PYTHON_UDF_MAX_BYTES_PER_BATCH)
+    val binaryAsBytes = conf.pysparkBinaryAsBytes
+    new BatchEvalPythonEvaluatorFactory(
+      child.output,
+      udfs,
+      requiredChildOutput,
+      resultAttrs,
+      batchSize,
+      maxBytesPerBatch,
+      pythonMetrics,
+      jobArtifactUUID,
+      sessionUUID,
+      binaryAsBytes,
+      rowSizeGuardEnabled = conf.getConf(SQLConf.PYTHON_UDF_ROW_SIZE_GUARD_ENABLED),
+      rowSizeGuardMaxRowHeapFraction =
+        conf.getConf(SQLConf.PYTHON_UDF_ROW_SIZE_GUARD_MAX_ROW_HEAP_FRACTION))
+  }
 
-    inputRDD.mapPartitions { iter =>
-      EvaluatePython.registerPicklers()  // register pickler for Row
+  override def withRequiredChildOutput(
+      requiredChildOutput: Seq[Attribute]): BatchEvalPythonExec =
+    copy(requiredChildOutput = requiredChildOutput)
 
-      // The queue used to buffer input rows so we can drain it to
-      // combine input with output from Python.
-      val queue = new java.util.concurrent.ConcurrentLinkedQueue[InternalRow]()
+  override protected def withNewChildInternal(newChild: SparkPlan): BatchEvalPythonExec =
+    copy(child = newChild)
+}
 
-      val (pyFuncs, inputs) = udfs.map(collectFunctions).unzip
+class BatchEvalPythonEvaluatorFactory(
+    childOutput: Seq[Attribute],
+    udfs: Seq[PythonUDF],
+    passThroughOutput: Seq[Attribute],
+    resultOutput: Seq[Attribute],
+    batchSize: Int,
+    maxBytesPerBatch: Long,
+    pythonMetrics: Map[String, SQLMetric],
+    jobArtifactUUID: Option[String],
+    sessionUUID: Option[String],
+    binaryAsBytes: Boolean,
+    rowSizeGuardEnabled: Boolean = false,
+    rowSizeGuardMaxRowHeapFraction: Double = -1.0)
+  extends EvalPythonEvaluatorFactory(childOutput, udfs, passThroughOutput, resultOutput) {
 
-      // flatten all the arguments
-      val allInputs = new ArrayBuffer[Expression]
-      val dataTypes = new ArrayBuffer[DataType]
-      val argOffsets = inputs.map { input =>
-        input.map { e =>
-          if (allInputs.exists(_.semanticEquals(e))) {
-            allInputs.indexWhere(_.semanticEquals(e))
-          } else {
-            allInputs += e
-            dataTypes += e.dataType
-            allInputs.length - 1
+  // This lazy val is first used in a task, even when the factory is built on the driver.
+  private lazy val rowSizeGuardMaxRowBytes = if (rowSizeGuardMaxRowHeapFraction > 0) {
+    (Runtime.getRuntime.maxMemory() * rowSizeGuardMaxRowHeapFraction).toLong
+  } else {
+    -1L
+  }
+
+  protected def projectedInputCheck(
+      inputTypes: Seq[DataType]): Option[InternalRow => Unit] = {
+    if (rowSizeGuardEnabled && rowSizeGuardMaxRowBytes >= 0) {
+      BatchEvalPythonExec.projectedInputPayloadSizeEstimator(inputTypes).map { estimate =>
+        row => {
+          val estimatedBytes = estimate(row)
+          if (estimatedBytes > rowSizeGuardMaxRowBytes) {
+            throw QueryExecutionErrors.pythonUDFRowSizeExceededError(
+              rowSizeGuardMaxRowBytes, estimatedBytes)
           }
-        }.toArray
-      }.toArray
-      val projection = newMutableProjection(allInputs, child.output)
-      val schema = StructType(dataTypes.map(dt => StructField("", dt)))
-      val needConversion = dataTypes.exists(EvaluatePython.needConversionInPython)
-
-      // enable memo iff we serialize the row with schema (schema and class should be memorized)
-      val pickle = new Pickler(needConversion)
-      // Input iterator to Python: input rows are grouped so we send them in batches to Python.
-      // For each row, add it to the queue.
-      val inputIterator = iter.grouped(100).map { inputRows =>
-        val toBePickled = inputRows.map { inputRow =>
-          queue.add(inputRow)
-          val row = projection(inputRow)
-          if (needConversion) {
-            EvaluatePython.toJava(row, schema)
-          } else {
-            // fast path for these types that does not need conversion in Python
-            val fields = new Array[Any](row.numFields)
-            var i = 0
-            while (i < row.numFields) {
-              val dt = dataTypes(i)
-              fields(i) = EvaluatePython.toJava(row.get(i, dt), dt)
-              i += 1
-            }
-            fields
-          }
-        }.toArray
-        pickle.dumps(toBePickled)
-      }
-
-      val context = TaskContext.get()
-
-      // Output iterator for results from Python.
-      val outputIterator = new PythonRunner(pyFuncs, bufferSize, reuseWorker, true, argOffsets)
-        .compute(inputIterator, context.partitionId(), context)
-
-      val unpickle = new Unpickler
-      val mutableRow = new GenericMutableRow(1)
-      val joined = new JoinedRow
-      val resultType = if (udfs.length == 1) {
-        udfs.head.dataType
-      } else {
-        StructType(udfs.map(u => StructField("", u.dataType, u.nullable)))
-      }
-      val resultProj = UnsafeProjection.create(output, output)
-
-      outputIterator.flatMap { pickedResult =>
-        val unpickledBatch = unpickle.loads(pickedResult)
-        unpickledBatch.asInstanceOf[java.util.ArrayList[Any]].asScala
-      }.map { result =>
-        val row = if (udfs.length == 1) {
-          // fast path for single UDF
-          mutableRow(0) = EvaluatePython.fromJava(result, resultType)
-          mutableRow
-        } else {
-          EvaluatePython.fromJava(result, resultType).asInstanceOf[InternalRow]
         }
-        resultProj(joined(queue.poll(), row))
       }
+    } else {
+      None
+    }
+  }
+
+  private[python] def getInputIterator(
+      iter: Iterator[InternalRow],
+      schema: StructType): Iterator[Array[Byte]] = {
+    BatchEvalPythonExec.getInputIterator(
+      iter, schema, batchSize, binaryAsBytes, maxBytesPerBatch, pythonMetrics,
+      projectedInputCheck(schema.map(_.dataType)))
+  }
+
+  override def evaluate(
+      funcs: Seq[(ChainedPythonFunctions, Long)],
+      argMetas: Array[Array[ArgumentMetadata]],
+      iter: Iterator[InternalRow],
+      schema: StructType,
+      context: TaskContext): Iterator[InternalRow] = {
+    EvaluatePython.registerPicklers() // register pickler for Row
+
+    // Input iterator to Python.
+    val inputIterator = getInputIterator(iter, schema)
+
+    // Output iterator for results from Python.
+    val outputIterator =
+      new PythonUDFWithNamedArgumentsRunner(
+        funcs, PythonEvalType.SQL_BATCHED_UDF, argMetas, pythonMetrics,
+        jobArtifactUUID, sessionUUID)
+      .compute(inputIterator, context.partitionId(), context)
+
+    val unpickle = new Unpickler
+    val mutableRow = new GenericInternalRow(1)
+    val resultType = if (udfs.length == 1) {
+      udfs.head.dataType
+    } else {
+      StructType(udfs.map(u => StructField("", u.dataType, u.nullable)))
+    }
+
+    val fromJava = EvaluatePython.makeFromJava(resultType)
+
+    outputIterator.flatMap { pickedResult =>
+      val unpickledBatch = unpickle.loads(pickedResult)
+      unpickledBatch.asInstanceOf[java.util.ArrayList[Any]].asScala
+    }.map { result =>
+      pythonMetrics("pythonNumRowsReceived") += 1
+      if (udfs.length == 1) {
+        // fast path for single UDF
+        mutableRow(0) = fromJava(result)
+        mutableRow
+      } else {
+        fromJava(result).asInstanceOf[InternalRow]
+      }
+    }
+  }
+}
+
+object BatchEvalPythonExec {
+  /**
+   * Estimates top-level variable-width payloads in a projected UDF argument row. Nested inputs are
+   * intentionally excluded to avoid a recursive walk of every value.
+   */
+  private[python] def projectedInputPayloadSizeEstimator(
+      inputTypes: Seq[DataType]): Option[InternalRow => Long] = {
+    val projectedPayloads = inputTypes.zipWithIndex.flatMap { case (dataType, ordinal) =>
+      dataType match {
+        case _: StringType | BinaryType => Some((ordinal, dataType))
+        case _ => None
+      }
+    }.toArray
+    if (projectedPayloads.isEmpty) {
+      None
+    } else {
+      Some { row =>
+        var estimatedBytes = 0L
+        var i = 0
+        while (i < projectedPayloads.length) {
+          val (ordinal, dataType) = projectedPayloads(i)
+          if (!row.isNullAt(ordinal)) {
+            estimatedBytes += (dataType match {
+              case _: StringType => row.getUTF8String(ordinal).numBytes.toLong
+              case BinaryType => row.getBinary(ordinal).length.toLong
+              case _ => 0L
+            })
+          }
+          i += 1
+        }
+        estimatedBytes
+      }
+    }
+  }
+
+  def getInputIterator(
+      iter: Iterator[InternalRow],
+      schema: StructType,
+      batchSize: Int,
+      binaryAsBytes: Boolean,
+      maxBytesPerBatch: Long = -1L,
+      pythonMetrics: Map[String, SQLMetric] = Map.empty,
+      projectedInputCheck: Option[InternalRow => Unit] = None): Iterator[Array[Byte]] = {
+    val peakPickledBatchBytesMetric = pythonMetrics.get("pythonPeakPickledBatchBytes")
+    val oversizedBatchMetric = pythonMetrics.get("pythonOversizedBatchCount")
+    val estimatedInputBytesMetric = pythonMetrics.get("pythonEstimatedInputBytes")
+    val dataTypes = schema.map(_.dataType)
+    val needConversion = dataTypes.exists(EvaluatePython.needConversionInPython)
+
+    // enable memo iff we serialize the row with schema (schema and class should be memorized)
+    // pyrolite 4.21+ can lookup objects in its cache by value, but `GenericRowWithSchema` objects,
+    // that we pass from JVM to Python, don't define their `equals()` to take the type of the
+    // values or the schema of the row into account. This causes like
+    // `GenericRowWithSchema(Array(1.0, 1.0),
+    //    StructType(Seq(StructField("_1", DoubleType), StructField("_2", DoubleType))))`
+    // and
+    // `GenericRowWithSchema(Array(1, 1),
+    //    StructType(Seq(StructField("_1", IntegerType), StructField("_2", IntegerType))))`
+    // to be `equal()` and so we need to disable this feature explicitly (`valueCompare=false`).
+    // Please note that cache by reference is still enabled depending on `needConversion`.
+    val pickle = new Pickler(/* useMemo = */ needConversion,
+      /* valueCompare = */ false)
+
+    // Converts a row to the java object pickled to Python. When `sizeAcc` is defined, toJava also
+    // accumulates the per-row pickled-size estimate at its leaf cases during this same traversal
+    // (no second walk).
+    def convertRowUnchecked(row: InternalRow, sizeAcc: Option[PickledSizeAccumulator]): Any = {
+      if (needConversion) {
+        EvaluatePython.toJava(row, schema, binaryAsBytes, sizeAcc)
+      } else {
+        // fast path for these types that does not need conversion in Python
+        sizeAcc.foreach(_.add(PickledSizeAccumulator.PER_VALUE_OVERHEAD))
+        val fields = new Array[Any](row.numFields)
+        var i = 0
+        while (i < row.numFields) {
+          val dt = dataTypes(i)
+          fields(i) = EvaluatePython.toJava(row.get(i, dt), dt, binaryAsBytes, sizeAcc)
+          i += 1
+        }
+        fields
+      }
+    }
+    val convertRow: (InternalRow, Option[PickledSizeAccumulator]) => Any =
+      projectedInputCheck match {
+        case Some(check) => (row, sizeAcc) => {
+          check(row)
+          convertRowUnchecked(row, sizeAcc)
+        }
+        case None => convertRowUnchecked
+      }
+
+    // Input iterator to Python: input rows are grouped so we send them in batches to Python.
+    val batchedIter: Iterator[Array[Any]] =
+      if (maxBytesPerBatch < 0) {
+        // No byte limit configured (the default, -1): preserve exact row-count batching behavior.
+        iter.map(convertRow(_, None)).grouped(batchSize).map(_.toArray)
+      } else {
+        // A finite byte cap is set, so batch by both row count and estimated bytes (see
+        // ByteBoundedAsArrayIterator). The size is estimated on the converted values (the things
+        // actually pickled), accounted by toJava during conversion itself; estimator accuracy is
+        // observable via pythonEstimatedInputBytes vs pythonDataSent.
+        val sizeAcc = new PickledSizeAccumulator
+        val someSizeAcc = Some(sizeAcc)
+        new ByteBoundedAsArrayIterator(
+          iter.map { row =>
+            val converted = convertRow(row, someSizeAcc)
+            (converted, sizeAcc.getAndReset())
+          },
+          batchSize,
+          maxBytesPerBatch,
+          oversizedBatchMetric,
+          estimatedInputBytesMetric)
+      }
+
+    batchedIter.map { objects =>
+      val baos = new ByteArrayOutputStream(1024)
+      pickle.dump(objects, baos)
+      // Record the peak pickled-batch size: the primary contiguous JVM-heap allocation on this
+      // path, and one oversized batch can OOM the executor. Read baos.size() BEFORE the
+      // toByteArray copy, so the measurement does not depend on that second contiguous allocation
+      // succeeding (a near-limit batch would OOM there, otherwise losing the metric). The
+      // `> value` guard keeps the per-task max (`set` overwrites); SQLMetric surfaces the
+      // cross-task max in the UI's (min, med, max) breakdown, mirroring how peakMemory is reported.
+      peakPickledBatchBytesMetric.foreach { metric =>
+        val pickledBytes = baos.size().toLong
+        if (pickledBytes > metric.value) {
+          metric.set(pickledBytes)
+        }
+      }
+      baos.toByteArray
     }
   }
 }

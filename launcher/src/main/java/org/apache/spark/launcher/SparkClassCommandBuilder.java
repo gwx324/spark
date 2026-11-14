@@ -38,47 +38,55 @@ class SparkClassCommandBuilder extends AbstractCommandBuilder {
   SparkClassCommandBuilder(String className, List<String> classArgs) {
     this.className = className;
     this.classArgs = classArgs;
+    if ("org.apache.hive.beeline.BeeLine".equals(className)) {
+      this.isBeeLine = true;
+    }
   }
 
   @Override
   public List<String> buildCommand(Map<String, String> env)
       throws IOException, IllegalArgumentException {
     List<String> javaOptsKeys = new ArrayList<>();
-    String memKey = null;
     String extraClassPath = null;
 
-    // Master, Worker, HistoryServer, ExternalShuffleService, MesosClusterDispatcher use
+    // Master, Worker, HistoryServer, ExternalShuffleService use
     // SPARK_DAEMON_JAVA_OPTS (and specific opts) + SPARK_DAEMON_MEMORY.
-    if (className.equals("org.apache.spark.deploy.master.Master")) {
-      javaOptsKeys.add("SPARK_DAEMON_JAVA_OPTS");
-      javaOptsKeys.add("SPARK_MASTER_OPTS");
-      memKey = "SPARK_DAEMON_MEMORY";
-    } else if (className.equals("org.apache.spark.deploy.worker.Worker")) {
-      javaOptsKeys.add("SPARK_DAEMON_JAVA_OPTS");
-      javaOptsKeys.add("SPARK_WORKER_OPTS");
-      memKey = "SPARK_DAEMON_MEMORY";
-    } else if (className.equals("org.apache.spark.deploy.history.HistoryServer")) {
-      javaOptsKeys.add("SPARK_DAEMON_JAVA_OPTS");
-      javaOptsKeys.add("SPARK_HISTORY_OPTS");
-      memKey = "SPARK_DAEMON_MEMORY";
-    } else if (className.equals("org.apache.spark.executor.CoarseGrainedExecutorBackend")) {
-      javaOptsKeys.add("SPARK_JAVA_OPTS");
-      javaOptsKeys.add("SPARK_EXECUTOR_OPTS");
-      memKey = "SPARK_EXECUTOR_MEMORY";
-    } else if (className.equals("org.apache.spark.executor.MesosExecutorBackend")) {
-      javaOptsKeys.add("SPARK_EXECUTOR_OPTS");
-      memKey = "SPARK_EXECUTOR_MEMORY";
-    } else if (className.equals("org.apache.spark.deploy.mesos.MesosClusterDispatcher")) {
-      javaOptsKeys.add("SPARK_DAEMON_JAVA_OPTS");
-    } else if (className.equals("org.apache.spark.deploy.ExternalShuffleService") ||
-        className.equals("org.apache.spark.deploy.mesos.MesosExternalShuffleService")) {
-      javaOptsKeys.add("SPARK_DAEMON_JAVA_OPTS");
-      javaOptsKeys.add("SPARK_SHUFFLE_OPTS");
-      memKey = "SPARK_DAEMON_MEMORY";
-    } else {
-      javaOptsKeys.add("SPARK_JAVA_OPTS");
-      memKey = "SPARK_DRIVER_MEMORY";
-    }
+    String memKey = switch (className) {
+      case "org.apache.spark.deploy.master.Master" -> {
+        javaOptsKeys.add("SPARK_DAEMON_JAVA_OPTS");
+        javaOptsKeys.add("SPARK_MASTER_OPTS");
+        extraClassPath = getenv("SPARK_DAEMON_CLASSPATH");
+        yield "SPARK_DAEMON_MEMORY";
+      }
+      case "org.apache.spark.deploy.worker.Worker" -> {
+        javaOptsKeys.add("SPARK_DAEMON_JAVA_OPTS");
+        javaOptsKeys.add("SPARK_WORKER_OPTS");
+        extraClassPath = getenv("SPARK_DAEMON_CLASSPATH");
+        yield "SPARK_DAEMON_MEMORY";
+      }
+      case "org.apache.spark.deploy.history.HistoryServer" -> {
+        javaOptsKeys.add("SPARK_DAEMON_JAVA_OPTS");
+        javaOptsKeys.add("SPARK_HISTORY_OPTS");
+        extraClassPath = getenv("SPARK_DAEMON_CLASSPATH");
+        yield "SPARK_DAEMON_MEMORY";
+      }
+      case "org.apache.spark.executor.CoarseGrainedExecutorBackend" -> {
+        javaOptsKeys.add("SPARK_EXECUTOR_OPTS");
+        extraClassPath = getenv("SPARK_EXECUTOR_CLASSPATH");
+        yield "SPARK_EXECUTOR_MEMORY";
+      }
+      case "org.apache.spark.deploy.ExternalShuffleService" -> {
+        javaOptsKeys.add("SPARK_DAEMON_JAVA_OPTS");
+        javaOptsKeys.add("SPARK_SHUFFLE_OPTS");
+        extraClassPath = getenv("SPARK_DAEMON_CLASSPATH");
+        yield "SPARK_DAEMON_MEMORY";
+      }
+      case "org.apache.hive.beeline.BeeLine" -> {
+        javaOptsKeys.add("SPARK_BEELINE_OPTS");
+        yield "SPARK_BEELINE_MEMORY";
+      }
+      default -> "SPARK_DRIVER_MEMORY";
+    };
 
     List<String> cmd = buildJavaCommand(extraClassPath);
 
@@ -94,7 +102,7 @@ class SparkClassCommandBuilder extends AbstractCommandBuilder {
 
     String mem = firstNonEmpty(memKey != null ? System.getenv(memKey) : null, DEFAULT_MEM);
     cmd.add("-Xmx" + mem);
-    addPermGenSizeOpt(cmd);
+    addOptionString(cmd, JavaModuleOptions.defaultModuleOptions());
     cmd.add(className);
     cmd.addAll(classArgs);
     return cmd;

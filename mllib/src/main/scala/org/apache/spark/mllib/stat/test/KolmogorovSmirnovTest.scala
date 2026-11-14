@@ -31,7 +31,8 @@ import org.apache.spark.rdd.RDD
  * distribution of the sample data and the theoretical distribution we can provide a test for the
  * the null hypothesis that the sample data comes from that theoretical distribution.
  * For more information on KS Test:
- * @see [[https://en.wikipedia.org/wiki/Kolmogorov%E2%80%93Smirnov_test]]
+ * @see <a href="https://en.wikipedia.org/wiki/Kolmogorov%E2%80%93Smirnov_test">
+ * Kolmogorov-Smirnov test (Wikipedia)</a>
  *
  * Implementation note: We seek to implement the KS test with a minimal number of distributed
  * passes. We sort the RDD, and then perform the following operations on a per-partition basis:
@@ -90,7 +91,7 @@ private[stat] object KolmogorovSmirnovTest extends Logging {
    * @param partData `Iterator[Double]` 1 partition of a sorted RDD
    * @param n `Double` the total size of the RDD
    * @param cdf `Double => Double` a function the calculates the theoretical CDF of a value
-   * @return `Iterator[(Double, Double)] `Unadjusted (ie. off by a constant) potential extrema
+   * @return `Iterator[(Double, Double)] `Unadjusted (i.e. off by a constant) potential extrema
    *        in a partition. The first element corresponds to the (empirical CDF - 1/N) - CDF,
    *        the second element corresponds to empirical CDF - CDF.  We can then search the resulting
    *        iterator for the minimum of the first and the maximum of the second element, and provide
@@ -124,7 +125,8 @@ private[stat] object KolmogorovSmirnovTest extends Logging {
     val pResults = partDiffs.foldLeft(initAcc) { case ((pMin, pMax, pCt), (dl, dp)) =>
       (math.min(pMin, dl), math.max(pMax, dp), pCt + 1)
     }
-    val results = if (pResults == initAcc) Array[(Double, Double, Double)]() else Array(pResults)
+    val results =
+      if (pResults == initAcc) Array.empty[(Double, Double, Double)] else Array(pResults)
     results.iterator
   }
 

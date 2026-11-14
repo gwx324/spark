@@ -1,13 +1,12 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,22 +17,25 @@
 
 package org.apache.hive.service;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.hive.conf.HiveConf;
+
+import org.apache.spark.internal.SparkLogger;
+import org.apache.spark.internal.SparkLoggerFactory;
+import org.apache.spark.internal.LogKeys;
+import org.apache.spark.internal.MDC;
 
 /**
  * ServiceOperations.
  *
  */
 public final class ServiceOperations {
-  private static final Log LOG = LogFactory.getLog(AbstractService.class);
+  private static final SparkLogger LOG = SparkLoggerFactory.getLogger(ServiceOperations.class);
 
   private ServiceOperations() {
   }
 
   /**
-   * Verify that that a service is in a given state.
+   * Verify that a service is in a given state.
    * @param state the actual state a service is in
    * @param expectedState the desired state
    * @throws IllegalStateException if the service state is different from
@@ -51,7 +53,7 @@ public final class ServiceOperations {
 
   /**
    * Initialize a service.
-   * <p/>
+   *
    * The service state is checked <i>before</i> the operation begins.
    * This process is <i>not</i> thread safe.
    * @param service a service that must be in the state
@@ -69,7 +71,7 @@ public final class ServiceOperations {
 
   /**
    * Start a service.
-   * <p/>
+   *
    * The service state is checked <i>before</i> the operation begins.
    * This process is <i>not</i> thread safe.
    * @param service a service that must be in the state
@@ -86,7 +88,7 @@ public final class ServiceOperations {
 
   /**
    * Initialize then start a service.
-   * <p/>
+   *
    * The service state is checked <i>before</i> the operation begins.
    * This process is <i>not</i> thread safe.
    * @param service a service that must be in the state
@@ -102,9 +104,9 @@ public final class ServiceOperations {
 
   /**
    * Stop a service.
-   * <p/>Do nothing if the service is null or not
-   * in a state in which it can be/needs to be stopped.
-   * <p/>
+   *
+   * Do nothing if the service is null or not in a state in which it can be/needs to be stopped.
+   *
    * The service state is checked <i>before</i> the operation begins.
    * This process is <i>not</i> thread safe.
    * @param service a service or null
@@ -130,9 +132,8 @@ public final class ServiceOperations {
     try {
       stop(service);
     } catch (Exception e) {
-      LOG.warn("When stopping the service " + service.getName()
-                   + " : " + e,
-               e);
+      LOG.warn("When stopping the service {}", e,
+        MDC.of(LogKeys.SERVICE_NAME, service.getName()));
       return e;
     }
     return null;

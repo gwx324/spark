@@ -1,0 +1,500 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.connector.util;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.StringJoiner;
+
+import org.apache.spark.SparkIllegalArgumentException;
+import org.apache.spark.SparkUnsupportedOperationException;
+import org.apache.spark.sql.connector.expressions.Cast;
+import org.apache.spark.sql.connector.expressions.Expression;
+import org.apache.spark.sql.connector.expressions.Extract;
+import org.apache.spark.sql.connector.expressions.NamedReference;
+import org.apache.spark.sql.connector.expressions.GeneralScalarExpression;
+import org.apache.spark.sql.connector.expressions.GetArrayItem;
+import org.apache.spark.sql.connector.expressions.VariantGet;
+import org.apache.spark.sql.connector.expressions.Literal;
+import org.apache.spark.sql.connector.expressions.NullOrdering;
+import org.apache.spark.sql.connector.expressions.SortDirection;
+import org.apache.spark.sql.connector.expressions.SortOrder;
+import org.apache.spark.sql.connector.expressions.UserDefinedScalarFunc;
+import org.apache.spark.sql.connector.expressions.filter.PartitionPredicate;
+import org.apache.spark.sql.connector.expressions.aggregate.Avg;
+import org.apache.spark.sql.connector.expressions.aggregate.Max;
+import org.apache.spark.sql.connector.expressions.aggregate.Min;
+import org.apache.spark.sql.connector.expressions.aggregate.Count;
+import org.apache.spark.sql.connector.expressions.aggregate.CountStar;
+import org.apache.spark.sql.connector.expressions.aggregate.GeneralAggregateFunc;
+import org.apache.spark.sql.connector.expressions.aggregate.Sum;
+import org.apache.spark.sql.connector.expressions.aggregate.UserDefinedAggregateFunc;
+import org.apache.spark.sql.types.DataType;
+
+/**
+ * The builder to generate SQL from V2 expressions.
+ *
+ * @since 3.3.0
+ */
+public class V2ExpressionSQLBuilder {
+
+  /**
+   * Escape the LIKE pattern special chars, using {@code \} as the escape character. The LIKE
+   * patterns produced by {@link #visitStartsWith}, {@link #visitEndsWith} and
+   * {@link #visitContains} declare {@code ESCAPE '\'}, so the wildcards {@code _} and {@code %}
+   * and the escape character {@code \} itself must each be prefixed with {@code \} to be matched
+   * literally.
+   *
+   * Note: This method adopts the escape representation within Spark and is not bound to any JDBC
+   * dialect. A JDBC dialect should overwrite this API if the underlying database has more LIKE
+   * special chars than {@code _}, {@code %} and {@code \}. Escaping that is instead needed because
+   * the database treats a character specially inside a SQL <em>string literal</em> belongs in
+   * {@link #escapeStringLiteralForLikePattern}.
+   */
+  protected String escapeSpecialCharsForLikePattern(String str) {
+    StringBuilder builder = new StringBuilder();
+
+    for (char c : str.toCharArray()) {
+      switch (c) {
+        case '_' -> builder.append("\\_");
+        case '%' -> builder.append("\\%");
+        case '\\' -> builder.append("\\\\");
+        default -> builder.append(c);
+      }
+    }
+
+    return builder.toString();
+  }
+
+  /**
+   * Escape the characters that the target database treats specially inside a SQL string literal,
+   * applied to a LIKE pattern (and its ESCAPE character) when embedding it into a {@code '...'}
+   * literal for predicate pushdown.
+   *
+   * The default returns the input unchanged: a standard SQL string literal is taken verbatim (the
+   * single-quote doubling is already applied when the literal is rendered), so the {@code \} that
+   * {@link #escapeSpecialCharsForLikePattern} uses as the LIKE escape character reaches the LIKE
+   * engine intact. A dialect whose string-literal syntax gives {@code \} a special meaning (e.g.
+   * MySQL, which treats {@code \} as an escape character inside string literals) must override this
+   * to double the backslash, so the LIKE pattern survives string-literal parsing unchanged.
+   */
+  protected String escapeStringLiteralForLikePattern(String str) {
+    return str;
+  }
+
+  public String build(Expression expr) {
+    if (expr instanceof Literal literal) {
+      return visitLiteral(literal);
+    } else if (expr instanceof NamedReference namedReference) {
+      return visitNamedReference(namedReference);
+    } else if (expr instanceof PartitionPredicate partitionPredicate) {
+      return visitPartitionPredicate(partitionPredicate);
+    } else if (expr instanceof Cast cast) {
+      return visitCast(build(cast.expression()), cast.expressionDataType(), cast.dataType());
+    } else if (expr instanceof Extract extract) {
+      return visitExtract(extract);
+    } else if (expr instanceof SortOrder sortOrder) {
+      return visitSortOrder(
+        build(sortOrder.expression()), sortOrder.direction(), sortOrder.nullOrdering());
+    } else if (expr instanceof GetArrayItem getArrayItem) {
+      return visitGetArrayItem(getArrayItem);
+    } else if (expr instanceof VariantGet variantGet) {
+      return visitVariantGet(variantGet);
+    } else if (expr instanceof GeneralScalarExpression e) {
+      String name = e.name();
+      if (isBinaryComparisonOperator(name)) {
+        return visitBinaryComparison(name, e.children()[0], e.children()[1]);
+      }
+      return switch (name) {
+        case "IN" -> {
+          Expression[] expressions = e.children();
+          List<String> children = expressionsToStringList(expressions, 1, expressions.length - 1);
+          // IN needs the same operand grouping as IS NULL: without it, NOT a IN (...)
+          // means NOT (a IN (...)) rather than (NOT a) IN (...).
+          yield visitIn(visitIsNullOperand(expressions[0]), children);
+        }
+        case "IS_NULL" -> visitIsNull(visitIsNullOperand(e.children()[0]));
+        case "IS_NOT_NULL" -> visitIsNotNull(visitIsNullOperand(e.children()[0]));
+        case "STARTS_WITH" -> visitStartsWith(build(e.children()[0]), build(e.children()[1]));
+        case "ENDS_WITH" -> visitEndsWith(build(e.children()[0]), build(e.children()[1]));
+        case "CONTAINS" -> visitContains(build(e.children()[0]), build(e.children()[1]));
+        case "BOOLEAN_EXPRESSION" ->
+          build(expr.children()[0]);
+        case "+", "*", "/", "%", "&", "|", "^" ->
+          visitBinaryArithmetic(name, inputToSQL(e.children()[0]), inputToSQL(e.children()[1]));
+        case "-" -> {
+          if (e.children().length == 1) {
+            yield visitUnaryArithmetic(name, inputToSQL(e.children()[0]));
+          } else {
+            yield visitBinaryArithmetic(
+              name, inputToSQL(e.children()[0]), inputToSQL(e.children()[1]));
+          }
+        }
+        case "AND" -> visitAnd(name, build(e.children()[0]), build(e.children()[1]));
+        case "OR" -> visitOr(name, build(e.children()[0]), build(e.children()[1]));
+        case "NOT" -> visitNot(build(e.children()[0]));
+        case "~" -> visitUnaryArithmetic(name, inputToSQL(e.children()[0]));
+        case "ABS", "COALESCE", "GREATEST", "LEAST", "RAND", "LOG", "LOG10", "LOG2", "LN", "EXP",
+          "POWER", "SQRT", "FLOOR", "CEIL", "ROUND", "SIN", "SINH", "COS", "COSH", "TAN", "TANH",
+          "COT", "ASIN", "ASINH", "ACOS", "ACOSH", "ATAN", "ATANH", "ATAN2", "CBRT", "DEGREES",
+          "RADIANS", "SIGN", "WIDTH_BUCKET", "SUBSTRING", "UPPER", "LOWER", "TRANSLATE",
+          "DATE_ADD", "DATE_DIFF", "TRUNC", "AES_ENCRYPT", "AES_DECRYPT", "SHA1", "SHA2", "MD5",
+          "CRC32", "BIT_LENGTH", "CHAR_LENGTH", "CONCAT", "RPAD", "LPAD" ->
+          visitSQLFunction(name, e.children());
+        case "CASE_WHEN" -> visitCaseWhen(expressionsToStringArray(e.children()));
+        case "TRIM" -> visitTrim("BOTH", expressionsToStringArray(e.children()));
+        case "LTRIM" -> visitTrim("LEADING", expressionsToStringArray(e.children()));
+        case "RTRIM" -> visitTrim("TRAILING", expressionsToStringArray(e.children()));
+        case "OVERLAY" -> visitOverlay(expressionsToStringArray(e.children()));
+        // TODO supports other expressions
+        default -> visitUnexpectedExpr(expr);
+      };
+    } else if (expr instanceof Min min) {
+      return visitAggregateFunction("MIN", false, min.children());
+    } else if (expr instanceof Max max) {
+      return visitAggregateFunction("MAX", false, max.children());
+    } else if (expr instanceof Count count) {
+      return visitAggregateFunction("COUNT", count.isDistinct(), count.children());
+    } else if (expr instanceof Sum sum) {
+      return visitAggregateFunction("SUM", sum.isDistinct(), sum.children());
+    } else if (expr instanceof CountStar countStar) {
+      return visitAggregateFunction("COUNT", false, countStar.children());
+    } else if (expr instanceof Avg avg) {
+      return visitAggregateFunction("AVG", avg.isDistinct(), avg.children());
+    } else if (expr instanceof GeneralAggregateFunc f) {
+      if (f.orderingWithinGroups().length == 0) {
+        return visitAggregateFunction(f.name(), f.isDistinct(), f.children());
+      } else {
+        return visitInverseDistributionFunction(
+          f.name(),
+          f.isDistinct(),
+          expressionsToStringArray(f.children()),
+          expressionsToStringArray(f.orderingWithinGroups()));
+      }
+    } else if (expr instanceof UserDefinedScalarFunc f) {
+      return visitUserDefinedScalarFunction(f.name(), f.canonicalName(),
+        expressionsToStringArray(f.children()));
+    } else if (expr instanceof UserDefinedAggregateFunc f) {
+      return visitUserDefinedAggregateFunction(f.name(), f.canonicalName(), f.isDistinct(),
+        expressionsToStringArray(f.children()));
+    } else {
+      return visitUnexpectedExpr(expr);
+    }
+  }
+
+  protected String visitLiteral(Literal<?> literal) {
+    return literal.toString();
+  }
+
+  protected String visitNamedReference(NamedReference namedRef) {
+    return namedRef.toString();
+  }
+
+  protected String visitIn(String v, List<String> list) {
+    if (list.isEmpty()) {
+      return "CASE WHEN " + v + " IS NULL THEN NULL ELSE FALSE END";
+    }
+    return joinListToString(list, ", ", v + " IN (", ")");
+  }
+
+  // The binary comparison operators, kept in one place so build, isNullOperandNeedsParens and
+  // dialect overrides stay in sync.
+  protected boolean isBinaryComparisonOperator(String name) {
+    return switch (name) {
+      case "=", "<>", "<=>", "<", "<=", ">", ">=" -> true;
+      default -> false;
+    };
+  }
+
+  // Operators whose rendered SQL is NOT a self-delimiting primary and therefore must be
+  // parenthesized before a trailing IS [NOT] NULL: binary comparisons (per SPARK-57243) plus IN,
+  // the boolean connectives, LIKE-family, and arithmetic. Function calls, CASE and CAST already
+  // render self-delimited (`f(...)`, `CASE ... END`, `CAST(...)`), so they are intentionally left
+  // unwrapped to avoid needlessly changing the generated SQL for cases that were already valid.
+  protected boolean isNullOperandNeedsParens(String name) {
+    return isBinaryComparisonOperator(name) || switch (name) {
+      case "IN", "NOT", "AND", "OR", "STARTS_WITH", "ENDS_WITH", "CONTAINS",
+           "+", "-", "*", "/", "%", "&", "|", "^", "~" -> true;
+      default -> false;
+    };
+  }
+
+  // Parenthesize an operand of IS [NOT] NULL whose rendered SQL is not self-delimiting, so
+  // `col = 'x' IS NULL` renders as `(col = 'x') IS NULL` and `a IN (1, 2) IS NULL` renders as
+  // `(a IN (1, 2)) IS NULL`. This keeps the output valid and preserves the intended precedence
+  // across dialects, some of which (e.g. Snowflake) bind IS NULL tighter than comparison operators.
+  protected String visitIsNullOperand(Expression operand) {
+    if (operand instanceof GeneralScalarExpression e && isNullOperandNeedsParens(e.name())) {
+      return "(" + build(operand) + ")";
+    }
+    return build(operand);
+  }
+
+  protected String visitIsNull(String v) {
+    return v + " IS NULL";
+  }
+
+  protected String visitIsNotNull(String v) {
+    return v + " IS NOT NULL";
+  }
+
+  protected String visitStartsWith(String l, String r) {
+    // Remove quotes at the beginning and end.
+    // e.g. converts "'str'" to "str".
+    String value = r.substring(1, r.length() - 1);
+    return likeWithEscape(l, escapeSpecialCharsForLikePattern(value) + "%");
+  }
+
+  protected String visitEndsWith(String l, String r) {
+    // Remove quotes at the beginning and end.
+    // e.g. converts "'str'" to "str".
+    String value = r.substring(1, r.length() - 1);
+    return likeWithEscape(l, "%" + escapeSpecialCharsForLikePattern(value));
+  }
+
+  protected String visitContains(String l, String r) {
+    // Remove quotes at the beginning and end.
+    // e.g. converts "'str'" to "str".
+    String value = r.substring(1, r.length() - 1);
+    return likeWithEscape(l, "%" + escapeSpecialCharsForLikePattern(value) + "%");
+  }
+
+  /**
+   * Build a {@code <left> LIKE '<pattern>' ESCAPE '\'} predicate. The pattern already has its LIKE
+   * special chars escaped (via {@link #escapeSpecialCharsForLikePattern}); both the pattern and
+   * the {@code \} escape character are then passed through
+   * {@link #escapeStringLiteralForLikePattern} so a dialect can add any string-literal escaping
+   * its SQL syntax requires.
+   */
+  private String likeWithEscape(String l, String pattern) {
+    return l + " LIKE '" + escapeStringLiteralForLikePattern(pattern)
+      + "' ESCAPE '" + escapeStringLiteralForLikePattern("\\") + "'";
+  }
+
+  protected String inputToSQL(Expression input) {
+    // NOT is unary, so the arity check alone misses it. Its lower precedence requires
+    // parentheses in comparisons and the IS NULL checks synthesized for null-safe equality.
+    if (input.children().length > 1 ||
+        (input instanceof GeneralScalarExpression e && e.name().equals("NOT"))) {
+      return "(" + build(input) + ")";
+    } else {
+      return build(input);
+    }
+  }
+
+  protected String visitBinaryComparison(String name, Expression le, Expression re) {
+    return visitBinaryComparison(name, inputToSQL(le), inputToSQL(re));
+  }
+
+  protected String visitBinaryComparison(String name, String l, String r) {
+    if (name.equals("<=>")) {
+      return "((" + l + " IS NOT NULL AND " + r + " IS NOT NULL AND " + l + " = " + r + ") " +
+              "OR (" + l + " IS NULL AND " + r + " IS NULL))";
+    }
+    return l + " " + name + " " + r;
+  }
+
+  protected String visitBinaryArithmetic(String name, String l, String r) {
+    return l + " " + name + " " + r;
+  }
+
+  protected String visitCast(String expr, DataType exprDataType, DataType targetDataType) {
+    return "CAST(" + expr + " AS " + targetDataType.typeName() + ")";
+  }
+
+  protected String visitAnd(String name, String l, String r) {
+    return "(" + l + ") " + name + " (" + r + ")";
+  }
+
+  protected String visitOr(String name, String l, String r) {
+    return "(" + l + ") " + name + " (" + r + ")";
+  }
+
+  protected String visitNot(String v) {
+    return "NOT (" + v + ")";
+  }
+
+  protected String visitUnaryArithmetic(String name, String v) { return name + v; }
+
+  protected String visitCaseWhen(String[] children) {
+    StringBuilder sb = new StringBuilder("CASE");
+    for (int i = 0; i < children.length; i += 2) {
+      String c = children[i];
+      int j = i + 1;
+      if (j < children.length) {
+        String v = children[j];
+        sb.append(" WHEN ");
+        sb.append(c);
+        sb.append(" THEN ");
+        sb.append(v);
+      } else {
+        sb.append(" ELSE ");
+        sb.append(c);
+      }
+    }
+    sb.append(" END");
+    return sb.toString();
+  }
+
+  protected String visitSQLFunction(String funcName, Expression[] inputs) {
+    return visitSQLFunction(funcName, expressionsToStringArray(inputs));
+  }
+
+  protected String visitSQLFunction(String funcName, String[] inputs) {
+    return joinArrayToString(inputs, ", ", funcName + "(", ")");
+  }
+
+  /**
+   * Builds SQL for an aggregate function.
+   *
+   * In V2ExpressionSQLBuilder, always use this override (with Expression[])
+   * instead of the String[] version, as the String[] version does not validate
+   * whether the function is supported in JDBC dialects.
+   */
+  protected String visitAggregateFunction(
+      String funcName, boolean isDistinct, Expression[] inputs) {
+    // CountStar has no children but should return with a star
+    if (funcName.equals("COUNT") && inputs.length == 0) {
+      return visitAggregateFunction(funcName, isDistinct, new String[]{"*"});
+    }
+    return visitAggregateFunction(funcName, isDistinct, expressionsToStringArray(inputs));
+  }
+
+  protected String visitAggregateFunction(String funcName, boolean isDistinct, String[] inputs) {
+    if (isDistinct) {
+      return joinArrayToString(inputs, ", ", funcName + "(DISTINCT ", ")");
+    } else {
+      return joinArrayToString(inputs, ", ", funcName + "(", ")");
+    }
+  }
+
+  protected String visitInverseDistributionFunction(
+      String funcName, boolean isDistinct, String[] inputs, String[] orderingWithinGroups) {
+    assert(isDistinct == false);
+    String withinGroup =
+      joinArrayToString(orderingWithinGroups, ", ", "WITHIN GROUP (ORDER BY ", ")");
+    String functionCall = joinArrayToString(inputs, ", ", funcName + "(", ")");
+    return functionCall + " " + withinGroup;
+  }
+
+  protected String visitUserDefinedScalarFunction(
+      String funcName, String canonicalName, String[] inputs) {
+    throw new SparkUnsupportedOperationException(
+      "V2_EXPRESSION_SQL_BUILDER_UDF_NOT_SUPPORTED",
+      Map.of("class", this.getClass().getName(), "funcName", funcName));
+  }
+
+  protected String visitUserDefinedAggregateFunction(
+      String funcName, String canonicalName, boolean isDistinct, String[] inputs) {
+    throw new SparkUnsupportedOperationException(
+      "V2_EXPRESSION_SQL_BUILDER_UDAF_NOT_SUPPORTED",
+      Map.of("class", this.getClass().getName(), "funcName", funcName));
+  }
+
+  protected String visitUnexpectedExpr(Expression expr) throws IllegalArgumentException {
+    throw new SparkIllegalArgumentException(
+      "UNEXPECTED_V2_EXPRESSION", Map.of("expr", String.valueOf(expr)));
+  }
+
+  protected String visitPartitionPredicate(PartitionPredicate partitionPredicate) {
+    return partitionPredicate.describe();
+  }
+
+  protected String visitOverlay(String[] inputs) {
+    assert(inputs.length == 3 || inputs.length == 4);
+    if (inputs.length == 3) {
+      return "OVERLAY(" + inputs[0] + " PLACING " + inputs[1] + " FROM " + inputs[2] + ")";
+    } else {
+      return "OVERLAY(" + inputs[0] + " PLACING " + inputs[1] + " FROM " + inputs[2] +
+        " FOR " + inputs[3]+ ")";
+    }
+  }
+
+  protected String visitTrim(String direction, String[] inputs) {
+    assert(inputs.length == 1 || inputs.length == 2);
+    if (inputs.length == 1) {
+      return "TRIM(" + direction + " FROM " + inputs[0] + ")";
+    } else {
+      return "TRIM(" + direction + " " + inputs[1] + " FROM " + inputs[0] + ")";
+    }
+  }
+
+  protected String visitGetArrayItem(GetArrayItem getArrayItem) {
+    throw new SparkUnsupportedOperationException(
+      "EXPRESSION_TRANSLATION_TO_V2_IS_NOT_SUPPORTED",
+      Map.of("expr", getArrayItem.toString())
+    );
+  }
+
+  protected String visitVariantGet(VariantGet variantGet) {
+    throw new SparkUnsupportedOperationException(
+      "EXPRESSION_TRANSLATION_TO_V2_IS_NOT_SUPPORTED",
+      Map.of("expr", variantGet.toString())
+    );
+  }
+
+  protected String visitExtract(Extract extract) {
+    return visitExtract(extract.field(), build(extract.source()));
+  }
+
+  protected String visitExtract(String field, String source) {
+    return "EXTRACT(" + field + " FROM " + source + ")";
+  }
+
+  protected String visitSortOrder(
+      String sortKey, SortDirection sortDirection, NullOrdering nullOrdering) {
+    return sortKey + " " + sortDirection + " " + nullOrdering;
+  }
+
+  private String joinArrayToString(
+      String[] inputs, CharSequence delimiter, CharSequence prefix, CharSequence suffix) {
+    StringJoiner joiner = new StringJoiner(delimiter, prefix, suffix);
+    for (String input : inputs) {
+      joiner.add(input);
+    }
+    return joiner.toString();
+  }
+
+  private String joinListToString(
+     List<String> inputs, CharSequence delimiter, CharSequence prefix, CharSequence suffix) {
+    StringJoiner joiner = new StringJoiner(delimiter, prefix, suffix);
+    for (String input : inputs) {
+      joiner.add(input);
+    }
+    return joiner.toString();
+  }
+
+  protected String[] expressionsToStringArray(Expression[] expressions) {
+    String[] result = new String[expressions.length];
+    for (int i = 0; i < expressions.length; i++) {
+      result[i] = build(expressions[i]);
+    }
+    return result;
+  }
+
+  private List<String> expressionsToStringList(Expression[] expressions, int offset, int length) {
+    List<String> list = new ArrayList<>(length);
+    final int till = Math.min(offset + length, expressions.length);
+    while (offset < till) {
+      list.add(build(expressions[offset]));
+      offset++;
+    }
+    return list;
+  }
+}

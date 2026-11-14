@@ -17,20 +17,105 @@
 
 package org.apache.spark.sql.catalyst.parser
 
-import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.annotation.DeveloperApi
+import org.apache.spark.sql.catalyst.{FunctionIdentifier, TableIdentifier}
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.types.StructType
 
 /**
  * Interface for a parser.
  */
-trait ParserInterface {
-  /** Creates LogicalPlan for a given SQL string. */
+@DeveloperApi
+trait ParserInterface extends DataTypeParserInterface {
+  /**
+   * Parse a string to a [[LogicalPlan]].
+   */
+  @throws[ParseException]("Text cannot be parsed to a LogicalPlan")
   def parsePlan(sqlText: String): LogicalPlan
 
-  /** Creates Expression for a given SQL string. */
+  /**
+   * Parse a string to a [[LogicalPlan]] with explicit parameter context.
+   * This method avoids thread-local usage for better API design.
+   */
+  @throws[ParseException]("Text cannot be parsed to a LogicalPlan")
+  def parsePlanWithParameters(sqlText: String, parameterContext: ParameterContext): LogicalPlan = {
+    // Default implementation falls back to regular parsePlan
+    // Concrete implementations can override this for parameter support
+    parsePlan(sqlText)
+  }
+
+  /**
+   * Parse a string to an [[Expression]].
+   */
+  @throws[ParseException]("Text cannot be parsed to an Expression")
   def parseExpression(sqlText: String): Expression
 
-  /** Creates TableIdentifier for a given SQL string. */
+  /**
+   * Parse a string to a [[TableIdentifier]].
+   */
+  @throws[ParseException]("Text cannot be parsed to a TableIdentifier")
   def parseTableIdentifier(sqlText: String): TableIdentifier
+
+  /**
+   * Parse a string to a [[FunctionIdentifier]].
+   */
+  @throws[ParseException]("Text cannot be parsed to a FunctionIdentifier")
+  def parseFunctionIdentifier(sqlText: String): FunctionIdentifier
+
+  /**
+   * Parse a string to a multi-part identifier.
+   */
+  @throws[ParseException]("Text cannot be parsed to a multi-part identifier")
+  def parseMultipartIdentifier(sqlText: String): Seq[String]
+
+  /**
+   * Parse a string to a [[TemporalIdentifier]].
+   */
+  @throws[ParseException]("Text cannot be parsed to a temporal table identifier")
+  def parseTemporalTableIdentifier(sqlText: String): TemporalIdentifier = {
+    // Default implementation does not recognize the time travel suffix. Concrete
+    // implementations can override this to support it.
+    TemporalIdentifier(parseMultipartIdentifier(sqlText), None, None)
+  }
+
+  /**
+   * Parse a query string to a [[LogicalPlan]].
+   */
+  @throws[ParseException]("Text cannot be parsed to a LogicalPlan")
+  def parseQuery(sqlText: String): LogicalPlan
+
+  /**
+   * Parse a string to a [[StructType]] as routine parameters, handling default values and comments.
+   */
+  @throws[ParseException]("Text cannot be parsed to routine parameters")
+  def parseRoutineParam(sqlText: String): StructType
+
+  /**
+   * Split a SQL string into individual statements at `;` boundaries.
+   *
+   * Designed for tooling such as the `spark-sql` CLI that needs to feed multiple
+   * statements to the parser one at a time, while correctly handling quoted
+   * strings, single-line and bracketed comments, and SQL scripting compound blocks
+   * (`BEGIN ... END`) so that semicolons inside them do not split the surrounding
+   * statement.
+   *
+   * The method is fault-tolerant: it does not throw on incomplete or malformed
+   * input. Trailing text that does not yet form a complete statement is returned
+   * in [[SqlStatementSplitResult.partialStatement]] so callers can buffer it and
+   * read more input.
+   *
+   * Variable substitution: the emitted [[SqlStatement]] text is always the
+   * **original** input -- variable references such as `${var}` are NOT
+   * substituted at split time, because their values may come from an earlier
+   * `SET` in the same batch that has not executed yet when the splitter runs.
+   * Substitution is deferred to `parsePlan` at execution time, where each
+   * complete statement is substituted individually after all preceding statements
+   * have run. Implementations whose grammar allows `${...}` in syntactically
+   * significant positions (e.g. block boundaries) may use a validation-only
+   * preprocessor to help the parser recognize complete statements -- see
+   * [[org.apache.spark.sql.catalyst.parser.SqlStatementSplitter.split]]'s
+   * `validationPreprocess` hook.
+   */
+  def splitStatements(sqlText: String): SqlStatementSplitResult
 }

@@ -53,15 +53,17 @@ object GradientBoostingClassificationExample {
       val prediction = model.predict(point.features)
       (point.label, prediction)
     }
-    val testErr = labelAndPreds.filter(r => r._1 != r._2).count.toDouble / testData.count()
-    println("Test Error = " + testErr)
-    println("Learned classification GBT model:\n" + model.toDebugString)
+    val testErr = labelAndPreds.filter(r => r._1 != r._2).count().toDouble / testData.count()
+    println(s"Test Error = $testErr")
+    println(s"Learned classification GBT model:\n ${model.toDebugString}")
 
     // Save and load model
     model.save(sc, "target/tmp/myGradientBoostingClassificationModel")
     val sameModel = GradientBoostedTreesModel.load(sc,
       "target/tmp/myGradientBoostingClassificationModel")
     // $example off$
+
+    sc.stop()
   }
 }
 // scalastyle:on println

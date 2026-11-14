@@ -22,7 +22,7 @@ import java.{util => ju}
 import breeze.linalg.{DenseMatrix => BDM, DenseVector => BDV, SparseVector => BSV}
 
 import org.apache.spark.{SparkException, SparkFunSuite}
-import org.apache.spark.mllib.linalg.{DenseMatrix, DenseVector, Matrices, Matrix, SparseMatrix, SparseVector, Vectors}
+import org.apache.spark.mllib.linalg.{DenseMatrix, Matrices, Matrix, SparseMatrix}
 import org.apache.spark.mllib.util.MLlibTestSparkContext
 import org.apache.spark.mllib.util.TestingUtils._
 
@@ -35,7 +35,7 @@ class BlockMatrixSuite extends SparkFunSuite with MLlibTestSparkContext {
   val numPartitions = 3
   var gridBasedMat: BlockMatrix = _
 
-  override def beforeAll() {
+  override def beforeAll(): Unit = {
     super.beforeAll()
     val blocks: Seq[((Int, Int), Matrix)] = Seq(
       ((0, 0), new DenseMatrix(2, 2, Array(1.0, 0.0, 0.0, 2.0))),
@@ -136,9 +136,9 @@ class BlockMatrixSuite extends SparkFunSuite with MLlibTestSparkContext {
     assert(rowMat.toBreeze() === gridBasedMat.toBreeze())
 
     // SPARK-15922: BlockMatrix to IndexedRowMatrix throws an error"
-    val bmat = rowMat.toBlockMatrix
-    val imat = bmat.toIndexedRowMatrix
-    imat.rows.collect
+    val bmat = rowMat.toBlockMatrix()
+    val imat = bmat.toIndexedRowMatrix()
+    imat.rows.collect()
 
     val rows = 1
     val cols = 10
@@ -155,7 +155,7 @@ class BlockMatrixSuite extends SparkFunSuite with MLlibTestSparkContext {
     val rdd = sc.parallelize(vectors)
     val B = new BlockMatrix(rdd, rows, cols)
 
-    val C = B.toIndexedRowMatrix.rows.collect
+    val C = B.toIndexedRowMatrix().rows.collect()
 
     (C(0).vector.asBreeze, C(1).vector.asBreeze) match {
       case (denseVector: BDV[Double], sparseVector: BSV[Double]) =>
@@ -267,6 +267,15 @@ class BlockMatrixSuite extends SparkFunSuite with MLlibTestSparkContext {
     assert(sparseBM.subtract(sparseBM).toBreeze() === sparseBM.subtract(denseBM).toBreeze())
   }
 
+  def testMultiply(A: BlockMatrix, B: BlockMatrix, expectedResult: Matrix,
+      numMidDimSplits: Int): Unit = {
+    val C = A.multiply(B, numMidDimSplits)
+    val localC = C.toLocalMatrix()
+    assert(C.numRows() === A.numRows())
+    assert(C.numCols() === B.numCols())
+    assert(localC ~== expectedResult absTol 1e-8)
+  }
+
   test("multiply") {
     // identity matrix
     val blocks: Seq[((Int, Int), Matrix)] = Seq(
@@ -302,12 +311,13 @@ class BlockMatrixSuite extends SparkFunSuite with MLlibTestSparkContext {
     // Try it with increased number of partitions
     val largeA = new BlockMatrix(sc.parallelize(largerAblocks, 10), 6, 4)
     val largeB = new BlockMatrix(sc.parallelize(largerBblocks, 8), 4, 4)
-    val largeC = largeA.multiply(largeB)
-    val localC = largeC.toLocalMatrix()
+
     val result = largeA.toLocalMatrix().multiply(largeB.toLocalMatrix().asInstanceOf[DenseMatrix])
-    assert(largeC.numRows() === largeA.numRows())
-    assert(largeC.numCols() === largeB.numCols())
-    assert(localC ~== result absTol 1e-8)
+
+    testMultiply(largeA, largeB, result, 1)
+    testMultiply(largeA, largeB, result, 2)
+    testMultiply(largeA, largeB, result, 3)
+    testMultiply(largeA, largeB, result, 4)
   }
 
   test("simulate multiply") {
@@ -318,7 +328,7 @@ class BlockMatrixSuite extends SparkFunSuite with MLlibTestSparkContext {
     val B = new BlockMatrix(rdd, colPerPart, rowPerPart)
     val resultPartitioner = GridPartitioner(gridBasedMat.numRowBlocks, B.numColBlocks,
       math.max(numPartitions, 2))
-    val (destinationsA, destinationsB) = gridBasedMat.simulateMultiply(B, resultPartitioner)
+    val (destinationsA, destinationsB) = gridBasedMat.simulateMultiply(B, resultPartitioner, 1)
     assert(destinationsA((0, 0)) === Set(0))
     assert(destinationsA((0, 1)) === Set(2))
     assert(destinationsA((1, 0)) === Set(0))

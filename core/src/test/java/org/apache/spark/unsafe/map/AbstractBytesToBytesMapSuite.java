@@ -19,25 +19,30 @@ package org.apache.spark.unsafe.map;
 
 import java.io.File;
 import java.io.IOException;
-import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.util.*;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
-import scala.Tuple2;
 import scala.Tuple2$;
-import scala.runtime.AbstractFunction1;
 
-import org.junit.After;
-import org.junit.Assert;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
-import org.mockito.invocation.InvocationOnMock;
-import org.mockito.stubbing.Answer;
 
 import org.apache.spark.SparkConf;
 import org.apache.spark.executor.ShuffleWriteMetrics;
+import org.apache.spark.memory.MemoryMode;
+import org.apache.spark.memory.SparkOutOfMemoryError;
+import org.apache.spark.memory.TestMemoryConsumer;
 import org.apache.spark.memory.TaskMemoryManager;
 import org.apache.spark.memory.TestMemoryManager;
 import org.apache.spark.network.util.JavaUtils;
@@ -46,15 +51,15 @@ import org.apache.spark.serializer.SerializerInstance;
 import org.apache.spark.serializer.SerializerManager;
 import org.apache.spark.storage.*;
 import org.apache.spark.unsafe.Platform;
+import org.apache.spark.unsafe.UnsafeAlignedOffset;
 import org.apache.spark.unsafe.array.ByteArrayMethods;
 import org.apache.spark.util.Utils;
+import org.apache.spark.internal.config.package$;
 
-import static org.hamcrest.Matchers.greaterThan;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
+import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Answers.RETURNS_SMART_NULLS;
-import static org.mockito.Matchers.any;
-import static org.mockito.Matchers.anyInt;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.when;
 
 
@@ -66,7 +71,7 @@ public abstract class AbstractBytesToBytesMapSuite {
   private TaskMemoryManager taskMemoryManager;
   private SerializerManager serializerManager = new SerializerManager(
       new JavaSerializer(new SparkConf()),
-      new SparkConf().set("spark.shuffle.spill.compress", "false"));
+      new SparkConf().set(package$.MODULE$.SHUFFLE_SPILL_COMPRESS(), false));
   private static final long PAGE_SIZE_BYTES = 1L << 26; // 64 megabytes
 
   final LinkedList<File> spillFilesCreated = new LinkedList<>();
@@ -75,76 +80,184 @@ public abstract class AbstractBytesToBytesMapSuite {
   @Mock(answer = RETURNS_SMART_NULLS) BlockManager blockManager;
   @Mock(answer = RETURNS_SMART_NULLS) DiskBlockManager diskBlockManager;
 
-  private static final class CompressStream extends AbstractFunction1<OutputStream, OutputStream> {
-    @Override
-    public OutputStream apply(OutputStream stream) {
-      return stream;
-    }
-  }
-
-  @Before
-  public void setup() {
+  @BeforeEach
+  public void setup() throws Exception {
     memoryManager =
       new TestMemoryManager(
         new SparkConf()
-          .set("spark.memory.offHeap.enabled", "" + useOffHeapMemoryAllocator())
-          .set("spark.memory.offHeap.size", "256mb")
-          .set("spark.shuffle.spill.compress", "false")
-          .set("spark.shuffle.compress", "false"));
+          .set(package$.MODULE$.MEMORY_OFFHEAP_ENABLED(), useOffHeapMemoryAllocator())
+          .set(package$.MODULE$.MEMORY_OFFHEAP_SIZE(), 256 * 1024 * 1024L)
+          .set(package$.MODULE$.SHUFFLE_SPILL_COMPRESS(), false)
+          .set(package$.MODULE$.SHUFFLE_COMPRESS(), false));
     taskMemoryManager = new TaskMemoryManager(memoryManager, 0);
 
     tempDir = Utils.createTempDir(System.getProperty("java.io.tmpdir"), "unsafe-test");
     spillFilesCreated.clear();
-    MockitoAnnotations.initMocks(this);
+    MockitoAnnotations.openMocks(this).close();
     when(blockManager.diskBlockManager()).thenReturn(diskBlockManager);
-    when(diskBlockManager.createTempLocalBlock()).thenAnswer(
-        new Answer<Tuple2<TempLocalBlockId, File>>() {
-      @Override
-      public Tuple2<TempLocalBlockId, File> answer(InvocationOnMock invocationOnMock)
-          throws Throwable {
-        TempLocalBlockId blockId = new TempLocalBlockId(UUID.randomUUID());
-        File file = File.createTempFile("spillFile", ".spill", tempDir);
-        spillFilesCreated.add(file);
-        return Tuple2$.MODULE$.apply(blockId, file);
-      }
+    when(diskBlockManager.createTempLocalBlock()).thenAnswer(invocationOnMock -> {
+      TempLocalBlockId blockId = new TempLocalBlockId(UUID.randomUUID());
+      File file = File.createTempFile("spillFile", ".spill", tempDir);
+      spillFilesCreated.add(file);
+      return Tuple2$.MODULE$.apply(blockId, file);
     });
     when(blockManager.getDiskWriter(
       any(BlockId.class),
       any(File.class),
       any(SerializerInstance.class),
       anyInt(),
-      any(ShuffleWriteMetrics.class))).thenAnswer(new Answer<DiskBlockObjectWriter>() {
-      @Override
-      public DiskBlockObjectWriter answer(InvocationOnMock invocationOnMock) throws Throwable {
+      any(ShuffleWriteMetrics.class))).thenAnswer(invocationOnMock -> {
         Object[] args = invocationOnMock.getArguments();
 
         return new DiskBlockObjectWriter(
           (File) args[1],
+          serializerManager,
           (SerializerInstance) args[2],
           (Integer) args[3],
-          new CompressStream(),
           false,
           (ShuffleWriteMetrics) args[4],
           (BlockId) args[0]
         );
-      }
-    });
+      });
   }
 
-  @After
+  @AfterEach
   public void tearDown() {
     Utils.deleteRecursively(tempDir);
     tempDir = null;
 
     if (taskMemoryManager != null) {
-      Assert.assertEquals(0L, taskMemoryManager.cleanUpAllAllocatedMemory());
+      Assertions.assertEquals(0L, taskMemoryManager.cleanUpAllAllocatedMemory());
       long leakedMemory = taskMemoryManager.getMemoryConsumptionForThisTask();
       taskMemoryManager = null;
-      Assert.assertEquals(0L, leakedMemory);
+      Assertions.assertEquals(0L, leakedMemory);
     }
   }
 
   protected abstract boolean useOffHeapMemoryAllocator();
+
+  @Test
+  public void supportsSemanticKeyOperations() throws Exception {
+    AtomicInteger operationsCreated = new AtomicInteger();
+    BytesToBytesMap.KeyOperationsFactory caseInsensitiveWithConstantHash = () -> {
+      operationsCreated.incrementAndGet();
+      return new BytesToBytesMap.KeyOperations() {
+        private final AtomicReference<Thread> owner = new AtomicReference<>();
+
+        private void assertThreadOwnership() {
+          final Thread currentThread = Thread.currentThread();
+          owner.compareAndSet(null, currentThread);
+          assertSame(currentThread, owner.get());
+        }
+
+        @Override
+        public int hash(Object base, long offset, int length) {
+          assertThreadOwnership();
+          return 0;
+        }
+
+        @Override
+        public boolean equals(
+            Object leftBase,
+            long leftOffset,
+            int leftLength,
+            Object rightBase,
+            long rightOffset,
+            int rightLength) {
+          assertThreadOwnership();
+          return Character.toLowerCase(Platform.getByte(leftBase, leftOffset)) ==
+            Character.toLowerCase(Platform.getByte(rightBase, rightOffset));
+        }
+      };
+    };
+    BytesToBytesMap map = new BytesToBytesMap(
+      taskMemoryManager, 64, PAGE_SIZE_BYTES, caseInsensitiveWithConstantHash);
+    ExecutorService executor = Executors.newFixedThreadPool(2);
+
+    byte[] firstStoredKey = new byte[8];
+    firstStoredKey[0] = 'A';
+    byte[] firstEquivalentKey = new byte[16];
+    firstEquivalentKey[0] = 'a';
+    byte[] firstValue = new byte[8];
+    Platform.putLong(firstValue, Platform.BYTE_ARRAY_OFFSET, 1L);
+    byte[] secondStoredKey = new byte[8];
+    secondStoredKey[0] = 'B';
+    byte[] secondEquivalentKey = new byte[16];
+    secondEquivalentKey[0] = 'b';
+    byte[] secondValue = new byte[8];
+    Platform.putLong(secondValue, Platform.BYTE_ARRAY_OFFSET, 2L);
+
+    try {
+      BytesToBytesMap.Location location = map.lookup(
+        firstStoredKey, Platform.BYTE_ARRAY_OFFSET, firstStoredKey.length);
+      assertFalse(location.isDefined());
+      assertTrue(location.append(
+        firstStoredKey,
+        Platform.BYTE_ARRAY_OFFSET,
+        firstStoredKey.length,
+        firstValue,
+        Platform.BYTE_ARRAY_OFFSET,
+        firstValue.length));
+
+      location = map.lookup(
+        secondStoredKey, Platform.BYTE_ARRAY_OFFSET, secondStoredKey.length);
+      assertFalse(location.isDefined());
+      assertTrue(location.append(
+        secondStoredKey,
+        Platform.BYTE_ARRAY_OFFSET,
+        secondStoredKey.length,
+        secondValue,
+        Platform.BYTE_ARRAY_OFFSET,
+        secondValue.length));
+
+      location = map.lookup(
+        firstEquivalentKey, Platform.BYTE_ARRAY_OFFSET, firstEquivalentKey.length);
+      assertTrue(location.isDefined());
+      assertEquals(firstStoredKey.length, location.getKeyLength());
+      assertEquals(1L, Platform.getLong(location.getValueBase(), location.getValueOffset()));
+
+      location = map.lookup(
+        secondEquivalentKey, Platform.BYTE_ARRAY_OFFSET, secondEquivalentKey.length);
+      assertTrue(location.isDefined());
+      assertEquals(secondStoredKey.length, location.getKeyLength());
+      assertEquals(2L, Platform.getLong(location.getValueBase(), location.getValueOffset()));
+
+      location = map.lookup(
+        firstEquivalentKey,
+        Platform.BYTE_ARRAY_OFFSET,
+        firstEquivalentKey.length,
+        Integer.MAX_VALUE);
+      assertTrue(location.isDefined());
+      assertEquals(2, map.numKeys());
+
+      CountDownLatch ready = new CountDownLatch(2);
+      CountDownLatch start = new CountDownLatch(1);
+      Callable<Void> concurrentLookup = () -> {
+        BytesToBytesMap.Location threadLocation = map.new Location();
+        ready.countDown();
+        start.await();
+        for (int i = 0; i < 100; i++) {
+          map.safeLookup(
+            firstEquivalentKey,
+            Platform.BYTE_ARRAY_OFFSET,
+            firstEquivalentKey.length,
+            threadLocation);
+          assertTrue(threadLocation.isDefined());
+        }
+        return null;
+      };
+      Future<Void> firstLookup = executor.submit(concurrentLookup);
+      Future<Void> secondLookup = executor.submit(concurrentLookup);
+      ready.await();
+      start.countDown();
+      firstLookup.get();
+      secondLookup.get();
+      assertEquals(3, operationsCreated.get());
+    } finally {
+      executor.shutdownNow();
+      map.free();
+    }
+  }
 
   private static byte[] getByteArray(Object base, long offset, int size) {
     final byte[] arr = new byte[size];
@@ -153,7 +266,7 @@ public abstract class AbstractBytesToBytesMapSuite {
   }
 
   private byte[] getRandomByteArray(int numWords) {
-    Assert.assertTrue(numWords >= 0);
+    Assertions.assertTrue(numWords >= 0);
     final int lengthInBytes = numWords * 8;
     final byte[] bytes = new byte[lengthInBytes];
     rand.nextBytes(bytes);
@@ -182,12 +295,14 @@ public abstract class AbstractBytesToBytesMapSuite {
   public void emptyMap() {
     BytesToBytesMap map = new BytesToBytesMap(taskMemoryManager, 64, PAGE_SIZE_BYTES);
     try {
-      Assert.assertEquals(0, map.numKeys());
+      Assertions.assertEquals(0, map.numKeys());
       final int keyLengthInWords = 10;
       final int keyLengthInBytes = keyLengthInWords * 8;
       final byte[] key = getRandomByteArray(keyLengthInWords);
-      Assert.assertFalse(map.lookup(key, Platform.BYTE_ARRAY_OFFSET, keyLengthInBytes).isDefined());
-      Assert.assertFalse(map.iterator().hasNext());
+      Assertions.assertFalse(
+        map.lookup(key, Platform.BYTE_ARRAY_OFFSET, keyLengthInBytes).isDefined());
+      Assertions.assertFalse(map.iterator().hasNext());
+      Assertions.assertFalse(map.iteratorWithKeyIndex().hasNext());
     } finally {
       map.free();
     }
@@ -203,8 +318,8 @@ public abstract class AbstractBytesToBytesMapSuite {
     try {
       final BytesToBytesMap.Location loc =
         map.lookup(keyData, Platform.BYTE_ARRAY_OFFSET, recordLengthBytes);
-      Assert.assertFalse(loc.isDefined());
-      Assert.assertTrue(loc.append(
+      Assertions.assertFalse(loc.isDefined());
+      Assertions.assertTrue(loc.append(
         keyData,
         Platform.BYTE_ARRAY_OFFSET,
         recordLengthBytes,
@@ -214,53 +329,42 @@ public abstract class AbstractBytesToBytesMapSuite {
       ));
       // After storing the key and value, the other location methods should return results that
       // reflect the result of this store without us having to call lookup() again on the same key.
-      Assert.assertEquals(recordLengthBytes, loc.getKeyLength());
-      Assert.assertEquals(recordLengthBytes, loc.getValueLength());
-      Assert.assertArrayEquals(keyData,
+      Assertions.assertEquals(recordLengthBytes, loc.getKeyLength());
+      Assertions.assertEquals(recordLengthBytes, loc.getValueLength());
+      Assertions.assertArrayEquals(keyData,
         getByteArray(loc.getKeyBase(), loc.getKeyOffset(), recordLengthBytes));
-      Assert.assertArrayEquals(valueData,
+      Assertions.assertArrayEquals(valueData,
         getByteArray(loc.getValueBase(), loc.getValueOffset(), recordLengthBytes));
 
       // After calling lookup() the location should still point to the correct data.
-      Assert.assertTrue(
+      Assertions.assertTrue(
         map.lookup(keyData, Platform.BYTE_ARRAY_OFFSET, recordLengthBytes).isDefined());
-      Assert.assertEquals(recordLengthBytes, loc.getKeyLength());
-      Assert.assertEquals(recordLengthBytes, loc.getValueLength());
-      Assert.assertArrayEquals(keyData,
+      Assertions.assertEquals(recordLengthBytes, loc.getKeyLength());
+      Assertions.assertEquals(recordLengthBytes, loc.getValueLength());
+      Assertions.assertArrayEquals(keyData,
         getByteArray(loc.getKeyBase(), loc.getKeyOffset(), recordLengthBytes));
-      Assert.assertArrayEquals(valueData,
+      Assertions.assertArrayEquals(valueData,
         getByteArray(loc.getValueBase(), loc.getValueOffset(), recordLengthBytes));
 
-      try {
-        Assert.assertTrue(loc.append(
-          keyData,
-          Platform.BYTE_ARRAY_OFFSET,
-          recordLengthBytes,
-          valueData,
-          Platform.BYTE_ARRAY_OFFSET,
-          recordLengthBytes
-        ));
-        Assert.fail("Should not be able to set a new value for a key");
-      } catch (AssertionError e) {
-        // Expected exception; do nothing.
-      }
     } finally {
       map.free();
     }
   }
 
-  private void iteratorTestBase(boolean destructive) throws Exception {
+  private int iteratorTestBase(boolean destructive, boolean isWithKeyIndex, long pageSizeBytes)
+      throws Exception {
     final int size = 4096;
-    BytesToBytesMap map = new BytesToBytesMap(taskMemoryManager, size / 2, PAGE_SIZE_BYTES);
+    BytesToBytesMap map = new BytesToBytesMap(taskMemoryManager, size / 2, pageSizeBytes);
+    Assertions.assertEquals(size / 2, map.maxNumKeysIndex());
     try {
       for (long i = 0; i < size; i++) {
         final long[] value = new long[] { i };
         final BytesToBytesMap.Location loc =
           map.lookup(value, Platform.LONG_ARRAY_OFFSET, 8);
-        Assert.assertFalse(loc.isDefined());
+        Assertions.assertFalse(loc.isDefined());
         // Ensure that we store some zero-length keys
         if (i % 5 == 0) {
-          Assert.assertTrue(loc.append(
+          Assertions.assertTrue(loc.append(
             null,
             Platform.LONG_ARRAY_OFFSET,
             0,
@@ -269,7 +373,7 @@ public abstract class AbstractBytesToBytesMapSuite {
             8
           ));
         } else {
-          Assert.assertTrue(loc.append(
+          Assertions.assertTrue(loc.append(
             value,
             Platform.LONG_ARRAY_OFFSET,
             8,
@@ -283,22 +387,27 @@ public abstract class AbstractBytesToBytesMapSuite {
       final Iterator<BytesToBytesMap.Location> iter;
       if (destructive) {
         iter = map.destructiveIterator();
+      } else if (isWithKeyIndex) {
+        iter = map.iteratorWithKeyIndex();
       } else {
         iter = map.iterator();
       }
-      int numPages = map.getNumDataPages();
+      final int totalPages = map.getNumDataPages();
+      int numPages = totalPages;
       int countFreedPages = 0;
       while (iter.hasNext()) {
         final BytesToBytesMap.Location loc = iter.next();
-        Assert.assertTrue(loc.isDefined());
+        Assertions.assertTrue(loc.isDefined());
         final long value = Platform.getLong(loc.getValueBase(), loc.getValueOffset());
         final long keyLength = loc.getKeyLength();
         if (keyLength == 0) {
-          Assert.assertTrue("value " + value + " was not divisible by 5", value % 5 == 0);
+          assertEquals(0, value % 5, "value " + value + " was not divisible by 5");
         } else {
           final long key = Platform.getLong(loc.getKeyBase(), loc.getKeyOffset());
-          Assert.assertEquals(value, key);
+          Assertions.assertEquals(value, key);
         }
+        Assertions.assertFalse(valuesSeen.get((int) value),
+          "value " + value + " was seen more than once");
         valuesSeen.set((int) value);
         if (destructive) {
           // The iterator moves onto next page and frees previous page
@@ -307,12 +416,20 @@ public abstract class AbstractBytesToBytesMapSuite {
             countFreedPages++;
           }
         }
+        if (keyLength != 0 && isWithKeyIndex) {
+          final BytesToBytesMap.Location expectedLoc = map.lookup(
+            loc.getKeyBase(), loc.getKeyOffset(), loc.getKeyLength());
+          Assertions.assertTrue(expectedLoc.isDefined() &&
+            expectedLoc.getKeyIndex() == loc.getKeyIndex());
+        }
       }
       if (destructive) {
-        // Latest page is not freed by iterator but by map itself
-        Assert.assertEquals(countFreedPages, numPages - 1);
+        // The iterator frees each page as it advances except the last, which map.free() releases.
+        Assertions.assertEquals(totalPages - 1, countFreedPages);
+        Assertions.assertEquals(1, map.getNumDataPages());
       }
-      Assert.assertEquals(size, valuesSeen.cardinality());
+      Assertions.assertEquals(size, valuesSeen.cardinality());
+      return totalPages;
     } finally {
       map.free();
     }
@@ -320,12 +437,26 @@ public abstract class AbstractBytesToBytesMapSuite {
 
   @Test
   public void iteratorTest() throws Exception {
-    iteratorTestBase(false);
+    iteratorTestBase(false, false, PAGE_SIZE_BYTES);
   }
 
   @Test
   public void destructiveIteratorTest() throws Exception {
-    iteratorTestBase(true);
+    iteratorTestBase(true, false, PAGE_SIZE_BYTES);
+  }
+
+  @Test
+  public void destructiveIteratorManyPagesTest() throws Exception {
+    // A small page size makes records span many data pages, so the destructive iterator
+    // repeatedly removes the head page. The 64 MiB default fits everything in one page.
+    final int totalPages = iteratorTestBase(true, false, 4096);
+    Assertions.assertTrue(totalPages > 1,
+      "expected the records to span multiple data pages, but got " + totalPages);
+  }
+
+  @Test
+  public void iteratorWithKeyIndexTest() throws Exception {
+    iteratorTestBase(false, true, PAGE_SIZE_BYTES);
   }
 
   @Test
@@ -348,8 +479,8 @@ public abstract class AbstractBytesToBytesMapSuite {
           Platform.LONG_ARRAY_OFFSET,
           KEY_LENGTH
         );
-        Assert.assertFalse(loc.isDefined());
-        Assert.assertTrue(loc.append(
+        Assertions.assertFalse(loc.isDefined());
+        Assertions.assertTrue(loc.append(
           key,
           Platform.LONG_ARRAY_OFFSET,
           KEY_LENGTH,
@@ -358,7 +489,7 @@ public abstract class AbstractBytesToBytesMapSuite {
           VALUE_LENGTH
         ));
       }
-      Assert.assertEquals(2, map.getNumDataPages());
+      Assertions.assertEquals(2, map.getNumDataPages());
 
       final java.util.BitSet valuesSeen = new java.util.BitSet(NUM_ENTRIES);
       final Iterator<BytesToBytesMap.Location> iter = map.iterator();
@@ -366,9 +497,9 @@ public abstract class AbstractBytesToBytesMapSuite {
       final long[] value = new long[VALUE_LENGTH / 8];
       while (iter.hasNext()) {
         final BytesToBytesMap.Location loc = iter.next();
-        Assert.assertTrue(loc.isDefined());
-        Assert.assertEquals(KEY_LENGTH, loc.getKeyLength());
-        Assert.assertEquals(VALUE_LENGTH, loc.getValueLength());
+        Assertions.assertTrue(loc.isDefined());
+        Assertions.assertEquals(KEY_LENGTH, loc.getKeyLength());
+        Assertions.assertEquals(VALUE_LENGTH, loc.getValueLength());
         Platform.copyMemory(
           loc.getKeyBase(),
           loc.getKeyOffset(),
@@ -384,14 +515,14 @@ public abstract class AbstractBytesToBytesMapSuite {
           VALUE_LENGTH
         );
         for (long j : key) {
-          Assert.assertEquals(key[0], j);
+          Assertions.assertEquals(key[0], j);
         }
         for (long j : value) {
-          Assert.assertEquals(key[0], j);
+          Assertions.assertEquals(key[0], j);
         }
         valuesSeen.set((int) key[0]);
       }
-      Assert.assertEquals(NUM_ENTRIES, valuesSeen.cardinality());
+      Assertions.assertEquals(NUM_ENTRIES, valuesSeen.cardinality());
     } finally {
       map.free();
     }
@@ -399,7 +530,7 @@ public abstract class AbstractBytesToBytesMapSuite {
 
   @Test
   public void randomizedStressTest() {
-    final int size = 65536;
+    final int size = 32768;
     // Java arrays' hashCodes() aren't based on the arrays' contents, so we need to wrap arrays
     // into ByteBuffers in order to use them as keys here.
     final Map<ByteBuffer, byte[]> expected = new HashMap<>();
@@ -408,7 +539,7 @@ public abstract class AbstractBytesToBytesMapSuite {
       // Fill the map to 90% full so that we can trigger probing
       for (int i = 0; i < size * 0.9; i++) {
         final byte[] key = getRandomByteArray(rand.nextInt(256) + 1);
-        final byte[] value = getRandomByteArray(rand.nextInt(512) + 1);
+        final byte[] value = getRandomByteArray(rand.nextInt(256) + 1);
         if (!expected.containsKey(ByteBuffer.wrap(key))) {
           expected.put(ByteBuffer.wrap(key), value);
           final BytesToBytesMap.Location loc = map.lookup(
@@ -416,8 +547,8 @@ public abstract class AbstractBytesToBytesMapSuite {
             Platform.BYTE_ARRAY_OFFSET,
             key.length
           );
-          Assert.assertFalse(loc.isDefined());
-          Assert.assertTrue(loc.append(
+          Assertions.assertFalse(loc.isDefined());
+          Assertions.assertTrue(loc.append(
             key,
             Platform.BYTE_ARRAY_OFFSET,
             key.length,
@@ -427,11 +558,11 @@ public abstract class AbstractBytesToBytesMapSuite {
           ));
           // After calling putNewKey, the following should be true, even before calling
           // lookup():
-          Assert.assertTrue(loc.isDefined());
-          Assert.assertEquals(key.length, loc.getKeyLength());
-          Assert.assertEquals(value.length, loc.getValueLength());
-          Assert.assertTrue(arrayEquals(key, loc.getKeyBase(), loc.getKeyOffset(), key.length));
-          Assert.assertTrue(
+          Assertions.assertTrue(loc.isDefined());
+          Assertions.assertEquals(key.length, loc.getKeyLength());
+          Assertions.assertEquals(value.length, loc.getValueLength());
+          Assertions.assertTrue(arrayEquals(key, loc.getKeyBase(), loc.getKeyOffset(), key.length));
+          Assertions.assertTrue(
             arrayEquals(value, loc.getValueBase(), loc.getValueOffset(), value.length));
         }
       }
@@ -441,10 +572,10 @@ public abstract class AbstractBytesToBytesMapSuite {
         final byte[] value = entry.getValue();
         final BytesToBytesMap.Location loc =
           map.lookup(key, Platform.BYTE_ARRAY_OFFSET, key.length);
-        Assert.assertTrue(loc.isDefined());
-        Assert.assertTrue(
+        Assertions.assertTrue(loc.isDefined());
+        Assertions.assertTrue(
           arrayEquals(key, loc.getKeyBase(), loc.getKeyOffset(), loc.getKeyLength()));
-        Assert.assertTrue(
+        Assertions.assertTrue(
           arrayEquals(value, loc.getValueBase(), loc.getValueOffset(), loc.getValueLength()));
       }
     } finally {
@@ -470,8 +601,8 @@ public abstract class AbstractBytesToBytesMapSuite {
             Platform.BYTE_ARRAY_OFFSET,
             key.length
           );
-          Assert.assertFalse(loc.isDefined());
-          Assert.assertTrue(loc.append(
+          Assertions.assertFalse(loc.isDefined());
+          Assertions.assertTrue(loc.append(
             key,
             Platform.BYTE_ARRAY_OFFSET,
             key.length,
@@ -481,11 +612,11 @@ public abstract class AbstractBytesToBytesMapSuite {
           ));
           // After calling putNewKey, the following should be true, even before calling
           // lookup():
-          Assert.assertTrue(loc.isDefined());
-          Assert.assertEquals(key.length, loc.getKeyLength());
-          Assert.assertEquals(value.length, loc.getValueLength());
-          Assert.assertTrue(arrayEquals(key, loc.getKeyBase(), loc.getKeyOffset(), key.length));
-          Assert.assertTrue(
+          Assertions.assertTrue(loc.isDefined());
+          Assertions.assertEquals(key.length, loc.getKeyLength());
+          Assertions.assertEquals(value.length, loc.getValueLength());
+          Assertions.assertTrue(arrayEquals(key, loc.getKeyBase(), loc.getKeyOffset(), key.length));
+          Assertions.assertTrue(
             arrayEquals(value, loc.getValueBase(), loc.getValueOffset(), value.length));
         }
       }
@@ -494,10 +625,10 @@ public abstract class AbstractBytesToBytesMapSuite {
         final byte[] value = entry.getValue();
         final BytesToBytesMap.Location loc =
           map.lookup(key, Platform.BYTE_ARRAY_OFFSET, key.length);
-        Assert.assertTrue(loc.isDefined());
-        Assert.assertTrue(
+        Assertions.assertTrue(loc.isDefined());
+        Assertions.assertTrue(
           arrayEquals(key, loc.getKeyBase(), loc.getKeyOffset(), loc.getKeyLength()));
-        Assert.assertTrue(
+        Assertions.assertTrue(
           arrayEquals(value, loc.getValueBase(), loc.getValueOffset(), loc.getValueLength()));
       }
     } finally {
@@ -513,8 +644,8 @@ public abstract class AbstractBytesToBytesMapSuite {
       final long[] emptyArray = new long[0];
       final BytesToBytesMap.Location loc =
         map.lookup(emptyArray, Platform.LONG_ARRAY_OFFSET, 0);
-      Assert.assertFalse(loc.isDefined());
-      Assert.assertFalse(loc.append(
+      Assertions.assertFalse(loc.isDefined());
+      Assertions.assertFalse(loc.append(
         emptyArray, Platform.LONG_ARRAY_OFFSET, 0, emptyArray, Platform.LONG_ARRAY_OFFSET, 0));
     } finally {
       map.free();
@@ -540,8 +671,8 @@ public abstract class AbstractBytesToBytesMapSuite {
           break;
         }
       }
-      Assert.assertThat(i, greaterThan(0));
-      Assert.assertFalse(success);
+      assertTrue(i > 0);
+      Assertions.assertFalse(success);
     } finally {
       map.free();
     }
@@ -550,7 +681,7 @@ public abstract class AbstractBytesToBytesMapSuite {
   @Test
   public void spillInIterator() throws IOException {
     BytesToBytesMap map = new BytesToBytesMap(
-      taskMemoryManager, blockManager, serializerManager, 1, 0.75, 1024, false);
+      taskMemoryManager, blockManager, serializerManager, 1, 0.75, 1024);
     try {
       int i;
       for (i = 0; i < 1024; i++) {
@@ -563,7 +694,7 @@ public abstract class AbstractBytesToBytesMapSuite {
         iter.next();
       }
       // Non-destructive iterator is not spillable
-      Assert.assertEquals(0, iter.spill(1024L * 10));
+      Assertions.assertEquals(0, iter.spill(1024L * 10));
       for (i = 100; i < 1024; i++) {
         iter.next();
       }
@@ -572,16 +703,18 @@ public abstract class AbstractBytesToBytesMapSuite {
       for (i = 0; i < 100; i++) {
         iter2.next();
       }
-      Assert.assertTrue(iter2.spill(1024) >= 1024);
+      Assertions.assertTrue(iter2.spill(1024) >= 1024);
       for (i = 100; i < 1024; i++) {
         iter2.next();
       }
       assertFalse(iter2.hasNext());
+      // calls hasNext twice deliberately, make sure it's idempotent
+      assertFalse(iter2.hasNext());
     } finally {
       map.free();
       for (File spillFile : spillFilesCreated) {
-        assertFalse("Spill file " + spillFile.getPath() + " was not cleaned up",
-          spillFile.exists());
+        assertFalse(spillFile.exists(),
+          "Spill file " + spillFile.getPath() + " was not cleaned up");
       }
     }
   }
@@ -589,7 +722,7 @@ public abstract class AbstractBytesToBytesMapSuite {
   @Test
   public void multipleValuesForSameKey() {
     BytesToBytesMap map =
-      new BytesToBytesMap(taskMemoryManager, blockManager, serializerManager, 1, 0.5, 1024, false);
+      new BytesToBytesMap(taskMemoryManager, blockManager, serializerManager, 1, 0.5, 1024);
     try {
       int i;
       for (i = 0; i < 1024; i++) {
@@ -597,27 +730,33 @@ public abstract class AbstractBytesToBytesMapSuite {
         map.lookup(arr, Platform.LONG_ARRAY_OFFSET, 8)
           .append(arr, Platform.LONG_ARRAY_OFFSET, 8, arr, Platform.LONG_ARRAY_OFFSET, 8);
       }
-      assert map.numKeys() == 1024;
-      assert map.numValues() == 1024;
+      assertEquals(1024, map.numKeys());
+      assertEquals(1024, map.numValues());
       for (i = 0; i < 1024; i++) {
         final long[] arr = new long[]{i};
         map.lookup(arr, Platform.LONG_ARRAY_OFFSET, 8)
           .append(arr, Platform.LONG_ARRAY_OFFSET, 8, arr, Platform.LONG_ARRAY_OFFSET, 8);
       }
-      assert map.numKeys() == 1024;
-      assert map.numValues() == 2048;
+      assertEquals(1024, map.numKeys());
+      assertEquals(2048, map.numValues());
       for (i = 0; i < 1024; i++) {
         final long[] arr = new long[]{i};
         final BytesToBytesMap.Location loc = map.lookup(arr, Platform.LONG_ARRAY_OFFSET, 8);
-        assert loc.isDefined();
-        assert loc.nextValue();
-        assert !loc.nextValue();
+        assertTrue(loc.isDefined());
+        assertTrue(loc.nextValue());
+        assertFalse(loc.nextValue());
       }
       BytesToBytesMap.MapIterator iter = map.iterator();
       for (i = 0; i < 2048; i++) {
-        assert iter.hasNext();
+        assertTrue(iter.hasNext());
         final BytesToBytesMap.Location loc = iter.next();
-        assert loc.isDefined();
+        assertTrue(loc.isDefined());
+      }
+      BytesToBytesMap.MapIteratorWithKeyIndex iterWithKeyIndex = map.iteratorWithKeyIndex();
+      for (i = 0; i < 2048; i++) {
+        assertTrue(iterWithKeyIndex.hasNext());
+        final BytesToBytesMap.Location loc = iterWithKeyIndex.next();
+        assertTrue(loc.isDefined() && loc.getKeyIndex() >= 0);
       }
     } finally {
       map.free();
@@ -626,22 +765,16 @@ public abstract class AbstractBytesToBytesMapSuite {
 
   @Test
   public void initialCapacityBoundsChecking() {
-    try {
-      new BytesToBytesMap(taskMemoryManager, 0, PAGE_SIZE_BYTES);
-      Assert.fail("Expected IllegalArgumentException to be thrown");
-    } catch (IllegalArgumentException e) {
-      // expected exception
-    }
-
-    try {
-      new BytesToBytesMap(
-        taskMemoryManager,
-        BytesToBytesMap.MAX_CAPACITY + 1,
-        PAGE_SIZE_BYTES);
-      Assert.fail("Expected IllegalArgumentException to be thrown");
-    } catch (IllegalArgumentException e) {
-      // expected exception
-    }
+    assertThrows(IllegalArgumentException.class,
+      () -> new BytesToBytesMap(taskMemoryManager, 0, PAGE_SIZE_BYTES));
+    assertThrows(IllegalArgumentException.class,
+      () -> new BytesToBytesMap(taskMemoryManager,
+              BytesToBytesMap.MAX_CAPACITY + 1, PAGE_SIZE_BYTES));
+    assertThrows(IllegalArgumentException.class,
+      () -> new BytesToBytesMap(taskMemoryManager, 1,
+              TaskMemoryManager.MAXIMUM_PAGE_SIZE_BYTES + 1));
+    assertThrows(IllegalArgumentException.class,
+      () -> new BytesToBytesMap(taskMemoryManager, 1, PAGE_SIZE_BYTES, 0));
   }
 
   @Test
@@ -682,6 +815,307 @@ public abstract class AbstractBytesToBytesMapSuite {
       newPeakMemory = map.getPeakMemoryUsedBytes();
       assertEquals(previousPeakMemory, newPeakMemory);
 
+    } finally {
+      map.free();
+    }
+  }
+
+  @Test
+  public void dataPagesGrowFromInitialPageSize() {
+    final BytesToBytesMap map = new BytesToBytesMap(taskMemoryManager, 1, 6144, 1024);
+    try {
+      // The pages double from 1 KiB, and the last growing page is cut to the 3 KiB left, so the
+      // growing pages add up to exactly one page size before the pages of 6 KiB begin.
+      assertEquals(1024, appendUntilNewDataPage(map, 1));
+      assertEquals(2048, appendUntilNewDataPage(map, 1));
+      assertEquals(3072, appendUntilNewDataPage(map, 1));
+      assertEquals(6144, appendUntilNewDataPage(map, 1));
+      assertEquals(6144, appendUntilNewDataPage(map, 1));
+
+      // reset() starts again from the initial page size.
+      map.reset();
+      assertEquals(1024, appendUntilNewDataPage(map, 1));
+      // A record larger than the next page size, 2 KiB, gets a page of its own size: the record
+      // count of the page, the two lengths, the key, the value and the pointer to the next value.
+      final int largeValueWords = 300;
+      assertEquals(3L * UnsafeAlignedOffset.getUaoSize() + 8 + largeValueWords * 8L + 8,
+        appendUntilNewDataPage(map, largeValueWords));
+    } finally {
+      map.free();
+    }
+
+    // An initial page size larger than the page size is capped at the page size.
+    final BytesToBytesMap cappedMap = new BytesToBytesMap(taskMemoryManager, 1, 1024, 4096);
+    try {
+      assertEquals(1024, appendUntilNewDataPage(cappedMap, 1));
+    } finally {
+      cappedMap.free();
+    }
+  }
+
+  @Test
+  public void growingDataPagesLeaveRoomForArrayHeader() {
+    // SPARK-61257: Like the default on-heap page size under G1 (SPARK-37593), this page size
+    // leaves room for the header of a long[], and so does each growing page. With the header, the
+    // pages double from 1 KiB, and the last growing page is cut to the 1 KiB left.
+    final long header = Platform.LONG_ARRAY_OFFSET;
+    final BytesToBytesMap map = new BytesToBytesMap(taskMemoryManager, 1, 8192 - header, 1024);
+    try {
+      assertEquals(1024 - header, appendUntilNewDataPage(map, 1));
+      assertEquals(2048 - header, appendUntilNewDataPage(map, 1));
+      assertEquals(4096 - header, appendUntilNewDataPage(map, 1));
+      assertEquals(1024 - header, appendUntilNewDataPage(map, 1));
+      assertEquals(8192 - header, appendUntilNewDataPage(map, 1));
+    } finally {
+      map.free();
+    }
+
+    // A map whose pages do not grow keeps pages of the page size.
+    final BytesToBytesMap fullPageMap = new BytesToBytesMap(taskMemoryManager, 1, 8192 - header);
+    try {
+      assertEquals(8192 - header, appendUntilNewDataPage(fullPageMap, 1));
+    } finally {
+      fullPageMap.free();
+    }
+  }
+
+  /**
+   * Appends records with a value of `valueWords` longs until the map allocates a new data page, and
+   * returns the size of that page. All records share one key, so the pointer array does not grow
+   * and every increase of the memory consumption is a new data page.
+   */
+  private static long appendUntilNewDataPage(BytesToBytesMap map, int valueWords) {
+    final long[] key = new long[]{0};
+    final long[] value = new long[valueWords];
+    final long previousMemory = map.getTotalMemoryConsumption();
+    while (true) {
+      assertTrue(map.lookup(key, Platform.LONG_ARRAY_OFFSET, 8).append(
+        key, Platform.LONG_ARRAY_OFFSET, 8, value, Platform.LONG_ARRAY_OFFSET, valueWords * 8));
+      final long memory = map.getTotalMemoryConsumption();
+      if (memory > previousMemory) {
+        return memory - previousMemory;
+      }
+    }
+  }
+
+  @Test
+  public void avoidDeadlock() throws InterruptedException {
+    memoryManager.limit(PAGE_SIZE_BYTES);
+    MemoryMode mode = useOffHeapMemoryAllocator() ? MemoryMode.OFF_HEAP: MemoryMode.ON_HEAP;
+    TestMemoryConsumer c1 = new TestMemoryConsumer(taskMemoryManager, mode);
+    BytesToBytesMap map =
+      new BytesToBytesMap(taskMemoryManager, blockManager, serializerManager, 1, 0.5, 1024);
+
+    Thread thread = new Thread(() -> {
+      int i = 0;
+      while (i < 10) {
+        c1.use(10000000);
+        i++;
+      }
+      c1.free(c1.getUsed());
+    });
+
+    try {
+      int i;
+      for (i = 0; i < 1024; i++) {
+        final long[] arr = new long[]{i};
+        final BytesToBytesMap.Location loc = map.lookup(arr, Platform.LONG_ARRAY_OFFSET, 8);
+        loc.append(arr, Platform.LONG_ARRAY_OFFSET, 8, arr, Platform.LONG_ARRAY_OFFSET, 8);
+      }
+
+      // Starts to require memory at another memory consumer.
+      thread.start();
+
+      BytesToBytesMap.MapIterator iter = map.destructiveIterator();
+      for (i = 0; i < 1024; i++) {
+        iter.next();
+      }
+      assertFalse(iter.hasNext());
+    } finally {
+      map.free();
+      thread.join();
+      for (File spillFile : spillFilesCreated) {
+        assertFalse(spillFile.exists(),
+          "Spill file " + spillFile.getPath() + " was not cleaned up");
+      }
+    }
+  }
+
+  @Test
+  public void freeAfterFailedReset() {
+    // SPARK-29244: BytesToBytesMap.free after a OOM reset operation should not cause failure.
+    memoryManager.limit(5000);
+    BytesToBytesMap map =
+      new BytesToBytesMap(taskMemoryManager, blockManager, serializerManager, 256, 0.5, 4000);
+    // Force OOM on next memory allocation.
+    memoryManager.markExecutionAsOutOfMemoryOnce();
+    try {
+      assertThrows(SparkOutOfMemoryError.class, map::reset);
+    } finally {
+      map.free();
+    }
+  }
+
+  @Test
+  public void operationsAfterFreeFail() {
+    BytesToBytesMap map =
+      new BytesToBytesMap(taskMemoryManager, blockManager, serializerManager, 256, 0.5, 4000);
+    final long[] key = new long[]{1L};
+    try {
+      BytesToBytesMap.Location loc = map.lookup(key, Platform.LONG_ARRAY_OFFSET, 8);
+      map.free();
+      assertThrows(IllegalStateException.class, map::reset);
+      assertThrows(
+        IllegalStateException.class,
+        () -> map.lookup(key, Platform.LONG_ARRAY_OFFSET, 8));
+      assertThrows(
+        IllegalStateException.class,
+        () -> loc.append(key, Platform.LONG_ARRAY_OFFSET, 8, key, Platform.LONG_ARRAY_OFFSET, 8));
+      assertThrows(IllegalStateException.class, map::getArray);
+      assertThrows(IllegalStateException.class, map::maxNumKeysIndex);
+      assertEquals(0L, taskMemoryManager.getMemoryConsumptionForThisTask());
+    } finally {
+      map.free();
+    }
+  }
+
+  @Test
+  public void configuredKeyOperationsRejectLookupAfterFree() {
+    BytesToBytesMap.KeyOperationsFactory keyOperationsFactory =
+      () -> fail("Key operations must not be created after free");
+    BytesToBytesMap map =
+      new BytesToBytesMap(taskMemoryManager, 64, PAGE_SIZE_BYTES, keyOperationsFactory);
+    final long[] key = new long[]{1L};
+    try {
+      map.free();
+      assertThrows(
+        IllegalStateException.class,
+        () -> map.lookup(key, Platform.LONG_ARRAY_OFFSET, 8));
+    } finally {
+      map.free();
+    }
+  }
+
+  @Test
+  public void operationsAfterDestructiveIterationFail() {
+    memoryManager.limit(PAGE_SIZE_BYTES);
+    BytesToBytesMap map =
+      new BytesToBytesMap(taskMemoryManager, blockManager, serializerManager, 256, 0.5, 4000);
+    final long[] key = new long[]{1L};
+    try {
+      BytesToBytesMap.Location loc = map.lookup(key, Platform.LONG_ARRAY_OFFSET, 8);
+      map.destructiveIterator();
+      assertThrows(IllegalStateException.class, map::reset);
+      assertThrows(
+        IllegalStateException.class,
+        () -> map.lookup(key, Platform.LONG_ARRAY_OFFSET, 8));
+      assertThrows(
+        IllegalStateException.class,
+        () -> loc.append(key, Platform.LONG_ARRAY_OFFSET, 8, key, Platform.LONG_ARRAY_OFFSET, 8));
+      assertThrows(IllegalStateException.class, map::getArray);
+      assertThrows(IllegalStateException.class, map::maxNumKeysIndex);
+      assertThrows(IllegalStateException.class, map::iterator);
+      assertThrows(IllegalStateException.class, map::iteratorWithKeyIndex);
+      assertThrows(IllegalStateException.class, map::destructiveIterator);
+      assertEquals(0L, taskMemoryManager.getMemoryConsumptionForThisTask());
+    } finally {
+      map.free();
+    }
+  }
+
+  @Test
+  public void failedResetRequiresSuccessfulReset() {
+    memoryManager.limit(5000);
+    BytesToBytesMap map =
+      new BytesToBytesMap(taskMemoryManager, blockManager, serializerManager, 256, 0.5, 4000);
+    try {
+      final long[] key = new long[]{1L};
+      final long[] value = new long[]{42L};
+      BytesToBytesMap.Location loc = map.lookup(key, Platform.LONG_ARRAY_OFFSET, 8);
+      assertTrue(
+        loc.append(key, Platform.LONG_ARRAY_OFFSET, 8, value, Platform.LONG_ARRAY_OFFSET, 8));
+
+      // A failed reset must clear the old page state without making lookup allocate implicitly.
+      memoryManager.markExecutionAsOutOfMemoryOnce();
+      assertThrows(SparkOutOfMemoryError.class, map::reset);
+      assertEquals(0, map.numKeys());
+      assertEquals(0, map.numValues());
+      assertEquals(0, map.getNumDataPages());
+      assertEquals(0L, taskMemoryManager.getMemoryConsumptionForThisTask());
+      assertThrows(
+        IllegalStateException.class,
+        () -> map.lookup(key, Platform.LONG_ARRAY_OFFSET, 8));
+      assertThrows(IllegalStateException.class, map::getArray);
+      assertThrows(IllegalStateException.class, map::maxNumKeysIndex);
+      assertThrows(IllegalStateException.class, map::iterator);
+      assertThrows(IllegalStateException.class, map::iteratorWithKeyIndex);
+
+      memoryManager.markExecutionAsOutOfMemoryOnce();
+      assertThrows(SparkOutOfMemoryError.class, map::reset);
+      memoryManager.limit(PAGE_SIZE_BYTES);
+      map.reset();
+      assertEquals(512L, map.getArray().size());
+      assertEquals(256, map.maxNumKeysIndex());
+
+      loc = map.lookup(key, Platform.LONG_ARRAY_OFFSET, 8);
+      assertFalse(loc.isDefined());
+      assertTrue(
+        loc.append(key, Platform.LONG_ARRAY_OFFSET, 8, value, Platform.LONG_ARRAY_OFFSET, 8));
+      assertEquals(1, map.getNumDataPages());
+      loc = map.lookup(key, Platform.LONG_ARRAY_OFFSET, 8);
+      assertTrue(loc.isDefined());
+      assertEquals(42L, Platform.getLong(loc.getValueBase(), loc.getValueOffset()));
+      assertEquals(1, map.numValues());
+    } finally {
+      map.free();
+    }
+  }
+
+  @Test
+  public void successfulResetAfterFailureRestoresGrowthState() {
+    memoryManager.limit(PAGE_SIZE_BYTES);
+    // A sub-one-key growth threshold makes canGrowArray observable through append(): after a
+    // failed grow, no new key is accepted until reset restores the flag.
+    BytesToBytesMap map =
+      new BytesToBytesMap(taskMemoryManager, blockManager, serializerManager, 64, 0.01, 4000);
+    try {
+      for (long i = 0; i < 2; i++) {
+        final long[] key = new long[]{i};
+        if (i == 1) {
+          // The data page already exists, so this OOM is consumed by growAndRehash().
+          memoryManager.markExecutionAsOutOfMemoryOnce();
+        }
+        assertTrue(map.lookup(key, Platform.LONG_ARRAY_OFFSET, 8).append(
+          key, Platform.LONG_ARRAY_OFFSET, 8, key, Platform.LONG_ARRAY_OFFSET, 8));
+      }
+
+      final long[] blockedKey = new long[]{2L};
+      assertFalse(map.lookup(blockedKey, Platform.LONG_ARRAY_OFFSET, 8).append(
+        blockedKey,
+        Platform.LONG_ARRAY_OFFSET,
+        8,
+        blockedKey,
+        Platform.LONG_ARRAY_OFFSET,
+        8));
+
+      memoryManager.markExecutionAsOutOfMemoryOnce();
+      assertThrows(SparkOutOfMemoryError.class, map::reset);
+
+      memoryManager.limit(PAGE_SIZE_BYTES);
+      map.reset();
+      for (long i = 10; i < 12; i++) {
+        final long[] key = new long[]{i};
+        final long[] value = new long[]{i * 10};
+        BytesToBytesMap.Location loc = map.lookup(key, Platform.LONG_ARRAY_OFFSET, 8);
+        assertFalse(loc.isDefined());
+        assertTrue(loc.append(
+          key, Platform.LONG_ARRAY_OFFSET, 8, value, Platform.LONG_ARRAY_OFFSET, 8));
+        loc = map.lookup(key, Platform.LONG_ARRAY_OFFSET, 8);
+        assertTrue(loc.isDefined());
+        assertEquals(i * 10, Platform.getLong(loc.getValueBase(), loc.getValueOffset()));
+      }
+      assertEquals(2, map.numKeys());
+      assertEquals(2, map.numValues());
     } finally {
       map.free();
     }

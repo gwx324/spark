@@ -1,0 +1,1721 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.connector.catalog
+
+import java.time.{Instant, ZoneId}
+import java.time.temporal.ChronoUnit
+import java.util
+import java.util.Objects
+import java.util.OptionalLong
+import java.util.concurrent.atomic.AtomicLong
+
+import scala.collection.mutable
+import scala.collection.mutable.{ArrayBuffer, ListBuffer}
+import scala.jdk.CollectionConverters._
+
+import org.apache.spark.sql.catalyst.{InternalRow, ProjectingInternalRow, StructFilters}
+import org.apache.spark.sql.catalyst.expressions.{AttributeReference, BoundReference, Cast, EvalMode, Expression => CatalystExpression, GenericInternalRow, GetStructField, JoinedRow, Literal, MetadataStructFieldWithLogicalName, Predicate => CatalystPredicate}
+import org.apache.spark.sql.catalyst.util.{ArrayBasedMapData, ArrayData, CaseInsensitiveMap, CharVarcharUtils, DateTimeUtils, GenericArrayData, MapData, ResolveDefaultColumns}
+import org.apache.spark.sql.connector.catalog.constraints.Constraint
+import org.apache.spark.sql.connector.catalog.functions.{FlipLowBitFunction, SelfReduceFunction}
+import org.apache.spark.sql.connector.distributions.{Distribution, Distributions}
+import org.apache.spark.sql.connector.expressions._
+import org.apache.spark.sql.connector.expressions.{Literal => V2Literal}
+import org.apache.spark.sql.connector.metric.{CustomMetric, CustomSumMetric, CustomTaskMetric}
+import org.apache.spark.sql.connector.read._
+import org.apache.spark.sql.connector.read.colstats.{ColumnStatistics, Histogram, HistogramBin}
+import org.apache.spark.sql.connector.read.partitioning.{KeyGroupedPartitioning, Partitioning, UnknownPartitioning}
+import org.apache.spark.sql.connector.read.streaming.{MicroBatchStream, Offset}
+import org.apache.spark.sql.connector.write._
+import org.apache.spark.sql.connector.write.streaming.{StreamingDataWriterFactory, StreamingWrite}
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.internal.connector.{ColumnImpl, SchemaAlignmentConfig, SupportsConfigurableSchemaAlignment, SupportsRuntimeCatalystFiltering, SupportsStreamingUpdateAsAppend}
+import org.apache.spark.sql.sources._
+import org.apache.spark.sql.types._
+import org.apache.spark.sql.util.CaseInsensitiveStringMap
+import org.apache.spark.unsafe.types.UTF8String
+import org.apache.spark.util.ArrayImplicits._
+
+/**
+ * A simple in-memory table. Rows are stored as a buffered group produced by each output task.
+ */
+abstract class InMemoryBaseTable(
+    val name: String,
+    val initialColumns: Array[Column],
+    override val partitioning: Array[Transform],
+    override val properties: util.Map[String, String],
+    override val constraints: Array[Constraint] = Array.empty,
+    val distribution: Distribution = Distributions.unspecified(),
+    val ordering: Array[SortOrder] = Array.empty,
+    val numPartitions: Option[Int] = None,
+    val advisoryPartitionSize: Option[Long] = None,
+    val isDistributionStrictlyRequired: Boolean = true,
+    val numRowsPerSplit: Int = Int.MaxValue,
+    override val schemaAlignmentConfig: SchemaAlignmentConfig = SchemaAlignmentConfig.DEFAULT)
+  extends Table with SupportsRead with SupportsWrite with SupportsMetadataColumns
+    with SupportsSchemaEvolution with SupportsConfigurableSchemaAlignment {
+
+  // Tracks the current version number of the table.
+  protected var tableVersion: Int = 0
+
+  // Stores the table version validated during the last `ALTER TABLE ... ADD CONSTRAINT` operation.
+  private var validatedTableVersion: String = null
+
+  private var tableDisplayProperties: util.Map[String, String] = null
+
+  // Assign column IDs to columns that do not have one, including nested struct fields within
+  // arrays and maps. This simulates connectors that support column identity tracking.
+  private var tableColumns: Array[Column] = InMemoryBaseTable.assignMissingIds(initialColumns)
+
+  override def columns(): Array[Column] = tableColumns
+
+  private[catalog] def updateColumns(newColumns: Array[Column]): Unit = {
+    tableColumns = newColumns
+  }
+
+  override def displayProperties(): util.Map[String, String] = {
+    Option(tableDisplayProperties).map(util.Collections.unmodifiableMap(_))
+      .getOrElse(super.displayProperties())
+  }
+
+  def setDisplayProperties(displayProperties: util.Map[String, String]): Unit = {
+    tableDisplayProperties = new util.HashMap[String, String](displayProperties)
+  }
+
+  override def version(): String = tableVersion.toString
+
+  def setVersion(version: String): Unit = {
+    tableVersion = version.toInt
+  }
+
+  /**
+   * Copies version, validated version and display-only metadata from another table.
+   *
+   * Some test catalogs (e.g. [[NullColumnIdInMemoryTableCatalog]],
+   * [[NullTableIdAndNullColumnIdInMemoryTableCatalog]]) create a new table object
+   * that overrides specific behavior (such as nulling out column IDs). The new
+   * object's version counter starts at 0. Without this call, the version counter
+   * resets every time the catalog creates such a replacement table, breaking the
+   * monotonic-version assumption that downstream consumers rely on (e.g.
+   * [[InMemoryTable]].copy, validated-version propagation, and the join-refresh
+   * tests in [[DSv2IncrementallyConstructedQueryTests]]).
+   */
+  def copyTableStateFrom(sourceTable: InMemoryBaseTable): Unit = {
+    setDisplayProperties(sourceTable.displayProperties())
+    setVersion(sourceTable.version())
+    if (sourceTable.validatedVersion() != null) {
+      setValidatedVersion(sourceTable.validatedVersion())
+    }
+  }
+
+  // Version-aware equality: two tables refer to the same metastore entity at the same state.
+  // Fall back to reference equality when `id()` is null (no metastore identity).
+  override def equals(obj: Any): Boolean = obj match {
+    case other: InMemoryBaseTable =>
+      if (this eq other) true
+      else if (id() == null || other.id() == null) false
+      else id() == other.id() && version() == other.version()
+    case _ => false
+  }
+
+  override def hashCode(): Int = {
+    if (id() == null) System.identityHashCode(this)
+    else java.util.Objects.hash(id(), version())
+  }
+
+  def increaseVersion(): Unit = {
+    tableVersion += 1
+  }
+
+  def validatedVersion(): String = {
+    validatedTableVersion
+  }
+
+  def setValidatedVersion(version: String): Unit = {
+    validatedTableVersion = version
+  }
+
+  protected def recordScanEvent(filters: Array[Filter]): Unit = {}
+
+  protected object PartitionKeyColumn extends MetadataColumn {
+    override def name: String = "_partition"
+    override def dataType: DataType = StringType
+    override def isNullable: Boolean = false
+    override def comment: String = "Partition key used to store the row"
+    override def metadataInJSON(): String = {
+      val metadata = new MetadataBuilder()
+        .putBoolean(MetadataColumn.PRESERVE_ON_UPDATE, value = true)
+        .putBoolean(MetadataColumn.PRESERVE_ON_REINSERT, value = true)
+        .build()
+      metadata.json
+    }
+  }
+
+  protected object IndexColumn extends MetadataColumn {
+    override def name: String = "index"
+    override def dataType: DataType = IntegerType
+    override def isNullable: Boolean = false
+    override def comment: String = "Metadata column used to conflict with a data column"
+    override def metadataInJSON(): String = {
+      val metadata = new MetadataBuilder()
+        .putBoolean(MetadataColumn.PRESERVE_ON_DELETE, value = false)
+        .putBoolean(MetadataColumn.PRESERVE_ON_UPDATE, value = false)
+        .build()
+      metadata.json
+    }
+  }
+
+  override def schema(): StructType = CatalogV2Util.v2ColumnsToStructType(columns())
+
+  override def supportsColumnChange(change: TableChange.ColumnChange): Boolean = change match {
+    case typeChange: TableChange.UpdateColumnType =>
+      val fieldNames = typeChange.fieldNames()
+      val newType = typeChange.newDataType()
+
+      // Only allow changing to a strictly wider type.
+      schema()
+        .findNestedField(fieldNames.toImmutableArraySeq, includeCollections = true)
+        .exists { field => Cast.canUpCast(field._2.dataType, newType) }
+    case _: TableChange.AddColumn => true
+    case _ => false
+  }
+
+  // purposely exposes a metadata column that conflicts with a data column in some tests
+  override val metadataColumns: Array[MetadataColumn] = Array(IndexColumn, PartitionKeyColumn)
+  private val metadataColumnNames = metadataColumns.map(_.name).toSet
+
+  // Metadata column renaming is supported -- see [[InMemoryScanBuilder.pruneColumns]] and
+  // [[BatchScanBaseClass.createReaderFactory]] for implementation details. Set the property to
+  // false to act like a connector that suppresses such conflicts instead of renaming them.
+  override val canRenameConflictingMetadataColumns: Boolean =
+    properties.getOrDefault("rename-conflicting-metadata-columns", "true").toBoolean
+
+  private val allowUnsupportedTransforms =
+    properties.getOrDefault("allow-unsupported-transforms", "false").toBoolean
+
+  private val simulatePartialColumnPruning = properties
+    .getOrDefault(InMemoryBaseTable.SIMULATE_PARTIAL_COLUMN_PRUNING, "false").toBoolean
+
+  private val simulateIncompleteColumnPruning = properties
+    .getOrDefault(InMemoryBaseTable.SIMULATE_INCOMPLETE_COLUMN_PRUNING, "false").toBoolean
+
+  private val simulateReorderedColumnPruning = properties
+    .getOrDefault(InMemoryBaseTable.SIMULATE_REORDERED_COLUMN_PRUNING, "false").toBoolean
+
+  private val simulateRetypedColumnPruning = properties
+    .getOrDefault(InMemoryBaseTable.SIMULATE_RETYPED_COLUMN_PRUNING, "false").toBoolean
+
+  private val simulateNonNullableColumnPruning = properties
+    .getOrDefault(InMemoryBaseTable.SIMULATE_NON_NULLABLE_COLUMN_PRUNING, "false").toBoolean
+
+  private val streamingColumnPruning = properties
+    .getOrDefault(InMemoryBaseTable.STREAMING_COLUMN_PRUNING, "false").toBoolean
+
+  private val streamingFilterPushdown = properties
+    .getOrDefault(InMemoryBaseTable.STREAMING_FILTER_PUSHDOWN, "false").toBoolean
+
+  private val simulateStreamingFilters = properties
+    .getOrDefault(InMemoryBaseTable.SIMULATE_STREAMING_FILTERS, "false").toBoolean
+
+  private val acceptAnySchema = properties.getOrDefault("accept-any-schema", "false").toBoolean
+  private val autoSchemaEvolution = properties.getOrDefault("auto-schema-evolution", "true")
+    .toBoolean
+  private val generateColumnValuesOnWrite =
+    properties.getOrDefault("generate-column-values-on-write", "true").toBoolean
+
+  partitioning.foreach {
+    case _: IdentityTransform =>
+    case _: YearsTransform =>
+    case _: MonthsTransform =>
+    case _: DaysTransform =>
+    case _: HoursTransform =>
+    case _: BucketTransform =>
+    case _: SortedBucketTransform =>
+    case _: ClusterByTransform =>
+    case NamedTransform("truncate", Seq(_: NamedReference, _: V2Literal[_])) =>
+    case NamedTransform("signed_zeros", Seq(_: NamedReference)) =>
+    case NamedTransform("flip_low_bit", Seq(_: NamedReference)) =>
+    case NamedTransform("self_reduce", Seq(_: NamedReference)) =>
+    case t if !allowUnsupportedTransforms =>
+      throw new IllegalArgumentException(s"Transform $t is not a supported transform")
+  }
+
+  // The key `Seq[Any]` is the partition values, value is a set of splits, each with a set of rows.
+  val dataMap: mutable.Map[Seq[Any], Seq[BufferedRows]] = mutable.Map.empty
+
+  val commits: ListBuffer[Commit] = ListBuffer[Commit]()
+
+  def data: Array[BufferedRows] = dataMap.values.flatten.toArray
+
+  def rows: Seq[InternalRow] = dataMap.values.flatten.flatMap(_.rows).toSeq
+
+  val partCols: Array[Array[String]] = partitioning.flatMap(_.references).map { ref =>
+    schema.findNestedField(ref.fieldNames().toImmutableArraySeq, includeCollections = false) match {
+      case Some(_) => ref.fieldNames()
+      case None => throw new IllegalArgumentException(s"${ref.describe()} does not exist.")
+    }
+  }
+
+  protected def identityPartitionReferences: Array[NamedReference] = {
+    partitioning.collect { case IdentityTransform(ref) => ref }
+  }
+
+  private val UTC = ZoneId.of("UTC")
+  private val EPOCH_LOCAL_DATE = Instant.EPOCH.atZone(UTC).toLocalDate
+
+  protected def getKey(row: InternalRow): Seq[Any] = {
+    getKey(row, schema)
+  }
+
+  protected def getKey(row: InternalRow, rowSchema: StructType): Seq[Any] = {
+    @scala.annotation.tailrec
+    def extractor(
+        fieldNames: Array[String],
+        schema: StructType,
+        row: InternalRow): (Any, DataType) = {
+      val index = schema.fieldIndex(fieldNames(0))
+      val field = schema(index)
+      val value = row.get(index, field.dataType)
+      if (fieldNames.length > 1) {
+        (value, schema(index).dataType) match {
+          case (row: InternalRow, nestedSchema: StructType) =>
+            extractor(fieldNames.drop(1), nestedSchema, row)
+          case (_, dataType) =>
+            throw new IllegalArgumentException(s"Unsupported type, ${dataType.simpleString}")
+        }
+      } else {
+        (value, schema(index).dataType)
+      }
+    }
+
+    val cleanedSchema = CharVarcharUtils.replaceCharVarcharWithStringInSchema(rowSchema)
+    partitioning.map {
+      case IdentityTransform(ref) =>
+        extractor(ref.fieldNames, cleanedSchema, row)._1
+      case YearsTransform(ref) =>
+        extractor(ref.fieldNames, cleanedSchema, row) match {
+          case (days: Int, DateType) =>
+            ChronoUnit.YEARS.between(EPOCH_LOCAL_DATE, DateTimeUtils.daysToLocalDate(days)).toInt
+          case (micros: Long, TimestampType) =>
+            val localDate = DateTimeUtils.microsToInstant(micros).atZone(UTC).toLocalDate
+            ChronoUnit.YEARS.between(EPOCH_LOCAL_DATE, localDate).toInt
+          case (v, t) =>
+            throw new IllegalArgumentException(s"Match: unsupported argument(s) type - ($v, $t)")
+        }
+      case MonthsTransform(ref) =>
+        extractor(ref.fieldNames, cleanedSchema, row) match {
+          case (days: Int, DateType) =>
+            ChronoUnit.MONTHS.between(EPOCH_LOCAL_DATE, DateTimeUtils.daysToLocalDate(days))
+          case (micros: Long, TimestampType) =>
+            val localDate = DateTimeUtils.microsToInstant(micros).atZone(UTC).toLocalDate
+            ChronoUnit.MONTHS.between(EPOCH_LOCAL_DATE, localDate)
+          case (v, t) =>
+            throw new IllegalArgumentException(s"Match: unsupported argument(s) type - ($v, $t)")
+        }
+      case DaysTransform(ref) =>
+        extractor(ref.fieldNames, cleanedSchema, row) match {
+          case (days, DateType) =>
+            days
+          case (micros: Long, TimestampType) =>
+            ChronoUnit.DAYS.between(Instant.EPOCH, DateTimeUtils.microsToInstant(micros)).toInt
+          case (v, t) =>
+            throw new IllegalArgumentException(s"Match: unsupported argument(s) type - ($v, $t)")
+        }
+      case HoursTransform(ref) =>
+        extractor(ref.fieldNames, cleanedSchema, row) match {
+          case (micros: Long, TimestampType) =>
+            ChronoUnit.HOURS.between(Instant.EPOCH, DateTimeUtils.microsToInstant(micros))
+          case (v, t) =>
+            throw new IllegalArgumentException(s"Match: unsupported argument(s) type - ($v, $t)")
+        }
+      // the result should be consistent with BucketFunctions defined at transformFunctions.scala
+      case BucketTransform(numBuckets, cols, _) =>
+        val hash: Long = cols.foldLeft(0L) { (acc, col) =>
+          val valueHash = extractor(col.fieldNames, cleanedSchema, row) match {
+            case (value: Byte, _: ByteType) => value.toLong
+            case (value: Short, _: ShortType) => value.toLong
+            case (value: Int, _: IntegerType) => value.toLong
+            case (value: Long, _: LongType) => value
+            case (value: Long, _: TimestampType) => value
+            case (value: Long, _: TimestampNTZType) => value
+            case (value: UTF8String, _: StringType) =>
+              value.hashCode.toLong
+            case (value: Array[Byte], BinaryType) =>
+              util.Arrays.hashCode(value).toLong
+            case (v, t) =>
+              throw new IllegalArgumentException(s"Match: unsupported argument(s) type - ($v, $t)")
+          }
+          acc + valueHash
+        }
+        Math.floorMod(hash, numBuckets)
+      case NamedTransform("truncate", Seq(ref: NamedReference, length: V2Literal[_])) =>
+        extractor(ref.fieldNames, cleanedSchema, row) match {
+          case (str: UTF8String, StringType) =>
+            str.substring(0, length.value.asInstanceOf[Int])
+          case (v, t) =>
+            throw new IllegalArgumentException(s"Match: unsupported argument(s) type - ($v, $t)")
+        }
+      // the result should be consistent with SignedZerosFunction defined at
+      // transformFunctions.scala
+      case NamedTransform("signed_zeros", Seq(ref: NamedReference)) =>
+        extractor(ref.fieldNames, cleanedSchema, row) match {
+          case (value: Long, LongType) =>
+            if (value == 1L) -0.0d else if (value == 2L) 0.0d else value.toDouble
+          case (v, t) =>
+            throw new IllegalArgumentException(s"Match: unsupported argument(s) type - ($v, $t)")
+        }
+      // The key is whatever the function itself computes, so the two cannot drift. The other
+      // transforms above repeat their function's arithmetic and keep it in step by comment only.
+      case NamedTransform("flip_low_bit", Seq(ref: NamedReference)) =>
+        extractor(ref.fieldNames, cleanedSchema, row) match {
+          case (value: Long, LongType) => FlipLowBitFunction.produceResult(InternalRow(value))
+          case (v, t) =>
+            throw new IllegalArgumentException(s"Match: unsupported argument(s) type - ($v, $t)")
+        }
+      case NamedTransform("self_reduce", Seq(ref: NamedReference)) =>
+        extractor(ref.fieldNames, cleanedSchema, row) match {
+          case (value: Long, LongType) => SelfReduceFunction.produceResult(InternalRow(value))
+          case (v, t) =>
+            throw new IllegalArgumentException(s"Match: unsupported argument(s) type - ($v, $t)")
+        }
+      case ClusterByTransform(columnNames) =>
+        columnNames.map { colName =>
+          extractor(colName.fieldNames, cleanedSchema, row)._1
+        }
+    }.toImmutableArraySeq
+  }
+
+  protected def addPartitionKey(key: Seq[Any]): Unit = {}
+
+  protected def renamePartitionKey(
+      partitionSchema: StructType,
+      from: Seq[Any],
+      to: Seq[Any]): Boolean = {
+    val splits = dataMap.remove(from).getOrElse(Seq(BufferedRows(from, columns())))
+    val existingSchema = splits.head.schema
+    val newSplits = splits.map { rows =>
+      val newRows = new BufferedRows(to, existingSchema)
+      rows.rows.foreach { r =>
+        val newRow = new GenericInternalRow(r.numFields)
+        for (i <- 0 until r.numFields) newRow.update(i, r.get(i, schema()(i).dataType))
+        for (i <- 0 until partitionSchema.length) {
+          val j = schema().fieldIndex(partitionSchema(i).name)
+          newRow.update(j, to(i))
+        }
+        newRows.withRow(newRow)
+      }
+      newRows
+    }
+    dataMap.put(to, newSplits).foreach { _ =>
+      throw new IllegalStateException(
+        s"The ${to.mkString("[", ", ", "]")} partition exists already")
+    }
+    true
+  }
+
+  protected def removePartitionKey(key: Seq[Any]): Unit = dataMap.synchronized {
+    dataMap.remove(key)
+  }
+
+  protected def createPartitionKey(key: Seq[Any]): Unit = dataMap.synchronized {
+    if (!dataMap.contains(key)) {
+      val emptyRows = BufferedRows(key, columns())
+      val rows = if (key.length == columns().length) {
+        emptyRows.withRow(InternalRow.fromSeq(key))
+      } else emptyRows
+      dataMap.put(key, Seq(rows))
+    }
+  }
+
+  protected def clearPartition(key: Seq[Any]): Unit = dataMap.synchronized {
+    assert(dataMap.contains(key))
+    val schema = dataMap(key).head.schema
+    dataMap.update(key, Seq(new BufferedRows(key, schema)))
+  }
+
+  def withDeletes(data: Array[BufferedRows]): InMemoryBaseTable = {
+    data.foreach { p =>
+      dataMap ++= dataMap.map { case (key, currentSplits) =>
+        val newSplits = currentSplits.map { currentRows =>
+          val newRows = new BufferedRows(currentRows.key, currentRows.schema)
+          newRows.rows ++= currentRows.rows.filter(r => !p.deletes.contains(r.getInt(0)))
+          newRows
+        }
+        key -> newSplits
+      }
+    }
+    this
+  }
+
+  def withData(data: Array[BufferedRows]): InMemoryBaseTable = {
+    withData(data, CatalogV2Util.v2ColumnsToStructType(columns()))
+  }
+
+  def withData(data: Array[BufferedRows], columns: Array[Column]): InMemoryBaseTable = {
+    withData(data, CatalogV2Util.v2ColumnsToStructType(columns))
+  }
+
+  def withData(
+      data: Array[BufferedRows],
+      writeSchema: StructType): InMemoryBaseTable = dataMap.synchronized {
+    data.foreach(_.rows.foreach { row =>
+      val key = getKey(row, writeSchema)
+      dataMap += dataMap.get(key)
+          .map { splits =>
+            val newSplits = if ((splits.last.rows.size >= numRowsPerSplit)
+            || (splits.last.schema != writeSchema)) {
+              splits :+ new BufferedRows(key, writeSchema)
+            } else {
+              splits
+            }
+            newSplits.last.withRow(row)
+            key -> newSplits
+          }
+          .getOrElse(key -> Seq(
+            new BufferedRows(key, writeSchema).withRow(row)))
+      addPartitionKey(key)
+    })
+    this
+  }
+
+  def alterTableWithData(
+      data: Array[BufferedRows],
+      newSchema: StructType): InMemoryBaseTable = {
+    val newFieldNames = newSchema.fieldNames.toSet
+    data.foreach { bufferedRow =>
+      val oldSchema = bufferedRow.schema
+
+      // Identify which columns from the old schema still exist in the new schema.
+      // Each entry is (StructField, original index in old row) so we can extract values later.
+      val fieldsRetainedInOldSchema = oldSchema.fields.zipWithIndex.filter {
+        case (oldField, _) => newFieldNames.contains(oldField.name)
+      }
+      val areColumnsDropped = fieldsRetainedInOldSchema.length < oldSchema.length
+
+      // Build a schema that only contains the retained columns.
+      // This becomes the write schema for the migrated rows.
+      val retainedSchemaAfterDroppedColumns = if (areColumnsDropped) {
+        StructType(fieldsRetainedInOldSchema.map(_._1))
+      } else {
+        oldSchema
+      }
+
+      bufferedRow.rows.foreach { row =>
+        // Physically remove dropped column values from the row so they do not
+        // survive through ALTER chains (e.g. DROP COLUMN then ADD COLUMN same name).
+        val retainedRowAfterDroppedColumns = if (areColumnsDropped) {
+          new GenericInternalRow(fieldsRetainedInOldSchema.map {
+            case (retainedField, idx) => row.get(idx, retainedField.dataType)
+          })
+        } else {
+          row
+        }
+
+        // handle partition evolution by re-keying all data
+        val key = getKey(retainedRowAfterDroppedColumns, newSchema)
+        dataMap += dataMap.get(key)
+          .map { splits =>
+            val newSplits = if ((splits.last.rows.size >= numRowsPerSplit) ||
+                (splits.last.schema != retainedSchemaAfterDroppedColumns)) {
+              splits :+ new BufferedRows(key, retainedSchemaAfterDroppedColumns)
+            } else {
+              splits
+            }
+            newSplits.last.withRow(retainedRowAfterDroppedColumns)
+            key -> newSplits
+          }
+          .getOrElse(key -> Seq(
+            new BufferedRows(key, retainedSchemaAfterDroppedColumns)
+              .withRow(retainedRowAfterDroppedColumns)))
+        addPartitionKey(key)
+      }
+    }
+    this
+  }
+
+  def baseCapabiilities: Set[TableCapability] = Set(
+    TableCapability.BATCH_READ,
+    TableCapability.MICRO_BATCH_READ,
+    TableCapability.BATCH_WRITE,
+    TableCapability.STREAMING_WRITE,
+    TableCapability.OVERWRITE_BY_FILTER,
+    TableCapability.OVERWRITE_DYNAMIC,
+    TableCapability.TRUNCATE)
+
+  override def capabilities(): util.Set[TableCapability] =
+    (baseCapabiilities ++
+      (if (acceptAnySchema) Seq(TableCapability.ACCEPT_ANY_SCHEMA) else Seq.empty) ++
+      (if (streamingColumnPruning) Seq(TableCapability.STREAMING_COLUMN_PRUNING) else Seq.empty) ++
+      (if (streamingFilterPushdown) {
+        Seq(TableCapability.STREAMING_FILTER_PUSHDOWN)
+      } else {
+        Seq.empty
+      }) ++
+      (if (autoSchemaEvolution) Seq(TableCapability.AUTOMATIC_SCHEMA_EVOLUTION) else Seq.empty) ++
+      (if (generateColumnValuesOnWrite) {
+        Seq(TableCapability.GENERATE_COLUMN_VALUES_ON_WRITE)
+      } else Seq.empty))
+      .asJava
+
+  override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
+    new InMemoryScanBuilder(schema, options)
+  }
+
+  private def canEvaluate(filter: Filter): Boolean = {
+    val identityRefs = identityPartitionReferences
+    if (partitioning.length == 1 && identityRefs.length == 1) {
+      filter match {
+        case In(attrName, _) if attrName == identityRefs.head.toString => true
+        case _ => false
+      }
+    } else {
+      false
+    }
+  }
+
+  class InMemoryScanBuilder(
+      tableSchema: StructType,
+      options: CaseInsensitiveStringMap) extends ScanBuilder
+    with SupportsPushDownRequiredColumns with SupportsPushDownFilters {
+    private var schema: StructType = tableSchema
+    private var postScanFilters: Array[Filter] = Array.empty
+    private var evaluableFilters: Array[Filter] = Array.empty
+    private var _pushedFilters: Array[Filter] = Array.empty
+
+    override def build: Scan = {
+      val scan = createScan(
+        data.map(_.asInstanceOf[InputPartition]).toImmutableArraySeq, schema, tableSchema, options)
+      scan match {
+        case s: InMemoryBatchScan =>
+          if (evaluableFilters.nonEmpty) {
+            s.filter(evaluableFilters)
+          }
+          s.pushedFilters = _pushedFilters
+        case _ =>
+      }
+      recordScanEvent(_pushedFilters)
+      scan
+    }
+
+    /**
+     * Creates the batch scan for [[build]].
+     */
+    protected def createScan(
+        partitions: Seq[InputPartition],
+        readSchema: StructType,
+        tableSchema: StructType,
+        options: CaseInsensitiveStringMap): BatchScanBaseClass = {
+      if (InMemoryBaseTable.this.ordering.nonEmpty) {
+        new InMemoryBatchScanWithOrdering(partitions, readSchema, tableSchema, options)
+      } else {
+        InMemoryBatchScan(partitions, readSchema, tableSchema, options)
+      }
+    }
+
+    override def pruneColumns(requiredSchema: StructType): Unit = {
+      // The required schema could contain conflict-renamed metadata columns, so we need to match
+      // them by their logical (original) names, not their current names.
+      val schemaNames = tableSchema.map(_.name).toSet
+      val prunedFields = requiredSchema.filter {
+        case MetadataStructFieldWithLogicalName(_, name) => metadataColumnNames.contains(name)
+        case f => schemaNames.contains(f.name)
+      }
+      lazy val dataFields = prunedFields.filterNot(isRequiredMetadataField)
+      schema = if (simulatePartialColumnPruning) {
+        // Prune the metadata columns as required, but report every data column back from
+        // `Scan.readSchema()` regardless of what was required.
+        StructType(tableSchema ++ prunedFields.filter(isRequiredMetadataField))
+      } else if (simulateIncompleteColumnPruning && dataFields.length < tableSchema.length) {
+        // Drop the first required data column when only some of them are required.
+        StructType(prunedFields.filterNot(dataFields.headOption.contains))
+      } else if (simulateRetypedColumnPruning && dataFields.length < tableSchema.length) {
+        // Report the required data columns as binary columns when only some of them are required.
+        StructType(prunedFields.map { field =>
+          if (isRequiredMetadataField(field)) field else field.copy(dataType = BinaryType)
+        })
+      } else if (simulateNonNullableColumnPruning) {
+        // Report the required data columns as not nullable.
+        StructType(prunedFields.map { field =>
+          if (isRequiredMetadataField(field)) field else field.copy(nullable = false)
+        })
+      } else if (simulateReorderedColumnPruning) {
+        // Return the required data columns in the reverse order.
+        StructType(dataFields.reverse ++ prunedFields.filter(isRequiredMetadataField))
+      } else {
+        StructType(prunedFields)
+      }
+    }
+
+    private def isRequiredMetadataField(field: StructField): Boolean = field match {
+      case MetadataStructFieldWithLogicalName(_, name) => metadataColumnNames.contains(name)
+      case _ => false
+    }
+
+    override def pushFilters(filters: Array[Filter]): Array[Filter] = {
+      val (evaluableFilters, postScanFilters) = filters.partition(canEvaluate)
+      this.evaluableFilters = evaluableFilters
+      this.postScanFilters = postScanFilters
+      this._pushedFilters = filters
+      postScanFilters
+    }
+
+    override def pushedFilters(): Array[Filter] = this._pushedFilters
+  }
+
+  case class InMemoryStats(
+      sizeInBytes: OptionalLong,
+      numRows: OptionalLong,
+      override val columnStats: util.Map[NamedReference, ColumnStatistics])
+    extends Statistics
+
+  case class InMemoryColumnStats(
+      override val distinctCount: OptionalLong,
+      override val nullCount: OptionalLong) extends ColumnStatistics
+
+  case class InMemoryHistogramBin(lo: Double, hi: Double, ndv: Long) extends HistogramBin
+
+  case class InMemoryHistogram(height: Double, bins: Array[HistogramBin]) extends Histogram
+
+  private class InMemoryTableOffset(val rowCount: Long) extends Offset {
+    override def json(): String = rowCount.toString
+  }
+
+  // The number of the micro-batch streams that the scans of the table created.
+  val createdMicroBatchStreams = new AtomicLong()
+
+  /**
+   * @param filters the filters that the rows of the stream pass, see SIMULATE_STREAMING_FILTERS
+   */
+  class InMemoryMicroBatchStream(
+      readSchema: StructType,
+      tableSchema: StructType,
+      filters: Array[Filter] = Array.empty)
+      extends MicroBatchStream {
+    override def initialOffset(): Offset = new InMemoryTableOffset(0)
+    override def latestOffset(): Offset =
+      new InMemoryTableOffset(InMemoryBaseTable.this.rows.size.toLong)
+    override def planInputPartitions(start: Offset, end: Offset): Array[InputPartition] = {
+      val s = start.asInstanceOf[InMemoryTableOffset].rowCount.toInt
+      val e = end.asInstanceOf[InMemoryTableOffset].rowCount.toInt
+      // The rows keep their positions in the micro-batch, which the metadata column index has
+      // with or without the filters.
+      Array(InMemoryMicroBatchPartition(InMemoryBaseTable.this.rows.slice(s, e).zipWithIndex
+        .filter { case (row, _) => filters.forall(InMemoryBaseTable.passes(_, row, tableSchema)) }))
+    }
+    override def createReaderFactory(): PartitionReaderFactory = {
+      val metadataColNames = new mutable.ArrayBuffer[String]()
+      val dataColumns = new mutable.ArrayBuffer[StructField]()
+      readSchema.foreach {
+        case MetadataStructFieldWithLogicalName(_, name) => metadataColNames += name
+        case field => dataColumns += field
+      }
+      // With STREAMING_COLUMN_PRUNING, the readers return the data columns of the read schema,
+      // which Spark may prune, by their position in the rows of the table. Otherwise, they return
+      // the rows of the table, as the streaming reads of in-memory tables did before the pruning.
+      val dataOrdinals = if (streamingColumnPruning) {
+        Some(dataColumns.map(field => tableSchema.fieldIndex(field.name)).toSeq)
+          .filterNot(_ == tableSchema.indices)
+      } else {
+        None
+      }
+      new InMemoryMicroBatchReaderFactory(
+        metadataColNames.toArray, dataOrdinals.map(_.toArray), StructType(dataColumns.toSeq))
+    }
+    override def deserializeOffset(json: String): Offset = new InMemoryTableOffset(json.toLong)
+    override def commit(end: Offset): Unit = {}
+    override def stop(): Unit = {}
+  }
+
+  abstract class BatchScanBaseClass(
+      var data: Seq[InputPartition],
+      readSchema: StructType,
+      tableSchema: StructType)
+    extends Scan with Batch with SupportsReportStatistics with SupportsReportPartitioning {
+
+    override def toBatch: Batch = this
+
+    protected def identityPartitionAttributes: Array[NamedReference] = {
+      identityPartitionReferences.distinct
+        .filter(ref => readSchema.findNestedField(
+          ref.fieldNames.toImmutableArraySeq, resolver = SQLConf.get.resolver).isDefined)
+    }
+
+    override def estimateStatistics(): Statistics = {
+      if (data.isEmpty) {
+        return InMemoryStats(OptionalLong.of(0L), OptionalLong.of(0L), new util.HashMap())
+      }
+
+      val inputPartitions = data.map(_.asInstanceOf[BufferedRows])
+      val numRows = inputPartitions.map(_.rows.size).sum
+      // we assume an average object header is 12 bytes
+      val objectHeaderSizeInBytes = 12L
+      val rowSizeInBytes = objectHeaderSizeInBytes + schema.defaultSize
+      val sizeInBytes = numRows * rowSizeInBytes
+
+      val numOfCols = tableSchema.fields.length
+      val colValueSets = new Array[util.HashSet[Any]](numOfCols)
+      val numOfNulls = new Array[Long](numOfCols)
+      for (i <- 0 until numOfCols) {
+        colValueSets(i) = new util.HashSet[Any]
+      }
+
+      inputPartitions.foreach(inputPartition =>
+        inputPartition.rows.foreach(row =>
+          for (i <- 0 until numOfCols) {
+            val field = tableSchema(i)
+            val colValue = if (i < row.numFields) {
+              row.get(i, field.dataType)
+            } else {
+              ResolveDefaultColumns.getExistenceDefaultValue(field)
+            }
+            colValueSets(i).add(colValue)
+            if (colValue == null) {
+              numOfNulls(i) += 1
+            }
+          }
+        )
+      )
+
+      val map = new util.HashMap[NamedReference, ColumnStatistics]()
+      val colNames = tableSchema.fields.map(_.name)
+      var i = 0
+      for (col <- colNames) {
+        val fieldReference = FieldReference.column(col)
+        val colStats = InMemoryColumnStats(
+          OptionalLong.of(colValueSets(i).size()),
+          OptionalLong.of(numOfNulls(i)))
+        map.put(fieldReference, colStats)
+        i = i + 1
+      }
+
+      InMemoryStats(OptionalLong.of(sizeInBytes), OptionalLong.of(numRows), map)
+    }
+
+    override def outputPartitioning(): Partitioning = {
+      if (InMemoryBaseTable.this.partitioning.nonEmpty) {
+        new KeyGroupedPartitioning(
+          InMemoryBaseTable.this.partitioning.map(_.asInstanceOf[Expression]),
+          data.size)
+      } else {
+        new UnknownPartitioning(data.size)
+      }
+    }
+
+    override def planInputPartitions(): Array[InputPartition] = data.toArray
+
+    /**
+     * The partitions this scan reported to Spark for reading. `data` for a scan that narrows
+     * itself in place when Spark pushes runtime filters, overridden by one that instead plans
+     * fresh partitions per call. `PartitionBasedReplaceData` replaces exactly these.
+     */
+    def readPartitions: Seq[InputPartition] = data
+
+    override def createReaderFactory(): PartitionReaderFactory = {
+      val metadataColumns = new mutable.ArrayBuffer[String]()
+      val nonMetadataColumns = readSchema.filter {
+        case MetadataStructFieldWithLogicalName(_, name) =>
+          metadataColumns += name
+          false
+        case _ => true
+      }
+      new BufferedRowsReaderFactory(metadataColumns.toSeq, nonMetadataColumns, tableSchema)
+    }
+
+    override def supportedCustomMetrics(): Array[CustomMetric] = {
+      Array(new RowsReadCustomMetric)
+    }
+
+    override def toMicroBatchStream(checkpointLocation: String): MicroBatchStream = {
+      createdMicroBatchStreams.incrementAndGet()
+      val filters = this match {
+        case scan: InMemoryBatchScan if simulateStreamingFilters => scan.pushedFilters
+        case _ => Array.empty[Filter]
+      }
+      new InMemoryMicroBatchStream(readSchema, tableSchema, filters)
+    }
+  }
+
+  /**
+   * Reference implementation of
+   * [[SupportsRuntimeCatalystFiltering.planInputPartitionsWithRuntimeFilters]] for the in-memory
+   * fixtures: records what was pushed, and binds expressions referencing only identity partition
+   * columns against the partition key to return the partitions that match. Interpreting the bound
+   * expression lets the fixture honor arbitrary pushed expressions. Mixing classes supply their own
+   * `filterAttributes()`.
+   */
+  trait CatalystRuntimeFilteringScan extends SupportsRuntimeCatalystFiltering {
+    self: BatchScanBaseClass =>
+
+    /** The full table schema, used to locate partition columns pruned out of `readSchema`. */
+    protected def tableSchema: StructType
+
+    private val catalystPredicates = ArrayBuffer.empty[CatalystExpression]
+    private var filterCalls = 0
+    private val plannedPartitions = ArrayBuffer.empty[Seq[InputPartition]]
+
+    override def planInputPartitionsWithRuntimeFilters(
+        expressions: Array[CatalystExpression]): Array[InputPartition] = {
+      catalystPredicates ++= expressions
+      filterCalls += 1
+      // The result comes from `expressions` and the unfiltered `data` alone. Spark calls this once
+      // per scan node, and several nodes can share one scan, so carrying one call's pruning into
+      // the next would drop partitions the second node still needs. `catalystPredicates` and
+      // `filterCalls` only record what happened, for test assertions; `plannedPartitions` is read
+      // back through `readPartitions`, which is what the group-based write replaces.
+      val filtered = prunePartitions(self.data, expressions)
+      plannedPartitions += filtered
+      filtered.toArray
+    }
+
+    private def prunePartitions(
+        partitions: Seq[InputPartition],
+        expressions: Array[CatalystExpression]): Seq[InputPartition] = {
+      val partAttrs = partitionAttributes
+      if (partAttrs.isEmpty) return partitions
+
+      expressions.foldLeft(partitions) { (remaining, expr) =>
+        // Top down, so `s.part` is rewritten before its `s` child is considered.
+        val remapped = expr.transformDown {
+          case e => partitionAttrFor(e, partAttrs).getOrElse(e)
+        }
+        // Evaluate expressions only when every reference maps to an identity partition-key slot.
+        if (remapped.references.isEmpty) {
+          val pred = CatalystPredicate.createInterpreted(remapped)
+          remaining.filter { p =>
+            try {
+              pred.eval(p.asInstanceOf[BufferedRows].partitionKey())
+            } catch {
+              // Keep the partition on eval failure, which is safe here because every predicate
+              // the fixture pushes evaluates cleanly. `PartitionPredicateImpl` keeps a partition
+              // it cannot evaluate only for a runtime filter, whose rows are filtered anyway, so
+              // it costs just a pruning opportunity; everywhere else it propagates, because Spark
+              // drops a filter the connector accepts. A scan declaring an attribute in
+              // `fullyPushedFilterAttributes()` likewise stands alone as the evaluator, so
+              // keeping an unevaluated partition would return nonmatching rows.
+              case _: Exception => true
+            }
+          }
+        } else {
+          remaining
+        }
+      }
+    }
+
+    /** Predicates recorded by [[planInputPartitionsWithRuntimeFilters]], for assertions only. */
+    def pushedCatalystPredicates: Seq[CatalystExpression] = catalystPredicates.toSeq
+
+    def filterCallCount: Int = filterCalls
+
+    /**
+     * Every partition [[planInputPartitionsWithRuntimeFilters]] handed to Spark, unioned over its
+     * calls because two scan nodes can share one scan and the group-based write has to replace
+     * everything they read; `data` when Spark never called it.
+     */
+    override def readPartitions: Seq[InputPartition] =
+      if (plannedPartitions.isEmpty) self.data else plannedPartitions.flatten.distinct.toSeq
+
+    /**
+     * Identity partition columns paired with their bound partition-key slots.
+     *
+     * Only identity transforms expose a source path because their partition-key slot retains the
+     * source value. Name parts stay separate so a quoted top-level column `a.b` remains distinct
+     * from a nested column `a`.`b`.
+     */
+    private def partitionAttributes: Seq[(Seq[String], BoundReference)] = {
+      partitioning.zipWithIndex.flatMap {
+        case (IdentityTransform(ref), ordinal) =>
+          val path = ref.fieldNames.toImmutableArraySeq
+          val resolver = SQLConf.get.resolver
+          readSchema.findNestedField(path, resolver = resolver)
+            .orElse(tableSchema.findNestedField(path, resolver = resolver)).map {
+            case (_, f) => path -> BoundReference(ordinal, f.dataType, f.nullable)
+          }
+        case _ => None
+      }.toSeq
+    }
+
+    /**
+     * The partition-key slot that `e` reads, or None if `e` reads no identity partition column.
+     * The path `e` reads is compared to each partition column's name parts component-wise with the
+     * resolver, so a quoted top-level column `a.b` cannot collide with a nested column `a`.`b`.
+     */
+    private def partitionAttrFor(
+        e: CatalystExpression,
+        partAttrs: Seq[(Seq[String], BoundReference)]): Option[BoundReference] = {
+      val resolver = SQLConf.get.resolver
+      partitionKeyPath(e).flatMap { path =>
+        partAttrs.collectFirst {
+          case (parts, attr) if parts.length == path.length &&
+            parts.lazyZip(path).forall((part, name) => resolver(part, name)) => attr
+        }
+      }
+    }
+
+    /**
+     * The name parts `e` reads, or None if it reads neither a column nor a struct field. Each
+     * `GetStructField` ordinal is the field's position in its parent struct. Examples:
+     *   - `AttributeReference(a)` -> `Seq("a")`, the top level column a
+     *   - `GetStructField(AttributeReference(a), 0)` -> `Seq("a", "b")`, the nested column a.b
+     *   - `GetStructField(GetStructField(AttributeReference(a), 0), 0)` -> `Seq("a", "b", "c")`
+     */
+    private def partitionKeyPath(e: CatalystExpression): Option[Seq[String]] = e match {
+      case a: AttributeReference => Some(Seq(a.name))
+      case g: GetStructField =>
+        partitionKeyPath(g.child).map(parent => parent :+ g.childSchema(g.ordinal).name)
+      case _ => None
+    }
+  }
+
+  case class InMemoryBatchScan(
+      var _data: Seq[InputPartition],
+      readSchema: StructType,
+      tableSchema: StructType,
+      options: CaseInsensitiveStringMap)
+    extends BatchScanBaseClass(_data, readSchema, tableSchema) with SupportsRuntimeFiltering {
+
+    // Back-pointer to the table this scan was built against.
+    val table: InMemoryBaseTable = InMemoryBaseTable.this
+
+    // The filters pushed to this scan at build time.
+    var pushedFilters: Array[Filter] = Array.empty
+
+    override def filterAttributes(): Array[NamedReference] = {
+      identityPartitionAttributes
+    }
+
+    override def filter(filters: Array[Filter]): Unit = {
+      if (filters.exists(_.isInstanceOf[AlwaysFalse])) {
+        this.data = Seq.empty
+        return
+      }
+      if (partitioning.length == 1 && identityPartitionReferences.length == 1) {
+        val ref = identityPartitionReferences.head
+        filters.foreach {
+          case In(attrName, values) if attrName == ref.toString =>
+            val matchingKeys = values.map { value =>
+              if (value != null) value.toString else null
+            }.toSet
+            this.data = this.data.filter(partition => {
+              val rows = partition.asInstanceOf[BufferedRows]
+              rows.key match {
+                // null partitions are represented as Seq(null)
+                case Seq(null) => matchingKeys.contains(null)
+                case _ => matchingKeys.contains(rows.keyString())
+              }
+            })
+
+          case _ => // skip
+        }
+      }
+    }
+  }
+
+  private class InMemoryBatchScanWithOrdering(
+      data: Seq[InputPartition],
+      readSchema: StructType,
+      tableSchema: StructType,
+      options: CaseInsensitiveStringMap)
+    extends InMemoryBatchScan(data, readSchema, tableSchema, options)
+      with SupportsReportOrdering {
+    override def outputOrdering(): Array[SortOrder] = InMemoryBaseTable.this.ordering
+  }
+
+  abstract class InMemoryWriterBuilder(val info: LogicalWriteInfo)
+    extends SupportsTruncate with SupportsDynamicOverwrite with SupportsStreamingUpdateAsAppend {
+
+    protected var writer: BatchWrite = new Append(info)
+    protected var streamingWriter: StreamingWrite = new StreamingAppend(info)
+
+    override def overwriteDynamicPartitions(): WriteBuilder = {
+      if (!writer.isInstanceOf[Append]) {
+        throw new IllegalArgumentException(s"Unsupported writer type: $writer")
+      }
+      writer = new DynamicOverwrite(info)
+      streamingWriter = new StreamingNotSupportedOperation("overwriteDynamicPartitions")
+      this
+    }
+
+    override def build(): Write = new Write with RequiresDistributionAndOrdering {
+      override def requiredDistribution: Distribution = distribution
+
+      override def distributionStrictlyRequired: Boolean = isDistributionStrictlyRequired
+
+      override def requiredOrdering: Array[SortOrder] = ordering
+
+      override def requiredNumPartitions(): Int = {
+        numPartitions.getOrElse(0)
+      }
+
+      override def advisoryPartitionSizeInBytes(): Long = {
+        advisoryPartitionSize.getOrElse(0)
+      }
+
+      override def toBatch: BatchWrite = {
+        val newSchema = info.schema()
+        val mergedSchema = mergeSchema(
+          oldType = CatalogV2Util.v2ColumnsToStructType(columns()),
+          newType = newSchema)
+        tableColumns = InMemoryBaseTable.assignMissingIds(
+          CatalogV2Util.structTypeToV2Columns(mergedSchema))
+        writer
+      }
+
+      override def toStreaming: StreamingWrite = streamingWriter match {
+        case exc: StreamingNotSupportedOperation => exc.throwsException()
+        case s => s
+      }
+
+      override def supportedCustomMetrics(): Array[CustomMetric] = {
+        Array(new InMemorySimpleCustomMetric, new InMemoryCustomDriverMetric)
+      }
+
+      override def reportDriverMetrics(): Array[CustomTaskMetric] = {
+        Array(new InMemoryCustomDriverTaskMetric(rows.size))
+      }
+
+      def mergeSchema(oldType: StructType, newType: StructType): StructType = {
+        val (oldFields, newFields) = (oldType.fields, newType.fields)
+
+        // this does not override the old field with the new field with same name for now
+        val nameToFieldMap = toFieldMap(oldFields)
+        val remainingNewFields = newFields.filterNot (f => nameToFieldMap.contains (f.name) )
+
+        // Create the merged struct with the new fields are appended at the end of the struct.
+        StructType (oldFields ++ remainingNewFields)
+      }
+
+      def toFieldMap(fields: Array[StructField]): Map[String, StructField] = {
+        val fieldMap = fields.map(field => field.name -> field).toMap
+        if (SQLConf.get.caseSensitiveAnalysis) {
+          fieldMap
+        } else {
+          CaseInsensitiveMap(fieldMap)
+        }
+      }
+    }
+  }
+
+  protected abstract class TestBatchWrite extends BatchWrite {
+
+    override def createBatchWriterFactory(info: PhysicalWriteInfo): DataWriterFactory = {
+      new BufferedRowsWriterFactory(CatalogV2Util.v2ColumnsToStructType(columns()))
+    }
+
+    override def abort(messages: Array[WriterCommitMessage]): Unit = {}
+
+    protected def doCommit(messages: Array[WriterCommitMessage]): Unit
+
+    override final def commit(messages: Array[WriterCommitMessage]): Unit = {
+      doCommit(messages)
+      commits += Commit(Instant.now().toEpochMilli)
+    }
+
+    override final def commit(
+        messages: Array[WriterCommitMessage],
+        summary: WriteSummary): Unit = {
+      doCommit(messages)
+      commits += Commit(Instant.now().toEpochMilli, writeSummary = Some(summary))
+    }
+  }
+
+  class Append(val info: LogicalWriteInfo) extends TestBatchWrite {
+    override protected def doCommit(
+        messages: Array[WriterCommitMessage]): Unit = dataMap.synchronized {
+      withData(messages.map(_.asInstanceOf[BufferedRows]))
+    }
+  }
+
+  class DynamicOverwrite(val info: LogicalWriteInfo) extends TestBatchWrite {
+    override protected def doCommit(
+        messages: Array[WriterCommitMessage]): Unit = dataMap.synchronized {
+      val newData = messages.map(_.asInstanceOf[BufferedRows])
+      dataMap --= newData.flatMap(_.rows.map(getKey))
+      withData(newData)
+    }
+  }
+
+  class TruncateAndAppend(val info: LogicalWriteInfo) extends TestBatchWrite {
+    override protected def doCommit(
+        messages: Array[WriterCommitMessage]): Unit = dataMap.synchronized {
+      dataMap.clear()
+      withData(messages.map(_.asInstanceOf[BufferedRows]))
+    }
+  }
+
+  protected abstract class TestStreamingWrite extends StreamingWrite {
+    def createStreamingWriterFactory(info: PhysicalWriteInfo): StreamingDataWriterFactory = {
+      new BufferedRowsWriterFactory(CatalogV2Util.v2ColumnsToStructType(columns()))
+    }
+
+    def abort(epochId: Long, messages: Array[WriterCommitMessage]): Unit = {}
+  }
+
+  protected class StreamingNotSupportedOperation(operation: String) extends TestStreamingWrite {
+    override def createStreamingWriterFactory(info: PhysicalWriteInfo): StreamingDataWriterFactory =
+      throwsException()
+
+    override def commit(epochId: Long, messages: Array[WriterCommitMessage]): Unit =
+      throwsException()
+
+    override def abort(epochId: Long, messages: Array[WriterCommitMessage]): Unit =
+      throwsException()
+
+    def throwsException[T](): T = throw new IllegalStateException("The operation " +
+      s"${operation} isn't supported for streaming query.")
+  }
+
+  class StreamingAppend(val info: LogicalWriteInfo) extends TestStreamingWrite {
+    override def commit(epochId: Long, messages: Array[WriterCommitMessage]): Unit = {
+      dataMap.synchronized {
+        withData(messages.map(_.asInstanceOf[BufferedRows]))
+      }
+    }
+  }
+
+  class StreamingTruncateAndAppend(val info: LogicalWriteInfo) extends TestStreamingWrite {
+    override def commit(epochId: Long, messages: Array[WriterCommitMessage]): Unit = {
+      dataMap.synchronized {
+        dataMap.clear()
+        withData(messages.map(_.asInstanceOf[BufferedRows]))
+      }
+    }
+  }
+
+  def copy(): Table = {
+    throw new UnsupportedOperationException(s"copy is not supported for ${getClass.getName}")
+  }
+}
+
+object InMemoryBaseTable {
+  private val columnIdGlobalCounter = new AtomicLong(0)
+  def nextColumnId(): Long = columnIdGlobalCounter.incrementAndGet()
+  def nextColumnIdString(): String = nextColumnId().toString
+
+  // SQL conf key that enables column ID assignment
+  val ASSIGN_COLUMN_IDS = "spark.sql.test.inMemoryTable.assignColumnIds"
+
+  // Test table property that simulates a connector which accepts a required schema but only
+  // partially applies it: every data column is reported from Scan.readSchema() while the required
+  // metadata columns are still pruned. `SupportsPushDownRequiredColumns` permits partial pruning of
+  // data columns; dropping the required metadata columns is not permitted, since
+  // `SupportsMetadataColumns` makes the read schema the only channel that delivers them.
+  val SIMULATE_PARTIAL_COLUMN_PRUNING = "simulate-partial-column-pruning"
+
+  // Test table property that simulates a connector whose pruning drops a column that was required,
+  // which `SupportsPushDownRequiredColumns` does not permit: when only some of the data columns
+  // are required, `Scan.readSchema()` does not have the first of them.
+  val SIMULATE_INCOMPLETE_COLUMN_PRUNING = "simulate-incomplete-column-pruning"
+
+  // Test table property that simulates a connector that returns the required columns in another
+  // order than they were asked in, which `SupportsPushDownRequiredColumns` permits:
+  // `Scan.readSchema()` has the required data columns in the reverse order, also when all of them
+  // are required.
+  val SIMULATE_REORDERED_COLUMN_PRUNING = "simulate-reordered-column-pruning"
+
+  // Test table property that simulates a connector whose pruning reports a required column with
+  // another type, which `SupportsPushDownRequiredColumns` does not permit: when only some of the
+  // data columns are required, `Scan.readSchema()` has them as binary columns.
+  val SIMULATE_RETYPED_COLUMN_PRUNING = "simulate-retyped-column-pruning"
+
+  // Test table property that simulates a connector whose pruning reports the required data columns
+  // as not nullable, whatever the nullability of the columns of the table is.
+  val SIMULATE_NON_NULLABLE_COLUMN_PRUNING = "simulate-non-nullable-column-pruning"
+
+  // Test table property: whether the table declares STREAMING_COLUMN_PRUNING, so that the scans of
+  // its streaming reads only read the columns that the queries read. Its streams then return the
+  // columns of their read schemas. It does not by default.
+  val STREAMING_COLUMN_PRUNING = "streaming-column-pruning"
+
+  // Test table property: whether the table declares STREAMING_FILTER_PUSHDOWN, so that the scan
+  // builders of its streaming reads get the filters of the queries, as for batch reads. It does not
+  // by default, so that the streaming reads of the other suites keep the path without it.
+  val STREAMING_FILTER_PUSHDOWN = "streaming-filter-pushdown"
+
+  // Test table property that simulates a connector whose micro-batch streams drop the rows that
+  // fail the filters that their scan builder took, which `STREAMING_FILTER_PUSHDOWN` permits:
+  // the streams of the table only return the rows that pass the pushed filters, see `passes`.
+  val SIMULATE_STREAMING_FILTERS = "simulate-streaming-filters"
+
+  /**
+   * Returns whether `row`, a row of a table with `schema`, may pass `filter`. It only returns
+   * false for a row that does not pass the filter, so that a stream that drops the other rows
+   * drops no row that Spark keeps.
+   */
+  def passes(filter: Filter, row: InternalRow, schema: StructType): Boolean = {
+    // Evaluates the filter as Spark does, with the Catalyst predicate that the CSV and JSON
+    // filters use. A filter over a column that the row does not have, such as a nested or a quoted
+    // one, or one added after the row was written, keeps the row, as does one that the predicate
+    // cannot express or evaluate.
+    val toRef = (name: String) => schema.getFieldIndex(name).filter(_ < row.numFields)
+      .map(i => BoundReference(i, schema(i).dataType, nullable = true))
+    StructFilters.filterToExpression(filter, toRef).forall { predicate =>
+      scala.util.Try(CatalystPredicate.createInterpreted(predicate).eval(row)).getOrElse(true)
+    }
+  }
+
+  /**
+   * Assigns fresh IDs to any top-level column or nested struct field that does not already
+   * have one. Recurses into struct fields within ArrayType and MapType so that every field
+   * at every depth gets an ID.
+   *
+   * Existing IDs are preserved: Column -> StructType -> Column round-trip encodes them in
+   * StructField metadata (see StructField.FIELD_ID_METADATA_KEY), so only genuinely new fields
+   * arrive here without an ID.
+   */
+  def assignMissingIds(columns: Array[Column]): Array[Column] = {
+    if (!SQLConf.get.getConfString(ASSIGN_COLUMN_IDS, "false").toBoolean) return columns
+    columns.map { col =>
+      val impl = col.asInstanceOf[ColumnImpl]
+      val colWithId = if (col.id == null) impl.copy(id = nextColumnIdString()) else impl
+      val updatedType = assignFieldIds(colWithId.dataType)
+      if (updatedType ne colWithId.dataType) {
+        colWithId.copy(dataType = updatedType)
+      } else {
+        colWithId
+      }
+    }
+  }
+
+  private def assignFieldIds(dataType: DataType): DataType = dataType match {
+    case s: StructType =>
+      val newFields = s.fields.map { field =>
+        val fieldWithId = if (field.id.isEmpty) field.withId(nextColumnIdString()) else field
+        val updatedType = assignFieldIds(fieldWithId.dataType)
+        if (updatedType ne fieldWithId.dataType) {
+          fieldWithId.copy(dataType = updatedType)
+        } else {
+          fieldWithId
+        }
+      }
+      if (newFields.zip(s.fields).forall { case (n, e) => n eq e }) s else StructType(newFields)
+
+    case a: ArrayType =>
+      val updatedElement = assignFieldIds(a.elementType)
+      if (updatedElement ne a.elementType) a.copy(elementType = updatedElement) else a
+
+    case m: MapType =>
+      val updatedKeyType = assignFieldIds(m.keyType)
+      val updatedValueType = assignFieldIds(m.valueType)
+      if ((updatedKeyType ne m.keyType) || (updatedValueType ne m.valueType)) {
+        m.copy(keyType = updatedKeyType, valueType = updatedValueType) }
+      else {
+        m
+      }
+
+    case other =>
+      other
+  }
+
+  val SIMULATE_FAILED_WRITE_OPTION = "spark.sql.test.simulateFailedWrite"
+
+  def extractValue(
+      attr: String,
+      partFieldNames: Seq[String],
+      partValues: Seq[Any]): Any = {
+    partFieldNames.zipWithIndex.find(_._1 == attr) match {
+      case Some((_, partIndex)) =>
+        partValues(partIndex)
+      case _ =>
+        throw new IllegalArgumentException(s"Unknown filter attribute: $attr")
+    }
+  }
+
+  def maybeSimulateFailedTableWrite(tableOptions: CaseInsensitiveStringMap): Unit = {
+    if (tableOptions.getBoolean(SIMULATE_FAILED_WRITE_OPTION, false)) {
+      throw new IllegalStateException("Manual write to table failure.")
+    }
+  }
+}
+
+/**
+ * A partition for [[InMemoryBaseTable]] micro-batch streaming reads: the rows of a micro-batch that
+ * pass the filters of its stream, each with its position in the micro-batch.
+ */
+case class InMemoryMicroBatchPartition(rows: Seq[(InternalRow, Int)]) extends InputPartition
+
+/**
+ * Represent a set of rows buffered in memory for a given partition key.
+ * @param key partition key
+ * @param schema schema used to write the rows
+ */
+class BufferedRows(val key: Seq[Any], val schema: StructType)
+  extends WriterCommitMessage
+    with InputPartition with HasPartitionKey with HasPartitionStatistics with Serializable {
+  val log = new mutable.ArrayBuffer[InternalRow]()
+  val rows = new mutable.ArrayBuffer[InternalRow]()
+  val deletes = new mutable.ArrayBuffer[Int]()
+
+  def withRow(row: InternalRow): BufferedRows = {
+    rows.append(row)
+    this
+  }
+
+  def keyString(): String = key.toArray.mkString("/")
+
+  override def partitionKey(): InternalRow = PartitionInternalRow(key.toArray)
+  override def sizeInBytes(): OptionalLong = OptionalLong.of(100L)
+  override def numRows(): OptionalLong = OptionalLong.of(rows.size)
+  override def filesCount(): OptionalLong = OptionalLong.of(100L)
+
+  def clear(): Unit = rows.clear()
+}
+
+/**
+ * @param dataOrdinals the positions in the rows of the table of the data columns to read, unless
+ *                     the readers return the rows of the table
+ * @param dataSchema the data columns to read
+ */
+private class InMemoryMicroBatchReaderFactory(
+    metaNames: Array[String],
+    dataOrdinals: Option[Array[Int]],
+    dataSchema: StructType) extends PartitionReaderFactory with Serializable {
+  override def createReader(partition: InputPartition): PartitionReader[InternalRow] = {
+    val rows = partition.asInstanceOf[InMemoryMicroBatchPartition].rows
+    new PartitionReader[InternalRow] {
+      private var idx = -1
+      private val projection =
+        dataOrdinals.map(ordinals => ProjectingInternalRow(dataSchema, ordinals.toSeq))
+      override def next(): Boolean = { idx += 1; idx < rows.size }
+      override def get(): InternalRow = {
+        val (tableRow, index) = rows(idx)
+        val rawRow = projection.map { projection =>
+          projection.project(tableRow)
+          projection
+        }.getOrElse(tableRow)
+        if (metaNames.isEmpty) rawRow
+        else {
+          val metaRow = new GenericInternalRow(metaNames.map {
+            case "index" => index.asInstanceOf[Any]
+            case "_partition" => UTF8String.fromString("").asInstanceOf[Any]
+            case _ => null
+          })
+          new JoinedRow(rawRow, metaRow)
+        }
+      }
+      override def close(): Unit = {}
+    }
+  }
+}
+
+object BufferedRows {
+  def apply(key: Seq[Any], schema: Array[Column]): BufferedRows = {
+    new BufferedRows(key, CatalogV2Util.v2ColumnsToStructType(schema))
+  }
+}
+
+/**
+ * Theoretically, [[InternalRow]] returned by [[HasPartitionKey#partitionKey()]]
+ * does not need to implement equal and hashcode methods.
+ * But [[GenericInternalRow]] implements equals and hashcode methods already. Here we override it
+ * to simulate that it has not been implemented to verify codes correctness.
+ */
+case class PartitionInternalRow(keys: Array[Any])
+  extends GenericInternalRow(keys) {
+  override def equals(other: Any): Boolean = {
+    if (!other.isInstanceOf[PartitionInternalRow]) {
+      return false
+    }
+    // Just compare by reference, not by value
+    this.keys == other.asInstanceOf[PartitionInternalRow].keys
+  }
+  override def hashCode: Int = {
+    Objects.hash(keys)
+  }
+}
+
+private class BufferedRowsReaderFactory(
+    metadataColumnNames: Seq[String],
+    nonMetaDataColumns: Seq[StructField],
+    tableSchema: StructType) extends PartitionReaderFactory {
+  override def createReader(partition: InputPartition): PartitionReader[InternalRow] = {
+    new BufferedRowsReader(partition.asInstanceOf[BufferedRows], metadataColumnNames,
+      nonMetaDataColumns, tableSchema)
+  }
+}
+
+private class BufferedRowsReader(
+    partition: BufferedRows,
+    metadataColumnNames: Seq[String],
+    nonMetadataColumns: Seq[StructField],
+    tableSchema: StructType) extends PartitionReader[InternalRow] {
+  private def addMetadata(row: InternalRow): InternalRow = {
+    val metadataRow = new GenericInternalRow(metadataColumnNames.map {
+      case "index" => index
+      case "_partition" => UTF8String.fromString(partition.keyString())
+    }.toArray)
+    new JoinedRow(row, metadataRow)
+  }
+
+  private var index: Int = -1
+  private var rowsRead: Long = 0
+  private var closed: Boolean = false
+
+  private def checkNotClosed(op: String): Unit =
+    if (closed) throw new IllegalStateException(s"$op called on a closed BufferedRowsReader")
+
+  override def next(): Boolean = {
+    checkNotClosed("next()")
+    index += 1
+    val hasNext = index < partition.rows.length
+    if (hasNext) rowsRead += 1
+    hasNext
+  }
+
+  override def get(): InternalRow = {
+    checkNotClosed("get()")
+    val originalRow = partition.rows(index)
+    val values = new Array[Any](nonMetadataColumns.length)
+    nonMetadataColumns.zipWithIndex.foreach { case (col, idx) =>
+      values(idx) = extractFieldValue(col, tableSchema,
+        partition.schema, originalRow)
+    }
+    addMetadata(new GenericInternalRow(values))
+  }
+
+  // Intentionally strict: double-close throws rather than being idempotent (as Closeable permits).
+  // This is test code whose purpose is to catch reader lifecycle bugs early; a silent no-op on
+  // double-close would mask the very errors we want to detect.
+  override def close(): Unit = {
+    checkNotClosed("close()")
+    closed = true
+  }
+
+  private def extractFieldValue(
+      field: StructField,
+      readSchema: StructType,
+      writeSchema: StructType,
+      row: InternalRow): Any = {
+    val writeIndexOpt = writeSchema.getFieldIndex(field.name)
+    val readIndexOpt = readSchema.getFieldIndex(field.name)
+    (writeIndexOpt, readIndexOpt) match {
+      case (Some(writeIndex), Some(readIndex)) =>
+        if (writeIndex >= row.numFields) {
+          return ResolveDefaultColumns.getExistenceDefaultValue(field)
+        }
+
+        field.dataType match {
+          case StructType(fields) =>
+            if (row.isNullAt(writeIndex)) {
+              return null
+            }
+            val childRow = row.toSeq(writeSchema)(writeIndex).asInstanceOf[InternalRow]
+            val childWriteSchema = writeSchema.fields(writeIndex).dataType.asInstanceOf[StructType]
+            val childReadSchema = readSchema.fields(writeIndex).dataType.asInstanceOf[StructType]
+            val resultValue = new Array[Any](fields.length)
+            fields.zipWithIndex.foreach { case (childField, idx) =>
+              val childValue = extractFieldValue(childField, childReadSchema,
+                childWriteSchema, childRow)
+              resultValue(idx) = childValue
+            }
+            new GenericInternalRow(resultValue)
+
+          case MapType(keyType, valueType, _) =>
+            val writeMapType = writeSchema.fields(writeIndex).dataType.asInstanceOf[MapType]
+            val mapData = row.getMap(writeIndex)
+            if (mapData == null) {
+              null
+            } else {
+              extractMapValue(mapData, keyType, valueType,
+                writeMapType.keyType, writeMapType.valueType)
+            }
+
+          case ArrayType(elementType, _) =>
+            val arrayData = row.getArray(writeIndex)
+            if (arrayData == null) {
+              null
+            } else {
+              val writeType = writeSchema.fields(writeIndex).dataType.asInstanceOf[ArrayType]
+              extractArrayValue(arrayData, elementType, writeType.elementType)
+            }
+
+          case dt =>
+            val writeType = writeSchema.fields(writeIndex).dataType
+            val value = row.get(writeIndex, writeType)
+            if (writeType != dt && value != null) {
+              castElement(value, dt, writeType)
+            } else {
+              value
+            }
+        }
+      case (None, Some(_)) =>
+        ResolveDefaultColumns.getExistenceDefaultValue(field)
+      case _ => throw new RuntimeException("Failed, " +
+        "field is not found in both read and write schema.")
+    }
+  }
+
+  private def extractArrayValue(
+      arrayData: ArrayData,
+      readType: DataType,
+      writeType: DataType): ArrayData = {
+    val elements = arrayData.toArray[Any](writeType)
+    val convertedElements = extractCollection(elements, readType, writeType)
+    new GenericArrayData(convertedElements)
+  }
+
+  private def extractMapValue(
+      mapData: MapData,
+      readKeyType: DataType,
+      readValueType: DataType,
+      writeKeyType: DataType,
+      writeValueType: DataType): MapData = {
+    val keys = mapData.keyArray().toArray[Any](writeKeyType)
+    val values = mapData.valueArray().toArray[Any](writeValueType)
+
+    val convertedKeys = extractCollection(keys, readKeyType, writeKeyType)
+    val convertedValues = extractCollection(values, readValueType, writeValueType)
+    ArrayBasedMapData(convertedKeys, convertedValues)
+  }
+
+  private def extractCollection(
+      elements: Array[Any],
+      readType: DataType,
+      writeType: DataType) = {
+    (readType, writeType) match {
+      case (readSt: StructType, writeSt: StructType) =>
+        elements.map { elem =>
+          if (elem == null) {
+            null
+          } else {
+            val elemRow = elem.asInstanceOf[InternalRow]
+            val result = readSt.fields
+              .map(f => extractFieldValue(f, readSt, writeSt, elemRow))
+            new GenericInternalRow(result)
+          }
+        }
+      case (ArrayType(readAType, _), ArrayType(writeAType, _)) =>
+        elements.map { elem =>
+          if (elem == null) {
+            null
+          } else {
+            extractArrayValue(elem.asInstanceOf[ArrayData], readAType, writeAType)
+          }
+        }
+      case (MapType(rKeyType, rValueType, _), MapType(wKeyType, wValueType, _)) =>
+        elements.map { elem =>
+          if (elem == null) {
+            null
+          } else {
+            extractMapValue(elem.asInstanceOf[MapData], rKeyType, rValueType,
+              wKeyType, wValueType)
+          }
+        }
+      case (readType: AtomicType, writeType: AtomicType) if readType != writeType =>
+        elements.map { elem =>
+          if (elem == null) {
+            null
+          } else {
+            castElement(elem, readType, writeType)
+          }
+        }
+      case (_, _) => elements
+    }
+  }
+
+  private def castElement(elem: Any, toType: DataType, fromType: DataType): Any =
+    Cast(Literal(elem, fromType), toType, None, EvalMode.TRY).eval(null)
+
+  override def currentMetricsValues(): Array[CustomTaskMetric] = {
+    checkNotClosed("currentMetricsValues()")
+    val metric = new CustomTaskMetric {
+      override def name(): String = "rows_read"
+      override def value(): Long = rowsRead
+    }
+    Array(metric)
+  }
+}
+
+private class BufferedRowsWriterFactory(schema: StructType)
+  extends DataWriterFactory with StreamingDataWriterFactory {
+  override def createWriter(partitionId: Int, taskId: Long): DataWriter[InternalRow] = {
+    new BufferWriter(schema)
+  }
+
+  override def createWriter(
+      partitionId: Int,
+      taskId: Long,
+      epochId: Long): DataWriter[InternalRow] = {
+    new BufferWriter(schema)
+  }
+}
+
+private class BufferWriter(schema: StructType) extends DataWriter[InternalRow] {
+
+  private final val WRITE = UTF8String.fromString(Write.toString)
+
+  protected val buffer = new BufferedRows(Seq.empty, schema)
+
+  override def write(metadata: InternalRow, row: InternalRow): Unit = {
+    buffer.rows.append(row.copy())
+    val logEntry = new GenericInternalRow(Array[Any](WRITE, null, metadata.copy(), row.copy()))
+    buffer.log.append(logEntry)
+  }
+
+  override def write(row: InternalRow): Unit = {
+    buffer.rows.append(row.copy())
+    val logEntry = new GenericInternalRow(Array[Any](WRITE, null, null, row.copy()))
+    buffer.log.append(logEntry)
+  }
+
+  override def commit(): WriterCommitMessage = buffer
+
+  override def abort(): Unit = {}
+
+  override def close(): Unit = {}
+
+  override def currentMetricsValues(): Array[CustomTaskMetric] = {
+    val metric = new CustomTaskMetric {
+      override def name(): String = "in_memory_buffer_rows"
+
+      override def value(): Long = buffer.rows.size
+    }
+    Array(metric)
+  }
+}
+
+class InMemorySimpleCustomMetric extends CustomMetric {
+  override def name(): String = "in_memory_buffer_rows"
+  override def description(): String = "number of rows in buffer"
+  override def aggregateTaskMetrics(taskMetrics: Array[Long]): String = {
+    s"in-memory rows: ${taskMetrics.sum}"
+  }
+}
+
+class InMemoryCustomDriverMetric extends CustomSumMetric {
+  override def name(): String = "number_of_rows_from_driver"
+  override def description(): String = "number of rows from driver"
+}
+
+class InMemoryCustomDriverTaskMetric(value: Long) extends CustomTaskMetric {
+  override def name(): String = "number_of_rows_from_driver"
+  override def value(): Long = value
+}
+
+class RowsReadCustomMetric extends CustomSumMetric {
+  override def name(): String = "rows_read"
+  override def description(): String = "number of rows read"
+}
+
+case class Commit(id: Long, writeSummary: Option[WriteSummary] = None)
+
+sealed trait Operation
+case object Write extends Operation
+case object Delete extends Operation
+case object Update extends Operation
+case object Reinsert extends Operation
+case object Insert extends Operation

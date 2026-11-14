@@ -27,17 +27,17 @@ import javax.security.sasl.RealmCallback;
 import javax.security.sasl.Sasl;
 import javax.security.sasl.SaslException;
 import javax.security.sasl.SaslServer;
-import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
+import java.util.Objects;
 
-import com.google.common.base.Preconditions;
-import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableMap;
+import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.handler.codec.base64.Base64;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+
+import org.apache.spark.internal.SparkLogger;
+import org.apache.spark.internal.SparkLoggerFactory;
 
 /**
  * A SASL Server for Spark which simply keeps track of the state of a single SASL session, from the
@@ -45,7 +45,7 @@ import org.slf4j.LoggerFactory;
  * connections on some socket.)
  */
 public class SparkSaslServer implements SaslEncryptionBackend {
-  private final Logger logger = LoggerFactory.getLogger(SparkSaslServer.class);
+  private static final SparkLogger logger = SparkLoggerFactory.getLogger(SparkSaslServer.class);
 
   /**
    * This is passed as the server name when creating the sasl client/server.
@@ -93,7 +93,7 @@ public class SparkSaslServer implements SaslEncryptionBackend {
       this.saslServer = Sasl.createSaslServer(DIGEST, null, DEFAULT_REALM, saslProps,
         new DigestCallbackHandler());
     } catch (SaslException e) {
-      throw Throwables.propagate(e);
+      throw new RuntimeException(e);
     }
   }
 
@@ -118,7 +118,7 @@ public class SparkSaslServer implements SaslEncryptionBackend {
     try {
       return saslServer != null ? saslServer.evaluateResponse(token) : new byte[0];
     } catch (SaslException e) {
-      throw Throwables.propagate(e);
+      throw new RuntimeException(e);
     }
   }
 
@@ -154,22 +154,18 @@ public class SparkSaslServer implements SaslEncryptionBackend {
    */
   private class DigestCallbackHandler implements CallbackHandler {
     @Override
-    public void handle(Callback[] callbacks) throws IOException, UnsupportedCallbackException {
+    public void handle(Callback[] callbacks) throws UnsupportedCallbackException {
       for (Callback callback : callbacks) {
-        if (callback instanceof NameCallback) {
+        if (callback instanceof NameCallback nc) {
           logger.trace("SASL server callback: setting username");
-          NameCallback nc = (NameCallback) callback;
           nc.setName(encodeIdentifier(secretKeyHolder.getSaslUser(secretKeyId)));
-        } else if (callback instanceof PasswordCallback) {
+        } else if (callback instanceof PasswordCallback pc) {
           logger.trace("SASL server callback: setting password");
-          PasswordCallback pc = (PasswordCallback) callback;
           pc.setPassword(encodePassword(secretKeyHolder.getSecretKey(secretKeyId)));
-        } else if (callback instanceof RealmCallback) {
+        } else if (callback instanceof RealmCallback rc) {
           logger.trace("SASL server callback: setting realm");
-          RealmCallback rc = (RealmCallback) callback;
           rc.setText(rc.getDefaultText());
-        } else if (callback instanceof AuthorizeCallback) {
-          AuthorizeCallback ac = (AuthorizeCallback) callback;
+        } else if (callback instanceof AuthorizeCallback ac) {
           String authId = ac.getAuthenticationID();
           String authzId = ac.getAuthorizationID();
           ac.setAuthorized(authId.equals(authzId));
@@ -186,15 +182,32 @@ public class SparkSaslServer implements SaslEncryptionBackend {
 
   /* Encode a byte[] identifier as a Base64-encoded string. */
   public static String encodeIdentifier(String identifier) {
-    Preconditions.checkNotNull(identifier, "User cannot be null if SASL is enabled");
-    return Base64.encode(Unpooled.wrappedBuffer(identifier.getBytes(StandardCharsets.UTF_8)))
-      .toString(StandardCharsets.UTF_8);
+    Objects.requireNonNull(identifier, "User cannot be null if SASL is enabled");
+    return getBase64EncodedString(identifier);
   }
 
   /** Encode a password as a base64-encoded char[] array. */
   public static char[] encodePassword(String password) {
-    Preconditions.checkNotNull(password, "Password cannot be null if SASL is enabled");
-    return Base64.encode(Unpooled.wrappedBuffer(password.getBytes(StandardCharsets.UTF_8)))
-      .toString(StandardCharsets.UTF_8).toCharArray();
+    Objects.requireNonNull(password, "Password cannot be null if SASL is enabled");
+    return getBase64EncodedString(password).toCharArray();
+  }
+
+  /** Return a Base64-encoded string. */
+  private static String getBase64EncodedString(String str) {
+    ByteBuf byteBuf = null;
+    ByteBuf encodedByteBuf = null;
+    try {
+      byteBuf = Unpooled.wrappedBuffer(str.getBytes(StandardCharsets.UTF_8));
+      encodedByteBuf = Base64.encode(byteBuf);
+      return encodedByteBuf.toString(StandardCharsets.UTF_8);
+    } finally {
+      // The release is called to suppress the memory leak error messages raised by netty.
+      if (byteBuf != null) {
+        byteBuf.release();
+        if (encodedByteBuf != null) {
+          encodedByteBuf.release();
+        }
+      }
+    }
   }
 }

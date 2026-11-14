@@ -29,9 +29,11 @@ object MemoryTestingUtils {
     val taskMemoryManager = new TaskMemoryManager(env.memoryManager, 0)
     new TaskContextImpl(
       stageId = 0,
+      stageAttemptNumber = 0,
       partitionId = 0,
       taskAttemptId = 0,
       attemptNumber = 0,
+      numPartitions = 1,
       taskMemoryManager = taskMemoryManager,
       localProperties = new Properties,
       metricsSystem = env.metricsSystem)

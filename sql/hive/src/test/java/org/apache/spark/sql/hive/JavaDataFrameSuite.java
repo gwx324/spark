@@ -21,46 +21,38 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 
-import org.junit.After;
-import org.junit.Assert;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 
-import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.sql.*;
 import org.apache.spark.sql.expressions.Window;
 import org.apache.spark.sql.expressions.UserDefinedAggregateFunction;
 import static org.apache.spark.sql.functions.*;
 import org.apache.spark.sql.hive.test.TestHive$;
-import org.apache.spark.sql.hive.aggregate.MyDoubleSum;
+import test.org.apache.spark.sql.MyDoubleSum;
 
 public class JavaDataFrameSuite {
-  private transient JavaSparkContext sc;
   private transient SQLContext hc;
 
   Dataset<Row> df;
 
   private static void checkAnswer(Dataset<Row> actual, List<Row> expected) {
-    String errorMessage = QueryTest$.MODULE$.checkAnswer(actual, expected);
-    if (errorMessage != null) {
-      Assert.fail(errorMessage);
-    }
+    QueryTest$.MODULE$.checkAnswer(actual, expected);
   }
 
-  @Before
+  @BeforeEach
   public void setUp() throws IOException {
     hc = TestHive$.MODULE$;
-    sc = new JavaSparkContext(hc.sparkContext());
-
     List<String> jsonObjects = new ArrayList<>(10);
     for (int i = 0; i < 10; i++) {
       jsonObjects.add("{\"key\":" + i + ", \"value\":\"str" + i + "\"}");
     }
-    df = hc.read().json(sc.parallelize(jsonObjects));
+    df = hc.read().json(hc.createDataset(jsonObjects, Encoders.STRING()));
     df.createOrReplaceTempView("window_table");
   }
 
-  @After
+  @AfterEach
   public void tearDown() throws IOException {
     // Clean up tables.
     if (hc != null) {
@@ -93,7 +85,7 @@ public class JavaDataFrameSuite {
           udaf.distinct(col("value")),
           udaf.apply(col("value")),
           registeredUDAF.apply(col("value")),
-          callUDF("mydoublesum", col("value")));
+          callUDF("mydoublesum", col("value")));  // test deprecated one
 
     List<Row> expectedResult = new ArrayList<>();
     expectedResult.add(RowFactory.create(4950.0, 9900.0, 9900.0, 9900.0));

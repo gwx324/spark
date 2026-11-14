@@ -1,0 +1,203 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.connector.catalog
+
+import org.apache.spark.sql.catalyst.SQLConfHelper
+import org.apache.spark.sql.catalyst.analysis.Resolver
+import org.apache.spark.sql.catalyst.expressions.MetadataAttributeWithLogicalName
+import org.apache.spark.sql.catalyst.util.{quoteIdentifier, quoteIfNeeded}
+import org.apache.spark.sql.connector.catalog.CatalogV2Implicits.IdentifierHelper
+import org.apache.spark.sql.errors.QueryCompilationErrors
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
+import org.apache.spark.sql.util.SchemaUtils
+import org.apache.spark.sql.util.SchemaValidationMode
+import org.apache.spark.sql.util.SchemaValidationMode.{ALLOW_NEW_FIELDS, PROHIBIT_CHANGES}
+import org.apache.spark.util.ArrayImplicits._
+
+private[sql] object V2TableUtil extends SQLConfHelper {
+
+  def toQualifiedName(catalog: CatalogPlugin, ident: Identifier): String = {
+    s"${quoteIfNeeded(catalog.name)}.${ident.quoted}"
+  }
+
+  /**
+   * Validates that captured data columns match the current table schema.
+   *
+   * @param table the current table metadata
+   * @param relation the relation with captured columns
+   * @param mode validation mode that defines what changes are acceptable
+   * @return validation errors, or empty sequence if valid
+   */
+  def validateCapturedColumns(
+      table: Table,
+      relation: DataSourceV2Relation,
+      mode: SchemaValidationMode,
+      checkIds: Boolean): Seq[String] = {
+    validateCapturedColumns(table, relation.table.columns.toImmutableArraySeq, mode, checkIds)
+  }
+
+  /**
+   * Validates that captured data columns match the current table schema.
+   *
+   * Checks for:
+   *  - Column ID changes (top-level and nested field IDs)
+   *  - Column type or nullability changes
+   *  - Removed columns (missing from the current table schema)
+   *  - Added columns (new in the current table schema)
+   *
+   * @param table the current table metadata
+   * @param originCols the originally captured columns
+   * @param mode validation mode that defines what changes are acceptable
+   * @param checkIds whether to check field IDs
+   * @return validation errors, or empty sequence if valid
+   */
+  def validateCapturedColumns(
+      table: Table,
+      originCols: Seq[Column],
+      mode: SchemaValidationMode,
+      checkIds: Boolean): Seq[String] = {
+    val originSchema = CatalogV2Util.v2ColumnsToStructType(originCols)
+    val schema = CatalogV2Util.v2ColumnsToStructType(table.columns)
+    SchemaUtils.validateSchemaCompatibility(originSchema, schema, resolver, mode, checkIds)
+  }
+
+  /**
+   * Validates that captured metadata columns are consistent with the current table metadata.
+   *
+   * @param table the current table metadata
+   * @param relation the relation with captured metadata columns
+   * @param mode validation mode that defines what changes are acceptable
+   * @return validation errors, or empty sequence if valid
+   */
+  def validateCapturedMetadataColumns(
+      table: Table,
+      relation: DataSourceV2Relation,
+      mode: SchemaValidationMode,
+      checkIds: Boolean): Seq[String] = {
+    validateCapturedMetadataColumns(table, extractMetadataColumns(relation), mode, checkIds)
+  }
+
+  /**
+   * Extracts original column info for all metadata attributes in the relation.
+   *
+   * @param relation the relation with captured metadata columns
+   * @return metadata columns captured by the relation
+   */
+  def extractMetadataColumns(relation: DataSourceV2Relation): Seq[MetadataColumn] = {
+    val metaAttrNames = relation.output.collect {
+      case MetadataAttributeWithLogicalName(_, logicalName) => logicalName
+    }
+    if (metaAttrNames.isEmpty) Nil else filter(metaAttrNames, metadataColumns(relation.table))
+  }
+
+  /**
+   * Validates that captured metadata columns are consistent with the current table metadata.
+   *
+   * Checks for:
+   *  - Column ID changes (top-level and nested field IDs)
+   *  - Metadata column type or nullability changes
+   *  - Removed metadata columns (missing from current table)
+   *  - Metadata columns hidden by a same-named data column added after capture (when the connector
+   *    suppresses rather than renames the conflict)
+   *
+   * @param table the current table metadata
+   * @param originMetaCols the originally captured metadata columns
+   * @param mode validation mode that defines what changes are acceptable
+   * @param checkIds whether to check IDs
+   * @return validation errors, or empty sequence if valid
+   */
+  def validateCapturedMetadataColumns(
+      table: Table,
+      originMetaCols: Seq[MetadataColumn],
+      mode: SchemaValidationMode,
+      checkIds: Boolean): Seq[String] = {
+    require(
+      mode == PROHIBIT_CHANGES || mode == ALLOW_NEW_FIELDS,
+      s"Unsupported schema validation mode for metadata columns: $mode")
+    val originMetaColNames = originMetaCols.map(_.name)
+    val originMetaSchema = CatalogV2Util.toStructType(originMetaCols)
+    val metaCols = filter(originMetaColNames, metadataColumns(table))
+    val metaSchema = CatalogV2Util.toStructType(metaCols)
+    val schemaErrors = SchemaUtils.validateSchemaCompatibility(
+      originMetaSchema, metaSchema, resolver, mode, checkIds)
+    schemaErrors ++ shadowedMetadataColumnErrors(table, metaCols)
+  }
+
+  /**
+   * Reports captured metadata columns that a data column of the same name now hides.
+   *
+   * When a data column takes a metadata column's name, a fresh relation for a connector that does
+   * not rename the conflict (`canRenameConflictingMetadataColumns` is false) suppresses the
+   * metadata column via `metadataOutputWithOutConflicts`. A refreshed relation retains an already
+   * captured metadata attribute in its output. Later, `PushDownUtils.toOutputAttrs` reconciles the
+   * scan schema to that output by physical name, which can bind the same-named data field to the
+   * metadata attribute and return the data column's values. The `SupportsMetadataColumns` contract
+   * advises a non-renaming source to reject such a data-column name but does not enforce it, so
+   * this reports the conflict rather than leaving it silent.
+   */
+  private def shadowedMetadataColumnErrors(
+      table: Table,
+      reportedMetaCols: Seq[MetadataColumn]): Seq[String] = {
+    if (reportedMetaCols.isEmpty || renamesConflictingMetadataColumns(table)) {
+      Nil
+    } else {
+      val dataColNames = table.columns.iterator.map(_.name).toSeq
+      reportedMetaCols
+        .filter(metaCol => dataColNames.exists(resolver(metaCol.name, _)))
+        .map { metaCol =>
+          s"${quoteIdentifier(metaCol.name)} metadata column is hidden by a data column " +
+            "with the same name"
+        }
+    }
+  }
+
+  private def renamesConflictingMetadataColumns(table: Table): Boolean = table match {
+    case hasMeta: SupportsMetadataColumns => hasMeta.canRenameConflictingMetadataColumns
+    case _ => false
+  }
+
+  private def filter(colNames: Seq[String], cols: Seq[MetadataColumn]): Seq[MetadataColumn] = {
+    val normalizedColNames = colNames.map(normalize).toSet
+    cols.filter(col => normalizedColNames.contains(normalize(col.name)))
+  }
+
+  private def metadataColumns(table: Table): Seq[MetadataColumn] = table match {
+    case hasMeta: SupportsMetadataColumns => hasMeta.metadataColumns.toImmutableArraySeq
+    case _ => Seq.empty
+  }
+
+  /**
+   * Validates that the identity of a loaded table matches a previously captured table id.
+   * Throws if the table was dropped and recreated under the same name (which changes the id).
+   * No-op if the connector does not support table ids (capturedId is null).
+   */
+  def validateTableId(name: String, capturedId: String, currentTable: Table): Unit = {
+    if (capturedId != null && capturedId != currentTable.id) {
+      throw QueryCompilationErrors.tableIdChangedAfterAnalysis(
+        name,
+        capturedTableId = capturedId,
+        currentTableId = currentTable.id)
+    }
+  }
+
+  private def normalize(name: String): String = {
+    SchemaUtils.foldName(name, conf.caseSensitiveAnalysis)
+  }
+
+  private def resolver: Resolver = conf.resolver
+}

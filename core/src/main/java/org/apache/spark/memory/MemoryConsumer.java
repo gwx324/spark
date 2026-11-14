@@ -18,7 +18,9 @@
 package org.apache.spark.memory;
 
 import java.io.IOException;
+import java.util.concurrent.atomic.AtomicLong;
 
+import org.apache.spark.errors.SparkCoreErrors;
 import org.apache.spark.unsafe.array.LongArray;
 import org.apache.spark.unsafe.memory.MemoryBlock;
 
@@ -26,13 +28,21 @@ import org.apache.spark.unsafe.memory.MemoryBlock;
  * A memory consumer of {@link TaskMemoryManager} that supports spilling.
  *
  * Note: this only supports allocation / spilling of Tungsten memory.
+ *
+ * Memory consumers have identity equality: {@link #equals} and {@link #hashCode} are defined here
+ * by reference, so a subclass, including a Scala case class when compiled against this version,
+ * does not get value equality unless it explicitly overrides them. {@link TaskMemoryManager} also
+ * tracks consumers by identity, even if a subclass overrides {@code equals}: distinct instances are
+ * never merged into one entry, so each of them can be offered for spilling and reported in the
+ * memory usage breakdown. How much memory a spill actually releases is decided by each consumer's
+ * {@link #spill(long, MemoryConsumer)}.
  */
 public abstract class MemoryConsumer {
 
   protected final TaskMemoryManager taskMemoryManager;
   private final long pageSize;
   private final MemoryMode mode;
-  protected long used;
+  protected final AtomicLong used = new AtomicLong(0L);
 
   protected MemoryConsumer(TaskMemoryManager taskMemoryManager, long pageSize, MemoryMode mode) {
     this.taskMemoryManager = taskMemoryManager;
@@ -40,8 +50,8 @@ public abstract class MemoryConsumer {
     this.mode = mode;
   }
 
-  protected MemoryConsumer(TaskMemoryManager taskMemoryManager) {
-    this(taskMemoryManager, taskMemoryManager.pageSizeBytes(), MemoryMode.ON_HEAP);
+  protected MemoryConsumer(TaskMemoryManager taskMemoryManager, MemoryMode mode) {
+    this(taskMemoryManager, taskMemoryManager.pageSizeBytes(), mode);
   }
 
   /**
@@ -54,14 +64,12 @@ public abstract class MemoryConsumer {
   /**
    * Returns the size of used memory in bytes.
    */
-  protected long getUsed() {
-    return used;
+  public long getUsed() {
+    return used.get();
   }
 
   /**
    * Force spill during building.
-   *
-   * For testing.
    */
   public void spill() throws IOException {
     spill(Long.MAX_VALUE, this);
@@ -73,33 +81,37 @@ public abstract class MemoryConsumer {
    *
    * This should be implemented by subclass.
    *
-   * Note: In order to avoid possible deadlock, should not call acquireMemory() from spill().
+   * Note: In order to avoid possible deadlock, implementations must release memory synchronously
+   * on the calling thread and must not acquire task memory from spill(), either directly or from
+   * another thread.
    *
    * Note: today, this only frees Tungsten-managed pages.
    *
    * @param size the amount of memory should be released
-   * @param trigger the MemoryConsumer that trigger this spilling
+   * @param trigger the MemoryConsumer that trigger this spilling. Compare it with this consumer
+   *                by reference ({@code eq}/{@code ne} in Scala), not by {@code equals}: a
+   *                distinct consumer that is equal to this one does not make this a
+   *                self-triggered spill.
    * @return the amount of released memory in bytes
-   * @throws IOException
    */
   public abstract long spill(long size, MemoryConsumer trigger) throws IOException;
 
   /**
-   * Allocates a LongArray of `size`.
+   * Allocates a LongArray of `size`. Note that this method may throw `SparkOutOfMemoryError`
+   * if Spark doesn't have enough memory for this allocation, or throw `TooLargePageException`
+   * if this `LongArray` is too large to fit in a single page. The caller side should take care of
+   * these two exceptions, or make sure the `size` is small enough that won't trigger exceptions.
+   *
+   * @throws SparkOutOfMemoryError
+   * @throws TooLargePageException
    */
   public LongArray allocateArray(long size) {
     long required = size * 8L;
     MemoryBlock page = taskMemoryManager.allocatePage(required, this);
     if (page == null || page.size() < required) {
-      long got = 0;
-      if (page != null) {
-        got = page.size();
-        taskMemoryManager.freePage(page, this);
-      }
-      taskMemoryManager.showMemoryUsage();
-      throw new OutOfMemoryError("Unable to acquire " + required + " bytes of memory, got " + got);
+      throwOom(page, required);
     }
-    used += required;
+    used.getAndAdd(required);
     return new LongArray(page);
   }
 
@@ -113,22 +125,24 @@ public abstract class MemoryConsumer {
   /**
    * Allocate a memory block with at least `required` bytes.
    *
-   * Throws IOException if there is not enough memory.
-   *
-   * @throws OutOfMemoryError
+   * @throws SparkOutOfMemoryError
    */
   protected MemoryBlock allocatePage(long required) {
-    MemoryBlock page = taskMemoryManager.allocatePage(Math.max(pageSize, required), this);
+    return allocatePage(Math.max(pageSize, required), required);
+  }
+
+  /**
+   * Allocate a memory block of `size` bytes. A smaller block may be returned, but it has at least
+   * `required` bytes, which must not exceed `size`.
+   *
+   * @throws SparkOutOfMemoryError
+   */
+  protected MemoryBlock allocatePage(long size, long required) {
+    MemoryBlock page = taskMemoryManager.allocatePageWithMinimum(size, required, this);
     if (page == null || page.size() < required) {
-      long got = 0;
-      if (page != null) {
-        got = page.size();
-        taskMemoryManager.freePage(page, this);
-      }
-      taskMemoryManager.showMemoryUsage();
-      throw new OutOfMemoryError("Unable to acquire " + required + " bytes of memory, got " + got);
+      throwOom(page, required);
     }
-    used += page.size();
+    used.getAndAdd(page.size());
     return page;
   }
 
@@ -136,8 +150,13 @@ public abstract class MemoryConsumer {
    * Free a memory block.
    */
   protected void freePage(MemoryBlock page) {
-    used -= page.size();
+    used.getAndAdd(-page.size());
     taskMemoryManager.freePage(page, this);
+  }
+
+  /** Returns whether this page came from a minimum retry after a partial allocation failed. */
+  protected boolean isPageAllocationFromMinimumRetry(MemoryBlock page) {
+    return taskMemoryManager.isPageAllocationFromMinimumRetry(page);
   }
 
   /**
@@ -145,7 +164,7 @@ public abstract class MemoryConsumer {
    */
   public long acquireMemory(long size) {
     long granted = taskMemoryManager.acquireExecutionMemory(size, this);
-    used += granted;
+    used.getAndAdd(granted);
     return granted;
   }
 
@@ -154,6 +173,34 @@ public abstract class MemoryConsumer {
    */
   public void freeMemory(long size) {
     taskMemoryManager.releaseExecutionMemory(size, this);
-    used -= size;
+    used.getAndAdd(-size);
+  }
+
+  /**
+   * Memory consumers are compared by identity. This is not final so that existing subclasses which
+   * override it keep compiling, but its presence stops Scala case classes compiled against this
+   * version from generating value equality. A case class compiled against an earlier version keeps
+   * its generated equality until it is rebuilt.
+   */
+  @Override
+  public boolean equals(Object other) {
+    return this == other;
+  }
+
+  @Override
+  public int hashCode() {
+    return System.identityHashCode(this);
+  }
+
+  private void throwOom(final MemoryBlock page, final long required) {
+    long got = 0;
+    if (page != null) {
+      got = page.size();
+      taskMemoryManager.freePage(page, this);
+    }
+    // Log the full breakdown and attach the bounded one to the error from a single snapshot, so the
+    // executor logs and the driver/UI error message describe the same instant and cannot disagree.
+    String consumerBreakdown = taskMemoryManager.logMemoryUsageAndGetBreakdown();
+    throw SparkCoreErrors.outOfMemoryError(required, got, consumerBreakdown);
   }
 }

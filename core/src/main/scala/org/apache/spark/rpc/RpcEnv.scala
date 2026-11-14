@@ -18,6 +18,7 @@
 package org.apache.spark.rpc
 
 import java.io.File
+import java.net.URI
 import java.nio.channels.ReadableByteChannel
 
 import scala.concurrent.Future
@@ -40,7 +41,20 @@ private[spark] object RpcEnv {
       conf: SparkConf,
       securityManager: SecurityManager,
       clientMode: Boolean = false): RpcEnv = {
-    val config = RpcEnvConfig(conf, name, host, port, securityManager, clientMode)
+    create(name, host, host, port, conf, securityManager, 0, clientMode)
+  }
+
+  def create(
+      name: String,
+      bindAddress: String,
+      advertiseAddress: String,
+      port: Int,
+      conf: SparkConf,
+      securityManager: SecurityManager,
+      numUsableCores: Int,
+      clientMode: Boolean): RpcEnv = {
+    val config = RpcEnvConfig(conf, name, bindAddress, advertiseAddress, port, securityManager,
+      numUsableCores, clientMode)
     new NettyRpcEnvFactory().create(config)
   }
 }
@@ -134,7 +148,6 @@ private[spark] abstract class RpcEnv(conf: SparkConf) {
    * @param uri URI with location of the file.
    */
   def openChannel(uri: String): ReadableByteChannel
-
 }
 
 /**
@@ -173,20 +186,47 @@ private[spark] trait RpcEnvFileServer {
    */
   def addDirectory(baseUri: String, path: File): String
 
+    /**
+   * Adds a local directory to be served via this file server.
+   * If the directory is already registered with the file server, it will result in a no-op.
+   *
+   * @param baseUri Leading URI path (files can be retrieved by appending their relative
+   *                path to this base URI). This cannot be "files" nor "jars".
+   * @param path Path to the local directory.
+   * @return URI for the root of the directory in the file server.
+   */
+  def addDirectoryIfAbsent(baseUri: String, path: File): String
+
   /** Validates and normalizes the base URI for directories. */
   protected def validateDirectoryUri(baseUri: String): String = {
-    val fixedBaseUri = "/" + baseUri.stripPrefix("/").stripSuffix("/")
+    val baseCanonicalUri = new URI(baseUri).normalize().getPath
+    val fixedBaseUri = "/" + baseCanonicalUri.stripPrefix("/").stripSuffix("/")
     require(fixedBaseUri != "/files" && fixedBaseUri != "/jars",
       "Directory URI cannot be /files nor /jars.")
     fixedBaseUri
   }
 
+  /**
+   * Removes a file from this RpcEnv.
+   *
+   * @param key Local file to remove.
+   */
+  def removeFile(key: String): Unit
+
+  /**
+   * Removes a jar to from this RpcEnv.
+   *
+   * @param key Local jar to remove.
+   */
+  def removeJar(key: String): Unit
 }
 
 private[spark] case class RpcEnvConfig(
     conf: SparkConf,
     name: String,
-    host: String,
+    bindAddress: String,
+    advertiseAddress: String,
     port: Int,
     securityManager: SecurityManager,
+    numUsableCores: Int,
     clientMode: Boolean)

@@ -1,31 +1,38 @@
 /*
-* Licensed to the Apache Software Foundation (ASF) under one or more
-* contributor license agreements.  See the NOTICE file distributed with
-* this work for additional information regarding copyright ownership.
-* The ASF licenses this file to You under the Apache License, Version 2.0
-* (the "License"); you may not use this file except in compliance with
-* the License.  You may obtain a copy of the License at
-*
-*    http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
-*/
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package org.apache.spark.unsafe.types;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
-import java.util.HashMap;
+import java.util.*;
 
-import com.google.common.collect.ImmutableMap;
-import org.junit.Test;
+import org.apache.spark.unsafe.Platform;
+import org.apache.spark.unsafe.UTF8StringBuilder;
 
-import static org.junit.Assert.*;
+import org.junit.jupiter.api.Test;
 
+import static org.apache.spark.unsafe.types.UTF8String.fromString;
+import static org.junit.jupiter.api.Assertions.*;
+
+import static org.apache.spark.unsafe.Platform.BYTE_ARRAY_OFFSET;
 import static org.apache.spark.unsafe.types.UTF8String.*;
 
 public class UTF8StringSuite {
@@ -33,28 +40,64 @@ public class UTF8StringSuite {
   private static void checkBasic(String str, int len) {
     UTF8String s1 = fromString(str);
     UTF8String s2 = fromBytes(str.getBytes(StandardCharsets.UTF_8));
-    assertEquals(s1.numChars(), len);
-    assertEquals(s2.numChars(), len);
+    assertEquals(len, s1.numChars());
+    assertEquals(len, s2.numChars());
 
-    assertEquals(s1.toString(), str);
-    assertEquals(s2.toString(), str);
+    assertEquals(str, s1.toString());
+    assertEquals(str, s1.toValidString());
+    assertEquals(str, s2.toString());
+    assertEquals(str, s2.toValidString());
     assertEquals(s1, s2);
 
     assertEquals(s1.hashCode(), s2.hashCode());
 
-    assertEquals(0, s1.compareTo(s2));
+    assertEquals(0, s1.binaryCompare(s2));
 
     assertTrue(s1.contains(s2));
     assertTrue(s2.contains(s1));
-    assertTrue(s1.startsWith(s1));
-    assertTrue(s1.endsWith(s1));
+    assertTrue(s1.startsWith(s2));
+    assertTrue(s1.endsWith(s2));
   }
 
   @Test
   public void basicTest() {
     checkBasic("", 0);
-    checkBasic("hello", 5);
+    checkBasic("¡", 1); // 2 bytes char
+    checkBasic("ку", 2); // 2 * 2 bytes chars
+    checkBasic("hello", 5); // 5 * 1 byte chars
     checkBasic("大 千 世 界", 7);
+    checkBasic("︽﹋％", 3); // 3 * 3 bytes chars
+    checkBasic("\uD83E\uDD19", 1); // 4 bytes char
+  }
+
+  @Test
+  public void numCharsCachesAsciiness() {
+    // numChars() determines ASCII-ness as a byproduct of its scan and caches it. Verify it
+    // agrees with getIsFullAscii() (reached via a fresh isFullAscii()), including for invalid
+    // UTF-8 where the code-point count equals the byte count but a byte is >= 0x80 (not ASCII).
+    byte[][] inputs = new byte[][] {
+      {0x68, 0x65, 0x6c, 0x6c, 0x6f},                     // "hello" - full ASCII
+      {},                                                 // empty
+      {0x61, (byte) 0x80},                                // 'a' + stray continuation (invalid)
+      {(byte) 0x80},                                      // lone continuation byte (invalid)
+      {(byte) 0xC3, (byte) 0xA9},                         // valid 2-byte char U+00E9
+      {0x61, (byte) 0xE5, (byte) 0xA4, (byte) 0xA7, 0x62} // 'a' + 3-byte char + 'b'
+    };
+    for (byte[] bytes : inputs) {
+      // Reference: a fresh string computes ASCII-ness via getIsFullAscii().
+      boolean expected = fromBytes(bytes).isFullAscii();
+      // Under test: numChars() runs first and must cache the identical answer.
+      UTF8String s = fromBytes(bytes);
+      s.numChars();
+      assertEquals(expected, s.isFullAscii(),
+        "numChars() cached wrong ASCII flag for " + Arrays.toString(bytes));
+    }
+
+    // The specific invalid case a naive `numChars == numBytes` test would misflag as ASCII:
+    // the count equals the byte count, but the 0x80 byte is not ASCII.
+    UTF8String invalid = fromBytes(new byte[] {0x61, (byte) 0x80});
+    assertEquals(invalid.numBytes(), invalid.numChars());
+    assertFalse(invalid.isFullAscii());
   }
 
   @Test
@@ -84,18 +127,18 @@ public class UTF8StringSuite {
   }
 
   @Test
-  public void compareTo() {
-    assertTrue(fromString("").compareTo(fromString("a")) < 0);
-    assertTrue(fromString("abc").compareTo(fromString("ABC")) > 0);
-    assertTrue(fromString("abc0").compareTo(fromString("abc")) > 0);
-    assertTrue(fromString("abcabcabc").compareTo(fromString("abcabcabc")) == 0);
-    assertTrue(fromString("aBcabcabc").compareTo(fromString("Abcabcabc")) > 0);
-    assertTrue(fromString("Abcabcabc").compareTo(fromString("abcabcabC")) < 0);
-    assertTrue(fromString("abcabcabc").compareTo(fromString("abcabcabC")) > 0);
+  public void binaryCompareTo() {
+    assertTrue(fromString("").binaryCompare(fromString("a")) < 0);
+    assertTrue(fromString("abc").binaryCompare(fromString("ABC")) > 0);
+    assertTrue(fromString("abc0").binaryCompare(fromString("abc")) > 0);
+    assertTrue(fromString("abcabcabc").binaryCompare(fromString("abcabcabc")) == 0);
+    assertTrue(fromString("aBcabcabc").binaryCompare(fromString("Abcabcabc")) > 0);
+    assertTrue(fromString("Abcabcabc").binaryCompare(fromString("abcabcabC")) < 0);
+    assertTrue(fromString("abcabcabc").binaryCompare(fromString("abcabcabC")) > 0);
 
-    assertTrue(fromString("abc").compareTo(fromString("世界")) < 0);
-    assertTrue(fromString("你好").compareTo(fromString("世界")) > 0);
-    assertTrue(fromString("你好123").compareTo(fromString("你好122")) > 0);
+    assertTrue(fromString("abc").binaryCompare(fromString("世界")) < 0);
+    assertTrue(fromString("你好").binaryCompare(fromString("世界")) > 0);
+    assertTrue(fromString("你好123").binaryCompare(fromString("你好122")) > 0);
   }
 
   protected static void testUpperandLower(String upper, String lower) {
@@ -216,11 +259,57 @@ public class UTF8StringSuite {
   }
 
   @Test
+  public void asciiLocateFastPathMatchesScan() {
+    // substring, getChar, charPosToByte and bytePosToChar take an ASCII fast-path when the
+    // isFullAscii flag is already FULL_ASCII. For each input, compare a cold instance (flag
+    // UNKNOWN -> general scan) against a warmed instance (isFullAscii() called -> fast-path for
+    // ASCII) and assert identical results. Covers ASCII, empty, multi-byte, and invalid UTF-8.
+    byte[][] inputs = new byte[][] {
+      "hello world".getBytes(StandardCharsets.UTF_8), // full ASCII -> exercises the fast-path
+      {}, // empty (vacuously ASCII)
+      {0x61, (byte) 0xC3, (byte) 0xA9, 0x62}, // 'a' + U+00E9 (2-byte) + 'b' (not ASCII)
+      {0x61, (byte) 0x80, 0x62} // invalid UTF-8, stray continuation (not ASCII)
+    };
+    int[] positions = {Integer.MIN_VALUE, -3, -1, 0, 1, 2, 3, 5, 100, Integer.MAX_VALUE};
+
+    for (byte[] bytes : inputs) {
+      UTF8String cold = fromBytes(bytes);
+      UTF8String warm = fromBytes(bytes);
+      warm.isFullAscii(); // warm the cached flag; fast-path branches read it without recomputing
+      String label = Arrays.toString(bytes);
+
+      for (int a : positions) {
+        for (int b : positions) {
+          assertEquals(cold.substring(a, b), warm.substring(a, b),
+            "substring(" + a + ", " + b + ") on " + label);
+        }
+        assertEquals(cold.charPosToByte(a), warm.charPosToByte(a),
+          "charPosToByte(" + a + ") on " + label);
+        assertEquals(cold.bytePosToChar(a), warm.bytePosToChar(a),
+          "bytePosToChar(" + a + ") on " + label);
+      }
+
+      for (int idx = 0; idx < warm.numChars(); idx++) {
+        assertEquals(cold.getChar(idx), warm.getChar(idx),
+          "getChar(" + idx + ") on " + label);
+      }
+    }
+  }
+
+  @Test
   public void trims() {
+    assertEquals(fromString("1"), fromString("1").trim());
+    assertEquals(fromString("1"), fromString("1\t").trimAll());
+
+    assertEquals(fromString("1中文").toString(), fromString("1中文").trimAll().toString());
+    assertEquals(fromString("1"), fromString("1\u0003").trimAll());
+    assertEquals(fromString("1"), fromString("1\u007F").trimAll());
+
     assertEquals(fromString("hello"), fromString("  hello ").trim());
     assertEquals(fromString("hello "), fromString("  hello ").trimLeft());
     assertEquals(fromString("  hello"), fromString("  hello ").trimRight());
 
+    assertEquals(EMPTY_UTF8, EMPTY_UTF8.trim());
     assertEquals(EMPTY_UTF8, fromString("  ").trim());
     assertEquals(EMPTY_UTF8, fromString("  ").trimLeft());
     assertEquals(EMPTY_UTF8, fromString("  ").trimRight());
@@ -232,6 +321,16 @@ public class UTF8StringSuite {
     assertEquals(fromString("数据砖头"), fromString("数据砖头").trim());
     assertEquals(fromString("数据砖头"), fromString("数据砖头").trimLeft());
     assertEquals(fromString("数据砖头"), fromString("数据砖头").trimRight());
+
+    char[] charsLessThan0x20 = new char[10];
+    Arrays.fill(charsLessThan0x20, (char)(' ' - 1));
+    String stringStartingWithSpace =
+      new String(charsLessThan0x20) + "hello" + new String(charsLessThan0x20);
+    assertEquals(fromString(stringStartingWithSpace), fromString(stringStartingWithSpace).trim());
+    assertEquals(fromString(stringStartingWithSpace),
+      fromString(stringStartingWithSpace).trimLeft());
+    assertEquals(fromString(stringStartingWithSpace),
+      fromString(stringStartingWithSpace).trimRight());
   }
 
   @Test
@@ -248,6 +347,72 @@ public class UTF8StringSuite {
     assertEquals(-1, fromString("数据砖头").indexOf(fromString("数"), 3));
     assertEquals(0, fromString("数据砖头").indexOf(fromString("数"), 0));
     assertEquals(3, fromString("数据砖头").indexOf(fromString("头"), 0));
+
+    // Tests for indexOf with start and occurrence parameters
+    // Forward search
+    assertEquals(1, fromString("abcabc").indexOf(fromString("b"), 1, 1));
+    assertEquals(4, fromString("abcabc").indexOf(fromString("b"), 1, 2));
+    assertEquals(4, fromString("abcabc").indexOf(fromString("b"), 3, 1));
+    assertEquals(-1, fromString("abcabc").indexOf(fromString("b"), 10, 1));
+    assertEquals(-1, fromString("abcabc").indexOf(fromString("b"), 0, 1));
+
+    // Backward search (negative start)
+    assertEquals(4, fromString("abcabc").indexOf(fromString("b"), -1, 1));
+    assertEquals(1, fromString("abcabc").indexOf(fromString("b"), -1, 2));
+    assertEquals(4, fromString("abcabc").indexOf(fromString("b"), -2, 1));
+    assertEquals(-1, fromString("abcabc").indexOf(fromString("b"), -10, 1));
+
+    // Overlapping matches ("aa" in "aaaa")
+    assertEquals(0, fromString("aaaa").indexOf(fromString("aa"), 1, 1));
+    assertEquals(1, fromString("aaaa").indexOf(fromString("aa"), 1, 2));
+    assertEquals(2, fromString("aaaa").indexOf(fromString("aa"), 1, 3));
+    assertEquals(-1, fromString("aaaa").indexOf(fromString("aa"), 1, 4));
+    assertEquals(2, fromString("aaaa").indexOf(fromString("aa"), -1, 1));
+    assertEquals(1, fromString("aaaa").indexOf(fromString("aa"), -1, 2));
+    assertEquals(0, fromString("aaaa").indexOf(fromString("aa"), -1, 3));
+    assertEquals(2, fromString("aaaa").indexOf(fromString("aa"), -2, 1));
+    assertEquals(1, fromString("aaaa").indexOf(fromString("aa"), -2, 2));
+    assertEquals(0, fromString("aaaa").indexOf(fromString("aa"), -2, 3));
+
+    // Multi-byte characters
+    assertEquals(0, fromString("你好世界你好").indexOf(fromString("你好"), 1, 1));
+    assertEquals(4, fromString("你好世界你好").indexOf(fromString("你好"), 1, 2));
+    assertEquals(4, fromString("你好世界你好").indexOf(fromString("你好"), -1, 1));
+    assertEquals(0, fromString("你好世界你好").indexOf(fromString("你好"), -1, 2));
+    assertEquals(4, fromString("你好世界你好").indexOf(fromString("你好"), -2, 1));
+    assertEquals(0, fromString("你好世界你好").indexOf(fromString("你好"), -2, 2));
+    assertEquals(0, fromString("你好世界你好").indexOf(fromString("你好"), -3, 1));
+    assertEquals(-1, fromString("你好世界你好").indexOf(fromString("你好"), -3, 2));
+
+    // Empty substring (behavior depends on indexOfEmpty, currently returns 0)
+    assertEquals(0, fromString("hello").indexOf(EMPTY_UTF8, 1, 1));
+    assertEquals(0, fromString("hello").indexOf(EMPTY_UTF8, 5, 1));
+    assertEquals(0, fromString("hello").indexOf(EMPTY_UTF8, -1, 1));
+
+    // Boundary cases
+    assertEquals(0, fromString("x").indexOf(fromString("x"), 1, 1));
+    assertEquals(-1, fromString("x").indexOf(fromString("x"), 1, 2));
+    assertEquals(0, fromString("x").indexOf(fromString("x"), -1, 1));
+    assertEquals(-1, fromString("x").indexOf(fromString("x"), -1, 2));
+    assertEquals(-1, EMPTY_UTF8.indexOf(fromString("a"), 1, 1));
+    assertEquals(-1, EMPTY_UTF8.indexOf(fromString("a"), -1, 1));
+    assertEquals(4, fromString("hello").indexOf(fromString("o"), 5, 1));
+    assertEquals(-1, fromString("hello").indexOf(fromString("o"), 6, 1));
+    assertEquals(0, fromString("hello").indexOf(fromString("h"), -5, 1));
+    assertEquals(-1, fromString("hello").indexOf(fromString("h"), -6, 1));
+    assertEquals(-1, fromString("abcabc").indexOf(fromString("abc"), Integer.MIN_VALUE, 1));
+    assertEquals(-1, fromString("abcabc").indexOf(fromString("abc"), Integer.MIN_VALUE + 1, 1));
+
+    // Target larger than string
+    assertEquals(-1, fromString("ab").indexOf(fromString("abc"), 1, 1));
+    assertEquals(-1, fromString("ab").indexOf(fromString("abc"), -1, 1));
+
+    // Backward search with multi-character patterns
+    assertEquals(2, fromString("abcde").indexOf(fromString("cd"), -3, 1));
+    assertEquals(1, fromString("abcde").indexOf(fromString("bc"), -3, 1));
+    assertEquals(0, fromString("abcde").indexOf(fromString("ab"), -3, 1));
+    assertEquals(-1, fromString("abcde").indexOf(fromString("de"), -3, 1));
+    assertEquals(2, fromString("abcde").indexOf(fromString("cde"), -1, 1));
   }
 
   @Test
@@ -286,6 +451,10 @@ public class UTF8StringSuite {
     // overlapped delim
     assertEquals(fromString("||"), fromString("||||||").subStringIndex(fromString("|||"), 3));
     assertEquals(fromString("|||"), fromString("||||||").subStringIndex(fromString("|||"), -4));
+    assertEquals(fromString("www.apache.org"),
+      fromString("www.apache.org").subStringIndex(fromString("."), Integer.MIN_VALUE));
+    assertEquals(fromString("www.apache.org"),
+      fromString("www.apache.org").subStringIndex(fromString("."), Integer.MIN_VALUE + 1));
   }
 
   @Test
@@ -294,6 +463,30 @@ public class UTF8StringSuite {
     assertEquals(EMPTY_UTF8, EMPTY_UTF8.reverse());
     assertEquals(fromString("者行孙"), fromString("孙行者").reverse());
     assertEquals(fromString("者行孙 olleh"), fromString("hello 孙行者").reverse());
+    // Malformed UTF-8: a truncated trailing multi-byte sequence must be reversed as orphan
+    // bytes without reading past the end of the string. The backing arrays carry an extra
+    // trailing byte so a regression that over-reads would produce a deterministically wrong
+    // result rather than reading uninitialized memory.
+    // 'A' followed by an incomplete 2-byte leader (0xCE).
+    byte[] truncated2 = new byte[]{0x41, (byte) 0xCE, 0x42};
+    assertEquals(
+      fromBytes(new byte[]{(byte) 0xCE, 0x41}),
+      fromBytes(truncated2, 0, 2).reverse());
+    // 'A' followed by an incomplete 3-byte leader (0xE4 0xB8).
+    byte[] truncated3 = new byte[]{0x41, (byte) 0xE4, (byte) 0xB8, 0x42};
+    assertEquals(
+      fromBytes(new byte[]{(byte) 0xE4, (byte) 0xB8, 0x41}),
+      fromBytes(truncated3, 0, 3).reverse());
+    // 'A' followed by an incomplete 4-byte leader (0xF0 0x90).
+    byte[] truncated4 = new byte[]{0x41, (byte) 0xF0, (byte) 0x90, 0x42};
+    assertEquals(
+      fromBytes(new byte[]{(byte) 0xF0, (byte) 0x90, 0x41}),
+      fromBytes(truncated4, 0, 3).reverse());
+    // A complete 3-byte character (U+4E16) followed by an incomplete 2-byte leader (0xCE).
+    byte[] truncatedMid = new byte[]{(byte) 0xE4, (byte) 0xB8, (byte) 0x96, (byte) 0xCE, 0x42};
+    assertEquals(
+      fromBytes(new byte[]{(byte) 0xCE, (byte) 0xE4, (byte) 0xB8, (byte) 0x96}),
+      fromBytes(truncatedMid, 0, 4).reverse());
   }
 
   @Test
@@ -301,6 +494,7 @@ public class UTF8StringSuite {
     assertEquals(fromString("数d数d数d数d数d"), fromString("数d").repeat(5));
     assertEquals(fromString("数d"), fromString("数d").repeat(1));
     assertEquals(EMPTY_UTF8, fromString("数d").repeat(-1));
+    assertEquals(fromString("aaaaa"), fromString("a").repeat(5)); // single-byte Arrays.fill path
   }
 
   @Test
@@ -348,35 +542,125 @@ public class UTF8StringSuite {
     assertEquals(fromString("数据砖头"), fromString("数据砖头").rpad(5, EMPTY_UTF8));
     assertEquals(fromString("数据砖"), fromString("数据砖头").rpad(3, EMPTY_UTF8));
     assertEquals(EMPTY_UTF8, EMPTY_UTF8.rpad(3, EMPTY_UTF8));
+
+    // SPARK-58708: `len - numChars()` wraps for len == Integer.MIN_VALUE, which used to send
+    // a non-positive length down the padding branch and fail with an ArithmeticException.
+    for (int len : new int[]{0, -1, -100, Integer.MIN_VALUE}) {
+      assertEquals(EMPTY_UTF8, fromString("hello").lpad(len, fromString("??")));
+      assertEquals(EMPTY_UTF8, fromString("hello").rpad(len, fromString("??")));
+      assertEquals(EMPTY_UTF8, fromString("hello").lpad(len, EMPTY_UTF8));
+      assertEquals(EMPTY_UTF8, fromString("hello").rpad(len, EMPTY_UTF8));
+    }
+  }
+
+  @Test
+  public void padExponentialDoubling() {
+    // Exercise the doubling fill with counts that trigger multiple doubling steps and the
+    // toCopy clamp (counts 3, 4 and 5), plus a multi-byte pad.
+    assertEquals(fromString("abababax"), fromString("x").lpad(8, fromString("ab")));
+    assertEquals(fromString("xabababa"), fromString("x").rpad(8, fromString("ab")));
+    assertEquals(fromString("abababababx"), fromString("x").lpad(11, fromString("ab")));
+    assertEquals(fromString("Zababababab"), fromString("Z").rpad(11, fromString("ab")));
+    assertEquals(fromString("数数数数x"), fromString("x").lpad(5, fromString("数")));
+    assertEquals(fromString("x数数数数"), fromString("x").rpad(5, fromString("数")));
+    // Single-byte pad takes the Arrays.fill fast path.
+    assertEquals(fromString("-----x"), fromString("x").lpad(6, fromString("-")));
+    assertEquals(fromString("x-----"), fromString("x").rpad(6, fromString("-")));
   }
 
   @Test
   public void substringSQL() {
     UTF8String e = fromString("example");
-    assertEquals(e.substringSQL(0, 2), fromString("ex"));
-    assertEquals(e.substringSQL(1, 2), fromString("ex"));
-    assertEquals(e.substringSQL(0, 7), fromString("example"));
-    assertEquals(e.substringSQL(1, 2), fromString("ex"));
-    assertEquals(e.substringSQL(0, 100), fromString("example"));
-    assertEquals(e.substringSQL(1, 100), fromString("example"));
-    assertEquals(e.substringSQL(2, 2), fromString("xa"));
-    assertEquals(e.substringSQL(1, 6), fromString("exampl"));
-    assertEquals(e.substringSQL(2, 100), fromString("xample"));
-    assertEquals(e.substringSQL(0, 0), fromString(""));
-    assertEquals(e.substringSQL(100, 4), EMPTY_UTF8);
-    assertEquals(e.substringSQL(0, Integer.MAX_VALUE), fromString("example"));
-    assertEquals(e.substringSQL(1, Integer.MAX_VALUE), fromString("example"));
-    assertEquals(e.substringSQL(2, Integer.MAX_VALUE), fromString("xample"));
+    assertEquals(fromString("ex"), e.substringSQL(0, 2));
+    assertEquals(fromString("ex"), e.substringSQL(1, 2));
+    assertEquals(fromString("example"), e.substringSQL(0, 7));
+    assertEquals(fromString("ex"), e.substringSQL(1, 2));
+    assertEquals(fromString("example"), e.substringSQL(0, 100));
+    assertEquals(fromString("example"), e.substringSQL(1, 100));
+    assertEquals(fromString("xa"), e.substringSQL(2, 2));
+    assertEquals(fromString("exampl"), e.substringSQL(1, 6));
+    assertEquals(fromString("xample"), e.substringSQL(2, 100));
+    assertEquals(fromString(""), e.substringSQL(0, 0));
+    assertEquals(EMPTY_UTF8, e.substringSQL(100, 4));
+    assertEquals(fromString("example"), e.substringSQL(0, Integer.MAX_VALUE));
+    assertEquals(fromString("example"), e.substringSQL(1, Integer.MAX_VALUE));
+    assertEquals(fromString("xample"), e.substringSQL(2, Integer.MAX_VALUE));
+    assertEquals(EMPTY_UTF8, e.substringSQL(-100, -100));
+    assertEquals(EMPTY_UTF8, e.substringSQL(-1207959552, -1207959552));
+    assertEquals(fromString("pl"), e.substringSQL(-3, 2));
+    assertEquals(EMPTY_UTF8, e.substringSQL(Integer.MIN_VALUE, 6));
   }
 
   @Test
   public void split() {
-    assertTrue(Arrays.equals(fromString("ab,def,ghi").split(fromString(","), -1),
-      new UTF8String[]{fromString("ab"), fromString("def"), fromString("ghi")}));
-    assertTrue(Arrays.equals(fromString("ab,def,ghi").split(fromString(","), 2),
-      new UTF8String[]{fromString("ab"), fromString("def,ghi")}));
-    assertTrue(Arrays.equals(fromString("ab,def,ghi").split(fromString(","), 2),
-      new UTF8String[]{fromString("ab"), fromString("def,ghi")}));
+    UTF8String[] negativeAndZeroLimitCase =
+      new UTF8String[]{fromString("ab"), fromString("def"), fromString("ghi"), fromString("")};
+    assertArrayEquals(
+      negativeAndZeroLimitCase,
+      fromString("ab,def,ghi,").split(fromString(","), 0));
+    assertArrayEquals(
+      negativeAndZeroLimitCase,
+      fromString("ab,def,ghi,").split(fromString(","), -1));
+    assertArrayEquals(
+      new UTF8String[]{fromString("ab"), fromString("def,ghi,")},
+      fromString("ab,def,ghi,").split(fromString(","), 2));
+    // Split with empty pattern ignores trailing empty spaces.
+    assertArrayEquals(
+      new UTF8String[]{fromString("a"), fromString("b")},
+      fromString("ab").split(fromString(""), 0));
+    assertArrayEquals(
+      new UTF8String[]{fromString("a"), fromString("b")},
+      fromString("ab").split(fromString(""), -1));
+    assertArrayEquals(
+      new UTF8String[]{fromString("a"), fromString("b")},
+      fromString("ab").split(fromString(""), 2));
+    assertArrayEquals(
+      new UTF8String[]{fromString("a"), fromString("b")},
+      fromString("ab").split(fromString(""), 100));
+    assertArrayEquals(
+      new UTF8String[]{fromString("ab")},
+      fromString("ab").split(fromString(""), 1));
+    assertArrayEquals(
+      new UTF8String[]{fromString("")},
+      fromString("").split(fromString(""), 0));
+  }
+
+  @Test
+  public void replace() {
+    assertEquals(
+      fromString("re123ace"),
+      fromString("replace").replace(fromString("pl"), fromString("123")));
+    assertEquals(
+      fromString("reace"),
+      fromString("replace").replace(fromString("pl"), fromString("")));
+    assertEquals(
+      fromString("replace"),
+      fromString("replace").replace(fromString(""), fromString("123")));
+    // tests for multiple replacements
+    assertEquals(
+      fromString("a12ca12c"),
+      fromString("abcabc").replace(fromString("b"), fromString("12")));
+    assertEquals(
+      fromString("adad"),
+      fromString("abcdabcd").replace(fromString("bc"), fromString("")));
+    // tests for single character search and replacement strings
+    assertEquals(
+      fromString("AbcAbc"),
+      fromString("abcabc").replace(fromString("a"), fromString("A")));
+    assertEquals(
+      fromString("abcabc"),
+      fromString("abcabc").replace(fromString("Z"), fromString("A")));
+    // Tests with non-ASCII characters
+    assertEquals(
+      fromString("花ab界"),
+      fromString("花花世界").replace(fromString("花世"), fromString("ab")));
+    assertEquals(
+      fromString("a水c"),
+      fromString("a火c").replace(fromString("火"), fromString("水")));
+    // Tests for a large number of replacements, triggering UTF8StringBuilder resize
+    assertEquals(
+      fromString("abcd").repeat(17),
+      fromString("a").repeat(17).replace(fromString("a"), fromString("abcd")));
   }
 
   @Test
@@ -397,29 +681,33 @@ public class UTF8StringSuite {
   public void translate() {
     assertEquals(
       fromString("1a2s3ae"),
-      fromString("translate").translate(ImmutableMap.of(
-        'r', '1',
-        'n', '2',
-        'l', '3',
-        't', '\0'
+      fromString("translate").translate(Map.of(
+        "r", "1",
+        "n", "2",
+        "l", "3",
+        "t", ""
       )));
     assertEquals(
       fromString("translate"),
-      fromString("translate").translate(new HashMap<Character, Character>()));
+      fromString("translate").translate(new HashMap<>()));
     assertEquals(
       fromString("asae"),
-      fromString("translate").translate(ImmutableMap.of(
-        'r', '\0',
-        'n', '\0',
-        'l', '\0',
-        't', '\0'
+      fromString("translate").translate(Map.of(
+        "r", "",
+        "n", "",
+        "l", "",
+        "t", ""
       )));
     assertEquals(
       fromString("aa世b"),
-      fromString("花花世界").translate(ImmutableMap.of(
-        '花', 'a',
-        '界', 'b'
+      fromString("花花世界").translate(Map.of(
+        "花", "a",
+        "界", "b"
       )));
+    // A literal U+0000 replacement value is preserved (not treated as deletion).
+    UTF8String withNul = fromString("abc").translate(Map.of("b", "\0"));
+    assertEquals(3, withNul.numChars());
+    assertEquals(fromString("a\0c"), withNul);
   }
 
   @Test
@@ -444,49 +732,904 @@ public class UTF8StringSuite {
 
   @Test
   public void soundex() {
-    assertEquals(fromString("Robert").soundex(), fromString("R163"));
-    assertEquals(fromString("Rupert").soundex(), fromString("R163"));
-    assertEquals(fromString("Rubin").soundex(), fromString("R150"));
-    assertEquals(fromString("Ashcraft").soundex(), fromString("A261"));
-    assertEquals(fromString("Ashcroft").soundex(), fromString("A261"));
-    assertEquals(fromString("Burroughs").soundex(), fromString("B620"));
-    assertEquals(fromString("Burrows").soundex(), fromString("B620"));
-    assertEquals(fromString("Ekzampul").soundex(), fromString("E251"));
-    assertEquals(fromString("Example").soundex(), fromString("E251"));
-    assertEquals(fromString("Ellery").soundex(), fromString("E460"));
-    assertEquals(fromString("Euler").soundex(), fromString("E460"));
-    assertEquals(fromString("Ghosh").soundex(), fromString("G200"));
-    assertEquals(fromString("Gauss").soundex(), fromString("G200"));
-    assertEquals(fromString("Gutierrez").soundex(), fromString("G362"));
-    assertEquals(fromString("Heilbronn").soundex(), fromString("H416"));
-    assertEquals(fromString("Hilbert").soundex(), fromString("H416"));
-    assertEquals(fromString("Jackson").soundex(), fromString("J250"));
-    assertEquals(fromString("Kant").soundex(), fromString("K530"));
-    assertEquals(fromString("Knuth").soundex(), fromString("K530"));
-    assertEquals(fromString("Lee").soundex(), fromString("L000"));
-    assertEquals(fromString("Lukasiewicz").soundex(), fromString("L222"));
-    assertEquals(fromString("Lissajous").soundex(), fromString("L222"));
-    assertEquals(fromString("Ladd").soundex(), fromString("L300"));
-    assertEquals(fromString("Lloyd").soundex(), fromString("L300"));
-    assertEquals(fromString("Moses").soundex(), fromString("M220"));
-    assertEquals(fromString("O'Hara").soundex(), fromString("O600"));
-    assertEquals(fromString("Pfister").soundex(), fromString("P236"));
-    assertEquals(fromString("Rubin").soundex(), fromString("R150"));
-    assertEquals(fromString("Robert").soundex(), fromString("R163"));
-    assertEquals(fromString("Rupert").soundex(), fromString("R163"));
-    assertEquals(fromString("Soundex").soundex(), fromString("S532"));
-    assertEquals(fromString("Sownteks").soundex(), fromString("S532"));
-    assertEquals(fromString("Tymczak").soundex(), fromString("T522"));
-    assertEquals(fromString("VanDeusen").soundex(), fromString("V532"));
-    assertEquals(fromString("Washington").soundex(), fromString("W252"));
-    assertEquals(fromString("Wheaton").soundex(), fromString("W350"));
+    assertEquals(fromString("R163"), fromString("Robert").soundex());
+    assertEquals(fromString("R163"), fromString("Rupert").soundex());
+    assertEquals(fromString("R150"), fromString("Rubin").soundex());
+    assertEquals(fromString("A261"), fromString("Ashcraft").soundex());
+    assertEquals(fromString("A261"), fromString("Ashcroft").soundex());
+    assertEquals(fromString("B620"), fromString("Burroughs").soundex());
+    assertEquals(fromString("B620"), fromString("Burrows").soundex());
+    assertEquals(fromString("E251"), fromString("Ekzampul").soundex());
+    assertEquals(fromString("E251"), fromString("Example").soundex());
+    assertEquals(fromString("E460"), fromString("Ellery").soundex());
+    assertEquals(fromString("E460"), fromString("Euler").soundex());
+    assertEquals(fromString("G200"), fromString("Ghosh").soundex());
+    assertEquals(fromString("G200"), fromString("Gauss").soundex());
+    assertEquals(fromString("G362"), fromString("Gutierrez").soundex());
+    assertEquals(fromString("H416"), fromString("Heilbronn").soundex());
+    assertEquals(fromString("H416"), fromString("Hilbert").soundex());
+    assertEquals(fromString("J250"), fromString("Jackson").soundex());
+    assertEquals(fromString("K530"), fromString("Kant").soundex());
+    assertEquals(fromString("K530"), fromString("Knuth").soundex());
+    assertEquals(fromString("L000"), fromString("Lee").soundex());
+    assertEquals(fromString("L222"), fromString("Lukasiewicz").soundex());
+    assertEquals(fromString("L222"), fromString("Lissajous").soundex());
+    assertEquals(fromString("L300"), fromString("Ladd").soundex());
+    assertEquals(fromString("L300"), fromString("Lloyd").soundex());
+    assertEquals(fromString("M220"), fromString("Moses").soundex());
+    assertEquals(fromString("O600"), fromString("O'Hara").soundex());
+    assertEquals(fromString("P236"), fromString("Pfister").soundex());
+    assertEquals(fromString("R150"), fromString("Rubin").soundex());
+    assertEquals(fromString("R163"), fromString("Robert").soundex());
+    assertEquals(fromString("R163"), fromString("Rupert").soundex());
+    assertEquals(fromString("S532"), fromString("Soundex").soundex());
+    assertEquals(fromString("S532"), fromString("Sownteks").soundex());
+    assertEquals(fromString("T522"), fromString("Tymczak").soundex());
+    assertEquals(fromString("V532"), fromString("VanDeusen").soundex());
+    assertEquals(fromString("W252"), fromString("Washington").soundex());
+    assertEquals(fromString("W350"), fromString("Wheaton").soundex());
 
-    assertEquals(fromString("a").soundex(), fromString("A000"));
-    assertEquals(fromString("ab").soundex(), fromString("A100"));
-    assertEquals(fromString("abc").soundex(), fromString("A120"));
-    assertEquals(fromString("abcd").soundex(), fromString("A123"));
-    assertEquals(fromString("").soundex(), fromString(""));
-    assertEquals(fromString("123").soundex(), fromString("123"));
-    assertEquals(fromString("世界千世").soundex(), fromString("世界千世"));
+    assertEquals(fromString("A000"), fromString("a").soundex());
+    assertEquals(fromString("A100"), fromString("ab").soundex());
+    assertEquals(fromString("A120"), fromString("abc").soundex());
+    assertEquals(fromString("A123"), fromString("abcd").soundex());
+    assertEquals(fromString(""), fromString("").soundex());
+    assertEquals(fromString("123"), fromString("123").soundex());
+    assertEquals(fromString("世界千世"), fromString("世界千世").soundex());
+  }
+
+  @Test
+  public void writeToOutputStreamUnderflow() throws IOException {
+    // offset underflow is apparently supported?
+    final ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+    final byte[] test = "01234567".getBytes(StandardCharsets.UTF_8);
+
+    for (int i = 1; i <= Platform.BYTE_ARRAY_OFFSET; ++i) {
+      UTF8String.fromAddress(test, Platform.BYTE_ARRAY_OFFSET - i, test.length + i)
+          .writeTo(outputStream);
+      final ByteBuffer buffer = ByteBuffer.wrap(outputStream.toByteArray(), i, test.length);
+      assertEquals("01234567", StandardCharsets.UTF_8.decode(buffer).toString());
+      outputStream.reset();
+    }
+  }
+
+  @Test
+  public void writeToOutputStreamSlice() throws IOException {
+    final ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+    final byte[] test = "01234567".getBytes(StandardCharsets.UTF_8);
+
+    for (int i = 0; i < test.length; ++i) {
+      for (int j = 0; j < test.length - i; ++j) {
+        UTF8String.fromAddress(test, Platform.BYTE_ARRAY_OFFSET + i, j)
+            .writeTo(outputStream);
+
+        assertArrayEquals(Arrays.copyOfRange(test, i, i + j), outputStream.toByteArray());
+        outputStream.reset();
+      }
+    }
+  }
+
+  @Test
+  public void writeToOutputStreamOverflow() throws IOException {
+    final ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+    final byte[] test = "01234567".getBytes(StandardCharsets.UTF_8);
+
+    final HashSet<Long> offsets = new HashSet<>();
+    for (int i = 0; i < 16; ++i) {
+      // touch more points around MAX_VALUE
+      offsets.add((long) Integer.MAX_VALUE - i);
+      // subtract off BYTE_ARRAY_OFFSET to avoid wrapping around to a negative value,
+      // which will hit the slower copy path instead of the optimized one
+      offsets.add(Long.MAX_VALUE - BYTE_ARRAY_OFFSET - i);
+    }
+
+    for (long i = 1; i > 0L; i <<= 1) {
+      for (long j = 0; j < 32L; ++j) {
+        offsets.add(i + j);
+      }
+    }
+
+    for (final long offset : offsets) {
+      try {
+        assertThrows(ArrayIndexOutOfBoundsException.class,
+          () -> fromAddress(test, BYTE_ARRAY_OFFSET + offset, test.length).writeTo(outputStream));
+      } finally {
+        outputStream.reset();
+      }
+    }
+  }
+
+  @Test
+  public void writeToOutputStream() throws IOException {
+    final ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+    EMPTY_UTF8.writeTo(outputStream);
+    assertEquals("", outputStream.toString(StandardCharsets.UTF_8.name()));
+    outputStream.reset();
+
+    fromString("数据砖很重").writeTo(outputStream);
+    assertEquals(
+        "数据砖很重",
+        outputStream.toString(StandardCharsets.UTF_8.name()));
+    outputStream.reset();
+  }
+
+  @Test
+  public void writeToOutputStreamIntArray() throws IOException {
+    // verify that writes work on objects that are not byte arrays
+    final ByteBuffer buffer = StandardCharsets.UTF_8.encode("大千世界");
+    buffer.position(0);
+    buffer.order(ByteOrder.nativeOrder());
+
+    final int length = buffer.limit();
+    assertEquals(12, length);
+
+    final int ints = length / 4;
+    final int[] array = new int[ints];
+
+    for (int i = 0; i < ints; ++i) {
+      array[i] = buffer.getInt();
+    }
+
+    final ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+    fromAddress(array, Platform.INT_ARRAY_OFFSET, length)
+        .writeTo(outputStream);
+    assertEquals("大千世界", outputStream.toString(StandardCharsets.UTF_8.name()));
+  }
+
+  @Test
+  public void testToShort() {
+    Map<String, Short> inputToExpectedOutput = new HashMap<>();
+    inputToExpectedOutput.put("1", (short) 1);
+    inputToExpectedOutput.put("+1", (short) 1);
+    inputToExpectedOutput.put("-1", (short) -1);
+    inputToExpectedOutput.put("0", (short) 0);
+    inputToExpectedOutput.put("1111.12345678901234567890", (short) 1111);
+    inputToExpectedOutput.put(String.valueOf(Short.MAX_VALUE), Short.MAX_VALUE);
+    inputToExpectedOutput.put(String.valueOf(Short.MIN_VALUE), Short.MIN_VALUE);
+
+    Random rand = new Random();
+    for (int i = 0; i < 10; i++) {
+      short value = (short) rand.nextInt();
+      inputToExpectedOutput.put(String.valueOf(value), value);
+    }
+
+    IntWrapper wrapper = new IntWrapper();
+    for (Map.Entry<String, Short> entry : inputToExpectedOutput.entrySet()) {
+      assertTrue(UTF8String.fromString(entry.getKey()).toShort(wrapper), entry.getKey());
+      assertEquals((short) entry.getValue(), wrapper.value);
+    }
+
+    List<String> negativeInputs =
+      Arrays.asList("", "  ", "null", "NULL", "\n", "~1212121", "3276700");
+
+    for (String negativeInput : negativeInputs) {
+      assertFalse(UTF8String.fromString(negativeInput).toShort(wrapper), negativeInput);
+    }
+  }
+
+  @Test
+  public void testToByte() {
+    Map<String, Byte> inputToExpectedOutput = new HashMap<>();
+    inputToExpectedOutput.put("1", (byte) 1);
+    inputToExpectedOutput.put("+1",(byte)  1);
+    inputToExpectedOutput.put("-1", (byte)  -1);
+    inputToExpectedOutput.put("0", (byte)  0);
+    inputToExpectedOutput.put("111.12345678901234567890", (byte) 111);
+    inputToExpectedOutput.put(String.valueOf(Byte.MAX_VALUE), Byte.MAX_VALUE);
+    inputToExpectedOutput.put(String.valueOf(Byte.MIN_VALUE), Byte.MIN_VALUE);
+
+    Random rand = new Random();
+    for (int i = 0; i < 10; i++) {
+      byte value = (byte) rand.nextInt();
+      inputToExpectedOutput.put(String.valueOf(value), value);
+    }
+
+    IntWrapper intWrapper = new IntWrapper();
+    for (Map.Entry<String, Byte> entry : inputToExpectedOutput.entrySet()) {
+      assertTrue(UTF8String.fromString(entry.getKey()).toByte(intWrapper), entry.getKey());
+      assertEquals((byte) entry.getValue(), intWrapper.value);
+    }
+
+    List<String> negativeInputs =
+      Arrays.asList("", "  ", "null", "NULL", "\n", "~1212121", "12345678901234567890");
+
+    for (String negativeInput : negativeInputs) {
+      assertFalse(UTF8String.fromString(negativeInput).toByte(intWrapper), negativeInput);
+    }
+  }
+
+  @Test
+  public void testToInt() {
+    Map<String, Integer> inputToExpectedOutput = new HashMap<>();
+    inputToExpectedOutput.put("1", 1);
+    inputToExpectedOutput.put("+1", 1);
+    inputToExpectedOutput.put("-1", -1);
+    inputToExpectedOutput.put("0", 0);
+    inputToExpectedOutput.put("11111.1234567", 11111);
+    inputToExpectedOutput.put(String.valueOf(Integer.MAX_VALUE), Integer.MAX_VALUE);
+    inputToExpectedOutput.put(String.valueOf(Integer.MIN_VALUE), Integer.MIN_VALUE);
+
+    Random rand = new Random();
+    for (int i = 0; i < 10; i++) {
+      int value = rand.nextInt();
+      inputToExpectedOutput.put(String.valueOf(value), value);
+    }
+
+    IntWrapper intWrapper = new IntWrapper();
+    for (Map.Entry<String, Integer> entry : inputToExpectedOutput.entrySet()) {
+      assertTrue(UTF8String.fromString(entry.getKey()).toInt(intWrapper), entry.getKey());
+      assertEquals((int) entry.getValue(), intWrapper.value);
+    }
+
+    List<String> negativeInputs =
+      Arrays.asList("", "  ", "null", "NULL", "\n", "~1212121", "12345678901234567890");
+
+    for (String negativeInput : negativeInputs) {
+      assertFalse(UTF8String.fromString(negativeInput).toInt(intWrapper), negativeInput);
+    }
+  }
+
+  @Test
+  public void testToLong() {
+    Map<String, Long> inputToExpectedOutput = new HashMap<>();
+    inputToExpectedOutput.put("1", 1L);
+    inputToExpectedOutput.put("+1", 1L);
+    inputToExpectedOutput.put("-1", -1L);
+    inputToExpectedOutput.put("0", 0L);
+    inputToExpectedOutput.put("1076753423.12345678901234567890", 1076753423L);
+    inputToExpectedOutput.put(String.valueOf(Long.MAX_VALUE), Long.MAX_VALUE);
+    inputToExpectedOutput.put(String.valueOf(Long.MIN_VALUE), Long.MIN_VALUE);
+
+    Random rand = new Random();
+    for (int i = 0; i < 10; i++) {
+      long value = rand.nextLong();
+      inputToExpectedOutput.put(String.valueOf(value), value);
+    }
+
+    LongWrapper wrapper = new LongWrapper();
+    for (Map.Entry<String, Long> entry : inputToExpectedOutput.entrySet()) {
+      assertTrue(UTF8String.fromString(entry.getKey()).toLong(wrapper), entry.getKey());
+      assertEquals((long) entry.getValue(), wrapper.value);
+    }
+
+    List<String> negativeInputs = Arrays.asList("", "  ", "null", "NULL", "\n", "~1212121",
+        "1234567890123456789012345678901234");
+
+    for (String negativeInput : negativeInputs) {
+      assertFalse(UTF8String.fromString(negativeInput).toLong(wrapper), negativeInput);
+    }
+  }
+
+  @Test
+  public void trimBothWithTrimString() {
+    assertEquals(fromString("hello"), fromString("  hello ").trim(fromString(" ")));
+    assertEquals(fromString("o"), fromString("  hello ").trim(fromString(" hle")));
+    assertEquals(fromString("h e"), fromString("ooh e ooo").trim(fromString("o ")));
+    assertEquals(fromString(""), fromString("ooo...oooo").trim(fromString("o.")));
+    assertEquals(fromString("b"), fromString("%^b[]@").trim(fromString("][@^%")));
+
+    assertEquals(EMPTY_UTF8, fromString("  ").trim(fromString(" ")));
+
+    assertEquals(fromString("数据砖头"), fromString("  数据砖头 ").trim());
+    assertEquals(fromString("数"), fromString("a数b").trim(fromString("ab")));
+    assertEquals(fromString(""), fromString("a").trim(fromString("a数b")));
+    assertEquals(fromString(""), fromString("数数 数数数").trim(fromString("数 ")));
+    assertEquals(fromString("据砖头"), fromString("数]数[数据砖头#数数").trim(fromString("[数]#")));
+    assertEquals(fromString("据砖头数数 "), fromString("数数数据砖头数数 ").trim(fromString("数")));
+  }
+
+  @Test
+  public void trimLeftWithTrimString() {
+    assertEquals(fromString("  hello "), fromString("  hello ").trimLeft(fromString("")));
+    assertEquals(fromString(""), fromString("a").trimLeft(fromString("a")));
+    assertEquals(fromString("b"), fromString("b").trimLeft(fromString("a")));
+    assertEquals(fromString("ba"), fromString("ba").trimLeft(fromString("a")));
+    assertEquals(fromString(""), fromString("aaaaaaa").trimLeft(fromString("a")));
+    assertEquals(fromString("trim"), fromString("oabtrim").trimLeft(fromString("bao")));
+    assertEquals(fromString("rim "), fromString("ooootrim ").trimLeft(fromString("otm")));
+
+    assertEquals(EMPTY_UTF8, fromString("  ").trimLeft(fromString(" ")));
+
+    assertEquals(fromString("数据砖头 "), fromString("  数据砖头 ").trimLeft(fromString(" ")));
+    assertEquals(fromString("数"), fromString("数").trimLeft(fromString("a")));
+    assertEquals(fromString("a"), fromString("a").trimLeft(fromString("数")));
+    assertEquals(fromString("砖头数数"), fromString("数数数据砖头数数").trimLeft(fromString("据数")));
+    assertEquals(fromString("据砖头数数"), fromString(" 数数数据砖头数数").trimLeft(fromString("数 ")));
+    assertEquals(fromString("据砖头数数"), fromString("aa数数数据砖头数数").trimLeft(fromString("a数砖")));
+    assertEquals(fromString("$S,.$BR"), fromString(",,,,%$S,.$BR").trimLeft(fromString("%,")));
+  }
+
+  @Test
+  public void trimRightWithTrimString() {
+    assertEquals(fromString("  hello "), fromString("  hello ").trimRight(fromString("")));
+    assertEquals(fromString(""), fromString("a").trimRight(fromString("a")));
+    assertEquals(fromString("cc"), fromString("ccbaaaa").trimRight(fromString("ba")));
+    assertEquals(fromString(""), fromString("aabbbbaaa").trimRight(fromString("ab")));
+    assertEquals(fromString("  he"), fromString("  hello ").trimRight(fromString(" ol")));
+    assertEquals(fromString("oohell"),
+        fromString("oohellooo../*&").trimRight(fromString("./,&%*o")));
+
+    assertEquals(EMPTY_UTF8, fromString("  ").trimRight(fromString(" ")));
+
+    assertEquals(fromString("  数据砖头"), fromString("  数据砖头 ").trimRight(fromString(" ")));
+    assertEquals(fromString("数数砖头"), fromString("数数砖头数aa数").trimRight(fromString("a数")));
+    assertEquals(fromString(""), fromString("数数数据砖ab").trimRight(fromString("数据砖ab")));
+    assertEquals(fromString("头"), fromString("头a???/").trimRight(fromString("数?/*&^%a")));
+    assertEquals(fromString("头"), fromString("头数b数数 [").trimRight(fromString(" []数b")));
+  }
+
+  @Test
+  public void skipWrongFirstByte() {
+    int[] wrongFirstBytes = {
+      0x80, 0x9F, 0xBF, // Skip Continuation bytes
+      0xC0, 0xC2, // 0xC0..0xC1 - disallowed in UTF-8
+      // 0xF5..0xFF - disallowed in UTF-8
+      0xF5, 0xF6, 0xF7, 0xF8, 0xF9,
+      0xFA, 0xFB, 0xFC, 0xFD, 0xFE, 0xFF
+    };
+    byte[] c = new byte[1];
+
+    for (int wrongFirstByte : wrongFirstBytes) {
+      c[0] = (byte) wrongFirstByte;
+      assertEquals(1, fromBytes(c).numChars());
+    }
+  }
+
+  private void testMakeValid(String input, String expected) {
+    ByteArrayOutputStream exp = new ByteArrayOutputStream();
+    for (String hex : expected.split(" ")) exp.write(Integer.parseInt(hex.substring(2), 16));
+    ByteArrayOutputStream inp = new ByteArrayOutputStream();
+    for (String hex : input.split(" ")) inp.write(Integer.parseInt(hex.substring(2), 16));
+    UTF8String expUTF8String = fromBytes(exp.toByteArray());
+    UTF8String inpUTF8String = fromBytes(inp.toByteArray());
+    assertEquals(expUTF8String, inpUTF8String.makeValid());
+    assertEquals(inpUTF8String.toValidString(), inpUTF8String.toString());
+  }
+  @Test
+  public void makeValid() {
+    // Basic tests
+    assertEquals(EMPTY_UTF8, EMPTY_UTF8.makeValid());
+    assertEquals(fromString(""), fromString("").makeValid());
+    assertEquals(fromString("abc"), fromString("abc").makeValid());
+    assertEquals(fromString("hello"), fromString("hello").makeValid());
+    assertEquals(fromString("大千世界"), fromString("大千世界").makeValid());
+    assertEquals(fromBytes(new byte[] {}), fromBytes(new byte[] {}).makeValid());
+    assertEquals(fromBytes(new byte[] {0x61}), fromBytes(new byte[] {0x61}).makeValid());
+    assertEquals(fromBytes(new byte[] {0x7F}), fromBytes(new byte[] {0x7F}).makeValid());
+    assertEquals(fromBytes(new byte[] {(byte) 0xEF, (byte) 0xBF, (byte) 0xBD}),
+      fromBytes(new byte[] {(byte) 0xFF}).makeValid());
+    assertEquals(fromBytes(new byte[] {(byte) 0xC2, (byte) 0x80}),
+      fromBytes(new byte[] {(byte) 0xC2, (byte) 0x80}).makeValid());
+    assertEquals(fromBytes(new byte[] {(byte) 0xDF, (byte) 0xBF}),
+      fromBytes(new byte[] {(byte) 0xDF, (byte) 0xBF}).makeValid());
+    assertEquals(fromString("��"),
+      fromBytes(new byte[] {(byte) 0xC0, (byte) 0x80}).makeValid());
+    assertEquals(fromString("��"),
+      fromBytes(new byte[] {(byte) 0xC1, (byte) 0xBF}).makeValid());
+    assertEquals(fromString("��"),
+      fromBytes(new byte[] {(byte) 0xDF, (byte) 0xC0}).makeValid());
+    assertEquals(fromString("��"),
+      fromBytes(new byte[] {(byte) 0xDF, (byte) 0xFF}).makeValid());
+    assertEquals(fromString("��"),
+      fromBytes(new byte[] {(byte) 0x80, (byte) 0x80}).makeValid());
+    assertEquals(fromBytes(new byte[] {(byte) 0xE0, (byte) 0xA0, (byte) 0x80}),
+      fromBytes(new byte[] {(byte) 0xE0, (byte) 0xA0, (byte) 0x80}).makeValid());
+    assertEquals(fromBytes(new byte[] {(byte) 0xEF, (byte) 0xBF, (byte) 0xBF}),
+      fromBytes(new byte[] {(byte) 0xEF, (byte) 0xBF, (byte) 0xBF}).makeValid());
+    assertEquals(fromBytes(new byte[] {(byte) 0xEF, (byte) 0xBF, (byte) 0xBF}),
+      fromBytes(new byte[] {(byte) 0xEF, (byte) 0xBF, (byte) 0xBF}).makeValid());
+    assertEquals(fromString("���"),
+      fromBytes(new byte[] {(byte) 0xE0, (byte) 0x9F, (byte) 0x80}).makeValid());
+    assertEquals(fromString("���"),
+      fromBytes(new byte[] {(byte) 0xE0, (byte) 0xC0, (byte) 0x80}).makeValid());
+    assertEquals(fromString("��"),
+      fromBytes(new byte[] {(byte) 0xEF, (byte) 0xBF, (byte) 0xC0}).makeValid());
+    assertEquals(fromString("���"),
+      fromBytes(new byte[] {(byte) 0x80, (byte) 0x80, (byte) 0x80}).makeValid());
+    assertEquals(fromBytes(new byte[] {(byte) 0xF0, (byte) 0x90, (byte) 0x80, (byte) 0x80}),
+      fromBytes(new byte[] {(byte) 0xF0, (byte) 0x90, (byte) 0x80, (byte) 0x80}).makeValid());
+    assertEquals(fromBytes(new byte[] {(byte) 0xF4, (byte) 0x8F, (byte) 0xBF, (byte) 0xBF}),
+      fromBytes(new byte[] {(byte) 0xF4, (byte) 0x8F, (byte) 0xBF, (byte) 0xBF}).makeValid());
+    assertEquals(fromString("����"),
+      fromBytes(new byte[] {(byte) 0xF0, (byte) 0x8F, (byte) 0x80, (byte) 0x80}).makeValid());
+    assertEquals(fromBytes(new byte[] {(byte) 0xEF, (byte) 0xBF, (byte) 0xBD, (byte) 0x7F}),
+      fromBytes(new byte[] {(byte) 0xF0, (byte) 0x90, (byte) 0x80, (byte) 0x7F}).makeValid());
+    assertEquals(fromString("����"),
+      fromBytes(new byte[] {(byte) 0xF4, (byte) 0x90, (byte) 0x80, (byte) 0x80}).makeValid());
+    assertEquals(fromString("��"),
+      fromBytes(new byte[] {(byte) 0xF4, (byte) 0x8F, (byte) 0xBF, (byte) 0xC0}).makeValid());
+    assertEquals(fromString("�����"), fromBytes(new byte[]
+      {(byte) 0xF8, (byte) 0x8F, (byte) 0x80, (byte) 0x80, (byte) 0x80}).makeValid());
+    assertEquals(fromString("�����"), fromBytes(new byte[]
+      {(byte) 0xF8, (byte) 0x90, (byte) 0x80, (byte) 0x80, (byte) 0x80}).makeValid());
+    assertEquals(fromString("�����"), fromBytes(new byte[]
+      {(byte) 0xFB, (byte) 0x8F, (byte) 0xBF, (byte) 0xBF, (byte) 0xBF}).makeValid());
+    assertEquals(fromString("�����"), fromBytes(new byte[]
+      {(byte) 0xFB, (byte) 0x90, (byte) 0x80, (byte) 0x80, (byte) 0x80}).makeValid());
+    // More tests
+    testMakeValid("0x42", "0x42");
+    testMakeValid("0x80", "0xEF 0xBF 0xBD");
+    testMakeValid("0xF4 0x92 0x12", "0xEF 0xBF 0xBD 0xEF 0xBF 0xBD 0x12");
+    testMakeValid("0x84 0xA5 0x63 0x64", "0xEF 0xBF 0xBD 0xEF 0xBF 0xBD 0x63 0x64");
+    testMakeValid("0xF4 0x9B", "0xEF 0xBF 0xBD 0xEF 0xBF 0xBD");
+    testMakeValid("0xE2 0x0C", "0xEF 0xBF 0xBD 0x0C");
+    testMakeValid("0xE8 0x3E", "0xEF 0xBF 0xBD 0x3E");
+    testMakeValid("0x17 0x1B 0xC2", "0x17 0x1B 0xEF 0xBF 0xBD");
+    testMakeValid("0x29 0xB2 0x7C 0xA0", "0x29 0xEF 0xBF 0xBD 0x7C 0xEF 0xBF 0xBD");
+    testMakeValid("0x13 0x68 0x28 0x2A 0x83", "0x13 0x68 0x28 0x2A 0xEF 0xBF 0xBD");
+    testMakeValid("0x3B 0xFE 0xC2 0xB7 0x9E", "0x3B 0xEF 0xBF 0xBD 0xC2 0xB7 0xEF 0xBF 0xBD");
+    testMakeValid("0xFC", "0xEF 0xBF 0xBD");
+    testMakeValid("0x8E 0xBD", "0xEF 0xBF 0xBD 0xEF 0xBF 0xBD");
+    testMakeValid("0x6A 0x8B 0x5C 0x5A", "0x6A 0xEF 0xBF 0xBD 0x5C 0x5A");
+    testMakeValid("0xB4 0xC0", "0xEF 0xBF 0xBD 0xEF 0xBF 0xBD");
+    testMakeValid("0xB0 0xD3", "0xEF 0xBF 0xBD 0xEF 0xBF 0xBD");
+    testMakeValid("0xAA", "0xEF 0xBF 0xBD");
+    testMakeValid("0x1A 0x66", "0x1A 0x66");
+    testMakeValid("0x32 0xB5 0x5F", "0x32 0xEF 0xBF 0xBD 0x5F");
+    testMakeValid("0x70 0xB6 0x69 0xBC", "0x70 0xEF 0xBF 0xBD 0x69 0xEF 0xBF 0xBD");
+    testMakeValid("0xDC 0x15 0x82", "0xEF 0xBF 0xBD 0x15 0xEF 0xBF 0xBD");
+    testMakeValid("0x7F 0x3F 0x72 0xBB", "0x7F 0x3F 0x72 0xEF 0xBF 0xBD");
+    testMakeValid("0x3C 0x3D 0x1F 0x6C 0x75", "0x3C 0x3D 0x1F 0x6C 0x75");
+    testMakeValid("0xBF 0x10 0xF4", "0xEF 0xBF 0xBD 0x10 0xEF 0xBF 0xBD");
+    testMakeValid("0xBF 0xDD 0x89", "0xEF 0xBF 0xBD 0xDD 0x89");
+    testMakeValid("0x85 0xD4 0x90 0x5E 0x6C", "0xEF 0xBF 0xBD 0xD4 0x90 0x5E 0x6C");
+    testMakeValid("0x0A 0x92 0x3C 0x17 0x7D", "0x0A 0xEF 0xBF 0xBD 0x3C 0x17 0x7D");
+    testMakeValid("0x49 0x4E 0x2C 0x7B 0x1C", "0x49 0x4E 0x2C 0x7B 0x1C");
+    testMakeValid("0x2E 0x0C 0x3E 0x02 0x9D", "0x2E 0x0C 0x3E 0x02 0xEF 0xBF 0xBD");
+    testMakeValid("0xF9 0xF2 0x11", "0xEF 0xBF 0xBD 0xEF 0xBF 0xBD 0x11");
+    testMakeValid("0xD1", "0xEF 0xBF 0xBD");
+    testMakeValid("0x74 0x35 0x56 0xC4", "0x74 0x35 0x56 0xEF 0xBF 0xBD");
+    testMakeValid("0xBE 0x45 0x7F", "0xEF 0xBF 0xBD 0x45 0x7F");
+    testMakeValid("0x2E", "0x2E");
+    testMakeValid("0x3B 0xC3", "0x3B 0xEF 0xBF 0xBD");
+    testMakeValid("0xF9 0x58 0xE0 0x84", "0xEF 0xBF 0xBD 0x58 0xEF 0xBF 0xBD 0xEF 0xBF 0xBD");
+    testMakeValid("0x72 0xF9 0x4F", "0x72 0xEF 0xBF 0xBD 0x4F");
+    testMakeValid("0xF2 0x2A 0x38", "0xEF 0xBF 0xBD 0x2A 0x38");
+    testMakeValid("0x66 0xFC 0x8D 0x5F", "0x66 0xEF 0xBF 0xBD 0xEF 0xBF 0xBD 0x5F");
+    testMakeValid("0x6D", "0x6D");
+    testMakeValid("0x6E 0xDF 0xDD", "0x6E 0xEF 0xBF 0xBD 0xEF 0xBF 0xBD");
+    testMakeValid("0x50 0xE8 0x45 0xDB", "0x50 0xEF 0xBF 0xBD 0x45 0xEF 0xBF 0xBD");
+    testMakeValid("0x71 0x06 0x1F 0x87", "0x71 0x06 0x1F 0xEF 0xBF 0xBD");
+    testMakeValid("0x02", "0x02");
+    testMakeValid("0x20 0x2B 0x38 0xCB 0xDF", "0x20 0x2B 0x38 0xEF 0xBF 0xBD 0xEF 0xBF 0xBD");
+    testMakeValid("0x10", "0x10");
+    testMakeValid("0x15", "0x15");
+    testMakeValid("0xC5 0xEA 0x2A", "0xEF 0xBF 0xBD 0xEF 0xBF 0xBD 0x2A");
+    testMakeValid("0x72 0x2D 0xBB 0x06", "0x72 0x2D 0xEF 0xBF 0xBD 0x06");
+    testMakeValid("0xB7", "0xEF 0xBF 0xBD");
+    testMakeValid("0xB8 0xB5", "0xEF 0xBF 0xBD 0xEF 0xBF 0xBD");
+    testMakeValid("0x9C 0x76 0x17", "0xEF 0xBF 0xBD 0x76 0x17");
+  }
+
+  private void testIsValid(String input, String expected) {
+    ByteArrayOutputStream inp = new ByteArrayOutputStream();
+    for (String hex : input.split(" ")) inp.write(Integer.parseInt(hex.substring(2), 16));
+    assertEquals(input.equals(expected), fromBytes(inp.toByteArray()).isValid());
+  }
+  @Test
+  public void isValid() {
+    // Basic tests
+    assertTrue(EMPTY_UTF8.isValid());
+    assertTrue(fromString("").isValid());
+    assertTrue(fromString("abc").isValid());
+    assertTrue(fromString("hello").isValid());
+    assertTrue(fromString("大千世界").isValid());
+    assertTrue(fromString("数据砖头").isValid());
+    assertTrue(fromBytes(new byte[] {}).isValid());
+    assertTrue(fromBytes(new byte[] {0x61}).isValid());
+    assertTrue(fromBytes(new byte[] {0x7F}).isValid());
+    assertFalse(fromBytes(new byte[] {(byte) 0xFF}).isValid());
+    assertTrue(fromBytes(new byte[] {(byte) 0xC2, (byte) 0x80}).isValid());
+    assertTrue(fromBytes(new byte[] {(byte) 0xDF, (byte) 0xBF}).isValid());
+    assertFalse(fromBytes(new byte[] {(byte) 0xC0, (byte) 0x80}).isValid());
+    assertFalse(fromBytes(new byte[] {(byte) 0xC1, (byte) 0xBF}).isValid());
+    assertFalse(fromBytes(new byte[] {(byte) 0xDF, (byte) 0xC0}).isValid());
+    assertFalse(fromBytes(new byte[] {(byte) 0xDF, (byte) 0xFF}).isValid());
+    assertFalse(fromBytes(new byte[] {(byte) 0x80, (byte) 0x80}).isValid());
+    assertTrue(fromBytes(new byte[] {(byte) 0xE0, (byte) 0xA0, (byte) 0x80}).isValid());
+    assertTrue(fromBytes(new byte[] {(byte) 0xEF, (byte) 0xBF, (byte) 0xBF}).isValid());
+    assertTrue(fromBytes(new byte[] {(byte) 0xEF, (byte) 0xBF, (byte) 0xBF}).isValid());
+    assertFalse(fromBytes(new byte[] {(byte) 0xE0, (byte) 0x9F, (byte) 0x80}).isValid());
+    assertFalse(fromBytes(new byte[] {(byte) 0xE0, (byte) 0xC0, (byte) 0x80}).isValid());
+    assertFalse(fromBytes(new byte[] {(byte) 0xEF, (byte) 0xBF, (byte) 0xC0}).isValid());
+    assertFalse(fromBytes(new byte[] {(byte) 0x80, (byte) 0x80, (byte) 0x80}).isValid());
+    assertTrue(fromBytes(
+      new byte[] {(byte) 0xF0, (byte) 0x90, (byte) 0x80, (byte) 0x80}).isValid());
+    assertTrue(fromBytes(
+      new byte[] {(byte) 0xF4, (byte) 0x8F, (byte) 0xBF, (byte) 0xBF}).isValid());
+    assertFalse(fromBytes(
+      new byte[] {(byte) 0xF0, (byte) 0x8F, (byte) 0x80, (byte) 0x80}).isValid());
+    assertFalse(fromBytes(
+      new byte[] {(byte) 0xF0, (byte) 0x90, (byte) 0x80, (byte) 0x7F}).isValid());
+    assertFalse(fromBytes(
+      new byte[] {(byte) 0xF4, (byte) 0x90, (byte) 0x80, (byte) 0x80}).isValid());
+    assertFalse(fromBytes(
+      new byte[] {(byte) 0xF4, (byte) 0x8F, (byte) 0xBF, (byte) 0xC0}).isValid());
+    assertFalse(fromBytes(
+      new byte[] {(byte) 0xF8, (byte) 0x8F, (byte) 0x80, (byte) 0x80, (byte) 0x80}).isValid());
+    assertFalse(fromBytes(
+      new byte[] {(byte) 0xF8, (byte) 0x90, (byte) 0x80, (byte) 0x80, (byte) 0x80}).isValid());
+    assertFalse(fromBytes(
+      new byte[] {(byte) 0xFB, (byte) 0x8F, (byte) 0xBF, (byte) 0xBF, (byte) 0xBF}).isValid());
+    assertFalse(fromBytes(
+      new byte[] {(byte) 0xFB, (byte) 0x90, (byte) 0x80, (byte) 0x80, (byte) 0x80}).isValid());
+    // More tests
+    testIsValid("0x42", "0x42");
+    testIsValid("0x80", "0xEF 0xBF 0xBD");
+    testIsValid("0xF4 0x92 0x12", "0xEF 0xBF 0xBD 0xEF 0xBF 0xBD 0x12");
+    testIsValid("0x84 0xA5 0x63 0x64", "0xEF 0xBF 0xBD 0xEF 0xBF 0xBD 0x63 0x64");
+    testIsValid("0xF4 0x9B", "0xEF 0xBF 0xBD 0xEF 0xBF 0xBD");
+    testIsValid("0xE2 0x0C", "0xEF 0xBF 0xBD 0x0C");
+    testIsValid("0xE8 0x3E", "0xEF 0xBF 0xBD 0x3E");
+    testIsValid("0x17 0x1B 0xC2", "0x17 0x1B 0xEF 0xBF 0xBD");
+    testIsValid("0x29 0xB2 0x7C 0xA0", "0x29 0xEF 0xBF 0xBD 0x7C 0xEF 0xBF 0xBD");
+    testIsValid("0x13 0x68 0x28 0x2A 0x83", "0x13 0x68 0x28 0x2A 0xEF 0xBF 0xBD");
+    testIsValid("0x3B 0xFE 0xC2 0xB7 0x9E", "0x3B 0xEF 0xBF 0xBD 0xC2 0xB7 0xEF 0xBF 0xBD");
+    testIsValid("0xFC", "0xEF 0xBF 0xBD");
+    testIsValid("0x8E 0xBD", "0xEF 0xBF 0xBD 0xEF 0xBF 0xBD");
+    testIsValid("0x6A 0x8B 0x5C 0x5A", "0x6A 0xEF 0xBF 0xBD 0x5C 0x5A");
+    testIsValid("0xB4 0xC0", "0xEF 0xBF 0xBD 0xEF 0xBF 0xBD");
+    testIsValid("0xB0 0xD3", "0xEF 0xBF 0xBD 0xEF 0xBF 0xBD");
+    testIsValid("0xAA", "0xEF 0xBF 0xBD");
+    testIsValid("0x1A 0x66", "0x1A 0x66");
+    testIsValid("0x32 0xB5 0x5F", "0x32 0xEF 0xBF 0xBD 0x5F");
+    testIsValid("0x70 0xB6 0x69 0xBC", "0x70 0xEF 0xBF 0xBD 0x69 0xEF 0xBF 0xBD");
+    testIsValid("0xDC 0x15 0x82", "0xEF 0xBF 0xBD 0x15 0xEF 0xBF 0xBD");
+    testIsValid("0x7F 0x3F 0x72 0xBB", "0x7F 0x3F 0x72 0xEF 0xBF 0xBD");
+    testIsValid("0x3C 0x3D 0x1F 0x6C 0x75", "0x3C 0x3D 0x1F 0x6C 0x75");
+    testIsValid("0xBF 0x10 0xF4", "0xEF 0xBF 0xBD 0x10 0xEF 0xBF 0xBD");
+    testIsValid("0xBF 0xDD 0x89", "0xEF 0xBF 0xBD 0xDD 0x89");
+    testIsValid("0x85 0xD4 0x90 0x5E 0x6C", "0xEF 0xBF 0xBD 0xD4 0x90 0x5E 0x6C");
+    testIsValid("0x0A 0x92 0x3C 0x17 0x7D", "0x0A 0xEF 0xBF 0xBD 0x3C 0x17 0x7D");
+    testIsValid("0x49 0x4E 0x2C 0x7B 0x1C", "0x49 0x4E 0x2C 0x7B 0x1C");
+    testIsValid("0x2E 0x0C 0x3E 0x02 0x9D", "0x2E 0x0C 0x3E 0x02 0xEF 0xBF 0xBD");
+    testIsValid("0xF9 0xF2 0x11", "0xEF 0xBF 0xBD 0xEF 0xBF 0xBD 0x11");
+    testIsValid("0xD1", "0xEF 0xBF 0xBD");
+    testIsValid("0x74 0x35 0x56 0xC4", "0x74 0x35 0x56 0xEF 0xBF 0xBD");
+    testIsValid("0xBE 0x45 0x7F", "0xEF 0xBF 0xBD 0x45 0x7F");
+    testIsValid("0x2E", "0x2E");
+    testIsValid("0x3B 0xC3", "0x3B 0xEF 0xBF 0xBD");
+    testIsValid("0xF9 0x58 0xE0 0x84", "0xEF 0xBF 0xBD 0x58 0xEF 0xBF 0xBD 0xEF 0xBF 0xBD");
+    testIsValid("0x72 0xF9 0x4F", "0x72 0xEF 0xBF 0xBD 0x4F");
+    testIsValid("0xF2 0x2A 0x38", "0xEF 0xBF 0xBD 0x2A 0x38");
+    testIsValid("0x66 0xFC 0x8D 0x5F", "0x66 0xEF 0xBF 0xBD 0xEF 0xBF 0xBD 0x5F");
+    testIsValid("0x6D", "0x6D");
+    testIsValid("0x6E 0xDF 0xDD", "0x6E 0xEF 0xBF 0xBD 0xEF 0xBF 0xBD");
+    testIsValid("0x50 0xE8 0x45 0xDB", "0x50 0xEF 0xBF 0xBD 0x45 0xEF 0xBF 0xBD");
+    testIsValid("0x71 0x06 0x1F 0x87", "0x71 0x06 0x1F 0xEF 0xBF 0xBD");
+    testIsValid("0x02", "0x02");
+    testIsValid("0x20 0x2B 0x38 0xCB 0xDF", "0x20 0x2B 0x38 0xEF 0xBF 0xBD 0xEF 0xBF 0xBD");
+    testIsValid("0x10", "0x10");
+    testIsValid("0x15", "0x15");
+    testIsValid("0xC5 0xEA 0x2A", "0xEF 0xBF 0xBD 0xEF 0xBF 0xBD 0x2A");
+    testIsValid("0x72 0x2D 0xBB 0x06", "0x72 0x2D 0xEF 0xBF 0xBD 0x06");
+    testIsValid("0xB7", "0xEF 0xBF 0xBD");
+    testIsValid("0xB8 0xB5", "0xEF 0xBF 0xBD 0xEF 0xBF 0xBD");
+    testIsValid("0x9C 0x76 0x17", "0xEF 0xBF 0xBD 0x76 0x17");
+  }
+
+  @Test
+  public void testGetByte() {
+    // Valid UTF-8 string
+    String validString = "abcde";
+    UTF8String validUTF8String = fromString(validString);
+    // Valid byte index handling
+    for (int i = 0; i < validString.length(); ++i) {
+      assertEquals(validString.charAt(i), validUTF8String.getByte(i));
+    }
+    // Invalid byte index handling
+    assertEquals(0, validUTF8String.getByte(-1));
+    assertEquals(0, validUTF8String.getByte(validString.length()));
+    assertEquals(0, validUTF8String.getByte(validString.length() + 1));
+
+    // Invalid UTF-8 string
+    byte[] invalidString = new byte[] {(byte) 0x41, (byte) 0x42, (byte) 0x80};
+    UTF8String invalidUTF8String = fromBytes(invalidString);
+    // Valid byte index handling
+    for (int i = 0; i < invalidString.length; ++i) {
+      assertEquals(invalidString[i], invalidUTF8String.getByte(i));
+    }
+    // Invalid byte index handling
+    assertEquals(0, invalidUTF8String.getByte(-1));
+    assertEquals(0, invalidUTF8String.getByte(invalidString.length));
+    assertEquals(0, invalidUTF8String.getByte(invalidString.length + 1));
+  }
+
+  @Test
+  public void testGetChar() {
+    // Valid UTF-8 string
+    String str = "abcde";
+    UTF8String s = fromString(str);
+    // Valid character index handling
+    for (int i = 0; i < str.length(); ++i) {
+      assertEquals(str.charAt(i), s.getChar(i));
+    }
+    // Invalid character index handling
+    assertThrows(IndexOutOfBoundsException.class, () -> s.getChar(-1));
+    assertThrows(IndexOutOfBoundsException.class, () -> s.getChar(str.length()));
+    assertThrows(IndexOutOfBoundsException.class, () -> s.getChar(str.length() + 1));
+
+    // Invalid UTF-8 string
+    byte[] invalidString = new byte[] {(byte) 0x41, (byte) 0x42, (byte) 0x80};
+    UTF8String invalidUTF8String = fromBytes(invalidString);
+    // Valid byte index handling
+    for (int i = 0; i < invalidString.length; ++i) {
+      if (Character.isValidCodePoint(invalidString[i])) {
+        assertEquals(invalidString[i], invalidUTF8String.getChar(i));
+      } else {
+        assertEquals(0, invalidUTF8String.getChar(i));
+      }
+    }
+    // Invalid byte index handling
+    assertThrows(IndexOutOfBoundsException.class, () -> s.getChar(-1));
+    assertThrows(IndexOutOfBoundsException.class, () -> s.getChar(str.length()));
+    assertThrows(IndexOutOfBoundsException.class, () -> s.getChar(str.length() + 1));
+  }
+
+  @Test
+  public void testCodePointFrom() {
+    // Valid UTF-8 string
+    String str = "abcde";
+    UTF8String s = fromString(str);
+    // Valid character index handling
+    for (int i = 0; i < str.length(); ++i) {
+      assertEquals(str.charAt(i), s.codePointFrom(i));
+    }
+    // Invalid character index handling
+    assertThrows(IndexOutOfBoundsException.class, () -> s.codePointFrom(-1));
+    assertThrows(IndexOutOfBoundsException.class, () -> s.codePointFrom(str.length()));
+    assertThrows(IndexOutOfBoundsException.class, () -> s.codePointFrom(str.length() + 1));
+
+    // Invalid UTF-8 string
+    byte[] invalidString = new byte[] {(byte) 0x41, (byte) 0x42, (byte) 0x80};
+    UTF8String invalidUTF8String = fromBytes(invalidString);
+    // Valid byte index handling
+    for (int i = 0; i < invalidString.length; ++i) {
+      if (Character.isValidCodePoint(invalidString[i])) {
+        assertEquals(invalidString[i], invalidUTF8String.codePointFrom(i));
+      } else {
+        assertEquals(0, invalidUTF8String.codePointFrom(i));
+      }
+    }
+    // Invalid byte index handling
+    assertThrows(IndexOutOfBoundsException.class, () -> s.codePointFrom(-1));
+    assertThrows(IndexOutOfBoundsException.class, () -> s.codePointFrom(str.length()));
+    assertThrows(IndexOutOfBoundsException.class, () -> s.codePointFrom(str.length() + 1));
+
+    // Truncated trailing multi-byte sequence: the leader declares more bytes than remain.
+    // codePointFrom should decode only the bytes present (missing continuation bytes count as
+    // 0) and not read past the end. Each backing array has extra trailing bytes, so an
+    // over-read regression would show up in the result.
+    // 2-byte leader 0xCE with no continuation byte present.
+    assertEquals((0xCE & 0x1F) << 6,
+      fromBytes(new byte[] {(byte) 0xCE, 0x42}, 0, 1).codePointFrom(0));
+    // 3-byte leader 0xE4 with no continuation bytes present.
+    assertEquals((0xE4 & 0x0F) << 12,
+      fromBytes(new byte[] {(byte) 0xE4, 0x42, 0x43}, 0, 1).codePointFrom(0));
+    // 3-byte leader 0xE4 0xB8 with the final continuation byte missing.
+    assertEquals(((0xE4 & 0x0F) << 12) | ((0xB8 & 0x3F) << 6),
+      fromBytes(new byte[] {(byte) 0xE4, (byte) 0xB8, 0x42}, 0, 2).codePointFrom(0));
+    // 4-byte leader 0xF1 with no continuation bytes present.
+    assertEquals((0xF1 & 0x07) << 18,
+      fromBytes(new byte[] {(byte) 0xF1, 0x42, 0x43, 0x44}, 0, 1).codePointFrom(0));
+    // 4-byte leader 0xF1 with two continuation bytes present and only the last one missing,
+    // so just the final read crosses the end.
+    assertEquals(((0xF1 & 0x07) << 18) | ((0x9F & 0x3F) << 12) | ((0x8F & 0x3F) << 6),
+      fromBytes(new byte[] {(byte) 0xF1, (byte) 0x9F, (byte) 0x8F, 0x42}, 0, 3).codePointFrom(0));
+  }
+
+  @Test
+  public void copyUTF8StringClampsToRemainingBytes() {
+    // Here `end` runs one byte past the string, as it would for a truncated trailing sequence.
+    // copyUTF8String should clamp to the available bytes; the extra backing byte would show up
+    // in the result if it over-read.
+    byte[] backing = new byte[] {0x41, 0x42, 0x43};
+    UTF8String s = fromBytes(backing, 0, 2); // views "AB"
+    // `end` (2) is one past the last valid byte index (1); only the two real bytes are copied.
+    assertEquals(fromString("AB"), s.copyUTF8String(0, 2));
+    // Same with a non-zero start, so the clamp uses `numBytes - start`, not `numBytes`.
+    assertEquals(fromString("B"), s.copyUTF8String(1, 2));
+    // In-bounds copies are unaffected.
+    assertEquals(fromString("AB"), s.copyUTF8String(0, 1));
+    assertEquals(fromString("B"), s.copyUTF8String(1, 1));
+  }
+
+  @Test
+  public void trimTruncatedTrailingSequence() {
+    // trimLeft/trimRight build the search character through copyUTF8String, so an over-read would
+    // make it longer than the bytes that remain. The backing arrays carry an extra trailing byte
+    // to make any over-read deterministic.
+    // A lone truncated 2-byte leader (0xC2): the clamped search char is just the leader, which
+    // matches the 1-byte trim set and is trimmed away.
+    UTF8String lone = fromBytes(new byte[] {(byte) 0xC2, 0x42}, 0, 1);
+    UTF8String trim2 = fromBytes(new byte[] {(byte) 0xC2});
+    assertEquals(EMPTY_UTF8, lone.trimLeft(trim2));
+    assertEquals(EMPTY_UTF8, lone.trimRight(trim2));
+    // 'A' followed by a truncated 3-byte leader (0xE4). Trimming the leader from the right must
+    // keep 'A': the trailing character occupies only one real byte, so only that byte is removed.
+    UTF8String prefixed = fromBytes(new byte[] {0x41, (byte) 0xE4, 0x42}, 0, 2);
+    UTF8String trim3 = fromBytes(new byte[] {(byte) 0xE4});
+    assertEquals(fromString("A"), prefixed.trimRight(trim3));
+  }
+
+  @Test
+  public void utf8StringCodePoints() {
+    String s = "aéह 日å!";
+    UTF8String s0 = fromString(s);
+    for (int i = 0; i < s.length(); ++i) {
+      assertEquals(s.codePointAt(i), s0.getChar(i));
+    }
+
+    UTF8String s1 = fromBytes(new byte[] {0x41, (byte) 0xC3, (byte) 0xB1, (byte) 0xE2,
+      (byte) 0x82, (byte) 0xAC, (byte) 0xF0, (byte) 0x90, (byte) 0x8D, (byte) 0x88});
+    // numBytesForFirstByte
+    assertEquals(1, UTF8String.numBytesForFirstByte(s1.getByte(0)));
+    assertEquals(2, UTF8String.numBytesForFirstByte(s1.getByte(1)));
+    assertEquals(3, UTF8String.numBytesForFirstByte(s1.getByte(3)));
+    assertEquals(4, UTF8String.numBytesForFirstByte(s1.getByte(6)));
+    // getByte
+    assertEquals((byte) 0x41, s1.getByte(0));
+    assertEquals((byte) 0xC3, s1.getByte(1));
+    assertEquals((byte) 0xE2, s1.getByte(3));
+    assertEquals((byte) 0xF0, s1.getByte(6));
+    // codePointFrom
+    assertEquals(0x41, s1.codePointFrom(0));
+    assertEquals(0xF1, s1.codePointFrom(1));
+    assertEquals(0x20AC, s1.codePointFrom(3));
+    assertEquals(0x10348, s1.codePointFrom(6));
+    assertThrows(IndexOutOfBoundsException.class, () -> s1.codePointFrom(-1));
+    assertThrows(IndexOutOfBoundsException.class, () -> s1.codePointFrom(99));
+    // getChar
+    assertEquals(0x41, s1.getChar(0));
+    assertEquals(0xF1, s1.getChar(1));
+    assertEquals(0x20AC, s1.getChar(2));
+    assertEquals(0x10348, s1.getChar(3));
+    assertThrows(IndexOutOfBoundsException.class, () -> s1.getChar(-1));
+    assertThrows(IndexOutOfBoundsException.class, () -> s1.getChar(99));
+
+    UTF8String s2 = fromString("Añ€𐍈");
+    // numBytesForFirstByte
+    assertEquals(1, UTF8String.numBytesForFirstByte(s2.getByte(0)));
+    assertEquals(2, UTF8String.numBytesForFirstByte(s2.getByte(1)));
+    assertEquals(3, UTF8String.numBytesForFirstByte(s2.getByte(3)));
+    assertEquals(4, UTF8String.numBytesForFirstByte(s2.getByte(6)));
+    // getByte
+    assertEquals((byte) 0x41, s2.getByte(0));
+    assertEquals((byte) 0xC3, s2.getByte(1));
+    assertEquals((byte) 0xE2, s2.getByte(3));
+    assertEquals((byte) 0xF0, s2.getByte(6));
+    // codePointFrom
+    assertEquals(0x41, s2.codePointFrom(0));
+    assertEquals(0xF1, s2.codePointFrom(1));
+    assertEquals(0x20AC, s2.codePointFrom(3));
+    assertEquals(0x10348, s2.codePointFrom(6));
+    assertThrows(IndexOutOfBoundsException.class, () -> s2.codePointFrom(-1));
+    assertThrows(IndexOutOfBoundsException.class, () -> s2.codePointFrom(99));
+    // getChar
+    assertEquals(0x41, s2.getChar(0));
+    assertEquals(0xF1, s2.getChar(1));
+    assertEquals(0x20AC, s2.getChar(2));
+    assertEquals(0x10348, s2.getChar(3));
+    assertThrows(IndexOutOfBoundsException.class, () -> s2.getChar(-1));
+    assertThrows(IndexOutOfBoundsException.class, () -> s2.getChar(99));
+
+    UTF8String s3 = EMPTY_UTF8;
+    // codePointFrom
+    assertThrows(IndexOutOfBoundsException.class, () -> s3.codePointFrom(0));
+    assertThrows(IndexOutOfBoundsException.class, () -> s3.codePointFrom(-1));
+    assertThrows(IndexOutOfBoundsException.class, () -> s3.codePointFrom(99));
+    // getChar
+    assertThrows(IndexOutOfBoundsException.class, () -> s3.getChar(0));
+    assertThrows(IndexOutOfBoundsException.class, () -> s3.getChar(-1));
+    assertThrows(IndexOutOfBoundsException.class, () -> s3.getChar(99));
+  }
+
+  private void testCodePointIterator(UTF8String utf8String) {
+    CodePointIteratorType iteratorMode = utf8String.isValid() ?
+      CodePointIteratorType.CODE_POINT_ITERATOR_ASSUME_VALID :
+      CodePointIteratorType.CODE_POINT_ITERATOR_MAKE_VALID;
+    Iterator<Integer> iterator = utf8String.codePointIterator(iteratorMode);
+    for (int i = 0; i < utf8String.numChars(); ++i) {
+      assertTrue(iterator.hasNext());
+      int codePoint = (utf8String.isValid() ? utf8String : utf8String.makeValid()).getChar(i);
+      assertEquals(codePoint, (int) iterator.next());
+    }
+    assertFalse(iterator.hasNext());
+  }
+  @Test
+  public void codePointIterator() {
+    // Valid UTF8 strings.
+    testCodePointIterator(fromString(""));
+    testCodePointIterator(fromString("abc"));
+    testCodePointIterator(fromString("a!2&^R"));
+    testCodePointIterator(fromString("aéह 日å!"));
+    testCodePointIterator(fromBytes(new byte[] {(byte) 0x41}));
+    testCodePointIterator(fromBytes(new byte[] {(byte) 0xC2, (byte) 0xA3}));
+    testCodePointIterator(fromBytes(new byte[] {(byte) 0xE2, (byte) 0x82, (byte) 0xAC}));
+    // Invalid UTF8 strings.
+    testCodePointIterator(fromBytes(new byte[] {(byte) 0xFF}));
+    testCodePointIterator(fromBytes(new byte[] {(byte) 0x80}));
+    testCodePointIterator(fromBytes(new byte[] {(byte) 0xC2, (byte) 0x80}));
+    testCodePointIterator(fromBytes(new byte[] {(byte) 0xE2, (byte) 0x82, (byte) 0x80}));
+    testCodePointIterator(fromBytes(new byte[] {(byte) 0x41, (byte) 0x80, (byte) 0x42}));
+    testCodePointIterator(fromBytes(new byte[] {
+      (byte) 0x41, (byte) 0xC2, (byte) 0x80, (byte) 0x42}));
+    testCodePointIterator(fromBytes(new byte[] {
+      (byte) 0x41, (byte) 0xE2, (byte) 0x82, (byte) 0x80, (byte) 0x42}));
+  }
+
+  private void testReverseCodePointIterator(UTF8String utf8String) {
+    CodePointIteratorType iteratorMode = utf8String.isValid() ?
+      CodePointIteratorType.CODE_POINT_ITERATOR_ASSUME_VALID :
+      CodePointIteratorType.CODE_POINT_ITERATOR_MAKE_VALID;
+    Iterator<Integer> iterator = utf8String.codePointIterator(iteratorMode);
+    for (int i = 0; i < utf8String.numChars(); ++i) {
+      assertTrue(iterator.hasNext());
+      int codePoint = (utf8String.isValid() ? utf8String : utf8String.makeValid()).getChar(i);
+      assertEquals(codePoint, (int) iterator.next());
+    }
+    assertFalse(iterator.hasNext());
+  }
+  @Test
+  public void reverseCodePointIterator() {
+    // Valid UTF8 strings
+    testReverseCodePointIterator(fromString(""));
+    testReverseCodePointIterator(fromString("abc"));
+    testReverseCodePointIterator(fromString("a!2&^R"));
+    testReverseCodePointIterator(fromString("aéह 日å!"));
+    testReverseCodePointIterator(fromBytes(new byte[] {(byte) 0x41}));
+    testReverseCodePointIterator(fromBytes(new byte[] {(byte) 0xC2, (byte) 0xA3}));
+    testReverseCodePointIterator(fromBytes(new byte[] {(byte) 0xE2, (byte) 0x82, (byte) 0xAC}));
+    // Invalid UTF8 strings
+    testReverseCodePointIterator(fromBytes(new byte[] {(byte) 0xFF}));
+    testReverseCodePointIterator(fromBytes(new byte[] {(byte) 0x80}));
+    testReverseCodePointIterator(fromBytes(new byte[] {(byte) 0xC2, (byte) 0x80}));
+    testReverseCodePointIterator(fromBytes(new byte[] {(byte) 0xE2, (byte) 0x82, (byte) 0x80}));
+    testReverseCodePointIterator(fromBytes(new byte[] {(byte) 0x41, (byte) 0x80, (byte) 0x42}));
+    testReverseCodePointIterator(fromBytes(new byte[] {
+      (byte) 0x41, (byte) 0xC2, (byte) 0x80, (byte) 0x42}));
+    testReverseCodePointIterator(fromBytes(new byte[] {
+      (byte) 0x41, (byte) 0xE2, (byte) 0x82, (byte) 0x80, (byte) 0x42}));
+  }
+
+  @Test
+  public void toBinaryString() {
+    assertEquals(ZERO_UTF8, UTF8String.toBinaryString(0));
+    assertEquals(UTF8String.fromString("1"), UTF8String.toBinaryString(1));
+    assertEquals(UTF8String.fromString("10"), UTF8String.toBinaryString(2));
+    assertEquals(UTF8String.fromString("100"), UTF8String.toBinaryString(4));
+    assertEquals(UTF8String.fromString("111"), UTF8String.toBinaryString(7));
+    assertEquals(
+      UTF8String.fromString("1111111111111111111111111111111111111111111111111111111111110011"),
+      UTF8String.toBinaryString(-13));
+    assertEquals(
+      UTF8String.fromString("1000000000000000000000000000000000000000000000000000000000000000"),
+      UTF8String.toBinaryString(Long.MIN_VALUE));
+    assertEquals(
+      UTF8String.fromString("111111111111111111111111111111111111111111111111111111111111111"),
+      UTF8String.toBinaryString(Long.MAX_VALUE));
+  }
+
+  /**
+   * This tests whether appending a codepoint to a 'UTF8StringBuilder' correctly appends every
+   * single codepoint. We test it against an already existing 'StringBuilder.appendCodePoint' and
+   * 'UTF8String.fromString'. We skip testing the surrogate codepoints because at some point while
+   * converting the surrogate codepoint to 'UTF8String' (via 'StringBuilder' and 'UTF8String') we
+   * get an ill-formated byte sequence (probably because 'String' is in UTF-16 format, and a single
+   * surrogate codepoint is handled differently in UTF-16 than in UTF-8, so somewhere during those
+   * conversions some different behaviour happens).
+   */
+  @Test
+  public void testAppendCodepointToUTF8StringBuilder() {
+    int surrogateRangeLowerBound = 0xD800;
+    int surrogateRangeUpperBound = 0xDFFF;
+    for (int i = Character.MIN_CODE_POINT; i <= Character.MAX_CODE_POINT; ++i) {
+      if(surrogateRangeLowerBound <= i && i <= surrogateRangeUpperBound) continue;
+      UTF8StringBuilder usb = new UTF8StringBuilder();
+      usb.appendCodePoint(i);
+      StringBuilder sb = new StringBuilder();
+      sb.appendCodePoint(i);
+      assert(usb.build().equals(UTF8String.fromString(sb.toString())));
+    }
   }
 }

@@ -17,22 +17,26 @@
 
 package org.apache.spark.network.shuffle;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+import java.util.UUID;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.google.common.io.CharStreams;
 import org.apache.spark.network.shuffle.protocol.ExecutorShuffleInfo;
-import org.apache.spark.network.util.SystemPropertyConfigProvider;
+import org.apache.spark.network.util.JavaUtils;
+import org.apache.spark.network.util.MapConfigProvider;
 import org.apache.spark.network.util.TransportConf;
 import org.apache.spark.network.shuffle.ExternalShuffleBlockResolver.AppExecId;
-import org.junit.AfterClass;
-import org.junit.BeforeClass;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.Assumptions;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 
-import static org.junit.Assert.*;
+import static org.junit.jupiter.api.Assertions.*;
 
 public class ExternalShuffleBlockResolverSuite {
   private static final String sortBlock0 = "Hello!";
@@ -42,9 +46,9 @@ public class ExternalShuffleBlockResolverSuite {
   private static TestShuffleDataContext dataContext;
 
   private static final TransportConf conf =
-      new TransportConf("shuffle", new SystemPropertyConfigProvider());
+      new TransportConf("shuffle", MapConfigProvider.EMPTY);
 
-  @BeforeClass
+  @BeforeAll
   public static void beforeAll() throws IOException {
     dataContext = new TestShuffleDataContext(2, 5);
 
@@ -55,7 +59,7 @@ public class ExternalShuffleBlockResolverSuite {
         sortBlock1.getBytes(StandardCharsets.UTF_8)});
   }
 
-  @AfterClass
+  @AfterAll
   public static void afterAll() {
     dataContext.cleanup();
   }
@@ -64,31 +68,15 @@ public class ExternalShuffleBlockResolverSuite {
   public void testBadRequests() throws IOException {
     ExternalShuffleBlockResolver resolver = new ExternalShuffleBlockResolver(conf, null);
     // Unregistered executor
-    try {
-      resolver.getBlockData("app0", "exec1", "shuffle_1_1_0");
-      fail("Should have failed");
-    } catch (RuntimeException e) {
-      assertTrue("Bad error message: " + e, e.getMessage().contains("not registered"));
-    }
-
-    // Invalid shuffle manager
-    try {
-      resolver.registerExecutor("app0", "exec2", dataContext.createExecutorInfo("foobar"));
-      resolver.getBlockData("app0", "exec2", "shuffle_1_1_0");
-      fail("Should have failed");
-    } catch (UnsupportedOperationException e) {
-      // pass
-    }
+    RuntimeException e = assertThrows(RuntimeException.class,
+      () -> resolver.getBlockData("app0", "exec1", 1, 1, 0));
+    assertTrue(e.getMessage().contains("not registered"), "Bad error message: " + e);
 
     // Nonexistent shuffle block
     resolver.registerExecutor("app0", "exec3",
       dataContext.createExecutorInfo(SORT_MANAGER));
-    try {
-      resolver.getBlockData("app0", "exec3", "shuffle_1_1_0");
-      fail("Should have failed");
-    } catch (Exception e) {
-      // pass
-    }
+    assertThrows(Exception.class,
+      () -> resolver.getBlockData("app0", "exec3", 1, 1, 0));
   }
 
   @Test
@@ -97,19 +85,128 @@ public class ExternalShuffleBlockResolverSuite {
     resolver.registerExecutor("app0", "exec0",
       dataContext.createExecutorInfo(SORT_MANAGER));
 
-    InputStream block0Stream =
-      resolver.getBlockData("app0", "exec0", "shuffle_0_0_0").createInputStream();
-    String block0 = CharStreams.toString(
-        new InputStreamReader(block0Stream, StandardCharsets.UTF_8));
-    block0Stream.close();
-    assertEquals(sortBlock0, block0);
+    try (InputStream block0Stream = resolver.getBlockData(
+        "app0", "exec0", 0, 0, 0).createInputStream()) {
+      assertEquals(sortBlock0, JavaUtils.toString(block0Stream));
+    }
 
-    InputStream block1Stream =
-      resolver.getBlockData("app0", "exec0", "shuffle_0_0_1").createInputStream();
-    String block1 = CharStreams.toString(
-        new InputStreamReader(block1Stream, StandardCharsets.UTF_8));
-    block1Stream.close();
-    assertEquals(sortBlock1, block1);
+    try (InputStream block1Stream = resolver.getBlockData(
+        "app0", "exec0", 0, 0, 1).createInputStream()) {
+      assertEquals(sortBlock1, JavaUtils.toString(block1Stream));
+    }
+
+    try (InputStream blocksStream = resolver.getContinuousBlocksData(
+        "app0", "exec0", 0, 0, 0, 2).createInputStream()) {
+      assertEquals(sortBlock0 + sortBlock1, JavaUtils.toString(blocksStream));
+    }
+  }
+
+  @Test
+  public void testBlockFileResolvingOutsideLocalDirsRejected() throws IOException {
+    // A registered executor's directories can be modified after registration. The resolver
+    // must refuse to serve a block whose resolved path escapes the registered local dirs.
+    File outsideFile = File.createTempFile("outside", ".txt");
+    TestShuffleDataContext context = new TestShuffleDataContext(2, 5);
+    context.create();
+    try {
+      context.insertSortShuffleData(1, 0, new byte[][] {
+        "AAAA".getBytes(StandardCharsets.UTF_8),
+        "BBBB".getBytes(StandardCharsets.UTF_8)});
+      ExternalShuffleBlockResolver resolver = new ExternalShuffleBlockResolver(conf, null);
+      resolver.registerExecutor("app1", "exec0", context.createExecutorInfo(SORT_MANAGER));
+
+      // Sanity check: the block is served normally before the file is replaced.
+      try (InputStream in = resolver.getBlockData("app1", "exec0", 1, 0, 0)
+          .createInputStream()) {
+        assertEquals("AAAA", JavaUtils.toString(in));
+      }
+
+      // Point the data file at a path outside the registered local dirs.
+      File dataFile = new File(ExecutorDiskUtils.getFilePath(
+        context.localDirs, context.subDirsPerLocalDir, "shuffle_1_0_0.data"));
+      assertTrue(dataFile.delete());
+      try {
+        Files.createSymbolicLink(dataFile.toPath(), outsideFile.toPath());
+      } catch (UnsupportedOperationException | IOException e) {
+        // Filesystems without symlink support cannot exercise this case.
+        Assumptions.assumeTrue(false, "symlinks unsupported on this filesystem");
+      }
+
+      RuntimeException e = assertThrows(RuntimeException.class,
+        () -> resolver.getBlockData("app1", "exec0", 1, 0, 0));
+      assertTrue(e.getMessage().contains("resolves outside"), "Bad error message: " + e);
+    } finally {
+      context.cleanup();
+      outsideFile.delete();
+    }
+  }
+
+  @Test
+  public void testIndexFileResolvingOutsideLocalDirsRejected() throws IOException {
+    // The index file is verified when it is loaded into the index cache.
+    File outsideFile = File.createTempFile("outside", ".index");
+    TestShuffleDataContext context = new TestShuffleDataContext(2, 5);
+    context.create();
+    try {
+      context.insertSortShuffleData(1, 0, new byte[][] {
+        "AAAA".getBytes(StandardCharsets.UTF_8),
+        "BBBB".getBytes(StandardCharsets.UTF_8)});
+      ExternalShuffleBlockResolver resolver = new ExternalShuffleBlockResolver(conf, null);
+      resolver.registerExecutor("app1", "exec0", context.createExecutorInfo(SORT_MANAGER));
+
+      // Replace the index file with a link to a valid copy outside the registered local dirs.
+      File indexFile = new File(ExecutorDiskUtils.getFilePath(
+        context.localDirs, context.subDirsPerLocalDir, "shuffle_1_0_0.index"));
+      Files.copy(indexFile.toPath(), outsideFile.toPath(),
+        StandardCopyOption.REPLACE_EXISTING);
+      assertTrue(indexFile.delete());
+      try {
+        Files.createSymbolicLink(indexFile.toPath(), outsideFile.toPath());
+      } catch (UnsupportedOperationException | IOException e) {
+        // Filesystems without symlink support cannot exercise this case.
+        Assumptions.assumeTrue(false, "symlinks unsupported on this filesystem");
+      }
+
+      RuntimeException e = assertThrows(RuntimeException.class,
+        () -> resolver.getBlockData("app1", "exec0", 1, 0, 0));
+      assertTrue(e.getMessage().contains("resolves outside"), "Bad error message: " + e);
+    } finally {
+      context.cleanup();
+      outsideFile.delete();
+    }
+  }
+
+  @Test
+  public void canonicalLocalDirsEvictedOnApplicationRemoved() throws IOException {
+    ExternalShuffleBlockResolver resolver =
+      new ExternalShuffleBlockResolver(conf, null, Runnable::run);
+    String root = new File(System.getProperty("java.io.tmpdir"), UUID.randomUUID().toString())
+      .getAbsolutePath();
+    String sharedDir = root + "/shared";
+    int numExecutors = 100;
+    for (String appId : new String[] {"app1", "app2"}) {
+      for (int i = 0; i < numExecutors; i++) {
+        String[] localDirs = {root + "/" + appId + "/exec" + i, sharedDir};
+        resolver.registerExecutor(appId, "exec" + i,
+          new ExecutorShuffleInfo(localDirs, 64, SORT_MANAGER));
+      }
+    }
+    assertEquals(2 * numExecutors + 1, resolver.canonicalLocalDirs.size());
+
+    // Executor removal keeps the executor registered, so its dirs stay cached.
+    for (int i = 0; i < numExecutors; i++) {
+      resolver.executorRemoved("exec" + i, "app1");
+    }
+    assertEquals(2 * numExecutors + 1, resolver.canonicalLocalDirs.size());
+
+    // A dir still referenced by another application's executor is kept.
+    resolver.applicationRemoved("app1", false);
+    assertEquals(numExecutors + 1, resolver.canonicalLocalDirs.size());
+    assertTrue(resolver.canonicalLocalDirs.containsKey(sharedDir));
+
+    resolver.applicationRemoved("app2", false);
+    assertTrue(resolver.canonicalLocalDirs.isEmpty());
+    assertEquals(0, resolver.getRegisteredExecutorsSize());
   }
 
   @Test
@@ -127,7 +224,7 @@ public class ExternalShuffleBlockResolverSuite {
       mapper.readValue(shuffleJson, ExecutorShuffleInfo.class);
     assertEquals(parsedShuffleInfo, shuffleInfo);
 
-    // Intentionally keep these hard-coded strings in here, to check backwards-compatability.
+    // Intentionally keep these hard-coded strings in here, to check backwards-compatibility.
     // its not legacy yet, but keeping this here in case anybody changes it
     String legacyAppIdJson = "{\"appId\":\"foo\", \"execId\":\"bar\"}";
     assertEquals(appId, mapper.readValue(legacyAppIdJson, AppExecId.class));
@@ -135,4 +232,104 @@ public class ExternalShuffleBlockResolverSuite {
       "\"subDirsPerLocalDir\": 7, \"shuffleManager\": " + "\"" + SORT_MANAGER + "\"}";
     assertEquals(shuffleInfo, mapper.readValue(legacyShuffleJson, ExecutorShuffleInfo.class));
   }
+
+  /**
+   * removeBlocks only operates on plain block-id file names. A block id containing parent-directory
+   * segments is skipped: it is not removed, and a file located outside the executor's local
+   * directory is left untouched.
+   */
+  @Test
+  public void removeBlocksIgnoresBlockIdWithParentDirSegments() throws IOException {
+    TestShuffleDataContext context = new TestShuffleDataContext(1, 5);
+    context.create();
+    File outsideFile = null;
+    try {
+      File localDir = new File(context.localDirs[0]);
+      File parentOfLocalDir = localDir.getParentFile();
+      outsideFile = new File(parentOfLocalDir, "outside-" + UUID.randomUUID() + ".txt");
+      Files.writeString(outsideFile.toPath(), "should not be deleted", StandardCharsets.UTF_8);
+      assertTrue(outsideFile.exists(), "precondition: file was created");
+
+      ExternalShuffleBlockResolver resolver = new ExternalShuffleBlockResolver(conf, null);
+      resolver.registerExecutor("app0", "0", context.createExecutorInfo(SORT_MANAGER));
+
+      String blockId = ".." + File.separator + ".." + File.separator + outsideFile.getName();
+      int removed = resolver.removeBlocks("app0", "0", new String[] { blockId });
+
+      assertEquals(0, removed, "A block id with parent-dir segments must not remove a block");
+      assertTrue(outsideFile.exists(),
+        "A file outside the local directory must not be removed (" +
+          outsideFile.getAbsolutePath() + ")");
+    } finally {
+      if (outsideFile != null && outsideFile.exists()) {
+        assertTrue(outsideFile.delete() || !outsideFile.exists());
+      }
+      context.cleanup();
+    }
+  }
+
+  /**
+   * A block id containing a path separator is not a plain file name and is skipped, so removeBlocks
+   * reports zero removed blocks.
+   */
+  @Test
+  public void removeBlocksIgnoresBlockIdWithSeparator() throws IOException {
+    TestShuffleDataContext context = new TestShuffleDataContext(1, 5);
+    context.create();
+    try {
+      ExternalShuffleBlockResolver resolver = new ExternalShuffleBlockResolver(conf, null);
+      resolver.registerExecutor("app0", "0", context.createExecutorInfo(SORT_MANAGER));
+
+      String blockId = "sub" + File.separator + "child";
+      int removed = resolver.removeBlocks("app0", "0", new String[] { blockId });
+
+      assertEquals(0, removed, "A block id containing a path separator must be skipped");
+    } finally {
+      context.cleanup();
+    }
+  }
+
+  /**
+   * In a batched call, an invalid block id does not abort the whole operation: a valid block id in
+   * the same batch is still removed while the invalid one is skipped.
+   */
+  @Test
+  public void removeBlocksContinuesAfterIgnoringInvalidBlockId() throws IOException {
+    TestShuffleDataContext context = new TestShuffleDataContext(1, 5);
+    context.create();
+    File outsideFile = null;
+    try {
+      File localDir = new File(context.localDirs[0]);
+      File parentOfLocalDir = localDir.getParentFile();
+      outsideFile = new File(parentOfLocalDir, "outside-" + UUID.randomUUID() + ".txt");
+      Files.writeString(outsideFile.toPath(), "should not be deleted", StandardCharsets.UTF_8);
+
+      // Plant a real, legitimately-named block in the localDir so the valid removal has something
+      // to actually remove.
+      context.insertCachedRddData(7, 0, new byte[] { 1, 2, 3 });
+      String validBlockId = "rdd_7_0";
+      File validFile = new File(ExecutorDiskUtils.getFilePath(
+        context.localDirs, context.subDirsPerLocalDir, validBlockId));
+      assertTrue(validFile.exists(), "precondition: block file was created");
+
+      ExternalShuffleBlockResolver resolver = new ExternalShuffleBlockResolver(conf, null);
+      resolver.registerExecutor("app0", "0", context.createExecutorInfo(SORT_MANAGER));
+
+      String invalidBlockId =
+        ".." + File.separator + ".." + File.separator + outsideFile.getName();
+      int removed = resolver.removeBlocks(
+        "app0", "0", new String[] { invalidBlockId, validBlockId });
+
+      assertEquals(1, removed, "The valid block id in the batch should still be removed");
+      assertTrue(outsideFile.exists(),
+        "The invalid entry must not remove a file outside the local directory");
+      assertFalse(validFile.exists(), "The valid block file should have been removed by the batch");
+    } finally {
+      if (outsideFile != null && outsideFile.exists()) {
+        assertTrue(outsideFile.delete() || !outsideFile.exists());
+      }
+      context.cleanup();
+    }
+  }
+
 }

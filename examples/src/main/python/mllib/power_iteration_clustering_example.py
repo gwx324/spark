@@ -15,11 +15,11 @@
 # limitations under the License.
 #
 
-from __future__ import print_function
-
 from pyspark import SparkContext
+
 # $example on$
 from pyspark.mllib.clustering import PowerIterationClustering, PowerIterationClusteringModel
+
 # $example off$
 
 if __name__ == "__main__":

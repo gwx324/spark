@@ -36,7 +36,7 @@ import org.apache.spark.graphx._
  * self cycles and canonicalizes the graph to ensure that the following conditions hold:
  * <ul>
  * <li> There are no self edges</li>
- * <li> All edges are oriented src > dst</li>
+ * <li> All edges are oriented (src is greater than dst)</li>
  * <li> There are no duplicate edges</li>
  * </ul>
  * However, the canonicalization procedure is costly as it requires repartitioning the graph.
@@ -81,11 +81,11 @@ object TriangleCount {
 
     // join the sets with the graph
     val setGraph: Graph[VertexSet, ED] = graph.outerJoinVertices(nbrSets) {
-      (vid, _, optSet) => optSet.getOrElse(null)
+      (vid, _, optSet) => optSet.orNull
     }
 
     // Edge function computes intersection of smaller vertex with larger vertex
-    def edgeFunc(ctx: EdgeContext[VertexSet, ED, Int]) {
+    def edgeFunc(ctx: EdgeContext[VertexSet, ED, Int]): Unit = {
       val (smallSet, largeSet) = if (ctx.srcAttr.size < ctx.dstAttr.size) {
         (ctx.srcAttr, ctx.dstAttr)
       } else {

@@ -18,16 +18,19 @@
 package org.apache.spark.api.r
 
 import java.io.{ByteArrayInputStream, ByteArrayOutputStream, DataInputStream, DataOutputStream}
-
-import scala.collection.mutable.HashMap
-import scala.language.existentials
+import java.util.concurrent.TimeUnit
 
 import io.netty.channel.{ChannelHandlerContext, SimpleChannelInboundHandler}
 import io.netty.channel.ChannelHandler.Sharable
+import io.netty.handler.timeout.ReadTimeoutException
 
+import org.apache.spark.{SparkConf, SparkEnv}
 import org.apache.spark.api.r.SerDe._
 import org.apache.spark.internal.Logging
-import org.apache.spark.util.Utils
+import org.apache.spark.internal.LogKeys._
+import org.apache.spark.internal.config.R._
+import org.apache.spark.util.{ThreadUtils, Utils}
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * Handler for RBackend
@@ -59,7 +62,7 @@ private[r] class RBackendHandler(server: RBackend)
           assert(numArgs == 1)
 
           writeInt(dos, 0)
-          writeObject(dos, args(0))
+          writeObject(dos, args(0), server.jvmObjectTracker)
         case "stopBackend" =>
           writeInt(dos, 0)
           writeType(dos, "void")
@@ -69,12 +72,12 @@ private[r] class RBackendHandler(server: RBackend)
             val t = readObjectType(dis)
             assert(t == 'c')
             val objToRemove = readString(dis)
-            JVMObjectTracker.remove(objToRemove)
+            server.jvmObjectTracker.remove(JVMObjectId(objToRemove))
             writeInt(dos, 0)
-            writeObject(dos, null)
+            writeObject(dos, null, server.jvmObjectTracker)
           } catch {
             case e: Exception =>
-              logError(s"Removing $objId failed", e)
+              logError(log"Removing ${MDC(OBJECT_ID, objId)} failed", e)
               writeInt(dos, -1)
               writeString(dos, s"Removing $objId failed: ${e.getMessage}")
           }
@@ -83,7 +86,27 @@ private[r] class RBackendHandler(server: RBackend)
           writeString(dos, s"Error: unknown method $methodName")
       }
     } else {
+      // To avoid timeouts when reading results in SparkR driver, we will be regularly sending
+      // heartbeat responses. We use special code +1 to signal the client that backend is
+      // alive and it should continue blocking for result.
+      val execService = ThreadUtils.newDaemonSingleThreadScheduledExecutor("SparkRKeepAliveThread")
+      val pingRunner = new Runnable {
+        override def run(): Unit = {
+          val pingBaos = new ByteArrayOutputStream()
+          val pingDaos = new DataOutputStream(pingBaos)
+          writeInt(pingDaos, +1)
+          ctx.write(pingBaos.toByteArray)
+        }
+      }
+      val conf = Option(SparkEnv.get).map(_.conf).getOrElse(new SparkConf())
+      val heartBeatInterval = conf.get(R_HEARTBEAT_INTERVAL)
+      val backendConnectionTimeout = conf.get(R_BACKEND_CONNECTION_TIMEOUT)
+      val interval = Math.min(heartBeatInterval, backendConnectionTimeout - 1)
+
+      execService.scheduleAtFixedRate(pingRunner, interval, interval, TimeUnit.SECONDS)
       handleMethodCall(isStatic, objId, methodName, numArgs, dis, dos)
+      execService.shutdown()
+      execService.awaitTermination(1, TimeUnit.SECONDS)
     }
 
     val reply = bos.toByteArray
@@ -95,9 +118,15 @@ private[r] class RBackendHandler(server: RBackend)
   }
 
   override def exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable): Unit = {
-    // Close the connection when an exception is raised.
-    cause.printStackTrace()
-    ctx.close()
+    cause match {
+      case timeout: ReadTimeoutException =>
+        // Do nothing. We don't want to timeout on read
+        logWarning("Ignoring read timeout in RBackendHandler")
+      case _ =>
+        // Close the connection when an exception is raised.
+        cause.printStackTrace()
+        ctx.close()
+    }
   }
 
   def handleMethodCall(
@@ -112,12 +141,8 @@ private[r] class RBackendHandler(server: RBackend)
       val cls = if (isStatic) {
         Utils.classForName(objId)
       } else {
-        JVMObjectTracker.get(objId) match {
-          case None => throw new IllegalArgumentException("Object not found " + objId)
-          case Some(o) =>
-            obj = o
-            o.getClass
-        }
+        obj = server.jvmObjectTracker(JVMObjectId(objId))
+        obj.getClass
       }
 
       val args = readArgs(numArgs, dis)
@@ -130,10 +155,11 @@ private[r] class RBackendHandler(server: RBackend)
           args)
 
         if (index.isEmpty) {
-          logWarning(s"cannot find matching method ${cls}.$methodName. "
-            + s"Candidates are:")
+          logWarning(log"cannot find matching method " +
+            log"${MDC(CLASS_NAME, cls)}.${MDC(METHOD_NAME, methodName)}. Candidates are:")
           selectedMethods.foreach { method =>
-            logWarning(s"$methodName(${method.getParameterTypes.mkString(",")})")
+            logWarning(log"${MDC(METHOD_NAME, methodName)}(" +
+              log"${MDC(METHOD_PARAM_TYPES, method.getParameterTypes.mkString(","))})")
           }
           throw new Exception(s"No matched method found for $cls.$methodName")
         }
@@ -142,7 +168,7 @@ private[r] class RBackendHandler(server: RBackend)
 
         // Write status bit
         writeInt(dos, 0)
-        writeObject(dos, ret.asInstanceOf[AnyRef])
+        writeObject(dos, ret, server.jvmObjectTracker)
       } else if (methodName == "<init>") {
         // methodName should be "<init>" for constructor
         val ctors = cls.getConstructors
@@ -151,10 +177,11 @@ private[r] class RBackendHandler(server: RBackend)
           args)
 
         if (index.isEmpty) {
-          logWarning(s"cannot find matching constructor for ${cls}. "
-            + s"Candidates are:")
+          logWarning(log"cannot find matching constructor for ${MDC(CLASS_NAME, cls)}. "
+            + log"Candidates are:")
           ctors.foreach { ctor =>
-            logWarning(s"$cls(${ctor.getParameterTypes.mkString(",")})")
+            logWarning(log"${MDC(CLASS_NAME, cls)}(" +
+              log"${MDC(METHOD_PARAM_TYPES, ctor.getParameterTypes.mkString(","))})")
           }
           throw new Exception(s"No matched constructor found for $cls")
         }
@@ -162,13 +189,13 @@ private[r] class RBackendHandler(server: RBackend)
         val obj = ctors(index.get).newInstance(args : _*)
 
         writeInt(dos, 0)
-        writeObject(dos, obj.asInstanceOf[AnyRef])
+        writeObject(dos, obj.asInstanceOf[AnyRef], server.jvmObjectTracker)
       } else {
         throw new IllegalArgumentException("invalid method " + methodName + " for object " + objId)
       }
     } catch {
       case e: Exception =>
-        logError(s"$methodName on $objId failed")
+        logError(log"${MDC(METHOD_NAME, methodName)} on ${MDC(OBJECT_ID, objId)} failed", e)
         writeInt(dos, -1)
         // Writing the error message of the cause for the exception. This will be returned
         // to user in the R process.
@@ -179,7 +206,7 @@ private[r] class RBackendHandler(server: RBackend)
   // Read a number of arguments from the data input stream
   def readArgs(numArgs: Int, dis: DataInputStream): Array[java.lang.Object] = {
     (0 until numArgs).map { _ =>
-      readObject(dis)
+      readObject(dis, server.jvmObjectTracker)
     }.toArray
   }
 
@@ -243,7 +270,7 @@ private[r] class RBackendHandler(server: RBackend)
           for (i <- 0 until numArgs) {
             if (parameterTypes(i) == classOf[Seq[Any]] && args(i).getClass.isArray) {
               // Convert a Java array to scala Seq
-              args(i) = args(i).asInstanceOf[Array[_]].toSeq
+              args(i) = args(i).asInstanceOf[Array[_]].toImmutableArraySeq
             }
           }
 
@@ -255,37 +282,4 @@ private[r] class RBackendHandler(server: RBackend)
   }
 }
 
-/**
- * Helper singleton that tracks JVM objects returned to R.
- * This is useful for referencing these objects in RPC calls.
- */
-private[r] object JVMObjectTracker {
 
-  // TODO: This map should be thread-safe if we want to support multiple
-  // connections at the same time
-  private[this] val objMap = new HashMap[String, Object]
-
-  // TODO: We support only one connection now, so an integer is fine.
-  // Investigate using use atomic integer in the future.
-  private[this] var objCounter: Int = 0
-
-  def getObject(id: String): Object = {
-    objMap(id)
-  }
-
-  def get(id: String): Option[Object] = {
-    objMap.get(id)
-  }
-
-  def put(obj: Object): String = {
-    val objId = objCounter.toString
-    objCounter = objCounter + 1
-    objMap.put(objId, obj)
-    objId
-  }
-
-  def remove(id: String): Option[Object] = {
-    objMap.remove(id)
-  }
-
-}

@@ -1,0 +1,188 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+import json
+import os
+import tempfile
+import zipfile
+from pathlib import Path
+
+from pyspark.errors import PySparkRuntimeError, SparkRuntimeException
+from pyspark.sql.functions import assert_true, lit, udf
+from pyspark.sql.tests.connect.client.test_artifact import ArtifactTestsMixin
+from pyspark.testing.sqlutils import ReusedSQLTestCase
+
+
+class ArtifactTests(ArtifactTestsMixin, ReusedSQLTestCase):
+    @classmethod
+    def root(cls):
+        from pyspark.core.files import SparkFiles
+
+        return SparkFiles.getRootDirectory()
+
+    def test_add_pyfile(self):
+        self.check_add_pyfile(self.spark)
+
+        # Test multi sessions. Should be able to add the same
+        # file from different session.
+        self.check_add_pyfile(self.spark.newSession())
+
+    def test_add_multiple_pyfiles(self):
+        def check_add_multiple_pyfiles(spark_session):
+            with tempfile.TemporaryDirectory(prefix="check_add_multiple_pyfiles") as d:
+                pyfile_paths = []
+                for name, value in [
+                    ("my_pyfile_a.py", 1),
+                    ("my_pyfile_b.py", 2),
+                    ("my_pyfile_c.py", 3),
+                ]:
+                    pyfile_path = os.path.join(d, name)
+                    with open(pyfile_path, "w") as f:
+                        f.write(f"my_func = lambda: {value}")
+                    pyfile_paths.append(pyfile_path)
+
+                @udf("int")
+                def func(x):
+                    import my_pyfile_a
+                    import my_pyfile_b
+                    import my_pyfile_c
+
+                    return my_pyfile_a.my_func() + my_pyfile_b.my_func() + my_pyfile_c.my_func()
+
+                spark_session.addArtifacts(*pyfile_paths, pyfile=True)
+                spark_session.range(1).select(assert_true(func("id") == lit(6))).show()
+
+        check_add_multiple_pyfiles(self.spark)
+
+        # Test multi sessions. Should be able to add the same
+        # files from different session.
+        check_add_multiple_pyfiles(self.spark.newSession())
+
+    def test_add_file(self):
+        self.check_add_file(self.spark)
+
+        # Test multi sessions. Should be able to add the same
+        # file from different session.
+        self.check_add_file(self.spark.newSession())
+
+    def test_add_archive(self):
+        self.check_add_archive(self.spark)
+
+        # Test multi sessions. Should be able to add the same
+        # file from different session.
+        self.check_add_file(self.spark.newSession())
+
+    def test_artifacts_cannot_be_overwritten(self):
+        with tempfile.TemporaryDirectory(prefix="test_artifacts_cannot_be_overwritten") as d:
+            pyfile_path = os.path.join(d, "my_pyfile.py")
+            with open(pyfile_path, "w+") as f:
+                f.write("my_func = lambda: 10")
+
+            self.spark.addArtifacts(pyfile_path, pyfile=True)
+
+            # Writing the same file twice is fine, and should not throw.
+            self.spark.addArtifacts(pyfile_path, pyfile=True)
+
+            with open(pyfile_path, "w+") as f:
+                f.write("my_func = lambda: 11")
+
+            with self.assertRaises(PySparkRuntimeError) as pe:
+                self.spark.addArtifacts(pyfile_path, pyfile=True)
+
+            self.check_error(
+                exception=pe.exception,
+                errorClass="DUPLICATED_ARTIFACT",
+                messageParameters={"normalized_path": pyfile_path},
+            )
+
+    def test_add_native_data_source_package(self):
+        # A new session, so that the packages do not affect the other tests.
+        spark = self.spark.newSession()
+        with tempfile.TemporaryDirectory(prefix="test_add_native_data_source_package") as d:
+            ffi = spark._jvm.org.apache.spark.sql.execution.datasources.v2.ffi
+            platform = ffi.NativePlatform.current()
+
+            def new_file(name):
+                file_path = os.path.join(d, name)
+                if name.endswith(".sparkpkg"):
+                    # Spark checks the manifest of a package when a session adds it, which has to
+                    # have a library for the platform of the driver.
+                    manifest = {
+                        "abiVersion": 1,
+                        "dataSources": ["my_source"],
+                        "libraries": {platform: "lib.so"},
+                    }
+                    with zipfile.ZipFile(file_path, "w") as z:
+                        z.writestr("spark-native-datasource.json", json.dumps(manifest))
+                        z.writestr("lib.so", name)
+                else:
+                    with open(file_path, "wb") as f:
+                        f.write(name.encode("utf-8"))
+                return file_path
+
+            spark.addArtifact(new_file("my_source.sparkpkg"))
+            # Packages are added to the session whatever the flags, as with Spark Connect, also
+            # together with other files.
+            spark.addArtifact(new_file("my_file_source.sparkpkg"), file=True)
+            spark.addArtifacts(new_file("my_other_source.sparkpkg"), new_file("other.txt"))
+            # A URI, and paths relative to the working directory of Python, which is not the
+            # one of the JVM, also with a colon, which is not the scheme of a URI.
+            spark.addArtifact(Path(new_file("my_uri_source.sparkpkg")).as_uri())
+            new_file("my_relative_source.sparkpkg")
+            new_file("my_source:1.sparkpkg")
+            cwd = os.getcwd()
+            os.chdir(d)
+            try:
+                spark.addArtifact("my_relative_source.sparkpkg")
+                spark.addArtifact("my_source:1.sparkpkg")
+            finally:
+                os.chdir(cwd)
+            # A file that is not a valid package is rejected.
+            invalid = os.path.join(d, "invalid.sparkpkg")
+            with open(invalid, "wb") as f:
+                f.write(b"not a zip")
+            with self.assertRaises(SparkRuntimeException) as e:
+                spark.addArtifact(invalid)
+            self.assertEqual(
+                e.exception.getCondition(), "INVALID_NATIVE_DATA_SOURCE_PACKAGE.INVALID_MANIFEST"
+            )
+            # It names the file of the user, which the JVM resolves to its canonical path.
+            self.assertEqual(e.exception.getMessageParameters()["path"], os.path.realpath(invalid))
+            packages = spark._jsparkSession.artifactManager().getNativeDataSourcePackages()._1()
+            self.assertEqual(
+                sorted(packages.apply(i).getName() for i in range(packages.size())),
+                [
+                    "my_file_source.sparkpkg",
+                    "my_other_source.sparkpkg",
+                    "my_relative_source.sparkpkg",
+                    "my_source.sparkpkg",
+                    "my_source:1.sparkpkg",
+                    "my_uri_source.sparkpkg",
+                ],
+            )
+
+    def test_add_zipped_package(self):
+        self.check_add_zipped_package(self.spark)
+
+        # Test multi sessions. Should be able to add the same
+        # file from different session.
+        self.check_add_file(self.spark.newSession())
+
+
+if __name__ == "__main__":
+    from pyspark.testing import main
+
+    main()

@@ -1,0 +1,1867 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.connect.pipelines
+
+import java.io.{BufferedReader, InputStreamReader}
+import java.nio.charset.StandardCharsets
+import java.nio.file.Paths
+import java.util.UUID
+import java.util.concurrent.TimeUnit
+
+import scala.collection.mutable.ArrayBuffer
+import scala.util.Try
+
+import org.scalactic.source.Position
+import org.scalatest.Tag
+
+import org.apache.spark.SparkConf
+import org.apache.spark.api.python.PythonUtils
+import org.apache.spark.sql.AnalysisException
+import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.classic.ColumnConversions._
+import org.apache.spark.sql.connect.PythonTestDepsChecker
+import org.apache.spark.sql.connect.service.SparkConnectService
+import org.apache.spark.sql.connector.catalog.{Identifier, InMemoryTableCatalog, TableCatalog}
+import org.apache.spark.sql.pipelines.Language.Python
+import org.apache.spark.sql.pipelines.autocdc.{ColumnSelection, ScdType, UnqualifiedColumnName}
+import org.apache.spark.sql.pipelines.common.FlowStatus
+import org.apache.spark.sql.pipelines.graph.{AutoCdcFlow, AutoCdcMergeFlow, DataflowGraph, PipelineUpdateContextImpl, QueryOrigin, QueryOriginType}
+import org.apache.spark.sql.pipelines.logging.EventLevel
+import org.apache.spark.sql.pipelines.utils.{EventVerificationTestHelpers, TestPipelineUpdateContextMixin}
+import org.apache.spark.sql.types.StructType
+
+/**
+ * Test suite that starts a Spark Connect server and executes Spark Declarative Pipelines Python
+ * code to define tables in the pipeline.
+ */
+class PythonPipelineSuite
+    extends SparkDeclarativePipelinesServerTest
+    with TestPipelineUpdateContextMixin
+    with EventVerificationTestHelpers {
+
+  // Register a V2 in-memory catalog so AutoCDC tests can exercise pipeline-default-catalog
+  // inheritance against a name that is never the session default `spark_catalog`. The V2 in-memory
+  // catalog doesn't support streaming reads, but the AutoCDC tests that touch it only run graph
+  // resolution -- not pipeline execution -- so this is sufficient.
+  override def sparkConf: SparkConf = super.sparkConf
+    .set("spark.sql.catalog.my_catalog", classOf[InMemoryTableCatalog].getName)
+
+  def buildGraph(
+      pythonText: String,
+      defaultCatalog: Option[String] = None,
+      defaultDatabase: Option[String] = None,
+      setupSql: Option[String] = None): DataflowGraph = {
+    val indentedPythonText = pythonText.linesIterator.map("        " + _).mkString("\n")
+    // create a unique identifier to allow identifying the session and dataflow graph
+    val customSessionIdentifier = UUID.randomUUID().toString
+    val defaultCatalogPyExpr = defaultCatalog.map(c => s""""$c"""").getOrElse("None")
+    val defaultDatabasePyExpr = defaultDatabase.map(d => s""""$d"""").getOrElse("None")
+    val setupSqlLine = setupSql.map(stmt => s"""spark.sql(\"\"\"$stmt\"\"\")""").getOrElse("")
+    val pythonCode =
+      s"""
+         |from pyspark.sql import SparkSession
+         |from pyspark import pipelines as dp
+         |from pyspark.pipelines.spark_connect_graph_element_registry import (
+         |    SparkConnectGraphElementRegistry,
+         |)
+         |from pyspark.pipelines.spark_connect_pipeline import create_dataflow_graph
+         |from pyspark.pipelines.graph_element_registry import (
+         |    graph_element_registration_context,
+         |)
+         |from pyspark.pipelines.add_pipeline_analysis_context import (
+         |    add_pipeline_analysis_context
+         |)
+         |
+         |spark = SparkSession.builder \\
+         |    .remote("sc://localhost:$serverPort") \\
+         |    .config("spark.connect.grpc.channel.timeout", "5s") \\
+         |    .config("spark.custom.identifier", "$customSessionIdentifier") \\
+         |    .create()
+         |
+         |$setupSqlLine
+         |
+         |dataflow_graph_id = create_dataflow_graph(
+         |    spark,
+         |    default_catalog=$defaultCatalogPyExpr,
+         |    default_database=$defaultDatabasePyExpr,
+         |    sql_conf={},
+         |)
+         |
+         |registry = SparkConnectGraphElementRegistry(spark, dataflow_graph_id)
+         |with add_pipeline_analysis_context(
+         |    spark=spark, dataflow_graph_id=dataflow_graph_id, flow_name=None
+         |):
+         |    with graph_element_registration_context(registry):
+         |$indentedPythonText
+         |""".stripMargin
+
+    logInfo(s"Running code: $pythonCode")
+    val (exitCode, output) = executePythonCode(pythonCode)
+
+    if (exitCode != 0) {
+      throw new RuntimeException(
+        s"Python process failed with exit code $exitCode. Output: ${output.mkString("\n")}")
+    }
+    val activeSessions = SparkConnectService.sessionManager.listActiveSessions
+
+    // get the session holder by finding the session with the custom UUID set in the conf
+    val sessionHolder = activeSessions
+      .map(info => SparkConnectService.sessionManager.getIsolatedSession(info.key, None))
+      .find(_.session.conf.get("spark.custom.identifier") == customSessionIdentifier)
+      .getOrElse(
+        throw new RuntimeException(s"Session with identifier $customSessionIdentifier not found"))
+
+    // get all dataflow graphs from the session holder
+    val dataflowGraphContexts = sessionHolder.dataflowGraphRegistry.getAllDataflowGraphs
+    assert(dataflowGraphContexts.size == 1)
+
+    dataflowGraphContexts.head.toDataflowGraph
+  }
+
+  def graphIdentifier(name: String): TableIdentifier = {
+    TableIdentifier(catalog = Option("spark_catalog"), database = Option("default"), table = name)
+  }
+
+  private def sessionCaseSensitive: Boolean = spark.sessionState.conf.caseSensitiveAnalysis
+
+  test("basic") {
+    val graph = buildGraph("""
+        |@dp.table
+        |def table1():
+        |    return spark.readStream.format("rate").load()
+        |""".stripMargin)
+      .resolve(sessionCaseSensitive)
+      .validate(sessionCaseSensitive)
+    assert(graph.flows.size == 1)
+    assert(graph.tables.size == 1)
+  }
+
+  test("failed flow progress event has correct python source code location") {
+    // Note that pythonText will be inserted into line 26 of the python script that is run.
+    val unresolvedGraph = buildGraph(pythonText = """
+        |@dp.table()
+        |def table1():
+        |    df = spark.createDataFrame([(25,), (30,), (45,)], ["age"])
+        |    return df.select("name")
+        |""".stripMargin)
+
+    val updateContext = TestPipelineUpdateContext(spark, unresolvedGraph, storageRoot)
+    updateContext.pipelineExecution.runPipeline()
+
+    assertFlowProgressEvent(
+      updateContext.eventBuffer,
+      identifier = graphIdentifier("table1"),
+      expectedFlowStatus = FlowStatus.FAILED,
+      cond = flowProgressEvent =>
+        flowProgressEvent.origin.sourceCodeLocation == Option(
+          QueryOrigin(
+            language = Option(Python()),
+            filePath = Option("<string>"),
+            line = Option(36),
+            objectName = Option("spark_catalog.default.table1"),
+            objectType = Option(QueryOriginType.Flow.toString))),
+      errorChecker = ex =>
+        ex.getMessage.contains(
+          "A column, variable, or function parameter with name `name` cannot be resolved."),
+      expectedEventLevel = EventLevel.WARN)
+  }
+
+  test("flow progress events have correct python source code location") {
+    // `standalone_flow1` writes to its own dedicated streaming table `st2` (rather than appending
+    // to `table1`, which already has its own implicit flow). Two flows writing concurrently to the
+    // same file-based streaming table share a single `_spark_metadata` log and race on the batch 0
+    // commit (`ManifestFileCommitProtocol`: "Race while writing batch 0"), which made this test
+    // flaky. Keeping each flow on a separate destination removes the race without changing what the
+    // test verifies (source-code-location propagation for an append flow).
+    val unresolvedGraph = buildGraph(pythonText = """
+        |@dp.table(
+        | comment = 'my table'
+        |)
+        |def table1():
+        |    return spark.readStream.table('mv')
+        |
+        |@dp.materialized_view
+        |def mv2():
+        |   return spark.range(26, 29)
+        |
+        |@dp.materialized_view
+        |def mv():
+        |   df = spark.createDataFrame([(25,), (30,), (45,)], ["age"])
+        |   return df.select("age")
+        |
+        |@dp.append_flow(
+        | target = 'st2'
+        |)
+        |def standalone_flow1():
+        |   return spark.readStream.table('mv2')
+        |
+        |dp.create_streaming_table('st2')
+        |""".stripMargin)
+
+    val updateContext = TestPipelineUpdateContext(spark, unresolvedGraph, storageRoot)
+    updateContext.pipelineExecution.runPipeline()
+    updateContext.pipelineExecution.awaitCompletion()
+
+    Seq(
+      FlowStatus.QUEUED,
+      FlowStatus.STARTING,
+      FlowStatus.PLANNING,
+      FlowStatus.RUNNING,
+      FlowStatus.COMPLETED).foreach { flowStatus =>
+      assertFlowProgressEvent(
+        updateContext.eventBuffer,
+        identifier = graphIdentifier("mv2"),
+        expectedFlowStatus = flowStatus,
+        cond = flowProgressEvent =>
+          flowProgressEvent.origin.sourceCodeLocation == Option(
+            QueryOrigin(
+              language = Option(Python()),
+              filePath = Option("<string>"),
+              line = Option(42),
+              objectName = Option("spark_catalog.default.mv2"),
+              objectType = Option(QueryOriginType.Flow.toString))),
+        expectedEventLevel = EventLevel.INFO)
+
+      assertFlowProgressEvent(
+        updateContext.eventBuffer,
+        identifier = graphIdentifier("mv"),
+        expectedFlowStatus = flowStatus,
+        cond = flowProgressEvent =>
+          flowProgressEvent.origin.sourceCodeLocation == Option(
+            QueryOrigin(
+              language = Option(Python()),
+              filePath = Option("<string>"),
+              line = Option(46),
+              objectName = Option("spark_catalog.default.mv"),
+              objectType = Option(QueryOriginType.Flow.toString))),
+        expectedEventLevel = EventLevel.INFO)
+    }
+
+    // Note that streaming flows do not have a PLANNING phase.
+    Seq(FlowStatus.QUEUED, FlowStatus.STARTING, FlowStatus.RUNNING, FlowStatus.COMPLETED)
+      .foreach { flowStatus =>
+        assertFlowProgressEvent(
+          updateContext.eventBuffer,
+          identifier = graphIdentifier("table1"),
+          expectedFlowStatus = flowStatus,
+          cond = flowProgressEvent =>
+            flowProgressEvent.origin.sourceCodeLocation == Option(
+              QueryOrigin(
+                language = Option(Python()),
+                filePath = Option("<string>"),
+                line = Option(36),
+                objectName = Option("spark_catalog.default.table1"),
+                objectType = Option(QueryOriginType.Flow.toString))),
+          expectedEventLevel = EventLevel.INFO)
+
+        assertFlowProgressEvent(
+          updateContext.eventBuffer,
+          identifier = graphIdentifier("standalone_flow1"),
+          expectedFlowStatus = flowStatus,
+          cond = flowProgressEvent =>
+            flowProgressEvent.origin.sourceCodeLocation == Option(
+              QueryOrigin(
+                language = Option(Python()),
+                filePath = Option("<string>"),
+                line = Option(51),
+                objectName = Option("spark_catalog.default.standalone_flow1"),
+                objectType = Option(QueryOriginType.Flow.toString))),
+          expectedEventLevel = EventLevel.INFO)
+      }
+  }
+
+  test("basic with inverted topological order") {
+    // This graph is purposefully in the wrong topological order to test the topological sort
+    val graph = buildGraph("""
+        |@dp.table()
+        |def b():
+        |  return spark.readStream.table("a")
+        |
+        |@dp.table()
+        |def c():
+        |  return spark.readStream.table("a")
+        |
+        |@dp.materialized_view()
+        |def d():
+        |  return spark.read.table("a")
+        |
+        |@dp.materialized_view()
+        |def a():
+        |  return spark.range(5)
+        |""".stripMargin)
+    val resolvedGraph = graph.resolve(sessionCaseSensitive).validate(sessionCaseSensitive)
+    assert(resolvedGraph.tables.size == 4)
+    assert(resolvedGraph.resolvedFlows.size == 4)
+  }
+
+  test("flows") {
+    val graph = buildGraph("""
+      |@dp.table()
+      |def a():
+      |  return spark.readStream.format("rate").load()
+      |
+      |@dp.append_flow(target = "a")
+      |def supplement():
+      |  return spark.readStream.format("rate").load()
+      |""".stripMargin).resolve(sessionCaseSensitive).validate(sessionCaseSensitive)
+
+    assert(graph.tables.map(_.identifier.table).toSet == Set("a"))
+    assert(graph.resolvedFlows.size == 2)
+    assert(
+      graph.flowsTo(graphIdentifier("a")).map(_.identifier).toSet == Set(
+        graphIdentifier("a"),
+        graphIdentifier("supplement")))
+  }
+
+  test("external sink") {
+    val graph = buildGraph("""
+        |dp.create_sink(
+        |  "myKafkaSink",
+        |  format = "kafka",
+        |  options = {"kafka.bootstrap.servers": "host1:port1,host2:port2"}
+        |)
+        |
+        |@dp.append_flow(
+        |  target = "myKafkaSink"
+        |)
+        |def mySinkFlow():
+        |  return spark.readStream.format("rate").load()
+        |""".stripMargin)
+
+    assert(graph.sinks.map(_.identifier) == Seq(TableIdentifier("myKafkaSink")))
+
+    // ensure format and options are properly set
+    graph.sinks.filter(_.identifier == TableIdentifier("myKafkaSink")).foreach { sink =>
+      assert(sink.format == "kafka")
+      assert(sink.options.get("kafka.bootstrap.servers").contains("host1:port1,host2:port2"))
+    }
+
+    // ensure the flow is properly linked to the sink
+    assert(
+      graph
+        .flowsTo(TableIdentifier("myKafkaSink"))
+        .map(_.identifier) == Seq(TableIdentifier("mySinkFlow")))
+  }
+
+  test("referencing internal datasets") {
+    val graph = buildGraph("""
+      |@dp.materialized_view
+      |def src():
+      |  return spark.range(5)
+      |
+      |@dp.materialized_view
+      |def a():
+      |  return spark.read.table("src")
+      |
+      |@dp.table
+      |def b():
+      |  return spark.readStream.table("src")
+      |
+      |@dp.materialized_view
+      |def c():
+      |  return spark.sql("SELECT * FROM src")
+      |
+      |@dp.table
+      |def d():
+      |  return spark.sql("SELECT * FROM STREAM src")
+      |""".stripMargin).resolve(sessionCaseSensitive).validate(sessionCaseSensitive)
+
+    assert(
+      graph.table.keySet == Set(
+        graphIdentifier("src"),
+        graphIdentifier("a"),
+        graphIdentifier("b"),
+        graphIdentifier("c"),
+        graphIdentifier("d")))
+    Seq("a", "b", "c").foreach { flowName =>
+      // dependency is properly tracked
+      assert(graph.resolvedFlow(graphIdentifier(flowName)).inputs == Set(graphIdentifier("src")))
+    }
+
+    val (streamingFlows, batchFlows) = graph.resolvedFlows.partition(_.df.isStreaming)
+    assert(
+      batchFlows.map(_.identifier).toSet == Set(
+        graphIdentifier("src"),
+        graphIdentifier("a"),
+        graphIdentifier("c")))
+    assert(
+      streamingFlows.map(_.identifier).toSet ==
+        Set(graphIdentifier("b"), graphIdentifier("d")))
+  }
+
+  test("SPARK-60494: referencing internal datasets through DataFrame arguments of spark.sql") {
+    // `d` and `e` have the SQL with DataFrame arguments under another relation.
+    val unresolvedGraph = buildGraph("""
+      |@dp.materialized_view
+      |def src():
+      |  return spark.range(5)
+      |
+      |@dp.temporary_view
+      |def view_src():
+      |  return spark.range(5)
+      |
+      |@dp.materialized_view
+      |def a():
+      |  return spark.sql("SELECT * FROM {df}", df=spark.read.table("src"))
+      |
+      |@dp.table
+      |def b():
+      |  return spark.sql("SELECT * FROM {df}", df=spark.readStream.table("src"))
+      |
+      |@dp.materialized_view
+      |def c():
+      |  return spark.sql("SELECT * FROM {df}", df=spark.read.table("view_src"))
+      |
+      |@dp.materialized_view
+      |def d():
+      |  return spark.sql("SELECT * FROM {df}", df=spark.read.table("src")).where("id > 0")
+      |
+      |@dp.materialized_view
+      |def e():
+      |  inner = spark.sql("SELECT * FROM {df}", df=spark.read.table("src"))
+      |  return spark.sql("SELECT * FROM {x}", x=inner)
+      |""".stripMargin)
+    val graph = unresolvedGraph.resolve(sessionCaseSensitive).validate(sessionCaseSensitive)
+
+    // dependency is properly tracked
+    Seq("a", "b", "d", "e").foreach { flowName =>
+      assert(graph.resolvedFlow(graphIdentifier(flowName)).inputs == Set(graphIdentifier("src")))
+    }
+    assert(graph.resolvedFlow(graphIdentifier("c")).inputs == Set(TableIdentifier("view_src")))
+    assert(!graph.resolvedFlow(graphIdentifier("a")).df.isStreaming)
+    assert(graph.resolvedFlow(graphIdentifier("b")).df.isStreaming)
+
+    val updateContext =
+      new PipelineUpdateContextImpl(unresolvedGraph, _ => (), storageRoot = storageRoot)
+    updateContext.pipelineExecution.runPipeline()
+    updateContext.pipelineExecution.awaitCompletion()
+    Seq("a", "b", "c", "e").foreach { table =>
+      assert(spark.table(table).collect().map(_.getLong(0)).toSet == (0L until 5L).toSet)
+    }
+    assert(spark.table("d").collect().map(_.getLong(0)).toSet == (1L until 5L).toSet)
+  }
+
+  test(
+    "SPARK-60494: referencing an internal dataset through DataFrame arguments of spark.sql " +
+      "tracks the dependency when its table already exists") {
+    // The table of `src` exists from a previous run of the pipeline.
+    sql("CREATE TABLE spark_catalog.default.src AS SELECT * FROM RANGE(5)")
+    val graph = buildGraph("""
+      |@dp.materialized_view
+      |def src():
+      |  return spark.range(5)
+      |
+      |@dp.materialized_view
+      |def a():
+      |  return spark.sql("SELECT * FROM {df}", df=spark.read.table("src"))
+      |""".stripMargin).resolve(sessionCaseSensitive).validate(sessionCaseSensitive)
+
+    assert(graph.resolvedFlow(graphIdentifier("a")).inputs == Set(graphIdentifier("src")))
+  }
+
+  test("referencing external datasets") {
+    sql("CREATE TABLE spark_catalog.default.src AS SELECT * FROM RANGE(5)")
+    val graph = buildGraph("""
+        |@dp.materialized_view
+        |def a():
+        |  return spark.read.table("spark_catalog.default.src")
+        |
+        |@dp.materialized_view
+        |def b():
+        |  return spark.table("spark_catalog.default.src")
+        |
+        |@dp.table
+        |def c():
+        |  return spark.readStream.table("spark_catalog.default.src")
+        |
+        |@dp.materialized_view
+        |def d():
+        |  return spark.sql("SELECT * FROM spark_catalog.default.src")
+        |
+        |@dp.table
+        |def e():
+        |  return spark.sql("SELECT * FROM STREAM spark_catalog.default.src")
+        |""".stripMargin).resolve(sessionCaseSensitive).validate(sessionCaseSensitive)
+
+    assert(
+      graph.tables.map(_.identifier).toSet == Set(
+        graphIdentifier("a"),
+        graphIdentifier("b"),
+        graphIdentifier("c"),
+        graphIdentifier("d"),
+        graphIdentifier("e")))
+    // dependency is not tracked
+    assert(graph.resolvedFlows.forall(_.inputs.isEmpty))
+    val (streamingFlows, batchFlows) = graph.resolvedFlows.partition(_.df.isStreaming)
+    assert(
+      batchFlows.map(_.identifier).toSet == Set(
+        graphIdentifier("a"),
+        graphIdentifier("b"),
+        graphIdentifier("d")))
+    assert(
+      streamingFlows.map(_.identifier).toSet == Set(graphIdentifier("c"), graphIdentifier("e")))
+  }
+
+  test("referencing internal datasets failed") {
+    val graph = buildGraph("""
+        |@dp.table
+        |def a():
+        |  return spark.read.table("src")
+        |
+        |@dp.table
+        |def b():
+        |  return spark.table("src")
+        |
+        |@dp.table
+        |def c():
+        |  return spark.readStream.table("src")
+        |
+        |@dp.materialized_view
+        |def d():
+        |  return spark.sql("SELECT * FROM src")
+        |
+        |@dp.table
+        |def e():
+        |  return spark.sql("SELECT * FROM STREAM src")
+        |
+        |@dp.materialized_view
+        |def f():
+        |  return spark.sql("SELECT * FROM {df}", df=spark.read.table("src"))
+        |""".stripMargin).resolve(sessionCaseSensitive)
+
+    assert(graph.resolutionFailedFlows.size == 6)
+    graph.resolutionFailedFlows.foreach { flow =>
+      assert(flow.failure.head.getMessage.contains("[TABLE_OR_VIEW_NOT_FOUND]"))
+      assert(flow.failure.head.getMessage.contains("`src`"))
+    }
+  }
+
+  test("referencing external datasets failed") {
+    val graph = buildGraph("""
+        |@dp.table
+        |def a():
+        |  return spark.read.table("spark_catalog.default.src")
+        |
+        |@dp.materialized_view
+        |def b():
+        |  return spark.table("spark_catalog.default.src")
+        |
+        |@dp.materialized_view
+        |def c():
+        |  return spark.readStream.table("spark_catalog.default.src")
+        |
+        |@dp.materialized_view
+        |def d():
+        |  return spark.sql("SELECT * FROM spark_catalog.default.src")
+        |
+        |@dp.table
+        |def e():
+        |  return spark.sql("SELECT * FROM STREAM spark_catalog.default.src")
+        |""".stripMargin).resolve(sessionCaseSensitive)
+    assert(graph.resolutionFailedFlows.size == 5)
+    graph.resolutionFailedFlows.foreach { flow =>
+      assert(flow.failure.head.getMessage.contains("[TABLE_OR_VIEW_NOT_FOUND]"))
+      assert(flow.failure.head.getMessage.contains("`spark_catalog`.`default`.`src`"))
+    }
+  }
+
+  test("reading external datasets outside query function works") {
+    sql("CREATE TABLE spark_catalog.default.src AS SELECT * FROM RANGE(5)")
+    val graph = buildGraph(s"""
+        |spark_sql_df = spark.sql("SELECT * FROM spark_catalog.default.src")
+        |read_table_df = spark.read.table("spark_catalog.default.src")
+        |
+        |@dp.materialized_view
+        |def mv_from_spark_sql_df():
+        |  return spark_sql_df
+        |
+        |@dp.materialized_view
+        |def mv_from_read_table_df():
+        |  return read_table_df
+        |""".stripMargin).resolve(sessionCaseSensitive).validate(sessionCaseSensitive)
+
+    assert(
+      graph.resolvedFlows.map(_.identifier).toSet == Set(
+        graphIdentifier("mv_from_spark_sql_df"),
+        graphIdentifier("mv_from_read_table_df")))
+    assert(graph.resolvedFlows.forall(_.inputs.isEmpty))
+    assert(graph.resolvedFlows.forall(!_.df.isStreaming))
+  }
+
+  test(
+    "reading internal datasets outside query function that don't trigger " +
+      "eager analysis or execution") {
+    val graph = buildGraph("""
+        |@dp.materialized_view
+        |def src():
+        |  return spark.range(5)
+        |
+        |read_table_df = spark.read.table("src")
+        |
+        |@dp.materialized_view
+        |def mv_from_read_table_df():
+        |  return read_table_df
+        |
+        |""".stripMargin).resolve(sessionCaseSensitive).validate(sessionCaseSensitive)
+    assert(
+      graph.resolvedFlows.map(_.identifier).toSet == Set(
+        graphIdentifier("mv_from_read_table_df"),
+        graphIdentifier("src")))
+    assert(graph.resolvedFlows.forall(!_.df.isStreaming))
+    assert(
+      graph
+        .resolvedFlow(graphIdentifier("mv_from_read_table_df"))
+        .inputs
+        .contains(graphIdentifier("src")))
+  }
+
+  gridTest(
+    "reading internal datasets outside query function that trigger " +
+      "eager analysis or execution will fail")(
+    Seq("""spark.sql("SELECT * FROM src")""", """spark.read.table("src").collect()""")) {
+    command =>
+      val ex = intercept[RuntimeException] {
+        buildGraph(s"""
+        |@dp.materialized_view
+        |def src():
+        |  return spark.range(5)
+        |
+        |spark_sql_df = $command
+        |
+        |@dp.materialized_view
+        |def mv_from_spark_sql_df():
+        |  return spark_sql_df
+        |""".stripMargin)
+      }
+      assert(ex.getMessage.contains("TABLE_OR_VIEW_NOT_FOUND"))
+      assert(ex.getMessage.contains("`src`"))
+  }
+
+  test("create dataset with the same name will fail") {
+    val ex = intercept[AnalysisException] {
+      buildGraph(s"""
+           |@dp.materialized_view
+           |def a():
+           |  return spark.range(1)
+           |
+           |@dp.materialized_view(name = "a")
+           |def b():
+           |  return spark.range(1)
+           |""".stripMargin)
+    }
+    assert(ex.getCondition == "PIPELINE_DUPLICATE_IDENTIFIERS.OUTPUT")
+  }
+
+  test("create datasets with fully/partially qualified names") {
+    val graph = buildGraph(s"""
+         |@dp.table
+         |def mv_1():
+         |  return spark.range(5)
+         |
+         |@dp.table(name = "schema_a.mv_2")
+         |def irrelevant_1():
+         |  return spark.range(5)
+         |
+         |@dp.table(name = "st_1")
+         |def irrelevant_2():
+         |  return spark.readStream.format("rate").load()
+         |
+         |@dp.table(name = "schema_b.st_2")
+         |def irrelevant_3():
+         |  return spark.readStream.format("rate").load()
+         |""".stripMargin).resolve(sessionCaseSensitive)
+
+    // validate these dataset are properly fully qualified
+    assert(
+      graph.tables.map(_.identifier).toSet == Set(
+        TableIdentifier(
+          catalog = Option("spark_catalog"),
+          database = Option("default"),
+          table = "mv_1"),
+        TableIdentifier(
+          catalog = Option("spark_catalog"),
+          database = Option("schema_a"),
+          table = "mv_2"),
+        TableIdentifier(
+          catalog = Option("spark_catalog"),
+          database = Option("default"),
+          table = "st_1"),
+        TableIdentifier(
+          catalog = Option("spark_catalog"),
+          database = Option("schema_b"),
+          table = "st_2")))
+    assert(
+      graph.flows.map(_.identifier).toSet == Set(
+        TableIdentifier(
+          catalog = Option("spark_catalog"),
+          database = Option("default"),
+          table = "mv_1"),
+        TableIdentifier(
+          catalog = Option("spark_catalog"),
+          database = Option("schema_a"),
+          table = "mv_2"),
+        TableIdentifier(
+          catalog = Option("spark_catalog"),
+          database = Option("default"),
+          table = "st_1"),
+        TableIdentifier(
+          catalog = Option("spark_catalog"),
+          database = Option("schema_b"),
+          table = "st_2")))
+  }
+
+  test("create datasets with three part names") {
+    val graphTry = Try {
+      buildGraph(s"""
+           |@dp.table(name = "some_catalog.some_schema.mv")
+           |def irrelevant_1():
+           |  return spark.range(5)
+           |
+           |@dp.table(name = "some_catalog.some_schema.st")
+           |def irrelevant_2():
+           |  return spark.readStream.format("rate").load()
+           |""".stripMargin).resolve(sessionCaseSensitive)
+    }
+    assert(graphTry.isSuccess)
+    assert(
+      graphTry.get.tables.map(_.identifier).toSet == Set(
+        TableIdentifier("mv", Some("some_schema"), Some("some_catalog")),
+        TableIdentifier("st", Some("some_schema"), Some("some_catalog"))))
+    assert(
+      graphTry.get.flows.map(_.identifier).toSet == Set(
+        TableIdentifier("mv", Some("some_schema"), Some("some_catalog")),
+        TableIdentifier("st", Some("some_schema"), Some("some_catalog"))))
+  }
+
+  test("temporary views works") {
+    // A table is defined since pipeline with only temporary views is invalid.
+    val graph = buildGraph(s"""
+         |@dp.table
+         |def mv_1():
+         |  return spark.range(5)
+         |@dp.temporary_view
+         |def view_1():
+         |  return spark.range(5)
+         |
+         |@dp.temporary_view(name= "view_2")
+         |def irrelevant_1():
+         |  return spark.read.table("view_1")
+         |
+         |@dp.temporary_view(name= "view_3")
+         |def irrelevant_2():
+         |  return spark.read.table("view_1")
+         |""".stripMargin).resolve(sessionCaseSensitive)
+    // views are temporary views, so they're not fully qualified.
+    assert(
+      Set("view_1", "view_2", "view_3").subsetOf(
+        graph.flows.map(_.identifier.unquotedString).toSet))
+    // dependencies are correctly resolved view_2 reading from view_1
+    assert(
+      graph.resolvedFlow(TableIdentifier("view_2")).inputs.contains(TableIdentifier("view_1")))
+    assert(
+      graph.resolvedFlow(TableIdentifier("view_3")).inputs.contains(TableIdentifier("view_1")))
+  }
+
+  test("create named flow with multipart name will fail") {
+    val ex = intercept[RuntimeException] {
+      buildGraph(s"""
+           |@dp.table
+           |def src():
+           |  return spark.readStream.table("src0")
+           |
+           |@dp.append_flow(name ="some_schema.some_flow", target = "src")
+           |def some_flow():
+           |  return spark.readStream.format("rate").load()
+           |""".stripMargin)
+    }
+    assert(ex.getMessage.contains("MULTIPART_FLOW_NAME_NOT_SUPPORTED"))
+  }
+
+  test("create flow with multipart target and no explicit name succeeds") {
+    val graph = buildGraph("""
+           |@dp.table()
+           |def a():
+           |  return spark.readStream.format("rate").load()
+           |
+           |@dp.append_flow(target = "default.a")
+           |def supplement():
+           |  return spark.readStream.format("rate").load()
+           |""".stripMargin).resolve(sessionCaseSensitive).validate(sessionCaseSensitive)
+
+    assert(graph.tables.map(_.identifier) == Seq(graphIdentifier("a")))
+    assert(
+      graph
+        .flowsTo(graphIdentifier("a"))
+        .map(_.identifier)
+        .toSet == Set(graphIdentifier("a"), graphIdentifier("supplement")))
+  }
+
+  test("create named flow with multipart target succeeds") {
+    val graph = buildGraph("""
+           |@dp.table()
+           |def a():
+           |  return spark.readStream.format("rate").load()
+           |
+           |@dp.append_flow(target = "default.a", name = "something")
+           |def supplement():
+           |  return spark.readStream.format("rate").load()
+           |""".stripMargin)
+
+    assert(graph.tables.map(_.identifier) == Seq(graphIdentifier("a")))
+    assert(
+      graph
+        .flowsTo(graphIdentifier("a"))
+        .map(_.identifier)
+        .toSet == Set(graphIdentifier("a"), graphIdentifier("something")))
+  }
+
+  test("groupby and rollup works with internal datasets, referencing with (col, str)") {
+    val graph = buildGraph("""
+      from pyspark.sql.functions import col, sum, count
+
+      @dp.materialized_view
+      def src():
+        return spark.range(3)
+
+      @dp.materialized_view
+      def groupby_with_col_result():
+        return spark.read.table("src").groupBy(col("id")).agg(
+          sum("id").alias("sum_id"),
+          count("*").alias("cnt")
+        )
+
+      @dp.materialized_view
+      def groupby_with_str_result():
+        return spark.read.table("src").groupBy("id").agg(
+          sum("id").alias("sum_id"),
+          count("*").alias("cnt")
+        )
+
+      @dp.materialized_view
+      def rollup_with_col_result():
+        return spark.read.table("src").rollup(col("id")).agg(
+          sum("id").alias("sum_id"),
+          count("*").alias("cnt")
+        )
+
+      @dp.materialized_view
+      def rollup_with_str_result():
+        return spark.read.table("src").rollup("id").agg(
+          sum("id").alias("sum_id"),
+          count("*").alias("cnt")
+        )
+    """)
+
+    val updateContext =
+      new PipelineUpdateContextImpl(graph, _ => (), storageRoot = storageRoot)
+    updateContext.pipelineExecution.runPipeline()
+    updateContext.pipelineExecution.awaitCompletion()
+
+    val groupbyDfs =
+      Seq(spark.table("groupby_with_col_result"), spark.table("groupby_with_str_result"))
+
+    val rollupDfs =
+      Seq(spark.table("rollup_with_col_result"), spark.table("rollup_with_str_result"))
+
+    // groupBy: each variant should have exactly one row per id [0,1,2]
+    groupbyDfs.foreach { df =>
+      assert(df.select("id").collect().map(_.getLong(0)).toSet == Set(0L, 1L, 2L))
+    }
+
+    // rollup: each variant should have groupBy rows + one total row
+    rollupDfs.foreach { df =>
+      assert(df.count() == 3 + 1) // 3 ids + 1 total
+      val totalRow = df.filter("id IS NULL").collect().head
+      assert(totalRow.getLong(1) == 3L && totalRow.getLong(2) == 3L)
+    }
+  }
+
+  test("MV/ST with partition columns works") {
+    withTable("mv", "st") {
+      val graph = buildGraph("""
+            |from pyspark.sql.functions import col
+            |
+            |@dp.materialized_view(partition_cols = ["id_mod"])
+            |def mv():
+            |  return spark.range(5).withColumn("id_mod", col("id") % 2)
+            |
+            |@dp.table(partition_cols = ["id_mod"])
+            |def st():
+            |  return spark.readStream.table("mv")
+            |""".stripMargin)
+
+      val updateContext =
+        new PipelineUpdateContextImpl(graph, eventCallback = _ => (), storageRoot = storageRoot)
+      updateContext.pipelineExecution.runPipeline()
+      updateContext.pipelineExecution.awaitCompletion()
+
+      // check table is created with correct partitioning
+      val catalog = spark.sessionState.catalogManager.currentCatalog.asInstanceOf[TableCatalog]
+
+      Seq("mv", "st").foreach { tableName =>
+        val table = catalog.loadTable(Identifier.of(Array("default"), tableName))
+        assert(
+          table.partitioning().map(_.references().head.fieldNames().head) === Array("id_mod"))
+
+        val rows = spark.table(tableName).collect().map(r => (r.getLong(0), r.getLong(1))).toSet
+        val expected = (0 until 5).map(id => (id.toLong, (id % 2).toLong)).toSet
+        assert(rows == expected)
+      }
+    }
+  }
+
+  test("create pipeline without table will throw RUN_EMPTY_PIPELINE exception") {
+    checkError(
+      exception = intercept[AnalysisException] {
+        buildGraph(s"""
+            |spark.range(1)
+            |""".stripMargin)
+      },
+      condition = "RUN_EMPTY_PIPELINE",
+      parameters = Map.empty)
+  }
+
+  test("create pipeline with only temp view will throw RUN_EMPTY_PIPELINE exception") {
+    checkError(
+      exception = intercept[AnalysisException] {
+        buildGraph(s"""
+            |@dp.temporary_view
+            |def view_1():
+            |  return spark.range(5)
+            |""".stripMargin)
+      },
+      condition = "RUN_EMPTY_PIPELINE",
+      parameters = Map.empty)
+  }
+
+  test("create pipeline with only flow will throw RUN_EMPTY_PIPELINE exception") {
+    checkError(
+      exception = intercept[AnalysisException] {
+        buildGraph(s"""
+            |@dp.append_flow(target = "a")
+            |def flow():
+            |  return spark.range(5)
+            |""".stripMargin)
+      },
+      condition = "RUN_EMPTY_PIPELINE",
+      parameters = Map.empty)
+  }
+
+  test("table with string schema") {
+    val graph = buildGraph("""
+        |from pyspark.sql.functions import lit
+        |
+        |@dp.materialized_view(schema="id LONG, name STRING")
+        |def table_with_string_schema():
+        |    return spark.range(5).withColumn("name", lit("test"))
+        |""".stripMargin)
+      .resolve(sessionCaseSensitive)
+      .validate(sessionCaseSensitive)
+
+    assert(graph.flows.size == 1)
+    assert(graph.tables.size == 1)
+
+    val table = graph.table(graphIdentifier("table_with_string_schema"))
+    assert(table.specifiedSchema.isDefined)
+    assert(table.specifiedSchema.get == StructType.fromDDL("id LONG, name STRING"))
+  }
+
+  test("table with StructType schema") {
+    val graph = buildGraph("""
+        |from pyspark.sql.types import StructType, StructField, LongType, StringType
+        |from pyspark.sql.functions import lit
+        |
+        |@dp.materialized_view(schema=StructType([
+        |    StructField("id", LongType(), True),
+        |    StructField("name", StringType(), True)
+        |]))
+        |def table_with_struct_schema():
+        |    return spark.range(5).withColumn("name", lit("test"))
+        |""".stripMargin)
+      .resolve(sessionCaseSensitive)
+      .validate(sessionCaseSensitive)
+
+    assert(graph.flows.size == 1)
+    assert(graph.tables.size == 1)
+
+    val table = graph.table(graphIdentifier("table_with_struct_schema"))
+    assert(table.specifiedSchema.isDefined)
+    assert(table.specifiedSchema.get == StructType.fromDDL("id LONG, name STRING"))
+  }
+
+  test("string schema validation error - schema mismatch") {
+    val graph = buildGraph("""
+        |from pyspark.sql.functions import lit
+        |
+        |@dp.materialized_view(schema="id LONG, name STRING")
+        |def table_with_wrong_schema():
+        |    return spark.range(5).withColumn("wrong_column", lit("test"))
+        |""".stripMargin)
+      .resolve(sessionCaseSensitive)
+
+    val ex = intercept[AnalysisException] { graph.validate(sessionCaseSensitive) }
+    assert(ex.getMessage.contains("has a user-specified schema that is incompatible"))
+    assert(ex.getMessage.contains("table_with_wrong_schema"))
+  }
+
+  test("StructType schema validation error - schema mismatch") {
+    val graph = buildGraph("""
+        |from pyspark.sql.types import StructType, StructField, LongType, StringType
+        |from pyspark.sql.functions import lit
+        |
+        |@dp.materialized_view(schema=StructType([
+        |    StructField("id", LongType(), True),
+        |    StructField("name", StringType(), True)
+        |]))
+        |def table_with_wrong_struct_schema():
+        |    return spark.range(5).withColumn("different_column", lit("test"))
+        |""".stripMargin)
+      .resolve(sessionCaseSensitive)
+
+    val ex = intercept[AnalysisException] { graph.validate(sessionCaseSensitive) }
+    assert(ex.getMessage.contains("has a user-specified schema that is incompatible"))
+    assert(ex.getMessage.contains("table_with_wrong_struct_schema"))
+  }
+
+  private def buildAutoCdcFlow(pipelineSource: String): AutoCdcFlow = {
+    val graph = buildGraph(pipelineSource)
+    graph.flows
+      .collectFirst { case f: AutoCdcFlow => f }
+      .getOrElse(fail(s"Expected an AutoCdcFlow in the graph, got: ${graph.flows}"))
+  }
+
+  /**
+   * Builds and resolves the graph, returning the resolved [[AutoCdcMergeFlow]]. Unlike
+   * [[buildAutoCdcFlow]], this exercises the flow analysis that rejects invalid change args (e.g.
+   * an ignore-null column that is also a key), so a test that asserts on the resolved flow is
+   * guaranteed to describe a configuration the flow accepts.
+   */
+  private def resolveAutoCdcMergeFlow(pipelineSource: String): AutoCdcMergeFlow = {
+    val graph = buildGraph(pipelineSource).resolve(sessionCaseSensitive)
+    graph.resolvedFlow(graphIdentifier("target")) match {
+      case f: AutoCdcMergeFlow => f
+      case other => fail(s"Expected an AutoCdcMergeFlow, got: $other")
+    }
+  }
+
+  test("AutoCDC API: minimal flow registers an AutoCdcFlow with default name and SCD1 default") {
+    val flow = buildAutoCdcFlow("""
+        |@dp.table
+        |def src():
+        |  return spark.readStream.format("rate").load()
+        |
+        |dp.create_streaming_table("target")
+        |
+        |dp.create_auto_cdc_flow(
+        |    target = "target",
+        |    source = "src",
+        |    keys = ["value"],
+        |    sequence_by = "timestamp",
+        |)
+        |""".stripMargin)
+
+    assert(flow.identifier == graphIdentifier("target"))
+    assert(flow.destinationIdentifier == graphIdentifier("target"))
+    assert(flow.changeArgs.keys == Seq(UnqualifiedColumnName("value")))
+    assert(flow.changeArgs.sequencing.expr.sql == "timestamp")
+    assert(flow.changeArgs.deleteCondition.isEmpty)
+    assert(flow.changeArgs.columnSelection.isEmpty)
+    assert(flow.changeArgs.storedAsScdType == ScdType.Type1)
+  }
+
+  test("AutoCDC API: composite keys are forwarded to ChangeArgs in order") {
+    val flow = buildAutoCdcFlow("""
+        |@dp.table
+        |def src():
+        |  return spark.readStream.format("rate").load()
+        |
+        |dp.create_streaming_table("target")
+        |
+        |dp.create_auto_cdc_flow(
+        |    target = "target",
+        |    source = "src",
+        |    keys = ["value", "timestamp"],
+        |    sequence_by = "timestamp",
+        |)
+        |""".stripMargin)
+
+    assert(
+      flow.changeArgs.keys ==
+        Seq(UnqualifiedColumnName("value"), UnqualifiedColumnName("timestamp")))
+  }
+
+  test("AutoCDC API: apply_as_deletes is forwarded as a delete condition column") {
+    val flow = buildAutoCdcFlow("""
+        |@dp.table
+        |def src():
+        |  return spark.readStream.format("rate").load()
+        |
+        |dp.create_streaming_table("target")
+        |
+        |dp.create_auto_cdc_flow(
+        |    target = "target",
+        |    source = "src",
+        |    keys = ["value"],
+        |    sequence_by = "timestamp",
+        |    apply_as_deletes = "value % 2 = 0",
+        |)
+        |""".stripMargin)
+
+    val deleteCondition = flow.changeArgs.deleteCondition.getOrElse(
+      fail("expected apply_as_deletes to populate deleteCondition"))
+    assert(deleteCondition.expr.sql.contains("value"))
+    assert(deleteCondition.expr.sql.contains("0"))
+  }
+
+  test("AutoCDC API: column_list is forwarded as IncludeColumns") {
+    val flow = buildAutoCdcFlow("""
+        |@dp.table
+        |def src():
+        |  return spark.readStream.format("rate").load()
+        |
+        |dp.create_streaming_table("target")
+        |
+        |dp.create_auto_cdc_flow(
+        |    target = "target",
+        |    source = "src",
+        |    keys = ["value"],
+        |    sequence_by = "timestamp",
+        |    column_list = ["value", "timestamp"],
+        |)
+        |""".stripMargin)
+
+    assert(
+      flow.changeArgs.columnSelection.contains(ColumnSelection.IncludeColumns(
+        Seq(UnqualifiedColumnName("value"), UnqualifiedColumnName("timestamp")))))
+  }
+
+  test("AutoCDC API: except_column_list is forwarded as ExcludeColumns") {
+    val flow = buildAutoCdcFlow("""
+        |@dp.table
+        |def src():
+        |  return spark.readStream.format("rate").load()
+        |
+        |dp.create_streaming_table("target")
+        |
+        |dp.create_auto_cdc_flow(
+        |    target = "target",
+        |    source = "src",
+        |    keys = ["value"],
+        |    sequence_by = "timestamp",
+        |    except_column_list = ["timestamp"],
+        |)
+        |""".stripMargin)
+
+    assert(
+      flow.changeArgs.columnSelection.contains(
+        ColumnSelection.ExcludeColumns(Seq(UnqualifiedColumnName("timestamp")))))
+  }
+
+  test(
+    "AutoCDC API: ignore_null_updates=True is forwarded as an all-columns ignore-null " +
+      "selection") {
+    val flow = resolveAutoCdcMergeFlow("""
+        |@dp.table
+        |def src():
+        |  return spark.readStream.format("rate").load()
+        |
+        |dp.create_streaming_table("target")
+        |
+        |dp.create_auto_cdc_flow(
+        |    target = "target",
+        |    source = "src",
+        |    keys = ["value"],
+        |    sequence_by = "timestamp",
+        |    ignore_null_updates = True,
+        |)
+        |""".stripMargin)
+
+    // "All columns" is an ExcludeColumns selection with an empty list.
+    assert(
+      flow.changeArgs.ignoreNullSelection.contains(ColumnSelection.ExcludeColumns(Seq.empty)))
+  }
+
+  test("AutoCDC API: ignore_null_updates_column_list is forwarded as IncludeColumns") {
+    // Ignore-null include columns must be non-key payload columns, so the source adds one.
+    val flow = resolveAutoCdcMergeFlow("""
+        |@dp.table
+        |def src():
+        |  return (
+        |    spark.readStream.format("rate").load()
+        |    .selectExpr("value", "timestamp", "value + 1 AS payload")
+        |  )
+        |
+        |dp.create_streaming_table("target")
+        |
+        |dp.create_auto_cdc_flow(
+        |    target = "target",
+        |    source = "src",
+        |    keys = ["value"],
+        |    sequence_by = "timestamp",
+        |    ignore_null_updates_column_list = ["payload"],
+        |)
+        |""".stripMargin)
+
+    assert(
+      flow.changeArgs.ignoreNullSelection.contains(
+        ColumnSelection.IncludeColumns(Seq(UnqualifiedColumnName("payload")))))
+  }
+
+  test("AutoCDC API: ignore_null_updates_except_column_list is forwarded as ExcludeColumns") {
+    val flow = resolveAutoCdcMergeFlow("""
+        |@dp.table
+        |def src():
+        |  return spark.readStream.format("rate").load()
+        |
+        |dp.create_streaming_table("target")
+        |
+        |dp.create_auto_cdc_flow(
+        |    target = "target",
+        |    source = "src",
+        |    keys = ["value"],
+        |    sequence_by = "timestamp",
+        |    ignore_null_updates_except_column_list = ["timestamp"],
+        |)
+        |""".stripMargin)
+
+    assert(
+      flow.changeArgs.ignoreNullSelection.contains(
+        ColumnSelection.ExcludeColumns(Seq(UnqualifiedColumnName("timestamp")))))
+  }
+
+  test("AutoCDC API: explicit `name` is honored as the flow identifier") {
+    val flow = buildAutoCdcFlow("""
+        |@dp.table
+        |def src():
+        |  return spark.readStream.format("rate").load()
+        |
+        |dp.create_streaming_table("target")
+        |
+        |dp.create_auto_cdc_flow(
+        |    target = "target",
+        |    source = "src",
+        |    keys = ["value"],
+        |    sequence_by = "timestamp",
+        |    name = "my_flow",
+        |)
+        |""".stripMargin)
+
+    assert(flow.identifier == graphIdentifier("my_flow"))
+    assert(flow.destinationIdentifier == graphIdentifier("target"))
+  }
+
+  test("AutoCDC API: spark_conf is forwarded to the flow's sqlConf") {
+    val flow = buildAutoCdcFlow("""
+        |@dp.table
+        |def src():
+        |  return spark.readStream.format("rate").load()
+        |
+        |dp.create_streaming_table("target")
+        |
+        |dp.create_auto_cdc_flow(
+        |    target = "target",
+        |    source = "src",
+        |    keys = ["value"],
+        |    sequence_by = "timestamp",
+        |    spark_conf = {"spark.sql.shuffle.partitions": "8"},
+        |)
+        |""".stripMargin)
+
+    assert(flow.sqlConf == Map("spark.sql.shuffle.partitions" -> "8"))
+  }
+
+  test("AutoCDC API: multi-part `keys` column is rejected at flow registration") {
+    val ex = intercept[RuntimeException] {
+      buildAutoCdcFlow("""
+          |@dp.table
+          |def src():
+          |  return spark.readStream.format("rate").load()
+          |
+          |dp.create_streaming_table("target")
+          |
+          |dp.create_auto_cdc_flow(
+          |    target = "target",
+          |    source = "src",
+          |    keys = ["a.b"],
+          |    sequence_by = "timestamp",
+          |)
+          |""".stripMargin)
+    }
+    assert(ex.getMessage.contains("AUTOCDC_MULTIPART_COLUMN_IDENTIFIER"))
+  }
+
+  test("AutoCDC API: multi-part `column_list` entry is rejected at flow registration") {
+    val ex = intercept[RuntimeException] {
+      buildAutoCdcFlow("""
+          |@dp.table
+          |def src():
+          |  return spark.readStream.format("rate").load()
+          |
+          |dp.create_streaming_table("target")
+          |
+          |dp.create_auto_cdc_flow(
+          |    target = "target",
+          |    source = "src",
+          |    keys = ["value"],
+          |    sequence_by = "timestamp",
+          |    column_list = ["nested.field"],
+          |)
+          |""".stripMargin)
+    }
+    assert(ex.getMessage.contains("AUTOCDC_MULTIPART_COLUMN_IDENTIFIER"))
+  }
+
+  test("AutoCDC API: Column-object form of keys/sequence_by/apply_as_deletes is honored") {
+    val flow = buildAutoCdcFlow("""
+        |from pyspark.sql.functions import col, expr
+        |
+        |@dp.table
+        |def src():
+        |  return spark.readStream.format("rate").load()
+        |
+        |dp.create_streaming_table("target")
+        |
+        |dp.create_auto_cdc_flow(
+        |    target = "target",
+        |    source = "src",
+        |    keys = [col("value")],
+        |    sequence_by = col("timestamp"),
+        |    apply_as_deletes = expr("value % 2 = 0"),
+        |)
+        |""".stripMargin)
+
+    assert(flow.changeArgs.keys == Seq(UnqualifiedColumnName("value")))
+    assert(flow.changeArgs.sequencing.expr.sql == "timestamp")
+    val deleteCondition = flow.changeArgs.deleteCondition.getOrElse(
+      fail("expected apply_as_deletes to populate deleteCondition"))
+    assert(deleteCondition.expr.sql.contains("value"))
+    assert(deleteCondition.expr.sql.contains("0"))
+  }
+
+  test("AutoCDC API: graph resolves with the source streaming table as the flow's input") {
+    val graph = buildGraph("""
+        |@dp.table
+        |def src():
+        |  return spark.readStream.format("rate").load()
+        |
+        |dp.create_streaming_table("target")
+        |
+        |dp.create_auto_cdc_flow(
+        |    target = "target",
+        |    source = "src",
+        |    keys = ["value"],
+        |    sequence_by = "timestamp",
+        |)
+        |""".stripMargin).resolve(sessionCaseSensitive)
+
+    val resolvedFlow = graph.resolvedFlow(graphIdentifier("target"))
+    assert(resolvedFlow.inputs == Set(graphIdentifier("src")))
+  }
+
+  test("AutoCDC API: single-part `source` inherits the pipeline's default catalog and database") {
+    // Use `my_catalog` (registered in `sparkConf`) so the pipeline-default catalog differs from
+    // the session default (`spark_catalog`), and a non-default namespace `my_db` so the
+    // pipeline-default database differs from the session default (`default`). The CREATE NAMESPACE
+    // runs on the same Connect session that subsequently creates the dataflow graph, so the
+    // namespace is visible to that session's per-session V2 catalog instance.
+    val graph = buildGraph(
+      """
+        |@dp.table
+        |def src():
+        |  return spark.readStream.format("rate").load()
+        |
+        |dp.create_streaming_table("target")
+        |
+        |dp.create_auto_cdc_flow(
+        |    target = "target",
+        |    source = "src",
+        |    keys = ["value"],
+        |    sequence_by = "timestamp",
+        |)
+        |""".stripMargin,
+      defaultCatalog = Some("my_catalog"),
+      defaultDatabase = Some("my_db"),
+      setupSql = Some("CREATE NAMESPACE IF NOT EXISTS my_catalog.my_db"))
+      .resolve(sessionCaseSensitive)
+
+    val resolvedFlow =
+      graph.resolvedFlow(TableIdentifier("target", Some("my_db"), Some("my_catalog")))
+    assert(
+      resolvedFlow.inputs ==
+        Set(TableIdentifier("src", Some("my_db"), Some("my_catalog"))))
+  }
+
+  test("AutoCDC API: multi-part `source` resolves to the corresponding qualified dataset") {
+    val graph = buildGraph("""
+        |@dp.table(name = "some_catalog.some_schema.src")
+        |def irrelevant():
+        |  return spark.readStream.format("rate").load()
+        |
+        |dp.create_streaming_table(name = "some_catalog.some_schema.target")
+        |
+        |dp.create_auto_cdc_flow(
+        |    target = "some_catalog.some_schema.target",
+        |    source = "some_catalog.some_schema.src",
+        |    keys = ["value"],
+        |    sequence_by = "timestamp",
+        |)
+        |""".stripMargin).resolve(sessionCaseSensitive)
+
+    val targetIdent = TableIdentifier("target", Some("some_schema"), Some("some_catalog"))
+    val srcIdent = TableIdentifier("src", Some("some_schema"), Some("some_catalog"))
+    val resolvedFlow = graph.resolvedFlow(targetIdent)
+    assert(resolvedFlow.inputs == Set(srcIdent))
+  }
+
+  test("AutoCDC API: non-attribute expression in keys is rejected") {
+    val ex = intercept[RuntimeException] {
+      buildGraph("""
+          |from pyspark.sql.functions import expr
+          |
+          |@dp.table
+          |def src():
+          |  return spark.readStream.format("rate").load()
+          |
+          |dp.create_streaming_table("target")
+          |
+          |dp.create_auto_cdc_flow(
+          |    target = "target",
+          |    source = "src",
+          |    keys = [expr("value + 1")],
+          |    sequence_by = "timestamp",
+          |)
+          |""".stripMargin)
+    }
+    assert(ex.getMessage.contains("AUTOCDC_NON_COLUMN_IDENTIFIER"))
+  }
+
+  test("AutoCDC API: specifying both column_list and except_column_list is rejected") {
+    // The Python create_auto_cdc_flow API rejects the "at most one" violation client-side with a
+    // CANNOT_SET_TOGETHER PySparkValueError, so the request never reaches the server. The
+    // server-side defense (AUTOCDC_BOTH_COLUMN_LIST_AND_EXCEPT_COLUMN_LIST) is exercised directly
+    // against a raw proto in SparkDeclarativePipelinesServerSuite.
+    val ex = intercept[RuntimeException] {
+      buildGraph("""
+          |@dp.table
+          |def src():
+          |  return spark.readStream.format("rate").load()
+          |
+          |dp.create_streaming_table("target")
+          |
+          |dp.create_auto_cdc_flow(
+          |    target = "target",
+          |    source = "src",
+          |    keys = ["value"],
+          |    sequence_by = "timestamp",
+          |    column_list = ["value"],
+          |    except_column_list = ["timestamp"],
+          |)
+          |""".stripMargin)
+    }
+    assert(ex.getMessage.contains("CANNOT_SET_TOGETHER"))
+  }
+
+  test("AutoCDC API: registered flow survives graph resolution and validation end-to-end") {
+    val graph = buildGraph("""
+        |@dp.table
+        |def src():
+        |  return spark.readStream.format("rate").load()
+        |
+        |dp.create_streaming_table("target")
+        |
+        |dp.create_auto_cdc_flow(
+        |    target = "target",
+        |    source = "src",
+        |    keys = ["value"],
+        |    sequence_by = "timestamp",
+        |    apply_as_deletes = "value % 2 = 0",
+        |    column_list = ["value", "timestamp"],
+        |)
+        |""".stripMargin).resolve(sessionCaseSensitive).validate(sessionCaseSensitive)
+
+    val resolvedFlow = graph.resolvedFlow(graphIdentifier("target"))
+    assert(resolvedFlow.isInstanceOf[AutoCdcMergeFlow])
+    val mergeFlow = resolvedFlow.asInstanceOf[AutoCdcMergeFlow]
+    assert(mergeFlow.changeArgs.keys == Seq(UnqualifiedColumnName("value")))
+    assert(mergeFlow.changeArgs.sequencing.expr.sql == "timestamp")
+    assert(mergeFlow.changeArgs.deleteCondition.isDefined)
+    assert(
+      mergeFlow.changeArgs.columnSelection.contains(ColumnSelection.IncludeColumns(
+        Seq(UnqualifiedColumnName("value"), UnqualifiedColumnName("timestamp")))))
+    assert(mergeFlow.changeArgs.storedAsScdType == ScdType.Type1)
+  }
+
+  // SCD2 flows are only asserted at registration (via buildAutoCdcFlow) rather than through
+  // resolve().validate(): the engine's SCD2 execution path is still landing in a parallel
+  // workstream and rejects SCD2 during graph analysis. These tests pin the API-to-ChangeArgs
+  // contract those changes plug into.
+  test("AutoCDC API: SCD2 with track_history_column_list forwards to ChangeArgs") {
+    val flow = buildAutoCdcFlow("""
+        |@dp.table
+        |def src():
+        |  return spark.readStream.format("rate").load()
+        |
+        |dp.create_streaming_table("target")
+        |
+        |dp.create_auto_cdc_flow(
+        |    target = "target",
+        |    source = "src",
+        |    keys = ["value"],
+        |    sequence_by = "timestamp",
+        |    stored_as_scd_type = 2,
+        |    track_history_column_list = ["value"],
+        |)
+        |""".stripMargin)
+
+    assert(flow.changeArgs.storedAsScdType == ScdType.Type2)
+    assert(
+      flow.changeArgs.trackHistorySelection.contains(
+        ColumnSelection.IncludeColumns(Seq(UnqualifiedColumnName("value")))))
+  }
+
+  test("AutoCDC API: SCD2 with track_history_except_column_list forwards to ChangeArgs") {
+    val flow = buildAutoCdcFlow("""
+        |@dp.table
+        |def src():
+        |  return spark.readStream.format("rate").load()
+        |
+        |dp.create_streaming_table("target")
+        |
+        |dp.create_auto_cdc_flow(
+        |    target = "target",
+        |    source = "src",
+        |    keys = ["value"],
+        |    sequence_by = "timestamp",
+        |    stored_as_scd_type = 2,
+        |    track_history_except_column_list = ["timestamp"],
+        |)
+        |""".stripMargin)
+
+    assert(flow.changeArgs.storedAsScdType == ScdType.Type2)
+    assert(
+      flow.changeArgs.trackHistorySelection.contains(
+        ColumnSelection.ExcludeColumns(Seq(UnqualifiedColumnName("timestamp")))))
+  }
+
+  test("AutoCDC API: SCD2 without track-history columns leaves selection unset") {
+    val flow = buildAutoCdcFlow("""
+        |@dp.table
+        |def src():
+        |  return spark.readStream.format("rate").load()
+        |
+        |dp.create_streaming_table("target")
+        |
+        |dp.create_auto_cdc_flow(
+        |    target = "target",
+        |    source = "src",
+        |    keys = ["value"],
+        |    sequence_by = "timestamp",
+        |    stored_as_scd_type = 2,
+        |)
+        |""".stripMargin)
+
+    assert(flow.changeArgs.storedAsScdType == ScdType.Type2)
+    assert(flow.changeArgs.trackHistorySelection.isEmpty)
+  }
+
+  test("AutoCDC API: specifying both track_history column lists is rejected") {
+    // The Python create_auto_cdc_flow API rejects the "at most one" violation client-side with a
+    // CANNOT_SET_TOGETHER PySparkValueError, so the request never reaches the server. The
+    // server-side defense (AUTOCDC_BOTH_TRACK_HISTORY_COLUMN_LIST_AND_EXCEPT_COLUMN_LIST) is
+    // exercised directly against a raw proto in SparkDeclarativePipelinesServerSuite.
+    val ex = intercept[RuntimeException] {
+      buildGraph("""
+          |@dp.table
+          |def src():
+          |  return spark.readStream.format("rate").load()
+          |
+          |dp.create_streaming_table("target")
+          |
+          |dp.create_auto_cdc_flow(
+          |    target = "target",
+          |    source = "src",
+          |    keys = ["value"],
+          |    sequence_by = "timestamp",
+          |    stored_as_scd_type = 2,
+          |    track_history_column_list = ["value"],
+          |    track_history_except_column_list = ["timestamp"],
+          |)
+          |""".stripMargin)
+    }
+    assert(ex.getMessage.contains("CANNOT_SET_TOGETHER"))
+  }
+
+  /**
+   * Executes Python code in a separate process and returns the exit code.
+   *
+   * @param pythonCode
+   *   The Python code to execute
+   * @return
+   *   The exit code of the Python process
+   */
+  private def executePythonCode(pythonCode: String): (Int, Seq[String]) = {
+    val pythonExec =
+      sys.env.getOrElse("PYSPARK_DRIVER_PYTHON", sys.env.getOrElse("PYSPARK_PYTHON", "python3"))
+
+    // Set up the PYTHONPATH to include PySpark
+    val sparkHome = sys.props.getOrElse("spark.test.home", sys.env.getOrElse("SPARK_HOME", "."))
+    val sourcePath = Paths.get(sparkHome, "python").toAbsolutePath
+    val py4jPath = Paths.get(sparkHome, "python", "lib", PythonUtils.PY4J_ZIP_NAME).toAbsolutePath
+    val pythonPath = PythonUtils.mergePythonPaths(
+      sourcePath.toString,
+      py4jPath.toString,
+      sys.env.getOrElse("PYTHONPATH", ""))
+
+    val pb = new ProcessBuilder(pythonExec, "-c", pythonCode)
+    pb.redirectErrorStream(true)
+    pb.environment().put("PYTHONPATH", pythonPath)
+
+    val process = pb.start()
+
+    // Read the output
+    val reader = new BufferedReader(
+      new InputStreamReader(process.getInputStream, StandardCharsets.UTF_8))
+    val output = new ArrayBuffer[String]()
+    var line: String = null
+    while ({ line = reader.readLine(); line != null }) {
+      output += line
+      // scalastyle:off println
+      println(s"Python output: $line")
+      // scalastyle:on println
+    }
+
+    // Wait for the process to complete and get the exit code
+    process.waitFor(60, TimeUnit.SECONDS)
+    val exitCode = process.exitValue()
+
+    // Log the output if the process failed
+    if (exitCode != 0) {
+      // scalastyle:off println
+      Console.err.println(s"Python process failed with exit code $exitCode")
+      Console.err.println("Output:")
+      output.foreach(line => Console.err.println(line))
+      // scalastyle:on println
+    }
+
+    (exitCode, output.toSeq)
+  }
+
+  test("empty cluster_by list should work and create table with no clustering") {
+    withTable("mv", "st") {
+      val graph = buildGraph("""
+            |from pyspark.sql.functions import col
+            |
+            |@dp.materialized_view(cluster_by = [])
+            |def mv():
+            |  return spark.range(5).withColumn("id_mod", col("id") % 2)
+            |
+            |@dp.table(cluster_by = [])
+            |def st():
+            |  return spark.readStream.table("mv")
+            |""".stripMargin)
+      val updateContext =
+        new PipelineUpdateContextImpl(graph, eventCallback = _ => (), storageRoot = storageRoot)
+      updateContext.pipelineExecution.runPipeline()
+      updateContext.pipelineExecution.awaitCompletion()
+
+      // Check tables are created with no clustering transforms
+      val catalog = spark.sessionState.catalogManager.currentCatalog.asInstanceOf[TableCatalog]
+
+      val mvIdentifier = Identifier.of(Array("default"), "mv")
+      val mvTable = catalog.loadTable(mvIdentifier)
+      val mvTransforms = mvTable.partitioning()
+      assert(
+        mvTransforms.isEmpty,
+        s"MaterializedView should have no transforms, but got: ${mvTransforms.mkString(", ")}")
+
+      val stIdentifier = Identifier.of(Array("default"), "st")
+      val stTable = catalog.loadTable(stIdentifier)
+      val stTransforms = stTable.partitioning()
+      assert(
+        stTransforms.isEmpty,
+        s"Table should have no transforms, but got: ${stTransforms.mkString(", ")}")
+    }
+  }
+
+  // List of unsupported SQL commands that should result in a failure.
+  private val unsupportedSqlCommandList: Seq[String] = Seq(
+    "SET CATALOG some_catalog",
+    "USE SCHEMA some_schema",
+    "USE SCHEMA IDENTIFIER('some_' || 'schema')",
+    "SET `test_conf` = `true`",
+    "CREATE TABLE some_table (id INT)",
+    "EXECUTE IMMEDIATE 'CREATE TABLE some_table (id INT)'",
+    "CREATE VIEW some_view AS SELECT * FROM some_table",
+    "CREATE TEMPORARY VIEW IDENTIFIER('some_view') AS SELECT 1",
+    "INSERT INTO some_table VALUES (1)",
+    "WITH v AS (SELECT 1 AS id) INSERT INTO some_table SELECT * FROM v",
+    "WITH v AS (SELECT 1 AS id) MERGE INTO some_table t USING v ON t.id = v.id " +
+      "WHEN MATCHED THEN DELETE",
+    "WITH v AS (SELECT 1 AS id) UPDATE some_table SET id = 2 WHERE id IN (SELECT id FROM v)",
+    "WITH v AS (SELECT 1 AS id) DELETE FROM some_table WHERE id IN (SELECT id FROM v)",
+    "FROM some_view INSERT INTO some_table SELECT * INSERT INTO some_new_table SELECT *",
+    "WITH v AS (SELECT 1 AS id) FROM v INSERT INTO some_table SELECT * " +
+      "INSERT INTO some_new_table SELECT *",
+    "ALTER TABLE some_table RENAME TO some_new_table",
+    "CREATE NAMESPACE some_namespace",
+    "DROP VIEW some_view",
+    "CALL some_catalog.some_schema.some_procedure()",
+    "CREATE MATERIALIZED VIEW some_view AS SELECT * FROM some_table",
+    "CREATE STREAMING TABLE some_table AS SELECT * FROM some_table")
+
+  gridTest("Unsupported SQL command outside query function should result in a failure")(
+    unsupportedSqlCommandList) { unsupportedSqlCommand =>
+    val ex = intercept[RuntimeException] {
+      buildGraph(s"""
+        |spark.sql("$unsupportedSqlCommand")
+        |
+        |@dp.materialized_view()
+        |def mv():
+        |  return spark.range(5)
+        |""".stripMargin)
+    }
+    assert(ex.getMessage.contains("UNSUPPORTED_PIPELINE_SPARK_SQL_COMMAND"))
+  }
+
+  gridTest("Unsupported SQL command inside query function should result in a failure")(
+    unsupportedSqlCommandList) { unsupportedSqlCommand =>
+    val ex = intercept[RuntimeException] {
+      buildGraph(s"""
+        |@dp.materialized_view()
+        |def mv():
+        |  spark.sql("$unsupportedSqlCommand")
+        |  return spark.range(5)
+        |""".stripMargin)
+    }
+    assert(ex.getMessage.contains("UNSUPPORTED_PIPELINE_SPARK_SQL_COMMAND"))
+  }
+
+  // List of supported SQL commands that should work.
+  val supportedSqlCommandList: Seq[String] = Seq(
+    "DESCRIBE TABLE spark_catalog.default.src",
+    "SHOW TABLES",
+    "SHOW TBLPROPERTIES spark_catalog.default.src",
+    "SHOW NAMESPACES",
+    "SHOW COLUMNS FROM spark_catalog.default.src",
+    "SHOW COLUMNS FROM IDENTIFIER('spark_catalog.default.' || 'src')",
+    "SHOW FUNCTIONS",
+    "SHOW VIEWS",
+    "SHOW CATALOGS",
+    "SHOW CREATE TABLE spark_catalog.default.src",
+    "SELECT * FROM RANGE(5)",
+    "SELECT * FROM spark_catalog.default.src",
+    "TABLE IDENTIFIER('spark_catalog.default.' || 'src')",
+    "WITH v AS (SELECT * FROM spark_catalog.default.src) SELECT * FROM v",
+    "SELECT * FROM RANGE(5) UNION ALL SELECT * FROM spark_catalog.default.src")
+
+  gridTest("Supported SQL command outside query function should work")(supportedSqlCommandList) {
+    supportedSqlCommand =>
+      sql("CREATE TABLE spark_catalog.default.src AS SELECT * FROM RANGE(5)")
+      buildGraph(s"""
+        |spark.sql("$supportedSqlCommand")
+        |
+        |@dp.materialized_view()
+        |def mv():
+        |  return spark.range(5)
+        |""".stripMargin)
+  }
+
+  gridTest("Supported SQL command inside query function should work")(supportedSqlCommandList) {
+    supportedSqlCommand =>
+      sql("CREATE TABLE spark_catalog.default.src AS SELECT * FROM RANGE(5)")
+      buildGraph(s"""
+        |@dp.materialized_view()
+        |def mv():
+        |  spark.sql("$supportedSqlCommand")
+        |  return spark.range(5)
+        |""".stripMargin)
+  }
+
+  private val eagerExecutionPythonCommands = Seq(
+    "df.collect()",
+    "df.first()",
+    "df.head(0)",
+    "df.toPandas()",
+    "spark.readStream.format(\"rate\").load().writeStream" +
+      ".format(\"memory\").queryName(\"test_query_name\").start()")
+
+  gridTest("unsupported eager execution inside flow function is blocked")(
+    eagerExecutionPythonCommands) { unsupportedEagerExecutionCommand =>
+    val ex = intercept[RuntimeException] {
+      buildGraph(s"""
+        |@dp.materialized_view()
+        |def mv():
+        |  df = spark.range(5)
+        |  $unsupportedEagerExecutionCommand
+        |  return df
+        |""".stripMargin)
+    }
+    assert(ex.getMessage.contains("ATTEMPT_ANALYSIS_IN_PIPELINE_QUERY_FUNCTION"))
+  }
+
+  gridTest("eager execution outside flow function is allowed")(eagerExecutionPythonCommands) {
+    unsupportedEagerExecutionCommand =>
+      buildGraph(s"""
+      |df = spark.range(5)
+      |$unsupportedEagerExecutionCommand
+      |
+      |@dp.materialized_view()
+      |def mv():
+      |  df = spark.range(5)
+      |  return df
+      |""".stripMargin)
+  }
+
+  private val eagerAnalysisPythonCommands = Seq("df.schema", "df.isStreaming", "df.isLocal()")
+
+  gridTest("eager analysis inside flow function is blocked")(eagerAnalysisPythonCommands) {
+    eagerAnalysisPythonCommand =>
+      val ex = intercept[RuntimeException] {
+        buildGraph(s"""
+          |@dp.materialized_view()
+          |def mv():
+          |  df = spark.range(5)
+          |  $eagerAnalysisPythonCommand
+          |  return df
+          |""".stripMargin)
+      }
+      assert(ex.getMessage.contains("ATTEMPT_ANALYSIS_IN_PIPELINE_QUERY_FUNCTION"))
+  }
+
+  gridTest("eager analysis outside flow function is allowed")(eagerAnalysisPythonCommands) {
+    eagerAnalysisPythonCommand =>
+      buildGraph(s"""
+        |df = spark.range(5)
+        |$eagerAnalysisPythonCommand
+        |
+        |@dp.materialized_view()
+        |def mv():
+        |  df = spark.range(5)
+        |  return df
+        |""".stripMargin)
+  }
+
+  override protected def test(testName: String, testTags: Tag*)(testFun: => Any)(implicit
+      pos: Position): Unit = {
+    if (PythonTestDepsChecker.isConnectDepsAvailable) {
+      super.test(testName, testTags: _*)(testFun)
+    } else {
+      super.ignore(testName, testTags: _*)(testFun)
+    }
+  }
+}

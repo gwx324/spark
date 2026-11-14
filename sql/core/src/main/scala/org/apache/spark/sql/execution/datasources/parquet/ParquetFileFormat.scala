@@ -17,50 +17,62 @@
 
 package org.apache.spark.sql.execution.datasources.parquet
 
-import java.net.URI
-import java.util.logging.{Logger => JLogger}
+import java.io.{Closeable, File, FileNotFoundException, IOException}
+import java.time.ZoneId
+import java.util.concurrent.atomic.AtomicBoolean
 
-import scala.collection.JavaConverters._
 import scala.collection.mutable
+import scala.jdk.CollectionConverters._
 import scala.util.{Failure, Try}
 
+import org.apache.commons.lang3.exception.ExceptionUtils
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.{FileStatus, Path}
+import org.apache.hadoop.fs.{FileStatus, GlobPattern, Path}
+import org.apache.hadoop.mapred.FileSplit
 import org.apache.hadoop.mapreduce._
-import org.apache.hadoop.mapreduce.lib.input.{FileInputFormat, FileSplit}
 import org.apache.hadoop.mapreduce.task.TaskAttemptContextImpl
-import org.apache.parquet.{Log => ApacheParquetLog}
 import org.apache.parquet.filter2.compat.FilterCompat
-import org.apache.parquet.filter2.predicate.FilterApi
+import org.apache.parquet.filter2.predicate.{FilterApi, FilterPredicate}
+import org.apache.parquet.format.converter.ParquetMetadataConverter.SKIP_ROW_GROUPS
 import org.apache.parquet.hadoop._
-import org.apache.parquet.hadoop.util.ContextUtil
-import org.apache.parquet.schema.MessageType
-import org.slf4j.bridge.SLF4JBridgeHandler
+import org.apache.parquet.hadoop.util.HadoopInputFile
 
-import org.apache.spark.SparkException
+import org.apache.spark.{SparkContext, SparkEnv, TaskContext}
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql._
-import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.internal.LogKeys.{PATH, SCHEMA}
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.catalyst.{FileSourceOptions, InternalRow}
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeProjection
 import org.apache.spark.sql.catalyst.parser.LegacyTypeStringParser
-import org.apache.spark.sql.execution.command.CreateDataSourceTableUtils
+import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
+import org.apache.spark.sql.catalyst.util.{CaseInsensitiveMap, DateTimeUtils, RebaseDateTime}
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.execution.datasources._
+import org.apache.spark.sql.execution.datasources.parquet.types.ops.ParquetTypeOps
 import org.apache.spark.sql.execution.metric.SQLMetric
-import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.execution.vectorized.{ConstantColumnVector, OffHeapColumnVector, OnHeapColumnVector}
+import org.apache.spark.sql.internal.{SessionStateHelper, SQLConf}
+import org.apache.spark.sql.internal.SQLConf._
 import org.apache.spark.sql.sources._
 import org.apache.spark.sql.types._
-import org.apache.spark.util.SerializableConfiguration
+import org.apache.spark.util.{SerializableConfiguration, ThreadUtils, Utils}
 
 class ParquetFileFormat
   extends FileFormat
   with DataSourceRegister
+  with SessionStateHelper
+  with SupportsArchiveFormat
   with Logging
   with Serializable {
 
+  // Reads every archive entry, matching a directory scan (Parquet part-files are often
+  // extensionless).
+  override protected def archiveEntryFilter(name: String): Boolean = true
+
   override def shortName(): String = "parquet"
 
-  override def toString: String = "ParquetFormat"
+  override def toString: String = "Parquet"
 
   override def hashCode(): Int = getClass.hashCode()
 
@@ -71,205 +83,106 @@ class ParquetFileFormat
       job: Job,
       options: Map[String, String],
       dataSchema: StructType): OutputWriterFactory = {
-
-    val parquetOptions = new ParquetOptions(options, sparkSession.sessionState.conf)
-
-    val conf = ContextUtil.getConfiguration(job)
-
-    val committerClass =
-      conf.getClass(
-        SQLConf.PARQUET_OUTPUT_COMMITTER_CLASS.key,
-        classOf[ParquetOutputCommitter],
-        classOf[ParquetOutputCommitter])
-
-    if (conf.get(SQLConf.PARQUET_OUTPUT_COMMITTER_CLASS.key) == null) {
-      logInfo("Using default output committer for Parquet: " +
-        classOf[ParquetOutputCommitter].getCanonicalName)
-    } else {
-      logInfo("Using user defined output committer for Parquet: " + committerClass.getCanonicalName)
-    }
-
-    conf.setClass(
-      SQLConf.OUTPUT_COMMITTER_CLASS.key,
-      committerClass,
-      classOf[ParquetOutputCommitter])
-
-    // We're not really using `ParquetOutputFormat[Row]` for writing data here, because we override
-    // it in `ParquetOutputWriter` to support appending and dynamic partitioning.  The reason why
-    // we set it here is to setup the output committer class to `ParquetOutputCommitter`, which is
-    // bundled with `ParquetOutputFormat[Row]`.
-    job.setOutputFormatClass(classOf[ParquetOutputFormat[Row]])
-
-    ParquetOutputFormat.setWriteSupportClass(job, classOf[ParquetWriteSupport])
-
-    // We want to clear this temporary metadata from saving into Parquet file.
-    // This metadata is only useful for detecting optional columns when pushdowning filters.
-    val dataSchemaToWrite = StructType.removeMetadata(StructType.metadataKeyForOptionalField,
-      dataSchema).asInstanceOf[StructType]
-    ParquetWriteSupport.setSchema(dataSchemaToWrite, conf)
-
-    // Sets flags for `CatalystSchemaConverter` (which converts Catalyst schema to Parquet schema)
-    // and `CatalystWriteSupport` (writing actual rows to Parquet files).
-    conf.set(
-      SQLConf.PARQUET_BINARY_AS_STRING.key,
-      sparkSession.sessionState.conf.isParquetBinaryAsString.toString)
-
-    conf.set(
-      SQLConf.PARQUET_INT96_AS_TIMESTAMP.key,
-      sparkSession.sessionState.conf.isParquetINT96AsTimestamp.toString)
-
-    conf.set(
-      SQLConf.PARQUET_WRITE_LEGACY_FORMAT.key,
-      sparkSession.sessionState.conf.writeLegacyParquetFormat.toString)
-
-    // Sets compression scheme
-    conf.set(ParquetOutputFormat.COMPRESSION, parquetOptions.compressionCodec)
-
-    // SPARK-15719: Disables writing Parquet summary files by default.
-    if (conf.get(ParquetOutputFormat.ENABLE_JOB_SUMMARY) == null) {
-      conf.setBoolean(ParquetOutputFormat.ENABLE_JOB_SUMMARY, false)
-    }
-
-    ParquetFileFormat.redirectParquetLogs()
-
-    new OutputWriterFactory {
-      override def newInstance(
-          path: String,
-          bucketId: Option[Int],
-          dataSchema: StructType,
-          context: TaskAttemptContext): OutputWriter = {
-        new ParquetOutputWriter(path, bucketId, context)
-      }
-    }
+    val sqlConf = getSqlConf(sparkSession)
+    val parquetOptions = new ParquetOptions(options, sqlConf)
+    ParquetUtils.prepareWrite(sqlConf, job, dataSchema, parquetOptions)
   }
 
-  def inferSchema(
+  override def inferSchema(
       sparkSession: SparkSession,
       parameters: Map[String, String],
       files: Seq[FileStatus]): Option[StructType] = {
-    val parquetOptions = new ParquetOptions(parameters, sparkSession.sessionState.conf)
-
-    // Should we merge schemas from all Parquet part-files?
-    val shouldMergeSchemas = parquetOptions.mergeSchema
-
-    val mergeRespectSummaries = sparkSession.conf.get(SQLConf.PARQUET_SCHEMA_RESPECT_SUMMARIES)
-
-    val filesByType = splitFiles(files)
-
-    // Sees which file(s) we need to touch in order to figure out the schema.
-    //
-    // Always tries the summary files first if users don't require a merged schema.  In this case,
-    // "_common_metadata" is more preferable than "_metadata" because it doesn't contain row
-    // groups information, and could be much smaller for large Parquet files with lots of row
-    // groups.  If no summary file is available, falls back to some random part-file.
-    //
-    // NOTE: Metadata stored in the summary files are merged from all part-files.  However, for
-    // user defined key-value metadata (in which we store Spark SQL schema), Parquet doesn't know
-    // how to merge them correctly if some key is associated with different values in different
-    // part-files.  When this happens, Parquet simply gives up generating the summary file.  This
-    // implies that if a summary file presents, then:
-    //
-    //   1. Either all part-files have exactly the same Spark SQL schema, or
-    //   2. Some part-files don't contain Spark SQL schema in the key-value metadata at all (thus
-    //      their schemas may differ from each other).
-    //
-    // Here we tend to be pessimistic and take the second case into account.  Basically this means
-    // we can't trust the summary files if users require a merged schema, and must touch all part-
-    // files to do the merge.
-    val filesToTouch =
-      if (shouldMergeSchemas) {
-        // Also includes summary files, 'cause there might be empty partition directories.
-
-        // If mergeRespectSummaries config is true, we assume that all part-files are the same for
-        // their schema with summary files, so we ignore them when merging schema.
-        // If the config is disabled, which is the default setting, we merge all part-files.
-        // In this mode, we only need to merge schemas contained in all those summary files.
-        // You should enable this configuration only if you are very sure that for the parquet
-        // part-files to read there are corresponding summary files containing correct schema.
-
-        // As filed in SPARK-11500, the order of files to touch is a matter, which might affect
-        // the ordering of the output columns. There are several things to mention here.
-        //
-        //  1. If mergeRespectSummaries config is false, then it merges schemas by reducing from
-        //     the first part-file so that the columns of the lexicographically first file show
-        //     first.
-        //
-        //  2. If mergeRespectSummaries config is true, then there should be, at least,
-        //     "_metadata"s for all given files, so that we can ensure the columns of
-        //     the lexicographically first file show first.
-        //
-        //  3. If shouldMergeSchemas is false, but when multiple files are given, there is
-        //     no guarantee of the output order, since there might not be a summary file for the
-        //     lexicographically first file, which ends up putting ahead the columns of
-        //     the other files. However, this should be okay since not enabling
-        //     shouldMergeSchemas means (assumes) all the files have the same schemas.
-
-        val needMerged: Seq[FileStatus] =
-          if (mergeRespectSummaries) {
-            Seq()
-          } else {
-            filesByType.data
-          }
-        needMerged ++ filesByType.metadata ++ filesByType.commonMetadata
-      } else {
-        // Tries any "_common_metadata" first. Parquet files written by old versions or Parquet
-        // don't have this.
-        filesByType.commonMetadata.headOption
-            // Falls back to "_metadata"
-            .orElse(filesByType.metadata.headOption)
-            // Summary file(s) not found, the Parquet file is either corrupted, or different part-
-            // files contain conflicting user defined metadata (two or more values are associated
-            // with a same key in different files).  In either case, we fall back to any of the
-            // first part-file, and just assume all schemas are consistent.
-            .orElse(filesByType.data.headOption)
-            .toSeq
-      }
-    ParquetFileFormat.mergeSchemasInParallel(filesToTouch, sparkSession)
-  }
-
-  case class FileTypes(
-      data: Seq[FileStatus],
-      metadata: Seq[FileStatus],
-      commonMetadata: Seq[FileStatus])
-
-  private def splitFiles(allFiles: Seq[FileStatus]): FileTypes = {
-    // Lists `FileStatus`es of all leaf nodes (files) under all base directories.
-    val leaves = allFiles.filter { f =>
-      isSummaryFile(f.getPath) ||
-        !((f.getPath.getName.startsWith("_") && !f.getPath.getName.contains("=")) ||
-          f.getPath.getName.startsWith("."))
-    }.toArray.sortBy(_.getPath.toString)
-
-    FileTypes(
-      data = leaves.filterNot(f => isSummaryFile(f.getPath)),
-      metadata =
-        leaves.filter(_.getPath.getName == ParquetFileWriter.PARQUET_METADATA_FILE),
-      commonMetadata =
-        leaves.filter(_.getPath.getName == ParquetFileWriter.PARQUET_COMMON_METADATA_FILE))
-  }
-
-  private def isSummaryFile(file: Path): Boolean = {
-    file.getName == ParquetFileWriter.PARQUET_COMMON_METADATA_FILE ||
-        file.getName == ParquetFileWriter.PARQUET_METADATA_FILE
+    ParquetUtils.inferSchema(sparkSession, parameters, files)
   }
 
   /**
-   * Returns whether the reader will return the rows as batch or not.
+   * Returns whether the reader can return the rows as batch or not.
    */
   override def supportBatch(sparkSession: SparkSession, schema: StructType): Boolean = {
-    val conf = sparkSession.sessionState.conf
-    conf.parquetVectorizedReaderEnabled && conf.wholeStageEnabled &&
-      schema.length <= conf.wholeStageMaxNumFields &&
-      schema.forall(_.dataType.isInstanceOf[AtomicType])
+    ParquetUtils.isBatchReadSupportedForSchema(getSqlConf(sparkSession), schema)
+  }
+
+  override def vectorTypes(
+      requiredSchema: StructType,
+      partitionSchema: StructType,
+      sqlConf: SQLConf): Option[Seq[String]] = {
+    Option(Seq.fill(requiredSchema.fields.length)(
+      if (!sqlConf.offHeapColumnVectorEnabled) {
+        classOf[OnHeapColumnVector].getName
+      } else {
+        classOf[OffHeapColumnVector].getName
+      }
+    ) ++ Seq.fill(partitionSchema.fields.length)(classOf[ConstantColumnVector].getName))
   }
 
   override def isSplitable(
       sparkSession: SparkSession,
       options: Map[String, String],
       path: Path): Boolean = {
+    val parquetOptions = new ParquetOptions(options, getSqlConf(sparkSession))
+    if (parquetOptions.archiveFormatEnabled && SupportsArchiveFormat.isArchivePath(path)) {
+      return false
+    }
     true
   }
 
+  private def setupHadoopConf(
+     hadoopConf: Configuration, sqlConf: SQLConf, requiredSchema: StructType): Unit = {
+    hadoopConf.set(
+      ParquetInputFormat.READ_SUPPORT_CLASS,
+      classOf[ParquetReadSupport].getName)
+    hadoopConf.set(
+      ParquetReadSupport.SPARK_ROW_REQUESTED_SCHEMA,
+      requiredSchema.json)
+    hadoopConf.set(
+      ParquetWriteSupport.SPARK_ROW_SCHEMA,
+      requiredSchema.json)
+    hadoopConf.set(
+      SQLConf.SESSION_LOCAL_TIMEZONE.key,
+      sqlConf.sessionLocalTimeZone)
+    hadoopConf.setBoolean(
+      SQLConf.NESTED_SCHEMA_PRUNING_ENABLED.key,
+      sqlConf.nestedSchemaPruningEnabled)
+    hadoopConf.setBoolean(
+      SQLConf.CASE_SENSITIVE.key,
+      sqlConf.caseSensitiveAnalysis)
+
+    // Sets flags for `ParquetToSparkSchemaConverter`
+    hadoopConf.setBoolean(
+      SQLConf.PARQUET_BINARY_AS_STRING.key,
+      sqlConf.isParquetBinaryAsString)
+    hadoopConf.setBoolean(
+      SQLConf.PARQUET_INT96_AS_TIMESTAMP.key,
+      sqlConf.isParquetINT96AsTimestamp)
+    hadoopConf.setBoolean(
+      SQLConf.PARQUET_INFER_TIMESTAMP_NTZ_ENABLED.key,
+      sqlConf.parquetInferTimestampNTZEnabled)
+    hadoopConf.setBoolean(
+      SQLConf.LEGACY_PARQUET_NANOS_AS_LONG.key,
+      sqlConf.legacyParquetNanosAsLong)
+    hadoopConf.setBoolean(
+      SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key,
+      sqlConf.timestampNanosTypesEnabled)
+    hadoopConf.setBoolean(
+      SQLConf.PARQUET_READER_RESPECT_UNKNOWN_TYPE_ANNOTATION.key,
+      sqlConf.parquetReaderRespectUnknownTypeAnnotation)
+    hadoopConf.setBoolean(
+      SQLConf.PARQUET_TIME_TYPE_ALLOW_IS_ADJUSTED_TO_UTC_READ.key,
+      sqlConf.parquetTimeTypeAllowIsAdjustedToUtcRead)
+  }
+
+  /**
+   * Build the reader.
+   *
+   * @note It is required to pass FileFormat.OPTION_RETURNING_BATCH in options, to indicate whether
+   *       the reader should return row or columnar output.
+   *       If the caller can handle both, pass
+   *       FileFormat.OPTION_RETURNING_BATCH ->
+   *         supportBatch(sparkSession,
+   *           StructType(requiredSchema.fields ++ partitionSchema.fields))
+   *       as the option.
+   *       It should be set to "true" only if this reader can support it.
+   */
   override def buildReaderWithPartitionValues(
       sparkSession: SparkSession,
       dataSchema: StructType,
@@ -277,311 +190,416 @@ class ParquetFileFormat
       requiredSchema: StructType,
       filters: Seq[Filter],
       options: Map[String, String],
-      hadoopConf: Configuration): (PartitionedFile) => Iterator[InternalRow] = {
-    // For Parquet data source, `buildReader` already handles partition values appending. Here we
-    // simply delegate to `buildReader`.
-    buildReader(
-      sparkSession, dataSchema, partitionSchema, requiredSchema, filters, options, hadoopConf)
+      hadoopConf: Configuration): PartitionedFile => Iterator[InternalRow] = {
+    buildParquetReader(
+      sparkSession, dataSchema, partitionSchema, requiredSchema, filters, Nil, options, hadoopConf,
+      Map.empty)
   }
 
-  override def buildReader(
+  /**
+   * The conf is read here, the way `supportBatch` reads its own. Subclasses answer false, since one
+   * may customize reading through `buildReaderWithPartitionValues`, which a scan with storage
+   * filters would bypass.
+   */
+  override def supportsStorageFilterPushdown(sparkSession: SparkSession): Boolean =
+    getSqlConf(sparkSession).parquetStorageFilterPushdownEnabled && isExactlyParquetFileFormat
+
+  /**
+   * Whether this is `ParquetFileFormat` itself rather than a subclass, which both storage-filter
+   * entry points ask. Private, so overriding one entry point does not opt a subclass in.
+   */
+  private def isExactlyParquetFileFormat: Boolean = getClass == classOf[ParquetFileFormat]
+
+  override def supportsStorageFilter(expr: Expression): Boolean =
+    ParquetStorageFilter.isSupportedStorageFilter(expr)
+
+  /** See `StorageFilterMetrics` for what each of these counts. */
+  override def storageFilterMetrics(sparkContext: SparkContext): Map[String, SQLMetric] =
+    StorageFilterMetrics.create(sparkContext)
+
+  override def buildReaderWithStorageFilters(
       sparkSession: SparkSession,
       dataSchema: StructType,
       partitionSchema: StructType,
       requiredSchema: StructType,
       filters: Seq[Filter],
+      storageFilters: Seq[Expression],
       options: Map[String, String],
-      hadoopConf: Configuration): PartitionedFile => Iterator[InternalRow] = {
-    hadoopConf.set(ParquetInputFormat.READ_SUPPORT_CLASS, classOf[ParquetReadSupport].getName)
-    hadoopConf.set(
-      ParquetReadSupport.SPARK_ROW_REQUESTED_SCHEMA,
-      ParquetSchemaConverter.checkFieldNames(requiredSchema).json)
-    hadoopConf.set(
-      ParquetWriteSupport.SPARK_ROW_SCHEMA,
-      ParquetSchemaConverter.checkFieldNames(requiredSchema).json)
+      hadoopConf: Configuration,
+      storageFilterMetrics: Map[String, SQLMetric])
+    : Option[PartitionedFile => Iterator[InternalRow]] = {
+    // Asked again, since this entry point is reachable without the planner, and `None` sends the
+    // caller to the builder a subclass overrides.
+    if (!isExactlyParquetFileFormat) {
+      None
+    } else {
+      Some(buildParquetReader(sparkSession, dataSchema, partitionSchema, requiredSchema, filters,
+        storageFilters, options, hadoopConf, storageFilterMetrics))
+    }
+  }
 
-    // We want to clear this temporary metadata from saving into Parquet file.
-    // This metadata is only useful for detecting optional columns when pushdowning filters.
-    val dataSchemaToWrite = StructType.removeMetadata(StructType.metadataKeyForOptionalField,
-      requiredSchema).asInstanceOf[StructType]
-    ParquetWriteSupport.setSchema(dataSchemaToWrite, hadoopConf)
-
-    // Sets flags for `CatalystSchemaConverter`
-    hadoopConf.setBoolean(
-      SQLConf.PARQUET_BINARY_AS_STRING.key,
-      sparkSession.conf.get(SQLConf.PARQUET_BINARY_AS_STRING))
-    hadoopConf.setBoolean(
-      SQLConf.PARQUET_INT96_AS_TIMESTAMP.key,
-      sparkSession.conf.get(SQLConf.PARQUET_INT96_AS_TIMESTAMP))
-
-    // Try to push down filters when filter push-down is enabled.
-    val pushed =
-      if (sparkSession.conf.get(SQLConf.PARQUET_FILTER_PUSHDOWN_ENABLED.key).toBoolean) {
-        filters
-          // Collects all converted Parquet filter predicates. Notice that not all predicates can be
-          // converted (`ParquetFilters.createFilter` returns an `Option`). That's why a `flatMap`
-          // is used here.
-          .flatMap(ParquetFilters.createFilter(requiredSchema, _))
-          .reduceOption(FilterApi.and)
-      } else {
-        None
-      }
+  /** The implementation behind both public entry points above. */
+  private def buildParquetReader(
+      sparkSession: SparkSession,
+      dataSchema: StructType,
+      partitionSchema: StructType,
+      requiredSchema: StructType,
+      filters: Seq[Filter],
+      storageFilters: Seq[Expression],
+      options: Map[String, String],
+      hadoopConf: Configuration,
+      storageFilterMetrics: Map[String, SQLMetric]): PartitionedFile => Iterator[InternalRow] = {
+    val sqlConf = getSqlConf(sparkSession)
+    setupHadoopConf(hadoopConf, sqlConf, requiredSchema)
 
     val broadcastedHadoopConf =
-      sparkSession.sparkContext.broadcast(new SerializableConfiguration(hadoopConf))
+      SerializableConfiguration.broadcast(sparkSession.sparkContext, hadoopConf)
 
     // TODO: if you move this into the closure it reverts to the default values.
     // If true, enable using the custom RecordReader for parquet. This only works for
     // a subset of the types (no complex types).
     val resultSchema = StructType(partitionSchema.fields ++ requiredSchema.fields)
+    val enableOffHeapColumnVector = sqlConf.offHeapColumnVectorEnabled
     val enableVectorizedReader: Boolean =
-      sparkSession.sessionState.conf.parquetVectorizedReaderEnabled &&
-      resultSchema.forall(_.dataType.isInstanceOf[AtomicType])
-    // Whole stage codegen (PhysicalRDD) is able to deal with batches directly
-    val returningBatch = supportBatch(sparkSession, resultSchema)
+      ParquetUtils.isBatchReadSupportedForSchema(sqlConf, resultSchema)
+    val enableRecordFilter: Boolean = sqlConf.parquetRecordFilterEnabled
+    val timestampConversion: Boolean = sqlConf.isParquetINT96TimestampConversion
+    val capacity = sqlConf.parquetVectorizedReaderBatchSize
+    val enableParquetFilterPushDown: Boolean = sqlConf.parquetFilterPushDown
+    val pushDownDate = sqlConf.parquetFilterPushDownDate
+    val pushDownTimestamp = sqlConf.parquetFilterPushDownTimestamp
+    val pushDownDecimal = sqlConf.parquetFilterPushDownDecimal
+    val pushDownStringPredicate = sqlConf.parquetFilterPushDownStringPredicate
+    val pushDownInFilterThreshold = sqlConf.parquetFilterPushDownInFilterThreshold
+    val isCaseSensitive = sqlConf.caseSensitiveAnalysis
+    // When shredded-variant predicate pushdown is enabled and `requiredSchema` actually carries a
+    // variant-extraction struct produced by PushVariantIntoScan, passing it lets ParquetFilters map
+    // logical paths like "v.`0`" to the physical shredded columns for row-group skipping. The
+    // `isVariantStruct` check keeps the per-file ParquetFilters construction free of any shredded
+    // traversal for the common case of scans with no variant-extraction columns.
+    val variantExtractionSchema =
+      if (sqlConf.getConf(SQLConf.VARIANT_SHREDDED_PREDICATE_PUSHDOWN_ENABLED) &&
+          requiredSchema.existsRecursively(VariantMetadata.isVariantStruct)) {
+        Some(requiredSchema)
+      } else {
+        None
+      }
+    val parquetOptions = new ParquetOptions(options, sqlConf)
+    val datetimeRebaseModeInRead = parquetOptions.datetimeRebaseModeInRead
+    val int96RebaseModeInRead = parquetOptions.int96RebaseModeInRead
+    val archiveFormatEnabled = parquetOptions.archiveFormatEnabled
 
-    (file: PartitionedFile) => {
+    // Late materialization needs the vectorized reader, which is decided again from the live conf
+    // here. So a flip after planning leaves the filters out, and the post-scan Filter holds them.
+    val storageFilterOpt: Option[ParquetStorageFilter] = if (storageFilters.isEmpty) {
+      None
+    } else if (!enableVectorizedReader) {
+      logInfo(log"Not honoring storage filters for schema " +
+        log"${MDC(SCHEMA, resultSchema.catalogString)}: the vectorized Parquet reader is disabled")
+      None
+    } else {
+      Some(ParquetStorageFilter.create(storageFilters, requiredSchema,
+        StorageFilterMetrics.fromMap(storageFilterMetrics),
+        sqlConf.parquetStorageFilterPushdownMaxSplicedRowGroupBytes))
+    }
+
+    // Should always be set by FileSourceScanExec creating this.
+    // Check conf before checking option, to allow working around an issue by changing conf.
+    val returningBatch = sqlConf.parquetVectorizedReaderEnabled &&
+      options.getOrElse(FileFormat.OPTION_RETURNING_BATCH,
+        throw new IllegalArgumentException(
+          "OPTION_RETURNING_BATCH should always be set for ParquetFileFormat. " +
+            s"To workaround this issue, set ${PARQUET_VECTORIZED_READER_ENABLED.key}=false."))
+        .equals("true")
+    if (returningBatch) {
+      // If the passed option said that we are to return batches, we need to also be able to
+      // do this based on config and resultSchema.
+      assert(supportBatch(sparkSession, resultSchema))
+    }
+
+    val readSingleFile: PartitionedFile => Iterator[InternalRow] = (file: PartitionedFile) => {
       assert(file.partitionValues.numFields == partitionSchema.size)
 
-      val fileSplit =
-        new FileSplit(new Path(new URI(file.filePath)), file.start, file.length, Array.empty)
+      val split = new FileSplit(file.toPath, file.start, file.length, Array.empty[String])
+      val sharedConf = broadcastedHadoopConf.value.value
 
-      val split =
-        new org.apache.parquet.hadoop.ParquetInputSplit(
-          fileSplit.getPath,
-          fileSplit.getStart,
-          fileSplit.getStart + fileSplit.getLength,
-          fileSplit.getLength,
-          fileSplit.getLocations,
-          null)
+      // When there are vectorized reads, we can avoid
+      // 1. opening the file twice by transfering the SeekableInputStream
+      // 2. reading the footer twice by reading all row groups in advance and filter row groups
+      //    according to filters that require push down
+      val openedFooter =
+        ParquetFooterReader.openFileAndReadFooter(sharedConf, file, enableVectorizedReader)
+      assert(openedFooter.inputStreamOpt.isPresent == enableVectorizedReader)
 
-      val attemptId = new TaskAttemptID(new TaskID(new JobID(), TaskType.MAP, 0), 0)
-      val hadoopAttemptContext =
-        new TaskAttemptContextImpl(broadcastedHadoopConf.value.value, attemptId)
+      // Before transferring the ownership of inputStream to the vectorizedReader,
+      // we must take responsibility to close the inputStream if something goes wrong
+      // to avoid resource leak.
+      val shouldCloseInputStream = new AtomicBoolean(openedFooter.inputStreamOpt.isPresent)
+      try {
+        val footerFileMetaData = openedFooter.footer.getFileMetaData
+        val datetimeRebaseSpec = DataSourceUtils.datetimeRebaseSpec(
+          footerFileMetaData.getKeyValueMetaData.get,
+          datetimeRebaseModeInRead)
+        val int96RebaseSpec = DataSourceUtils.int96RebaseSpec(
+          footerFileMetaData.getKeyValueMetaData.get, int96RebaseModeInRead)
 
-      // Try to push down filters when filter push-down is enabled.
-      // Notice: This push-down is RowGroups level, not individual records.
-      if (pushed.isDefined) {
-        ParquetInputFormat.setFilterPredicate(hadoopAttemptContext.getConfiguration, pushed.get)
-      }
-      val parquetReader = if (enableVectorizedReader) {
-        val vectorizedReader = new VectorizedParquetRecordReader()
-        vectorizedReader.initialize(split, hadoopAttemptContext)
-        logDebug(s"Appending $partitionSchema ${file.partitionValues}")
-        vectorizedReader.initBatch(partitionSchema, file.partitionValues)
-        if (returningBatch) {
-          vectorizedReader.enableReturningBatches()
+        // Try to push down filters when filter push-down is enabled.
+        val pushed = if (enableParquetFilterPushDown) {
+          val parquetSchema = footerFileMetaData.getSchema
+          val parquetFilters = new ParquetFilters(
+            parquetSchema,
+            pushDownDate,
+            pushDownTimestamp,
+            pushDownDecimal,
+            pushDownStringPredicate,
+            pushDownInFilterThreshold,
+            isCaseSensitive,
+            datetimeRebaseSpec,
+            variantExtractionSchema = variantExtractionSchema,
+            readSchema = Some(requiredSchema))
+          filters
+            // Collects all converted Parquet filter predicates. Notice that not all predicates
+            // can be converted (`ParquetFilters.createFilter` returns an `Option`). That's why
+            // a `flatMap` is used here.
+            .flatMap(parquetFilters.createFilter)
+            .reduceOption(FilterApi.and)
+        } else {
+          None
         }
-        vectorizedReader
+
+        // PARQUET_INT96_TIMESTAMP_CONVERSION says to apply timezone conversions to int96
+        // timestamps *only* if the file was created by something other than "parquet-mr",
+        // so check the actual writer here for this file.  We have to do this per-file,
+        // as each file in the table may have different writers.
+        // Define isCreatedByParquetMr as function to avoid unnecessary parquet footer reads.
+        def isCreatedByParquetMr: Boolean =
+          footerFileMetaData.getCreatedBy.startsWith("parquet-mr")
+
+        val convertTz =
+          if (timestampConversion && !isCreatedByParquetMr) {
+            Some(DateTimeUtils.getZoneId(sharedConf.get(SQLConf.SESSION_LOCAL_TIMEZONE.key)))
+          } else {
+            None
+          }
+
+        val attemptId = new TaskAttemptID(new TaskID(new JobID(), TaskType.MAP, 0), 0)
+        val hadoopAttemptContext =
+          new TaskAttemptContextImpl(broadcastedHadoopConf.value.value, attemptId)
+
+        // Try to push down filters when filter push-down is enabled.
+        // Notice: This push-down is RowGroups level, not individual records.
+        pushed.foreach {
+          ParquetInputFormat.setFilterPredicate(hadoopAttemptContext.getConfiguration, _)
+        }
+        if (enableVectorizedReader) {
+          buildVectorizedIterator(
+            hadoopAttemptContext, split, file.partitionValues, partitionSchema, convertTz,
+            datetimeRebaseSpec, int96RebaseSpec, enableOffHeapColumnVector, returningBatch,
+            capacity, openedFooter, shouldCloseInputStream, storageFilterOpt)
+        } else {
+          logDebug(s"Falling back to parquet-mr")
+          buildRowBasedIterator(
+            hadoopAttemptContext, split, file.partitionValues, partitionSchema, convertTz,
+            datetimeRebaseSpec, int96RebaseSpec, requiredSchema, pushed, enableRecordFilter)
+        }
+      } finally {
+        if (shouldCloseInputStream.get) {
+          openedFooter.inputStreamOpt.ifPresent(Utils.closeQuietly)
+        }
+      }
+    }
+
+    // An archive is read by unpacking each Parquet entry to a local temp file and reading it with
+    // the plain reader (readSingleFile); readLocalizedEntries owns the unpack/iterate/cleanup.
+    def readArchiveFile(file: PartitionedFile): Iterator[InternalRow] =
+      readLocalizedEntries(
+          file, broadcastedHadoopConf.value.value, "parquet-archive",
+          parquetOptions.archivePathFilterPattern) {
+        entryFile => readSingleFile(entryFile)
+      }
+
+    (file: PartitionedFile) => {
+      if (archiveFormatEnabled && SupportsArchiveFormat.isArchivePath(file.toPath)) {
+        readArchiveFile(file)
       } else {
-        logDebug(s"Falling back to parquet-mr")
-        // ParquetRecordReader returns UnsafeRow
-        val reader = pushed match {
-          case Some(filter) =>
-            new ParquetRecordReader[UnsafeRow](
-              new ParquetReadSupport,
-              FilterCompat.get(filter, null))
-          case _ =>
-            new ParquetRecordReader[UnsafeRow](new ParquetReadSupport)
-        }
-        reader.initialize(split, hadoopAttemptContext)
-        reader
+        readSingleFile(file)
       }
+    }
+  }
 
-      val iter = new RecordReaderIterator(parquetReader)
+  // scalastyle:off argcount
+  private def buildVectorizedIterator(
+      hadoopAttemptContext: TaskAttemptContextImpl,
+      split: FileSplit,
+      partitionValues: InternalRow,
+      partitionSchema: StructType,
+      convertTz: Option[ZoneId],
+      datetimeRebaseSpec: RebaseDateTime.RebaseSpec,
+      int96RebaseSpec: RebaseDateTime.RebaseSpec,
+      enableOffHeapColumnVector: Boolean,
+      returningBatch: Boolean,
+      batchSize: Int,
+      openedFooter: OpenedParquetFooter,
+      shouldCloseInputStream: AtomicBoolean,
+      storageFilter: Option[ParquetStorageFilter]): Iterator[InternalRow] = {
+    // scalastyle:on argcount
+    assert(openedFooter.inputStreamOpt.isPresent)
+    // The storage-filter read path lives in a subclass, so the plain reader carries none of it.
+    val vectorizedReader = storageFilter match {
+      case None =>
+        new VectorizedParquetRecordReader(
+          convertTz.orNull,
+          datetimeRebaseSpec.mode.toString,
+          datetimeRebaseSpec.timeZone,
+          int96RebaseSpec.mode.toString,
+          int96RebaseSpec.timeZone,
+          enableOffHeapColumnVector && TaskContext.get() != null,
+          batchSize)
+      case Some(filter) =>
+        new LateMaterializationParquetRecordReader(
+          convertTz.orNull,
+          datetimeRebaseSpec.mode.toString,
+          datetimeRebaseSpec.timeZone,
+          int96RebaseSpec.mode.toString,
+          int96RebaseSpec.timeZone,
+          enableOffHeapColumnVector && TaskContext.get() != null,
+          batchSize,
+          filter)
+    }
+    // SPARK-37089: We cannot register a task completion listener to close this iterator here
+    // because downstream exec nodes have already registered their listeners. Since listeners
+    // are executed in reverse order of registration, a listener registered here would close the
+    // iterator while downstream exec nodes are still running. When off-heap column vectors are
+    // enabled, this can cause a use-after-free bug leading to a segfault.
+    //
+    // Instead, we use FileScanRDD's task completion listener to close this iterator.
+    val iter = new RecordReaderIterator(vectorizedReader)
+    try {
+      vectorizedReader.initialize(
+        split, hadoopAttemptContext, Some(openedFooter.inputFile),
+        Some(openedFooter.inputStream), Some(openedFooter.footer))
+      // The caller don't need to take care of the close of inputStream after calling
+      // `initialize` because the ownership of inputStream has been transferred to the
+      // vectorizedReader
+      shouldCloseInputStream.set(false)
+      logDebug(s"Appending $partitionSchema $partitionValues")
+      vectorizedReader.initBatch(partitionSchema, partitionValues)
+      if (returningBatch) {
+        vectorizedReader.enableReturningBatches()
+      }
 
       // UnsafeRowParquetRecordReader appends the columns internally to avoid another copy.
-      if (parquetReader.isInstanceOf[VectorizedParquetRecordReader] &&
-          enableVectorizedReader) {
-        iter.asInstanceOf[Iterator[InternalRow]]
+      iter.asInstanceOf[Iterator[InternalRow]]
+    } catch {
+      case e: Throwable =>
+        // SPARK-23457: In case there is an exception in initialization, close the iterator to
+        // avoid leaking resources.
+        iter.close()
+        throw e
+    }
+  }
+
+  private def buildRowBasedIterator(
+      hadoopAttemptContext: TaskAttemptContextImpl,
+      split: FileSplit,
+      partitionValues: InternalRow,
+      partitionSchema: StructType,
+      convertTz: Option[ZoneId],
+      datetimeRebaseSpec: RebaseDateTime.RebaseSpec,
+      int96RebaseSpec: RebaseDateTime.RebaseSpec,
+      requiredSchema: StructType,
+      pushed: Option[FilterPredicate],
+      enableRecordFilter: Boolean): Iterator[InternalRow] with Closeable = {
+    // ParquetRecordReader returns InternalRow
+    val readSupport = new ParquetReadSupport(
+      convertTz,
+      enableVectorizedReader = false,
+      datetimeRebaseSpec,
+      int96RebaseSpec)
+    val reader = if (pushed.isDefined && enableRecordFilter) {
+      val parquetFilter = FilterCompat.get(pushed.get, null)
+      new ParquetRecordReader[InternalRow](readSupport, parquetFilter)
+    } else {
+      new ParquetRecordReader[InternalRow](readSupport)
+    }
+    val readerWithRowIndexes = ParquetRowIndexUtil.addRowIndexToRecordReaderIfNeeded(reader,
+      requiredSchema)
+    val iter = new RecordReaderIterator[InternalRow](readerWithRowIndexes)
+    try {
+      readerWithRowIndexes.initialize(split, hadoopAttemptContext)
+
+      val fullSchema = toAttributes(requiredSchema) ++ toAttributes(partitionSchema)
+      val unsafeProjection = GenerateUnsafeProjection.generate(fullSchema, fullSchema)
+
+      if (partitionSchema.length == 0) {
+        // There is no partition columns
+        iter.map(unsafeProjection)
       } else {
-        val fullSchema = requiredSchema.toAttributes ++ partitionSchema.toAttributes
         val joinedRow = new JoinedRow()
-        val appendPartitionColumns = GenerateUnsafeProjection.generate(fullSchema, fullSchema)
-
-        // This is a horrible erasure hack...  if we type the iterator above, then it actually check
-        // the type in next() and we get a class cast exception.  If we make that function return
-        // Object, then we can defer the cast until later!
-        if (partitionSchema.length == 0) {
-          // There is no partition columns
-          iter.asInstanceOf[Iterator[InternalRow]]
-        } else {
-          iter.asInstanceOf[Iterator[InternalRow]]
-            .map(d => appendPartitionColumns(joinedRow(d, file.partitionValues)))
-        }
+        iter.map(d => unsafeProjection(joinedRow(d, partitionValues)))
       }
+    } catch {
+      case e: Throwable =>
+        // SPARK-23457: In case there is an exception in initialization, close the iterator to
+        // avoid leaking resources.
+        iter.close()
+        throw e
     }
   }
 
-  override def buildWriter(
-      sqlContext: SQLContext,
-      dataSchema: StructType,
-      options: Map[String, String]): OutputWriterFactory = {
-    new ParquetOutputWriterFactory(
-      sqlContext.conf,
-      dataSchema,
-      sqlContext.sessionState.newHadoopConf(),
-      options)
-  }
-}
+  override def supportDataType(dataType: DataType): Boolean =
+    // Types Framework: framework FIRST, original match as fallback.
+    ParquetTypeOps(dataType).map(_.supportDataType)
+      .getOrElse(supportDataTypeDefault(dataType))
 
-/**
- * A factory for generating OutputWriters for writing parquet files. This implemented is different
- * from the [[ParquetOutputWriter]] as this does not use any [[OutputCommitter]]. It simply
- * writes the data to the path used to generate the output writer. Callers of this factory
- * has to ensure which files are to be considered as committed.
- */
-private[parquet] class ParquetOutputWriterFactory(
-    sqlConf: SQLConf,
-    dataSchema: StructType,
-    hadoopConf: Configuration,
-    options: Map[String, String]) extends OutputWriterFactory {
+  private def supportDataTypeDefault(dataType: DataType): Boolean = dataType match {
+    // GeoSpatial data types in Parquet are limited only to types with supported SRIDs.
+    case g: GeometryType => GeometryType.isSridSupported(g.srid)
+    case g: GeographyType => GeographyType.isSridSupported(g.srid)
 
-  private val serializableConf: SerializableConfiguration = {
-    val job = Job.getInstance(hadoopConf)
-    val conf = ContextUtil.getConfiguration(job)
-    val parquetOptions = new ParquetOptions(options, sqlConf)
+    case _: AtomicType | _: NullType => true
 
-    // We're not really using `ParquetOutputFormat[Row]` for writing data here, because we override
-    // it in `ParquetOutputWriter` to support appending and dynamic partitioning.  The reason why
-    // we set it here is to setup the output committer class to `ParquetOutputCommitter`, which is
-    // bundled with `ParquetOutputFormat[Row]`.
-    job.setOutputFormatClass(classOf[ParquetOutputFormat[Row]])
+    case st: StructType => st.forall { f => supportDataType(f.dataType) }
 
-    ParquetOutputFormat.setWriteSupportClass(job, classOf[ParquetWriteSupport])
+    case ArrayType(elementType, _) => supportDataType(elementType)
 
-    // We want to clear this temporary metadata from saving into Parquet file.
-    // This metadata is only useful for detecting optional columns when pushing down filters.
-    val dataSchemaToWrite = StructType.removeMetadata(
-      StructType.metadataKeyForOptionalField,
-      dataSchema).asInstanceOf[StructType]
-    ParquetWriteSupport.setSchema(dataSchemaToWrite, conf)
+    case MapType(keyType, valueType, _) =>
+      supportDataType(keyType) && supportDataType(valueType)
 
-    // Sets flags for `CatalystSchemaConverter` (which converts Catalyst schema to Parquet schema)
-    // and `CatalystWriteSupport` (writing actual rows to Parquet files).
-    conf.set(
-      SQLConf.PARQUET_BINARY_AS_STRING.key,
-      sqlConf.isParquetBinaryAsString.toString)
+    case udt: UserDefinedType[_] => supportDataType(udt.sqlType)
 
-    conf.set(
-      SQLConf.PARQUET_INT96_AS_TIMESTAMP.key,
-      sqlConf.isParquetINT96AsTimestamp.toString)
-
-    conf.set(
-      SQLConf.PARQUET_WRITE_LEGACY_FORMAT.key,
-      sqlConf.writeLegacyParquetFormat.toString)
-
-    // Sets compression scheme
-    conf.set(ParquetOutputFormat.COMPRESSION, parquetOptions.compressionCodec)
-    new SerializableConfiguration(conf)
+    case _ => false
   }
 
-  /**
-   * Returns a [[OutputWriter]] that writes data to the give path without using
-   * [[OutputCommitter]].
-   */
-  override def newWriter(path: String): OutputWriter = new OutputWriter {
-
-    // Create TaskAttemptContext that is used to pass on Configuration to the ParquetRecordWriter
-    private val hadoopTaskAttemptId = new TaskAttemptID(new TaskID(new JobID, TaskType.MAP, 0), 0)
-    private val hadoopAttemptContext = new TaskAttemptContextImpl(
-      serializableConf.value, hadoopTaskAttemptId)
-
-    // Instance of ParquetRecordWriter that does not use OutputCommitter
-    private val recordWriter = createNoCommitterRecordWriter(path, hadoopAttemptContext)
-
-    override def write(row: Row): Unit = {
-      throw new UnsupportedOperationException("call writeInternal")
-    }
-
-    protected[sql] override def writeInternal(row: InternalRow): Unit = {
-      recordWriter.write(null, row)
-    }
-
-    override def close(): Unit = recordWriter.close(hadoopAttemptContext)
+  override def metadataSchemaFields: Seq[StructField] = {
+    super.metadataSchemaFields :+ ParquetFileFormat.ROW_INDEX_FIELD
   }
-
-  /** Create a [[ParquetRecordWriter]] that writes the given path without using OutputCommitter */
-  private def createNoCommitterRecordWriter(
-      path: String,
-      hadoopAttemptContext: TaskAttemptContext): RecordWriter[Void, InternalRow] = {
-    // Custom ParquetOutputFormat that disable use of committer and writes to the given path
-    val outputFormat = new ParquetOutputFormat[InternalRow]() {
-      override def getOutputCommitter(c: TaskAttemptContext): OutputCommitter = { null }
-      override def getDefaultWorkFile(c: TaskAttemptContext, ext: String): Path = { new Path(path) }
-    }
-    outputFormat.getRecordWriter(hadoopAttemptContext)
-  }
-
-  /** Disable the use of the older API. */
-  def newInstance(
-      path: String,
-      bucketId: Option[Int],
-      dataSchema: StructType,
-      context: TaskAttemptContext): OutputWriter = {
-    throw new UnsupportedOperationException(
-      "this version of newInstance not supported for " +
-        "ParquetOutputWriterFactory")
-  }
-}
-
-
-// NOTE: This class is instantiated and used on executor side only, no need to be serializable.
-private[parquet] class ParquetOutputWriter(
-    path: String,
-    bucketId: Option[Int],
-    context: TaskAttemptContext)
-  extends OutputWriter {
-
-  private val recordWriter: RecordWriter[Void, InternalRow] = {
-    val outputFormat = {
-      new ParquetOutputFormat[InternalRow]() {
-        // Here we override `getDefaultWorkFile` for two reasons:
-        //
-        //  1. To allow appending.  We need to generate unique output file names to avoid
-        //     overwriting existing files (either exist before the write job, or are just written
-        //     by other tasks within the same write job).
-        //
-        //  2. To allow dynamic partitioning.  Default `getDefaultWorkFile` uses
-        //     `FileOutputCommitter.getWorkPath()`, which points to the base directory of all
-        //     partitions in the case of dynamic partitioning.
-        override def getDefaultWorkFile(context: TaskAttemptContext, extension: String): Path = {
-          val configuration = context.getConfiguration
-          val uniqueWriteJobId = configuration.get(
-            CreateDataSourceTableUtils.DATASOURCE_WRITEJOBUUID)
-          val taskAttemptId = context.getTaskAttemptID
-          val split = taskAttemptId.getTaskID.getId
-          val bucketString = bucketId.map(BucketingUtils.bucketIdToString).getOrElse("")
-          // It has the `.parquet` extension at the end because (de)compression tools
-          // such as gunzip would not be able to decompress this as the compression
-          // is not applied on this whole file but on each "page" in Parquet format.
-          new Path(path, f"part-r-$split%05d-$uniqueWriteJobId$bucketString$extension")
-        }
-      }
-    }
-
-    outputFormat.getRecordWriter(context)
-  }
-
-  override def write(row: Row): Unit = throw new UnsupportedOperationException("call writeInternal")
-
-  override def writeInternal(row: InternalRow): Unit = recordWriter.write(null, row)
-
-  override def close(): Unit = recordWriter.close(context)
 }
 
 object ParquetFileFormat extends Logging {
+  val ROW_INDEX = "row_index"
+
+  // A name for a temporary column that holds row indexes computed by the file format reader
+  // until they can be placed in the _metadata struct.
+  val ROW_INDEX_TEMPORARY_COLUMN_NAME = s"_tmp_metadata_$ROW_INDEX"
+
+  // The field readers can use to access the generated row index column.
+  val ROW_INDEX_FIELD = FileSourceGeneratedMetadataStructField(
+    ROW_INDEX, ROW_INDEX_TEMPORARY_COLUMN_NAME, LongType, nullable = false)
+
   private[parquet] def readSchema(
       footers: Seq[Footer], sparkSession: SparkSession): Option[StructType] = {
 
-    def parseParquetSchema(schema: MessageType): StructType = {
-      val converter = new ParquetSchemaConverter(
-        sparkSession.sessionState.conf.isParquetBinaryAsString,
-        sparkSession.sessionState.conf.isParquetBinaryAsString,
-        sparkSession.sessionState.conf.writeLegacyParquetFormat)
-
-      converter.convert(schema)
-    }
+    val sqlConf = SessionStateHelper.getSqlConf(sparkSession)
+    val converter = new ParquetToSparkSchemaConverter(
+      sqlConf.isParquetBinaryAsString,
+      sqlConf.isParquetINT96AsTimestamp,
+      inferTimestampNTZ = sqlConf.parquetInferTimestampNTZEnabled,
+      nanosAsLong = sqlConf.legacyParquetNanosAsLong,
+      timestampNanosTypesEnabled = sqlConf.timestampNanosTypesEnabled,
+      respectUnknownTypeAnnotation =
+        sqlConf.parquetReaderRespectUnknownTypeAnnotation,
+      timeIsAdjustedToUTC = sqlConf.parquetTimeTypeAllowIsAdjustedToUtcRead)
 
     val seen = mutable.HashSet[String]()
     val finalSchemas: Seq[StructType] = footers.flatMap { footer =>
@@ -592,7 +610,7 @@ object ParquetFileFormat extends Logging {
         .get(ParquetReadSupport.SPARK_METADATA_KEY)
       if (serializedSchema.isEmpty) {
         // Falls back to Parquet schema if no Spark SQL schema found.
-        Some(parseParquetSchema(metadata.getSchema))
+        Some(converter.convert(metadata.getSchema))
       } else if (!seen.contains(serializedSchema.get)) {
         seen += serializedSchema.get
 
@@ -603,19 +621,19 @@ object ParquetFileFormat extends Logging {
             logInfo(
               "Serialized Spark schema in Parquet key-value metadata is not in JSON format, " +
                 "falling back to the deprecated DataType.fromCaseClassString parser.")
-            LegacyTypeStringParser.parse(serializedSchema.get)
+            LegacyTypeStringParser.parseString(serializedSchema.get)
           }
           .recover { case cause: Throwable =>
             logWarning(
-              s"""Failed to parse serialized Spark schema in Parquet key-value metadata:
-                 |\t$serializedSchema
+              log"""Failed to parse serialized Spark schema in Parquet key-value metadata:
+                 |\t${MDC(SCHEMA, serializedSchema)}
                """.stripMargin,
               cause)
           }
           .map(_.asInstanceOf[StructType])
           .getOrElse {
             // Falls back to Parquet schema if Spark SQL schema can't be parsed.
-            parseParquetSchema(metadata.getSchema)
+            converter.convert(metadata.getSchema)
           })
       } else {
         None
@@ -624,74 +642,95 @@ object ParquetFileFormat extends Logging {
 
     finalSchemas.reduceOption { (left, right) =>
       try left.merge(right) catch { case e: Throwable =>
-        throw new SparkException(s"Failed to merge incompatible schemas $left and $right", e)
+        throw QueryExecutionErrors.failedToMergeIncompatibleSchemasError(left, right, e)
       }
     }
   }
 
   /**
-   * Reconciles Hive Metastore case insensitivity issue and data type conflicts between Metastore
-   * schema and Parquet schema.
-   *
-   * Hive doesn't retain case information, while Parquet is case sensitive. On the other hand, the
-   * schema read from Parquet files may be incomplete (e.g. older versions of Parquet doesn't
-   * distinguish binary and string).  This method generates a correct schema by merging Metastore
-   * schema data types and Parquet schema field names.
+   * Reads Parquet footers in multi-threaded manner.
+   * If the config "spark.sql.files.ignoreCorruptFiles" is set to true, we will ignore the corrupted
+   * files when reading footers.
+   * If the config "spark.sql.files.ignoreMissingFiles" is set to true, we will ignore the missing
+   * files when reading footers.
    */
-  def mergeMetastoreParquetSchema(
-      metastoreSchema: StructType,
-      parquetSchema: StructType): StructType = {
-    def schemaConflictMessage: String =
-      s"""Converting Hive Metastore Parquet, but detected conflicting schemas. Metastore schema:
-         |${metastoreSchema.prettyJson}
-         |
-         |Parquet schema:
-         |${parquetSchema.prettyJson}
-       """.stripMargin
-
-    val mergedParquetSchema = mergeMissingNullableFields(metastoreSchema, parquetSchema)
-
-    assert(metastoreSchema.size <= mergedParquetSchema.size, schemaConflictMessage)
-
-    val ordinalMap = metastoreSchema.zipWithIndex.map {
-      case (field, index) => field.name.toLowerCase -> index
-    }.toMap
-
-    val reorderedParquetSchema = mergedParquetSchema.sortBy(f =>
-      ordinalMap.getOrElse(f.name.toLowerCase, metastoreSchema.size + 1))
-
-    StructType(metastoreSchema.zip(reorderedParquetSchema).map {
-      // Uses Parquet field names but retains Metastore data types.
-      case (mSchema, pSchema) if mSchema.name.toLowerCase == pSchema.name.toLowerCase =>
-        mSchema.copy(name = pSchema.name)
-      case _ =>
-        throw new SparkException(schemaConflictMessage)
-    })
+  private[parquet] def readParquetFootersInParallel(
+      conf: Configuration,
+      partFiles: Seq[FileStatus],
+      ignoreCorruptFiles: Boolean,
+      ignoreMissingFiles: Boolean = false): Seq[Footer] = {
+    val archiveEnabled = SQLConf.get.getConf(SQLConf.ARCHIVE_FORMAT_READER_ENABLED)
+    // This signature is shared with `SchemaMergeUtils.mergeSchemasInParallel`'s `schemaReader`, so
+    // the glob comes from `conf`, which that caller builds with the user options via
+    // `newHadoopConfWithOptions`.
+    val archivePathFilter = Option(conf.get(FileSourceOptions.ARCHIVE_PATH_FILTER))
+      .filter(_.nonEmpty).map(FileSourceOptions.compileArchivePathFilter)
+    ThreadUtils.parmap(partFiles, "readingParquetFooters", 8,
+        preserveSparkThrowable = true) { currentFile =>
+      try {
+        // Skips row group information since we only need the schema.
+        // ParquetFileReader.readFooter throws RuntimeException, instead of IOException,
+        // when it can't read the footer.
+        if (archiveEnabled && SupportsArchiveFormat.isArchivePath(currentFile.getPath)) {
+          // An archive is one file here; read each of its Parquet entries' footers (the archive is
+          // atomic under ignoreCorruptFiles, see readArchiveFooters).
+          readArchiveFooters(conf, currentFile, archivePathFilter)
+        } else {
+          Seq(new Footer(currentFile.getPath,
+            ParquetFooterReader.readFooter(
+              HadoopInputFile.fromStatus(currentFile, conf), SKIP_ROW_GROUPS)))
+        }
+      } catch {
+        case e: Exception if ignoreMissingFiles &&
+            ExceptionUtils.getThrowables(e).exists(_.isInstanceOf[FileNotFoundException]) =>
+          logWarning(log"Skipped missing file: ${MDC(PATH, currentFile)}", e)
+          Seq.empty
+        case e: RuntimeException if ignoreCorruptFiles =>
+          logWarning(log"Skipped the footer in the corrupted file: ${MDC(PATH, currentFile)}", e)
+          Seq.empty
+        // A corrupt archive's failure arrives wrapped, not as a bare RuntimeException; a missing
+        // file (FileNotFoundException) is excluded since ignoreMissingFiles governs it.
+        case e: Exception if ignoreCorruptFiles &&
+            archiveEnabled && SupportsArchiveFormat.isArchivePath(currentFile.getPath) && {
+              val root = Utils.getRootCause(e)
+              root.isInstanceOf[IOException] && !root.isInstanceOf[FileNotFoundException]
+            } =>
+          logWarning(log"Skipped the footer in the corrupted file: ${MDC(PATH, currentFile)}", e)
+          Seq.empty
+        case e: Exception =>
+          throw QueryExecutionErrors.cannotReadFooterForFileError(currentFile.getPath, e)
+      }
+    }.flatten
   }
 
-  /**
-   * Returns the original schema from the Parquet file with any missing nullable fields from the
-   * Hive Metastore schema merged in.
-   *
-   * When constructing a DataFrame from a collection of structured data, the resulting object has
-   * a schema corresponding to the union of the fields present in each element of the collection.
-   * Spark SQL simply assigns a null value to any field that isn't present for a particular row.
-   * In some cases, it is possible that a given table partition stored as a Parquet file doesn't
-   * contain a particular nullable field in its schema despite that field being present in the
-   * table schema obtained from the Hive Metastore. This method returns a schema representing the
-   * Parquet file schema along with any additional nullable fields from the Metastore schema
-   * merged in.
-   */
-  private[parquet] def mergeMissingNullableFields(
-      metastoreSchema: StructType,
-      parquetSchema: StructType): StructType = {
-    val fieldMap = metastoreSchema.map(f => f.name.toLowerCase -> f).toMap
-    val missingFields = metastoreSchema
-      .map(_.name.toLowerCase)
-      .diff(parquetSchema.map(_.name.toLowerCase))
-      .map(fieldMap(_))
-      .filter(_.nullable)
-    StructType(parquetSchema ++ missingFields)
+  /** Reads every Parquet entry's footer in one archive. */
+  private def readArchiveFooters(
+      conf: Configuration,
+      archive: FileStatus,
+      archivePathFilter: Option[GlobPattern]): Seq[Footer] = {
+    val tempDir = Utils.createTempDir(Utils.getLocalDir(SparkEnv.get.conf), "parquet-archive-infer")
+    // localizeEntries eagerly opens/copies the first entry, so build it inside the try -- a corrupt
+    // archive throws there and the finally must still delete tempDir.
+    var entries: Iterator[(String, File)] = Iterator.empty
+    try {
+      entries = SupportsArchiveFormat.localizeEntries(
+        archive.getPath, conf, tempDir, _ => true, archivePathFilter)
+      entries.map { case (_, entryFile) =>
+        try {
+          val status = new FileStatus(entryFile.length(), false, 0, 0, entryFile.lastModified(),
+            0, null, null, null, new Path(entryFile.toURI))
+          new Footer(archive.getPath,
+            ParquetFooterReader.readFooter(HadoopInputFile.fromStatus(status, conf),
+              SKIP_ROW_GROUPS))
+        } finally entryFile.delete()
+      }.toList
+    } finally {
+      entries match {
+        case c: Closeable => c.close()
+        case _ =>
+      }
+      Utils.deleteRecursively(tempDir)
+    }
   }
 
   /**
@@ -709,97 +748,51 @@ object ParquetFileFormat extends Logging {
    *     S3 nodes).
    */
   def mergeSchemasInParallel(
+      parameters: Map[String, String],
       filesToTouch: Seq[FileStatus],
       sparkSession: SparkSession): Option[StructType] = {
-    val assumeBinaryIsString = sparkSession.sessionState.conf.isParquetBinaryAsString
-    val assumeInt96IsTimestamp = sparkSession.sessionState.conf.isParquetINT96AsTimestamp
-    val writeLegacyParquetFormat = sparkSession.sessionState.conf.writeLegacyParquetFormat
-    val serializedConf = new SerializableConfiguration(sparkSession.sessionState.newHadoopConf())
+    val sqlConf = SessionStateHelper.getSqlConf(sparkSession)
+    val assumeBinaryIsString = sqlConf.isParquetBinaryAsString
+    val assumeInt96IsTimestamp = sqlConf.isParquetINT96AsTimestamp
+    val inferTimestampNTZ = sqlConf.parquetInferTimestampNTZEnabled
+    val nanosAsLong = sqlConf.legacyParquetNanosAsLong
+    val timestampNanosTypesEnabled = sqlConf.timestampNanosTypesEnabled
+    val respectUnknownTypeAnnotation =
+      sqlConf.parquetReaderRespectUnknownTypeAnnotation
+    val timeIsAdjustedToUTC = sqlConf.parquetTimeTypeAllowIsAdjustedToUtcRead
 
-    // !! HACK ALERT !!
-    //
-    // Parquet requires `FileStatus`es to read footers.  Here we try to send cached `FileStatus`es
-    // to executor side to avoid fetching them again.  However, `FileStatus` is not `Serializable`
-    // but only `Writable`.  What makes it worse, for some reason, `FileStatus` doesn't play well
-    // with `SerializableWritable[T]` and always causes a weird `IllegalStateException`.  These
-    // facts virtually prevents us to serialize `FileStatus`es.
-    //
-    // Since Parquet only relies on path and length information of those `FileStatus`es to read
-    // footers, here we just extract them (which can be easily serialized), send them to executor
-    // side, and resemble fake `FileStatus`es there.
-    val partialFileStatusInfo = filesToTouch.map(f => (f.getPath.toString, f.getLen))
+    val reader = (files: Seq[FileStatus], conf: Configuration, ignoreCorruptFiles: Boolean,
+        ignoreMissingFiles: Boolean) => {
+      // Converter used to convert Parquet `MessageType` to Spark SQL `StructType`
+      val converter = new ParquetToSparkSchemaConverter(
+        assumeBinaryIsString = assumeBinaryIsString,
+        assumeInt96IsTimestamp = assumeInt96IsTimestamp,
+        inferTimestampNTZ = inferTimestampNTZ,
+        nanosAsLong = nanosAsLong,
+        timestampNanosTypesEnabled = timestampNanosTypesEnabled,
+        respectUnknownTypeAnnotation = respectUnknownTypeAnnotation,
+        timeIsAdjustedToUTC = timeIsAdjustedToUTC)
 
-    // Set the number of partitions to prevent following schema reads from generating many tasks
-    // in case of a small number of parquet files.
-    val numParallelism = Math.min(Math.max(partialFileStatusInfo.size, 1),
-      sparkSession.sparkContext.defaultParallelism)
+      // readParquetFootersInParallel reads archivePathFilter from the conf (its signature is fixed
+      // by SchemaMergeUtils' schemaReader type), so put the option there.
+      new FileSourceOptions(CaseInsensitiveMap(parameters)).archivePathFilter.foreach(
+        conf.set(FileSourceOptions.ARCHIVE_PATH_FILTER, _))
 
-    // Issues a Spark job to read Parquet schema in parallel.
-    val partiallyMergedSchemas =
-      sparkSession
-        .sparkContext
-        .parallelize(partialFileStatusInfo, numParallelism)
-        .mapPartitions { iterator =>
-          // Resembles fake `FileStatus`es with serialized path and length information.
-          val fakeFileStatuses = iterator.map { case (path, length) =>
-            new FileStatus(length, false, 0, 0, 0, 0, null, null, null, new Path(path))
-          }.toSeq
-
-          // Skips row group information since we only need the schema
-          val skipRowGroups = true
-
-          // Reads footers in multi-threaded manner within each task
-          val footers =
-            ParquetFileReader.readAllFootersInParallel(
-              serializedConf.value, fakeFileStatuses.asJava, skipRowGroups).asScala
-
-          // Converter used to convert Parquet `MessageType` to Spark SQL `StructType`
-          val converter =
-            new ParquetSchemaConverter(
-              assumeBinaryIsString = assumeBinaryIsString,
-              assumeInt96IsTimestamp = assumeInt96IsTimestamp,
-              writeLegacyParquetFormat = writeLegacyParquetFormat)
-
-          if (footers.isEmpty) {
-            Iterator.empty
-          } else {
-            var mergedSchema = ParquetFileFormat.readSchemaFromFooter(footers.head, converter)
-            footers.tail.foreach { footer =>
-              val schema = ParquetFileFormat.readSchemaFromFooter(footer, converter)
-              try {
-                mergedSchema = mergedSchema.merge(schema)
-              } catch { case cause: SparkException =>
-                throw new SparkException(
-                  s"Failed merging schema of file ${footer.getFile}:\n${schema.treeString}", cause)
-              }
-            }
-            Iterator.single(mergedSchema)
-          }
-        }.collect()
-
-    if (partiallyMergedSchemas.isEmpty) {
-      None
-    } else {
-      var finalSchema = partiallyMergedSchemas.head
-      partiallyMergedSchemas.tail.foreach { schema =>
-        try {
-          finalSchema = finalSchema.merge(schema)
-        } catch { case cause: SparkException =>
-          throw new SparkException(
-            s"Failed merging schema:\n${schema.treeString}", cause)
-        }
-      }
-      Some(finalSchema)
+      readParquetFootersInParallel(conf, files, ignoreCorruptFiles, ignoreMissingFiles)
+        .map(ParquetFileFormat.readSchemaFromFooter(_, converter))
     }
+
+    SchemaMergeUtils.mergeSchemasInParallel(sparkSession, parameters, filesToTouch, reader)
   }
 
   /**
    * Reads Spark SQL schema from a Parquet footer.  If a valid serialized Spark SQL schema string
    * can be found in the file metadata, returns the deserialized [[StructType]], otherwise, returns
-   * a [[StructType]] converted from the [[MessageType]] stored in this footer.
+   * a [[StructType]] converted from the [[org.apache.parquet.schema.MessageType]] stored in this
+   * footer.
    */
   def readSchemaFromFooter(
-      footer: Footer, converter: ParquetSchemaConverter): StructType = {
+      footer: Footer, converter: ParquetToSparkSchemaConverter): StructType = {
     val fileMetaData = footer.getParquetMetadata.getFileMetaData
     fileMetaData
       .getKeyValueMetaData
@@ -817,53 +810,13 @@ object ParquetFileFormat extends Logging {
         logInfo(
           "Serialized Spark schema in Parquet key-value metadata is not in JSON format, " +
             "falling back to the deprecated DataType.fromCaseClassString parser.")
-        LegacyTypeStringParser.parse(schemaString).asInstanceOf[StructType]
+        LegacyTypeStringParser.parseString(schemaString).asInstanceOf[StructType]
     }.recoverWith {
       case cause: Throwable =>
         logWarning(
-          "Failed to parse and ignored serialized Spark schema in " +
-            s"Parquet key-value metadata:\n\t$schemaString", cause)
+          log"Failed to parse and ignored serialized Spark schema in " +
+            log"Parquet key-value metadata:\n\t${MDC(SCHEMA, schemaString)}", cause)
         Failure(cause)
     }.toOption
   }
-
-  // JUL loggers must be held by a strong reference, otherwise they may get destroyed by GC.
-  // However, the root JUL logger used by Parquet isn't properly referenced.  Here we keep
-  // references to loggers in both parquet-mr <= 1.6 and >= 1.7
-  val apacheParquetLogger: JLogger = JLogger.getLogger(classOf[ApacheParquetLog].getPackage.getName)
-  val parquetLogger: JLogger = JLogger.getLogger("parquet")
-
-  // Parquet initializes its own JUL logger in a static block which always prints to stdout.  Here
-  // we redirect the JUL logger via SLF4J JUL bridge handler.
-  val redirectParquetLogsViaSLF4J: Unit = {
-    def redirect(logger: JLogger): Unit = {
-      logger.getHandlers.foreach(logger.removeHandler)
-      logger.setUseParentHandlers(false)
-      logger.addHandler(new SLF4JBridgeHandler)
-    }
-
-    // For parquet-mr 1.7.0 and above versions, which are under `org.apache.parquet` namespace.
-    // scalastyle:off classforname
-    Class.forName(classOf[ApacheParquetLog].getName)
-    // scalastyle:on classforname
-    redirect(JLogger.getLogger(classOf[ApacheParquetLog].getPackage.getName))
-
-    // For parquet-mr 1.6.0 and lower versions bundled with Hive, which are under `parquet`
-    // namespace.
-    try {
-      // scalastyle:off classforname
-      Class.forName("parquet.Log")
-      // scalastyle:on classforname
-      redirect(JLogger.getLogger("parquet"))
-    } catch { case _: Throwable =>
-      // SPARK-9974: com.twitter:parquet-hadoop-bundle:1.6.0 is not packaged into the assembly
-      // when Spark is built with SBT. So `parquet.Log` may not be found.  This try/catch block
-      // should be removed after this issue is fixed.
-    }
-  }
-
-  /**
-   * ParquetFileFormat.prepareWrite calls this function to initialize `redirectParquetLogsViaSLF4J`.
-   */
-  def redirectParquetLogs(): Unit = {}
 }

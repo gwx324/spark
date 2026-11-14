@@ -18,17 +18,21 @@
 package org.apache.spark.serializer
 
 import java.io._
+import java.lang.reflect.{InvocationHandler, Method, Proxy}
 import java.nio.ByteBuffer
 
 import scala.reflect.ClassTag
 
 import org.apache.spark.SparkConf
 import org.apache.spark.annotation.DeveloperApi
+import org.apache.spark.internal.config._
 import org.apache.spark.util.{ByteBufferInputStream, ByteBufferOutputStream, Utils}
 
 private[spark] class JavaSerializationStream(
-    out: OutputStream, counterReset: Int, extraDebugInfo: Boolean)
-  extends SerializationStream {
+    out: OutputStream,
+    counterReset: Int,
+    extraDebugInfo: Boolean)
+    extends SerializationStream {
   private val objOut = new ObjectOutputStream(out)
   private var counter = 0
 
@@ -53,14 +57,18 @@ private[spark] class JavaSerializationStream(
     this
   }
 
-  def flush() { objOut.flush() }
-  def close() { objOut.close() }
+  def flush(): Unit = { objOut.flush() }
+  def close(): Unit = { objOut.close() }
 }
 
-private[spark] class JavaDeserializationStream(in: InputStream, loader: ClassLoader)
-  extends DeserializationStream {
+private[spark] class JavaDeserializationStream(
+    in: InputStream,
+    loader: ClassLoader,
+    filter: Option[ObjectInputFilter] = None)
+    extends DeserializationStream {
 
   private val objIn = new ObjectInputStream(in) {
+
     override def resolveClass(desc: ObjectStreamClass): Class[_] =
       try {
         // scalastyle:off classforname
@@ -70,13 +78,39 @@ private[spark] class JavaDeserializationStream(in: InputStream, loader: ClassLoa
         case e: ClassNotFoundException =>
           JavaDeserializationStream.primitiveMappings.getOrElse(desc.getName, throw e)
       }
+
+    override def resolveProxyClass(ifaces: Array[String]): Class[_] = {
+      // scalastyle:off classforname
+      val resolved = ifaces.map(iface => Class.forName(iface, false, loader))
+      // scalastyle:on classforname
+      Proxy.newProxyInstance(loader, resolved, DummyInvocationHandler).getClass
+    }
+
+  }
+
+  // A JEP-290 deserialization filter for callers that restrict which classes may be
+  // instantiated on read (e.g. the master recovery store). Applied per-stream so it cannot
+  // affect other JavaSerializer users. If the stream already has a filter (e.g. a JVM-wide
+  // jdk.serialFilter), merge the two instead of replacing it, so a rejection by either one
+  // rejects. The caller's filter is consulted first: merge stops at the first rejection, so
+  // this lets a caller that tracks its own rejections see all of them.
+  filter.foreach { f =>
+    objIn.setObjectInputFilter(
+      Option(objIn.getObjectInputFilter).map(ObjectInputFilter.merge(f, _)).getOrElse(f))
   }
 
   def readObject[T: ClassTag](): T = objIn.readObject().asInstanceOf[T]
-  def close() { objIn.close() }
+  def close(): Unit = { objIn.close() }
+}
+
+private[spark] object DummyInvocationHandler extends InvocationHandler {
+  override def invoke(proxy: Any, method: Method, args: Array[AnyRef]): AnyRef = {
+    throw new UnsupportedOperationException("Not implemented")
+  }
 }
 
 private object JavaDeserializationStream {
+
   val primitiveMappings = Map[String, Class[_]](
     "boolean" -> classOf[Boolean],
     "byte" -> classOf[Byte],
@@ -86,13 +120,15 @@ private object JavaDeserializationStream {
     "long" -> classOf[Long],
     "float" -> classOf[Float],
     "double" -> classOf[Double],
-    "void" -> classOf[Void]
-  )
+    "void" -> classOf[Unit])
+
 }
 
 private[spark] class JavaSerializerInstance(
-    counterReset: Int, extraDebugInfo: Boolean, defaultClassLoader: ClassLoader)
-  extends SerializerInstance {
+    counterReset: Int,
+    extraDebugInfo: Boolean,
+    defaultClassLoader: ClassLoader)
+    extends SerializerInstance {
 
   override def serialize[T: ClassTag](t: T): ByteBuffer = {
     val bos = new ByteBufferOutputStream()
@@ -125,35 +161,43 @@ private[spark] class JavaSerializerInstance(
   def deserializeStream(s: InputStream, loader: ClassLoader): DeserializationStream = {
     new JavaDeserializationStream(s, loader)
   }
+
+  def deserializeStream(s: InputStream, filter: ObjectInputFilter): DeserializationStream = {
+    new JavaDeserializationStream(s, defaultClassLoader, Some(filter))
+  }
+
 }
 
 /**
  * :: DeveloperApi ::
  * A Spark serializer that uses Java's built-in serialization.
  *
- * Note that this serializer is not guaranteed to be wire-compatible across different versions of
+ * @note This serializer is not guaranteed to be wire-compatible across different versions of
  * Spark. It is intended to be used to serialize/de-serialize data within a single
  * Spark application.
  */
 @DeveloperApi
 class JavaSerializer(conf: SparkConf) extends Serializer with Externalizable {
-  private var counterReset = conf.getInt("spark.serializer.objectStreamReset", 100)
-  private var extraDebugInfo = conf.getBoolean("spark.serializer.extraDebugInfo", true)
+  private var counterReset = conf.get(SERIALIZER_OBJECT_STREAM_RESET)
+  private var extraDebugInfo = conf.get(SERIALIZER_EXTRA_DEBUG_INFO)
 
-  protected def this() = this(new SparkConf())  // For deserialization only
+  protected def this() = this(new SparkConf()) // For deserialization only
 
   override def newInstance(): SerializerInstance = {
     val classLoader = defaultClassLoader.getOrElse(Thread.currentThread.getContextClassLoader)
     new JavaSerializerInstance(counterReset, extraDebugInfo, classLoader)
   }
 
-  override def writeExternal(out: ObjectOutput): Unit = Utils.tryOrIOException {
-    out.writeInt(counterReset)
-    out.writeBoolean(extraDebugInfo)
-  }
+  override def writeExternal(out: ObjectOutput): Unit =
+    Utils.tryOrIOException {
+      out.writeInt(counterReset)
+      out.writeBoolean(extraDebugInfo)
+    }
 
-  override def readExternal(in: ObjectInput): Unit = Utils.tryOrIOException {
-    counterReset = in.readInt()
-    extraDebugInfo = in.readBoolean()
-  }
+  override def readExternal(in: ObjectInput): Unit =
+    Utils.tryOrIOException {
+      counterReset = in.readInt()
+      extraDebugInfo = in.readBoolean()
+    }
+
 }

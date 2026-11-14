@@ -1,0 +1,163 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.ml
+
+import org.apache.spark.annotation.Since
+import org.apache.spark.ml.linalg.{DenseVector, SparseVector, Vector, VectorUDT}
+import org.apache.spark.sql.{functions => sf}
+import org.apache.spark.sql.Column
+import org.apache.spark.sql.types.{ArrayType, DoubleType, IntegerType}
+
+// scalastyle:off
+@Since("3.0.0")
+object functions {
+// scalastyle:on
+
+  /**
+   * Converts a column of MLlib sparse/dense vectors into a column of dense arrays.
+   * @param v: the column of MLlib sparse/dense vectors
+   * @param dtype: the desired underlying data type in the returned array
+   * @return an array&lt;float&gt; if dtype is float32, or array&lt;double&gt; if dtype is float64
+   * @since 3.0.0
+   */
+  def vector_to_array(v: Column, dtype: String = "float64"): Column =
+    Column.internalFn("vector_to_array", v, sf.lit(dtype))
+
+  /**
+   * Converts a column of array of numeric type into a column of dense vectors in MLlib.
+   * @param v: the column of array&lt;NumericType&gt type
+   * @return a column of type `org.apache.spark.ml.linalg.Vector`
+   * @since 3.1.0
+   */
+  def array_to_vector(v: Column): Column = Column.internalFn("array_to_vector", v)
+
+  /**
+   * Creates a new row for each index-value pair in the given vector column. This expression is
+   * dedicated only for Spark ML. It always emits a marker row with index `-1 - vector.size` and
+   * value `Double.NaN` before each non-null vector.
+   * @param v: the column of MLlib sparse/dense vectors
+   * @param mode: `dense` emits all elements, and `sparse` emits nonzero elements
+   * @return the index and value columns of the vector elements
+   * @since 4.4.0
+   */
+  private[ml] def vector_posexplode(
+      v: Column,
+      mode: String = "sparse"): Column = {
+    Column.internalFn("ml_vector_posexplode", sf.unwrap_udt(v), sf.lit(mode))
+  }
+
+  private[ml] def vector_dot_product(left: Column, right: Column): Column =
+    Column.internalFn("ml_vector_dot_product", sf.unwrap_udt(left), sf.unwrap_udt(right))
+
+  private[ml] def vector_dot_product(left: Column, right: Vector): Column = {
+    Column.internalFn(
+      "ml_vector_dot_product",
+      sf.unwrap_udt(left),
+      vectorToStruct(right))
+  }
+
+  private[ml] def vector_scale_shift(
+      vector: Column,
+      scale: Column,
+      shift: Column): Column = {
+    val transformed = Column.internalFn(
+      "ml_vector_scale_shift",
+      sf.unwrap_udt(vector),
+      scale,
+      shift)
+    sf.wrap_udt(transformed, new VectorUDT)
+  }
+
+  private[ml] def vector_scale_shift(
+      vector: Column,
+      scale: Array[Double],
+      shift: Array[Double]): Column = {
+    val transformed = Column.internalFn(
+      "ml_vector_scale_shift",
+      sf.unwrap_udt(vector),
+      doubleArrayLiteral(scale),
+      doubleArrayLiteral(shift))
+    sf.wrap_udt(transformed, new VectorUDT)
+  }
+
+  private def doubleArrayLiteral(values: Array[Double]): Column = {
+    if (values == null) {
+      sf.lit(null).cast(ArrayType(DoubleType, containsNull = false))
+    } else {
+      sf.typedLit(values)
+    }
+  }
+
+  private def vectorToStruct(vector: Vector): Column = vector match {
+    case null => sf.lit(null).cast(new VectorUDT().sqlType)
+    case sparse: SparseVector =>
+      sf.struct(
+        sf.lit(0.toByte).alias("type"),
+        sf.lit(sparse.size).alias("size"),
+        sf.lit(sparse.indices).alias("indices"),
+        sf.lit(sparse.values).alias("values"))
+    case dense: DenseVector =>
+      sf.struct(
+        sf.lit(1.toByte).alias("type"),
+        sf.lit(null).cast(IntegerType).alias("size"),
+        sf.lit(null).cast(ArrayType(IntegerType)).alias("indices"),
+        sf.lit(dense.values).alias("values"))
+  }
+
+  private[ml] def array_binary_search(a: Column, v: Column): Column =
+    Column.internalFn("array_binary_search", a, v)
+
+  // input: vector, output: double
+  private[ml] def vector_get(v: Column, index: Column): Column = {
+    val unwrapped = sf.unwrap_udt(v)
+    val isDense = unwrapped.getField("type") === sf.lit(1)
+    val values = unwrapped.getField("values")
+    val size = sf.when(isDense, sf.array_size(values)).otherwise(unwrapped.getField("size"))
+    val sparseIdx = array_binary_search(unwrapped.getField("indices"), index)
+
+    sf.when(index >= 0 && index < size,
+      sf.when(isDense, sf.get(values, index))
+        .when(sparseIdx >= 0, sf.get(values, sparseIdx))
+        .otherwise(sf.lit(0.0))
+    ).otherwise(
+      sf.raise_error(sf.printf(
+        sf.lit(s"Vector index must be in [0, %s), but got %s"), size, index)
+      )
+    )
+  }
+
+  // input: array<double>, output: int
+  private[ml] def array_argmax(arr: Column): Column = {
+    sf.aggregate(
+      arr,
+      sf.struct(
+        sf.lit(Double.NegativeInfinity).alias("v"), // max value
+        sf.lit(-1).alias("i"),              // index of max value
+        sf.lit(0).alias("j")),              // current index
+      (acc, vv) => {
+        val v = acc.getField("v")
+        val i = acc.getField("i")
+        val j = acc.getField("j")
+        sf.when((!vv.isNaN) && (!vv.isNull) && (vv > v),
+            sf.struct(vv.alias("v"), j.alias("i"), j + 1))
+          .otherwise(sf.struct(v.alias("v"), i.alias("i"), j + 1))
+      },
+      acc => acc.getField("i")
+    )
+  }
+}

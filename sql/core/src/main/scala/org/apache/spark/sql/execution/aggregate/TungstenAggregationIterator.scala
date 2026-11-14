@@ -17,24 +17,26 @@
 
 package org.apache.spark.sql.execution.aggregate
 
-import org.apache.spark.TaskContext
+import org.apache.spark.{SparkException, TaskContext}
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate._
 import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeRowJoiner
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.execution.{UnsafeFixedWidthAggregationMap, UnsafeKVExternalSorter}
 import org.apache.spark.sql.execution.metric.SQLMetric
-import org.apache.spark.sql.types.StructType
 import org.apache.spark.unsafe.KVIterator
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * An iterator used to evaluate aggregate functions. It operates on [[UnsafeRow]]s.
  *
  * This iterator first uses hash-based aggregation to process input rows. It uses
- * a hash map to store groups and their corresponding aggregation buffers. If we
- * this map cannot allocate memory from memory manager, it spill the map into disk
- * and create a new one. After processed all the input, then merge all the spills
+ * a hash map to store groups and their corresponding aggregation buffers. If
+ * this map cannot allocate memory from memory manager, it spills the map into disk
+ * and creates a new one. After processed all the input, then merge all the spills
  * together using external sorter, and do sort-based aggregation.
  *
  * The process has the following step:
@@ -55,11 +57,14 @@ import org.apache.spark.unsafe.KVIterator
  *  - Part 3: Methods and fields used by hash-based aggregation.
  *  - Part 4: Methods and fields used when we switch to sort-based aggregation.
  *  - Part 5: Methods and fields used by sort-based aggregation.
- *  - Part 6: Loads input and process input rows.
- *  - Part 7: Public methods of this iterator.
- *  - Part 8: A utility function used to generate a result when there is no
+ *  - Part 6: Methods and fields used by adaptive partial aggregation pass-through.
+ *  - Part 7: Loads input and processes input rows.
+ *  - Part 8: Public methods of this iterator.
+ *  - Part 9: A utility function used to generate a result when there is no
  *            input and there is no grouping expression.
  *
+ * @param partIndex
+ *   index of the partition
  * @param groupingExpressions
  *   expressions for grouping keys
  * @param aggregateExpressions
@@ -77,6 +82,7 @@ import org.apache.spark.unsafe.KVIterator
  *   the iterator containing input [[UnsafeRow]]s.
  */
 class TungstenAggregationIterator(
+    partIndex: Int,
     groupingExpressions: Seq[NamedExpression],
     aggregateExpressions: Seq[AggregateExpression],
     aggregateAttributes: Seq[Attribute],
@@ -88,8 +94,16 @@ class TungstenAggregationIterator(
     testFallbackStartsAt: Option[(Int, Int)],
     numOutputRows: SQLMetric,
     peakMemory: SQLMetric,
-    spillSize: SQLMetric)
+    spillSize: SQLMetric,
+    avgHashProbe: SQLMetric,
+    numTasksFallBacked: SQLMetric,
+    numPassthroughRows: SQLMetric,
+    adaptivePartialAggEnabled: Boolean,
+    adaptiveMinRows: Long,
+    adaptiveMinCompaction: Double,
+    adaptiveMinCompactionToSpill: Double)
   extends AggregationIterator(
+    partIndex,
     groupingExpressions,
     originalInputAttributes,
     aggregateExpressions,
@@ -113,12 +127,13 @@ class TungstenAggregationIterator(
   ///////////////////////////////////////////////////////////////////////////
 
   // Creates a new aggregation buffer and initializes buffer values.
-  // This function should be only called at most two times (when we create the hash map,
-  // and when we create the re-used buffer for sort-based aggregation).
+  // This function should be called at most three times: when we create the hash map, when we
+  // create the re-used buffer for sort-based aggregation, and when we create the buffer for
+  // pass-through rows.
   private def createNewAggregationBuffer(): UnsafeRow = {
     val bufferSchema = aggregateFunctions.flatMap(_.aggBufferAttributes)
     val buffer: UnsafeRow = UnsafeProjection.create(bufferSchema.map(_.dataType))
-      .apply(new GenericMutableRow(bufferSchema.length))
+      .apply(new GenericInternalRow(bufferSchema.length))
     // Initialize declarative aggregates' buffer values
     expressionAggInitialProjection.target(buffer)(EmptyRow)
     // Initialize imperative aggregates' buffer values
@@ -127,17 +142,17 @@ class TungstenAggregationIterator(
   }
 
   // Creates a function used to generate output rows.
-  override protected def generateResultProjection(): (UnsafeRow, MutableRow) => UnsafeRow = {
+  override protected def generateResultProjection(): (UnsafeRow, InternalRow) => UnsafeRow = {
     val modes = aggregateExpressions.map(_.mode).distinct
     if (modes.nonEmpty && !modes.contains(Final) && !modes.contains(Complete)) {
       // Fast path for partial aggregation, UnsafeRowJoiner is usually faster than projection
       val groupingAttributes = groupingExpressions.map(_.toAttribute)
       val bufferAttributes = aggregateFunctions.flatMap(_.aggBufferAttributes)
-      val groupingKeySchema = StructType.fromAttributes(groupingAttributes)
-      val bufferSchema = StructType.fromAttributes(bufferAttributes)
+      val groupingKeySchema = DataTypeUtils.fromAttributes(groupingAttributes)
+      val bufferSchema = DataTypeUtils.fromAttributes(bufferAttributes.toImmutableArraySeq)
       val unsafeRowJoiner = GenerateUnsafeRowJoiner.create(groupingKeySchema, bufferSchema)
 
-      (currentGroupingKey: UnsafeRow, currentBuffer: MutableRow) => {
+      (currentGroupingKey: UnsafeRow, currentBuffer: InternalRow) => {
         unsafeRowJoiner.join(currentGroupingKey, currentBuffer.asInstanceOf[UnsafeRow])
       }
     } else {
@@ -158,12 +173,12 @@ class TungstenAggregationIterator(
   // all groups and their corresponding aggregation buffers for hash-based aggregation.
   private[this] val hashMap = new UnsafeFixedWidthAggregationMap(
     initialAggregationBuffer,
-    StructType.fromAttributes(aggregateFunctions.flatMap(_.aggBufferAttributes)),
-    StructType.fromAttributes(groupingExpressions.map(_.toAttribute)),
-    TaskContext.get().taskMemoryManager(),
+    DataTypeUtils.fromAttributes(
+      aggregateFunctions.flatMap(_.aggBufferAttributes).toImmutableArraySeq),
+    DataTypeUtils.fromAttributes(groupingExpressions.map(_.toAttribute)),
+    TaskContext.get(),
     1024 * 16, // initial capacity
-    TaskContext.get().taskMemoryManager().pageSizeBytes,
-    false // disable tracking of performance metrics
+    TaskContext.get().taskMemoryManager().pageSizeBytes
   )
 
   // The function used to read and process input rows. When processing input rows,
@@ -171,6 +186,27 @@ class TungstenAggregationIterator(
   // hashMap. If there is not enough memory, it will multiple hash-maps, spilling
   // after each becomes full then using sort to merge these spills, finally do sort
   // based aggregation.
+  //
+  // When adaptive partial aggregation is enabled (`adaptivePartialAggEnabled`), the processing may
+  // stop early and switch to pass-through mode: the remaining input rows are not added to the map
+  // but are instead emitted as single-row partial buffers by the output stage (see
+  // `nextPassThroughOutput`). The aggregation is ineffective when `rows` processed rows do not
+  // collapse into their `keys` keys by at least `threshold`, checked at two points:
+  //   - periodically, every `minRows` processed rows, over the whole epoch against
+  //     `minCompaction`;
+  //   - when the map is about to spill, over the recent rows (those since the periodic check
+  //     before last) against the higher `minCompactionToSpill`. Keeping the aggregation then
+  //     means aggregating the rest of the input through spills, which pays off only if that input
+  //     keeps repeating keys; when keys repeat across the input, the ratio of the recent rows
+  //     climbs above the epoch's as the map fills. Below the threshold, the map does not spill
+  //     and the row that could not be inserted becomes the first pass-through row. Pass-through
+  //     cannot be undone within the task, so like the periodic check this waits until the current
+  //     epoch has processed `minRows` rows; a map that fills sooner spills as usual.
+  // A spill starts a new in-memory map epoch: the row counters restart so that epoch is judged on
+  // its own rows, which lets an input whose cardinality only turns unfavorable later still be
+  // passed through. Pass-through may therefore coexist with earlier spills. The output order
+  // matches the generated path: the frozen map (or sort-based) output comes first, and the
+  // pass-through rows stream afterwards.
   private def processInputs(fallbackStartsAt: (Int, Int)): Unit = {
     if (groupingExpressions.isEmpty) {
       // If there is no grouping expressions, we can just reuse the same buffer over and over again.
@@ -183,7 +219,30 @@ class TungstenAggregationIterator(
       }
     } else {
       var i = 0
-      while (inputIter.hasNext) {
+      var processedRows = 0L
+      val minRows = adaptiveMinRows
+      // The processed-row count at which the compaction ratio is evaluated next. It advances by
+      // `minRows` after every check, and restarts after a spill so the new in-memory map epoch is
+      // judged on its own rows. `minRows = 0` disables the periodic check: the count is only ever
+      // compared after being incremented past 0, so it never matches and only the spill check
+      // below remains.
+      var nextCheckRow = minRows
+      // The spill check waits for `minRows` rows of the current epoch, and for at least one row
+      // when `minRows = 0`.
+      val spillCheckMinRows = math.max(minRows, 1L)
+      // The epoch's key count at its last periodic check, and at the check before that, where the
+      // window of recent rows that the spill check judges starts. The checks run at multiples of
+      // `minRows`, and `nextCheckRow` advances only past a check that keeps aggregating, so the
+      // window starts `2 * minRows` rows before `nextCheckRow`, or at the epoch start before the
+      // second check.
+      var checkKeys = 0L
+      var windowKeys = 0L
+      def windowRows: Long = math.max(0L, nextCheckRow - 2 * minRows)
+      // Whether `rows` processed rows fail to collapse into `keys` keys by at least `threshold`.
+      // There is no fast map on this path, so the map's keys are all the operator holds.
+      def ineffective(rows: Long, keys: Long, threshold: Double): Boolean =
+        rows < keys.toDouble * threshold
+      while (inputIter.hasNext && !passThrough) {
         val newInput = inputIter.next()
         val groupingKey = groupingProjection.apply(newInput)
         var buffer: UnsafeRow = null
@@ -191,21 +250,53 @@ class TungstenAggregationIterator(
           buffer = hashMap.getAggregationBufferFromUnsafeRow(groupingKey)
         }
         if (buffer == null) {
-          val sorter = hashMap.destructAndCreateExternalSorter()
-          if (externalSorter == null) {
-            externalSorter = sorter
+          // The map is full and would normally spill. Adaptive partial aggregation may instead
+          // bypass: keep the in-memory map as-is, pass this row and all remaining rows through,
+          // and skip the spill entirely.
+          if (adaptivePartialAggEnabled && processedRows >= spillCheckMinRows &&
+              ineffective(processedRows - windowRows, hashMap.getNumKeys() - windowKeys,
+                adaptiveMinCompactionToSpill)) {
+            passThrough = true
+            // `newInput` could not be inserted; stash a copy as the first pass-through row so it
+            // is not lost when we drain the rest of `inputIter`.
+            pendingPassThroughRow = newInput.copy()
           } else {
-            externalSorter.merge(sorter)
-          }
-          i = 0
-          buffer = hashMap.getAggregationBufferFromUnsafeRow(groupingKey)
-          if (buffer == null) {
-            // failed to allocate the first page
-            throw new OutOfMemoryError("No enough memory for aggregation")
+            val sorter = hashMap.destructAndCreateExternalSorter()
+            if (externalSorter == null) {
+              externalSorter = sorter
+            } else {
+              externalSorter.merge(sorter)
+            }
+            i = 0
+            // The map starts a new in-memory epoch, so the counters restart and the ratio of that
+            // epoch alone decides whether the remaining rows are passed through.
+            processedRows = 0L
+            nextCheckRow = minRows
+            checkKeys = 0L
+            windowKeys = 0L
+            buffer = hashMap.getAggregationBufferFromUnsafeRow(groupingKey)
+            if (buffer == null) {
+              // failed to allocate the first page
+              throw QueryExecutionErrors.aggregateOutOfMemoryError()
+            }
           }
         }
-        processRow(buffer, newInput)
-        i += 1
+        if (!passThrough) {
+          processRow(buffer, newInput)
+          i += 1
+          processedRows += 1
+          // Periodic check: if the aggregation is not collapsing enough rows, bypass it for the
+          // rest of the input.
+          if (adaptivePartialAggEnabled && processedRows == nextCheckRow) {
+            if (ineffective(processedRows, hashMap.getNumKeys(), adaptiveMinCompaction)) {
+              passThrough = true
+            } else {
+              nextCheckRow += minRows
+              windowKeys = checkKeys
+              checkKeys = hashMap.getNumKeys()
+            }
+          }
+        }
       }
 
       if (externalSorter != null) {
@@ -242,15 +333,16 @@ class TungstenAggregationIterator(
     // Basically the value of the KVIterator returned by externalSorter
     // will be just aggregation buffer, so we rewrite the aggregateExpressions to reflect it.
     val newExpressions = aggregateExpressions.map {
-      case agg @ AggregateExpression(_, Partial, _, _) =>
+      case agg @ AggregateExpression(_, Partial, _, _, _) =>
         agg.copy(mode = PartialMerge)
-      case agg @ AggregateExpression(_, Complete, _, _) =>
+      case agg @ AggregateExpression(_, Complete, _, _, _) =>
         agg.copy(mode = Final)
       case other => other
     }
     val newFunctions = initializeAggregateFunctions(newExpressions, 0)
     val newInputAttributes = newFunctions.flatMap(_.inputAggBufferAttributes)
-    sortBasedProcessRow = generateProcessRow(newExpressions, newFunctions, newInputAttributes)
+    sortBasedProcessRow = generateProcessRow(
+      newExpressions, newFunctions.toImmutableArraySeq, newInputAttributes.toImmutableArraySeq)
 
     // Step 5: Get the sorted iterator from the externalSorter.
     sortedKVIterator = externalSorter.sortedIterator()
@@ -270,6 +362,7 @@ class TungstenAggregationIterator(
 
     // Step 7: set sortBased to true.
     sortBased = true
+    numTasksFallBacked += 1
   }
 
   ///////////////////////////////////////////////////////////////////////////
@@ -300,7 +393,7 @@ class TungstenAggregationIterator(
   private[this] val sortBasedAggregationBuffer: UnsafeRow = createNewAggregationBuffer()
 
   // The function used to process rows in a group
-  private[this] var sortBasedProcessRow: (MutableRow, InternalRow) => Unit = null
+  private[this] var sortBasedProcessRow: (InternalRow, InternalRow) => Unit = null
 
   // Processes rows in the current group. It will stop when it find a new group.
   private def processCurrentSortedGroup(): Unit = {
@@ -324,7 +417,7 @@ class TungstenAggregationIterator(
       val inputAggregationBuffer = sortedKVIterator.getValue
 
       // Check if the current row belongs the current input row.
-      if (currentGroupingKey.equals(groupingKey)) {
+      if (hashMap.keysEqual(currentGroupingKey, groupingKey)) {
         sortBasedProcessRow(sortBasedAggregationBuffer, inputAggregationBuffer)
 
         hasNext = sortedKVIterator.next()
@@ -345,7 +438,48 @@ class TungstenAggregationIterator(
   }
 
   ///////////////////////////////////////////////////////////////////////////
-  // Part 6: Loads input rows and setup aggregationBufferMapIterator if we
+  // Part 6: Methods and fields used by adaptive partial aggregation pass-through.
+  ///////////////////////////////////////////////////////////////////////////
+
+  // Indicates that partial aggregation has been bypassed and the remaining input rows should be
+  // passed through as single-row partial buffers. Set in `processInputs` by either check point.
+  // It may coexist with earlier spills. The output order matches the generated path: the frozen
+  // map (or sort-based) output comes first, and the pass-through rows stream afterwards.
+  private[this] var passThrough: Boolean = false
+
+  // The row that could not be inserted at the spill check. It is stashed here (as
+  // a copy) so it becomes the first pass-through row rather than being lost.
+  private[this] var pendingPassThroughRow: InternalRow = null
+
+  // A reused aggregation buffer for building single-row partial buffers during pass-through. It is
+  // re-initialized from `initialAggregationBuffer` for every passed-through row.
+  private[this] lazy val passThroughAggregationBuffer: UnsafeRow = createNewAggregationBuffer()
+
+  // Whether there are remaining pass-through rows to emit.
+  private def passThroughHasNext: Boolean =
+    passThrough && (pendingPassThroughRow != null || inputIter.hasNext)
+
+  // Emits the next input row as a single-row partial aggregation buffer, i.e. a group of size one.
+  // The output (grouping key ++ buffer) is a valid partial buffer that the downstream Final
+  // aggregation merges, so the result is identical to running partial aggregation on this row.
+  private def nextPassThroughOutput(): UnsafeRow = {
+    val row = if (pendingPassThroughRow != null) {
+      val stashed = pendingPassThroughRow
+      pendingPassThroughRow = null
+      stashed
+    } else {
+      inputIter.next()
+    }
+    val groupingKey = groupingProjection.apply(row)
+    // Reset the buffer to initial values, then update it with this single row.
+    passThroughAggregationBuffer.copyFrom(initialAggregationBuffer)
+    processRow(passThroughAggregationBuffer, row)
+    numPassthroughRows += 1
+    generateOutput(groupingKey, passThroughAggregationBuffer)
+  }
+
+  ///////////////////////////////////////////////////////////////////////////
+  // Part 7: Loads input rows and sets up aggregationBufferMapIterator if we
   //         have not switched to sort-based aggregation.
   ///////////////////////////////////////////////////////////////////////////
 
@@ -367,17 +501,34 @@ class TungstenAggregationIterator(
     }
   }
 
+  TaskContext.get().addTaskCompletionListener[Unit](_ => {
+    // At the end of the task, update the task's peak memory usage. Since we destroy
+    // the map to create the sorter, their memory usages should not overlap, so it is safe
+    // to just use the max of the two.
+    val mapMemory = hashMap.getPeakMemoryUsedBytes
+    val sorterMemory = Option(externalSorter).map(_.getPeakMemoryUsedBytes).getOrElse(0L)
+    val maxMemory = Math.max(mapMemory, sorterMemory)
+    val metrics = TaskContext.get().taskMetrics()
+    peakMemory.set(maxMemory)
+    spillSize.set(metrics.memoryBytesSpilled - spillSizeBefore)
+    metrics.incPeakExecutionMemory(maxMemory)
+
+    // Updating average hashmap probe
+    avgHashProbe.set(hashMap.getAvgHashProbesPerKey)
+  })
+
   ///////////////////////////////////////////////////////////////////////////
-  // Part 7: Iterator's public methods.
+  // Part 8: Iterator's public methods.
   ///////////////////////////////////////////////////////////////////////////
 
   override final def hasNext: Boolean = {
-    (sortBased && sortedInputHasNewGroup) || (!sortBased && mapIteratorHasNext)
+    (sortBased && sortedInputHasNewGroup) || (!sortBased && mapIteratorHasNext) ||
+      passThroughHasNext
   }
 
   override final def next(): UnsafeRow = {
     if (hasNext) {
-      val res = if (sortBased) {
+      val res = if (sortBased && sortedInputHasNewGroup) {
         // Process the current group.
         processCurrentSortedGroup()
         // Generate output row for the current group.
@@ -386,7 +537,7 @@ class TungstenAggregationIterator(
         sortBasedAggregationBuffer.copyFrom(initialAggregationBuffer)
 
         outputRow
-      } else {
+      } else if (mapIteratorHasNext) {
         // We did not fall back to sort-based aggregation.
         val result =
           generateOutput(
@@ -400,27 +551,22 @@ class TungstenAggregationIterator(
         if (!mapIteratorHasNext) {
           // If there is no input from aggregationBufferMapIterator, we copy current result.
           val resultCopy = result.copy()
-          // Then, we free the map.
+          // Then, we free the map. Pass-through (if any) does not use the map.
           hashMap.free()
 
           resultCopy
         } else {
           result
         }
+      } else {
+        // Adaptive partial aggregation bypassed partial aggregation: emit the remaining input
+        // rows as single-row partial buffers, after the frozen map output above. The drain is
+        // not timed: timing each row would cost two `System.nanoTime()` calls per row, comparable
+        // to passing it through, and `next()` is pulled lazily, so timing from the first to the
+        // last pass-through row would also count the downstream work between the calls.
+        nextPassThroughOutput()
       }
 
-      // If this is the last record, update the task's peak memory usage. Since we destroy
-      // the map to create the sorter, their memory usages should not overlap, so it is safe
-      // to just use the max of the two.
-      if (!hasNext) {
-        val mapMemory = hashMap.getPeakMemoryUsedBytes
-        val sorterMemory = Option(externalSorter).map(_.getPeakMemoryUsedBytes).getOrElse(0L)
-        val maxMemory = Math.max(mapMemory, sorterMemory)
-        val metrics = TaskContext.get().taskMetrics()
-        peakMemory += maxMemory
-        spillSize += metrics.memoryBytesSpilled - spillSizeBefore
-        metrics.incPeakExecutionMemory(maxMemory)
-      }
       numOutputRows += 1
       res
     } else {
@@ -430,7 +576,7 @@ class TungstenAggregationIterator(
   }
 
   ///////////////////////////////////////////////////////////////////////////
-  // Part 8: Utility functions
+  // Part 9: Utility functions
   ///////////////////////////////////////////////////////////////////////////
 
   /**
@@ -445,7 +591,7 @@ class TungstenAggregationIterator(
       hashMap.free()
       resultCopy
     } else {
-      throw new IllegalStateException(
+      throw SparkException.internalError(
         "This method should not be called when groupingExpressions is not empty.")
     }
   }

@@ -24,6 +24,7 @@ import org.apache.spark.ml.linalg.{BLAS, Vector, Vectors}
 import org.apache.spark.ml.param.{IntParam, ParamMap}
 import org.apache.spark.ml.util.Identifiable
 import org.apache.spark.sql.{Dataset, Row, SparkSession}
+import org.apache.spark.sql.functions.col
 
 /**
  * A simple example demonstrating how to write your own learning algorithm using Estimator,
@@ -36,12 +37,11 @@ import org.apache.spark.sql.{Dataset, Row, SparkSession}
  */
 object DeveloperApiExample {
 
-  def main(args: Array[String]) {
+  def main(args: Array[String]): Unit = {
     val spark = SparkSession
-      .builder
+      .builder()
       .appName("DeveloperApiExample")
       .getOrCreate()
-    import spark.implicits._
 
     // Prepare training data.
     val training = spark.createDataFrame(Seq(
@@ -53,7 +53,7 @@ object DeveloperApiExample {
     // Create a LogisticRegression instance. This instance is an Estimator.
     val lr = new MyLogisticRegression()
     // Print out the parameters, documentation, and any default values.
-    println("MyLogisticRegression parameters:\n" + lr.explainParams() + "\n")
+    println(s"MyLogisticRegression parameters:\n ${lr.explainParams()}")
 
     // We may set parameters using setter methods.
     lr.setMaxIter(10)
@@ -121,8 +121,10 @@ private class MyLogisticRegression(override val uid: String)
 
   // This method is used by fit()
   override protected def train(dataset: Dataset[_]): MyLogisticRegressionModel = {
-    // Extract columns from data using helper method.
-    val oldDataset = extractLabeledPoints(dataset)
+    // Extract columns from data.
+    val oldDataset = dataset.select(col($(labelCol)).cast("double"), col($(featuresCol)))
+      .rdd
+      .map { case Row(l: Double, f: Vector) => LabeledPoint(l, f) }
 
     // Do learning to estimate the coefficients vector.
     val numFeatures = oldDataset.take(1)(0).features.size
@@ -162,17 +164,17 @@ private class MyLogisticRegressionModel(
    *          This raw prediction may be any real number, where a larger value indicates greater
    *          confidence for that label.
    */
-  override protected def predictRaw(features: Vector): Vector = {
+  override def predictRaw(features: Vector): Vector = {
     val margin = BLAS.dot(features, coefficients)
     // There are 2 classes (binary classification), so we return a length-2 vector,
     // where index i corresponds to class i (i = 0, 1).
     Vectors.dense(-margin, margin)
   }
 
-  /** Number of classes the label can take. 2 indicates binary classification. */
+  // Number of classes the label can take. 2 indicates binary classification.
   override val numClasses: Int = 2
 
-  /** Number of features the model was trained on. */
+  // Number of features the model was trained on.
   override val numFeatures: Int = coefficients.size
 
   /**

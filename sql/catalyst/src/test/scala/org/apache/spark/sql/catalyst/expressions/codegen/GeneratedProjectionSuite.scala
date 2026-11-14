@@ -23,20 +23,22 @@ import org.apache.spark.SparkFunSuite
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.util.GenericArrayData
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * A test suite for generated projections
  */
-class GeneratedProjectionSuite extends SparkFunSuite {
+class GeneratedProjectionSuite extends SparkFunSuite with ExpressionEvalHelper {
 
   test("generated projections on wider table") {
     val N = 1000
-    val wideRow1 = new GenericInternalRow((1 to N).toArray[Any])
+    val wideRow1 = new GenericInternalRow((0 until N).toArray[Any])
     val schema1 = StructType((1 to N).map(i => StructField("", IntegerType)))
     val wideRow2 = new GenericInternalRow(
-      (1 to N).map(i => UTF8String.fromString(i.toString)).toArray[Any])
+      (0 until N).map(i => UTF8String.fromString(i.toString)).toArray[Any])
     val schema2 = StructType((1 to N).map(i => StructField("", StringType)))
     val joined = new JoinedRow(wideRow1, wideRow2)
     val joinedSchema = StructType(schema1 ++ schema2)
@@ -48,34 +50,84 @@ class GeneratedProjectionSuite extends SparkFunSuite {
     val unsafeProj = UnsafeProjection.create(nestedSchema)
     val unsafe: UnsafeRow = unsafeProj(nested)
     (0 until N).foreach { i =>
-      val s = UTF8String.fromString((i + 1).toString)
-      assert(i + 1 === unsafe.getInt(i + 2))
+      val s = UTF8String.fromString(i.toString)
+      assert(i === unsafe.getInt(i + 2))
       assert(s === unsafe.getUTF8String(i + 2 + N))
-      assert(i + 1 === unsafe.getStruct(0, N * 2).getInt(i))
+      assert(i === unsafe.getStruct(0, N * 2).getInt(i))
       assert(s === unsafe.getStruct(0, N * 2).getUTF8String(i + N))
-      assert(i + 1 === unsafe.getStruct(1, N * 2).getInt(i))
+      assert(i === unsafe.getStruct(1, N * 2).getInt(i))
       assert(s === unsafe.getStruct(1, N * 2).getUTF8String(i + N))
     }
 
     // test generated SafeProjection
-    val safeProj = FromUnsafeProjection(nestedSchema)
+    val safeProj = SafeProjection.create(nestedSchema)
     val result = safeProj(unsafe)
     // Can't compare GenericInternalRow with JoinedRow directly
     (0 until N).foreach { i =>
-      val r = i + 1
-      val s = UTF8String.fromString((i + 1).toString)
-      assert(r === result.getInt(i + 2))
+      val s = UTF8String.fromString(i.toString)
+      assert(i === result.getInt(i + 2))
       assert(s === result.getUTF8String(i + 2 + N))
-      assert(r === result.getStruct(0, N * 2).getInt(i))
+      assert(i === result.getStruct(0, N * 2).getInt(i))
       assert(s === result.getStruct(0, N * 2).getUTF8String(i + N))
-      assert(r === result.getStruct(1, N * 2).getInt(i))
+      assert(i === result.getStruct(1, N * 2).getInt(i))
       assert(s === result.getStruct(1, N * 2).getUTF8String(i + N))
     }
 
     // test generated MutableProjection
     val exprs = nestedSchema.fields.zipWithIndex.map { case (f, i) =>
       BoundReference(i, f.dataType, true)
+    }.toImmutableArraySeq
+    val mutableProj = GenerateMutableProjection.generate(exprs)
+    val row1 = mutableProj(result)
+    assert(result === row1)
+    val row2 = mutableProj(result)
+    assert(result === row2)
+  }
+
+  test("SPARK-18016: generated projections on wider table requiring class-splitting") {
+    val N = 4000
+    val wideRow1 = new GenericInternalRow((0 until N).toArray[Any])
+    val schema1 = StructType((1 to N).map(i => StructField("", IntegerType)))
+    val wideRow2 = new GenericInternalRow(
+      (0 until N).map(i => UTF8String.fromString(i.toString)).toArray[Any])
+    val schema2 = StructType((1 to N).map(i => StructField("", StringType)))
+    val joined = new JoinedRow(wideRow1, wideRow2)
+    val joinedSchema = StructType(schema1 ++ schema2)
+    val nested = new JoinedRow(InternalRow(joined, joined), joined)
+    val nestedSchema = StructType(
+      Seq(StructField("", joinedSchema), StructField("", joinedSchema)) ++ joinedSchema)
+
+    // test generated UnsafeProjection
+    val unsafeProj = UnsafeProjection.create(nestedSchema)
+    val unsafe: UnsafeRow = unsafeProj(nested)
+    (0 until N).foreach { i =>
+      val s = UTF8String.fromString(i.toString)
+      assert(i === unsafe.getInt(i + 2))
+      assert(s === unsafe.getUTF8String(i + 2 + N))
+      assert(i === unsafe.getStruct(0, N * 2).getInt(i))
+      assert(s === unsafe.getStruct(0, N * 2).getUTF8String(i + N))
+      assert(i === unsafe.getStruct(1, N * 2).getInt(i))
+      assert(s === unsafe.getStruct(1, N * 2).getUTF8String(i + N))
     }
+
+    // test generated SafeProjection
+    val safeProj = SafeProjection.create(nestedSchema)
+    val result = safeProj(unsafe)
+    // Can't compare GenericInternalRow with JoinedRow directly
+    (0 until N).foreach { i =>
+      val s = UTF8String.fromString(i.toString)
+      assert(i === result.getInt(i + 2))
+      assert(s === result.getUTF8String(i + 2 + N))
+      assert(i === result.getStruct(0, N * 2).getInt(i))
+      assert(s === result.getStruct(0, N * 2).getUTF8String(i + N))
+      assert(i === result.getStruct(1, N * 2).getInt(i))
+      assert(s === result.getStruct(1, N * 2).getUTF8String(i + N))
+    }
+
+    // test generated MutableProjection
+    val exprs = nestedSchema.fields.zipWithIndex.map { case (f, i) =>
+      BoundReference(i, f.dataType, true)
+    }.toImmutableArraySeq
     val mutableProj = GenerateMutableProjection.generate(exprs)
     val row1 = mutableProj(result)
     assert(result === row1)
@@ -97,7 +149,7 @@ class GeneratedProjectionSuite extends SparkFunSuite {
     assert(unsafeRow.getArray(1).getBinary(1) === null)
     assert(java.util.Arrays.equals(unsafeRow.getArray(1).getBinary(2), Array[Byte](3, 4)))
 
-    val safeProj = FromUnsafeProjection(fields)
+    val safeProj = SafeProjection.create(fields)
     val row2 = safeProj(unsafeRow)
     assert(row2 === row)
   }
@@ -121,5 +173,152 @@ class GeneratedProjectionSuite extends SparkFunSuite {
     val unsafe3 = unsafeProj(row1).copy()
     assert(unsafe1 === unsafe3)
     assert(unsafe1.getStruct(1, 7) === unsafe3.getStruct(1, 7))
+  }
+
+  test("MutableProjection should not cache content from the input row") {
+    val mutableProj = GenerateMutableProjection.generate(
+      Seq(BoundReference(0, new StructType().add("i", StringType), true)))
+    val row = new GenericInternalRow(1)
+    mutableProj.target(row)
+
+    val unsafeProj = GenerateUnsafeProjection.generate(
+      Seq(BoundReference(0, new StructType().add("i", StringType), true)))
+    val unsafeRow = unsafeProj.apply(InternalRow(InternalRow(UTF8String.fromString("a"))))
+
+    mutableProj.apply(unsafeRow)
+    assert(row.getStruct(0, 1).getString(0) == "a")
+
+    // Even if the input row of the mutable projection has been changed, the target mutable row
+    // should keep same.
+    unsafeProj.apply(InternalRow(InternalRow(UTF8String.fromString("b"))))
+    assert(row.getStruct(0, 1).getString(0).toString == "a")
+  }
+
+  test("SafeProjection should not cache content from the input row") {
+    val safeProj = GenerateSafeProjection.generate(
+      Seq(BoundReference(0, new StructType().add("i", StringType), true)))
+
+    val unsafeProj = GenerateUnsafeProjection.generate(
+      Seq(BoundReference(0, new StructType().add("i", StringType), true)))
+    val unsafeRow = unsafeProj.apply(InternalRow(InternalRow(UTF8String.fromString("a"))))
+
+    val row = safeProj.apply(unsafeRow)
+    assert(row.getStruct(0, 1).getString(0) == "a")
+
+    // Even if the input row of the mutable projection has been changed, the target mutable row
+    // should keep same.
+    unsafeProj.apply(InternalRow(InternalRow(UTF8String.fromString("b"))))
+    assert(row.getStruct(0, 1).getString(0).toString == "a")
+  }
+
+  test("SPARK-57180: SafeProjection over statically non-nullable fields") {
+    // Non-nullable fields take the dead-branch-free path in GenerateSafeProjection (no
+    // setNullAt). Cover atomic, struct and array types and verify the projected values.
+    val fields = Array[DataType](
+      IntegerType,
+      StringType,
+      new StructType().add("i", IntegerType, nullable = false),
+      ArrayType(IntegerType, containsNull = false))
+    val refs = fields.zipWithIndex.map { case (dt, i) =>
+      BoundReference(i, dt, nullable = false)
+    }.toImmutableArraySeq
+
+    val safeProj = GenerateSafeProjection.generate(refs)
+    val unsafeProj = GenerateUnsafeProjection.generate(refs)
+    val input = InternalRow(
+      1,
+      UTF8String.fromString("a"),
+      InternalRow(2),
+      new GenericArrayData(Array(3, 4)))
+    val row = safeProj.apply(unsafeProj.apply(input))
+
+    assert(row.getInt(0) == 1)
+    assert(row.getUTF8String(1).toString == "a")
+    assert(row.getStruct(2, 1).getInt(0) == 2)
+    assert(row.getArray(3).toIntArray().sameElements(Array(3, 4)))
+  }
+
+  test("SPARK-22699: GenerateSafeProjection should not use global variables for struct") {
+    val safeProj = GenerateSafeProjection.generate(
+      Seq(BoundReference(0, new StructType().add("i", IntegerType), true)))
+    val globalVariables = safeProj.getClass.getDeclaredFields
+    // We need always 3 variables:
+    // - one is a reference to this
+    // - one is the references object
+    // - one is the mutableRow
+    assert(globalVariables.length == 3)
+  }
+
+  test("SPARK-18016: generated projections on wider table requiring state compaction") {
+    val N = 6000
+    val wideRow1 = new GenericInternalRow(new Array[Any](N))
+    val schema1 = StructType((1 to N).map(i => StructField("", IntegerType)))
+    val wideRow2 = new GenericInternalRow(
+      Array.tabulate[Any](N)(i => UTF8String.fromString(i.toString)))
+    val schema2 = StructType((1 to N).map(i => StructField("", StringType)))
+    val joined = new JoinedRow(wideRow1, wideRow2)
+    val joinedSchema = StructType(schema1 ++ schema2)
+    val nested = new JoinedRow(InternalRow(joined, joined), joined)
+    val nestedSchema = StructType(
+      Seq(StructField("", joinedSchema), StructField("", joinedSchema)) ++ joinedSchema)
+
+    val safeProj = SafeProjection.create(nestedSchema)
+    val result = safeProj(nested)
+
+    // test generated MutableProjection
+    val exprs = nestedSchema.fields.zipWithIndex.map { case (f, i) =>
+      BoundReference(i, f.dataType, true)
+    }.toImmutableArraySeq
+    val mutableProj = GenerateMutableProjection.generate(exprs)
+    val row1 = mutableProj(result)
+    assert(result === row1)
+    val row2 = mutableProj(result)
+    assert(result === row2)
+  }
+
+  test("SPARK-33473: subexpression elimination for interpreted SafeProjection") {
+    Seq("true", "false").foreach { enabled =>
+      withSQLConf(
+        SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> enabled,
+        SQLConf.CODEGEN_FACTORY_MODE.key -> CodegenObjectFactoryMode.NO_CODEGEN.toString) {
+        val one = BoundReference(0, DoubleType, true)
+        val two = BoundReference(1, DoubleType, true)
+
+        val mul = Multiply(one, two)
+        val mul2 = Multiply(mul, mul)
+        val sqrt = Sqrt(mul2)
+        val sum = Add(mul2, sqrt)
+
+        val proj = SafeProjection.create(Seq(sum))
+        val result = (d1: Double, d2: Double) =>
+          ((d1 * d2) * (d1 * d2)) + Math.sqrt((d1 * d2) * (d1 * d2))
+
+        val inputRows = Seq(
+          InternalRow.fromSeq(Seq(1.0, 2.0)),
+          InternalRow.fromSeq(Seq(2.0, 3.0)),
+          InternalRow.fromSeq(Seq(1.0, null)),
+          InternalRow.fromSeq(Seq(null, 2.0)),
+          InternalRow.fromSeq(Seq(3.0, 4.0)),
+          InternalRow.fromSeq(Seq(null, null))
+        )
+        val expectedResults = Seq(
+          result(1.0, 2.0),
+          result(2.0, 3.0),
+          null,
+          null,
+          result(3.0, 4.0),
+          null
+        )
+
+        inputRows.zip(expectedResults).foreach { case (inputRow, expected) =>
+          val projRow = proj.apply(inputRow)
+          if (expected != null) {
+            assert(projRow.getDouble(0) == expected)
+          } else {
+            assert(projRow.isNullAt(0))
+          }
+        }
+      }
+    }
   }
 }

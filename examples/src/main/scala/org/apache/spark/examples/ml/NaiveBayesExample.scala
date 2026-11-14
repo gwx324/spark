@@ -27,7 +27,7 @@ import org.apache.spark.sql.SparkSession
 object NaiveBayesExample {
   def main(args: Array[String]): Unit = {
     val spark = SparkSession
-      .builder
+      .builder()
       .appName("NaiveBayesExample")
       .getOrCreate()
 
@@ -52,7 +52,7 @@ object NaiveBayesExample {
       .setPredictionCol("prediction")
       .setMetricName("accuracy")
     val accuracy = evaluator.evaluate(predictions)
-    println("Test set accuracy = " + accuracy)
+    println(s"Test set accuracy = $accuracy")
     // $example off$
 
     spark.stop()

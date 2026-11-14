@@ -31,9 +31,7 @@ final class ShuffleInMemorySorter {
   private static final class SortComparator implements Comparator<PackedRecordPointer> {
     @Override
     public int compare(PackedRecordPointer left, PackedRecordPointer right) {
-      int leftId = left.getPartitionId();
-      int rightId = right.getPartitionId();
-      return leftId < rightId ? -1 : (leftId > rightId ? 1 : 0);
+      return Integer.compare(left.getPartitionId(), right.getPartitionId());
     }
   }
   private static final SortComparator SORT_COMPARATOR = new SortComparator();
@@ -66,7 +64,7 @@ final class ShuffleInMemorySorter {
    */
   private int usableCapacity = 0;
 
-  private int initialSize;
+  private final int initialSize;
 
   ShuffleInMemorySorter(MemoryConsumer consumer, int initialSize, boolean useRadixSort) {
     this.consumer = consumer;
@@ -78,9 +76,13 @@ final class ShuffleInMemorySorter {
   }
 
   private int getUsableCapacity() {
+    return getUsableCapacity(array.size());
+  }
+
+  private int getUsableCapacity(long size) {
     // Radix sort requires same amount of used memory as buffer, Tim sort requires
     // half of the used memory as buffer.
-    return (int) (array.size() / (useRadixSort ? 2 : 1.5));
+    return (int) (size / (useRadixSort ? 2 : 1.5));
   }
 
   public void free() {
@@ -94,25 +96,47 @@ final class ShuffleInMemorySorter {
     return pos;
   }
 
-  public void reset() {
-    if (consumer != null) {
-      consumer.freeArray(array);
-      array = consumer.allocateArray(initialSize);
-      usableCapacity = getUsableCapacity();
+  public int getInitialSize() {
+    return initialSize;
+  }
+
+  public long getInitialSizeWithUsableCapacity() {
+    long size = initialSize;
+    while (getUsableCapacity(size) == 0) {
+      size = Math.multiplyExact(size, 2L);
     }
+    return size;
+  }
+
+  public boolean hasPointerArray() {
+    return array != null;
+  }
+
+  public void reset() {
     pos = 0;
+    if (consumer != null) {
+      if (array != null) {
+        consumer.freeArray(array);
+      }
+      // Allocate the replacement lazily. reset() is called while spilling, and allocating here can
+      // recursively trigger another spill while a partially complete allocation is still retained.
+      array = null;
+      usableCapacity = 0;
+    }
   }
 
   public void expandPointerArray(LongArray newArray) {
-    assert(newArray.size() > array.size());
-    Platform.copyMemory(
-      array.getBaseObject(),
-      array.getBaseOffset(),
-      newArray.getBaseObject(),
-      newArray.getBaseOffset(),
-      pos * 8L
-    );
-    consumer.freeArray(array);
+    if (array != null) {
+      assert(newArray.size() > array.size());
+      Platform.copyMemory(
+        array.getBaseObject(),
+        array.getBaseOffset(),
+        newArray.getBaseObject(),
+        newArray.getBaseOffset(),
+        pos * 8L
+      );
+      consumer.freeArray(array);
+    }
     array = newArray;
     usableCapacity = getUsableCapacity();
   }
@@ -122,6 +146,9 @@ final class ShuffleInMemorySorter {
   }
 
   public long getMemoryUsage() {
+    if (array == null) {
+      return 0L;
+    }
     return array.size() * 8;
   }
 
@@ -173,6 +200,10 @@ final class ShuffleInMemorySorter {
    * Return an iterator over record pointers in sorted order.
    */
   public ShuffleSorterIterator getSortedIterator() {
+    if (pos == 0) {
+      return new ShuffleSorterIterator(0, array, 0);
+    }
+
     int offset = 0;
     if (useRadixSort) {
       offset = RadixSort.sort(

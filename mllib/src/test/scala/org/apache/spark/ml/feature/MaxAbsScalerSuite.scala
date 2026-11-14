@@ -14,15 +14,30 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.spark.ml.feature
 
-import org.apache.spark.SparkFunSuite
 import org.apache.spark.ml.linalg.{Vector, Vectors}
-import org.apache.spark.ml.util.{DefaultReadWriteTest, MLTestingUtils}
-import org.apache.spark.mllib.util.MLlibTestSparkContext
+import org.apache.spark.ml.util.{DefaultReadWriteTest, MLTest, MLTestingUtils}
 import org.apache.spark.sql.Row
 
-class MaxAbsScalerSuite extends SparkFunSuite with MLlibTestSparkContext with DefaultReadWriteTest {
+class MaxAbsScalerSuite extends MLTest with DefaultReadWriteTest {
+
+  import testImplicits._
+
+  test("MaxAbsScalerModel estimated size") {
+    val model = new MaxAbsScaler()
+      .setInputCol("features")
+      .setOutputCol("scaled")
+      .fit(Seq(
+        Tuple1(Vectors.dense(1.0, 0.0)),
+        Tuple1(Vectors.dense(0.0, 1.0))).toDF("features"))
+
+    val maxSize = 2 * 1024
+    assert(model.estimatedSize < maxSize,
+      s"Estimation (${model.estimatedSize}) should be less than $maxSize")
+  }
+
   test("MaxAbsScaler fit basic case") {
     val data = Array(
       Vectors.dense(1, 0, 100),
@@ -36,19 +51,22 @@ class MaxAbsScalerSuite extends SparkFunSuite with MLlibTestSparkContext with De
       Vectors.sparse(3, Array(0, 2), Array(-1, -1)),
       Vectors.sparse(3, Array(0), Array(-0.75)))
 
-    val df = spark.createDataFrame(data.zip(expected)).toDF("features", "expected")
+    val df = data.zip(expected).toSeq.toDF("features", "expected")
     val scaler = new MaxAbsScaler()
       .setInputCol("features")
       .setOutputCol("scaled")
 
     val model = scaler.fit(df)
-    model.transform(df).select("expected", "scaled").collect()
-      .foreach { case Row(vector1: Vector, vector2: Vector) =>
-      assert(vector1.equals(vector2), s"MaxAbsScaler ut error: $vector2 should be $vector1")
+    val transformed = model.transform(df)
+    checkVectorSizeOnDF(transformed, "scaled", model.maxAbs.size)
+
+    testTransformer[(Vector, Vector)](df, model, "expected", "scaled") {
+      case Row(expectedVec: Vector, actualVec: Vector) =>
+        assert(expectedVec === actualVec,
+          s"MaxAbsScaler error: Expected $expectedVec but computed $actualVec")
     }
 
-    // copied model must have the same parent.
-    MLTestingUtils.checkCopy(model)
+    MLTestingUtils.checkCopyAndUids(scaler, model)
   }
 
   test("MaxAbsScaler read/write") {

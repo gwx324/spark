@@ -15,7 +15,7 @@
 # limitations under the License.
 #
 
-"""
+r"""
  Counts words in UTF8 encoded, '\n' delimited text received from the network over a
  sliding window of configurable duration. Each line from the network is tagged
  with a timestamp that is used to determine the windows into which it falls.
@@ -39,21 +39,17 @@
 
  One recommended <window duration>, <slide duration> pair is 10, 5
 """
-from __future__ import print_function
-
 import sys
 
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import explode
-from pyspark.sql.functions import split
-from pyspark.sql.functions import window
+from pyspark.sql.functions import explode, split, window
 
 if __name__ == "__main__":
     if len(sys.argv) != 5 and len(sys.argv) != 4:
         msg = ("Usage: structured_network_wordcount_windowed.py <hostname> <port> "
                "<window duration in seconds> [<slide duration in seconds>]")
         print(msg, file=sys.stderr)
-        exit(-1)
+        sys.exit(-1)
 
     host = sys.argv[1]
     port = int(sys.argv[2])

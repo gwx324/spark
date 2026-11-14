@@ -18,18 +18,15 @@
 """
 Randomly generated RDDs.
 """
-from __future__ import print_function
-
 import sys
 
 from pyspark import SparkContext
 from pyspark.mllib.random import RandomRDDs
 
-
 if __name__ == "__main__":
     if len(sys.argv) not in [1, 2]:
         print("Usage: random_rdd_generation", file=sys.stderr)
-        exit(-1)
+        sys.exit(-1)
 
     sc = SparkContext(appName="PythonRandomRDDGeneration")
 

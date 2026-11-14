@@ -1,0 +1,2627 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.catalyst.expressions.variant
+
+import java.time.{LocalDateTime, Period, ZoneId, ZoneOffset}
+
+import scala.collection.mutable
+import scala.reflect.runtime.universe.TypeTag
+
+import org.apache.spark.{SparkFunSuite, SparkRuntimeException}
+import org.apache.spark.sql.Row
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.analysis.ResolveTimeZone
+import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.util.DateTimeConstants._
+import org.apache.spark.sql.catalyst.util.DateTimeTestUtils
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.types._
+import org.apache.spark.types.variant.{Variant, VariantBuilder}
+import org.apache.spark.types.variant.VariantUtil._
+import org.apache.spark.unsafe.types.{UTF8String, VariantVal}
+import org.apache.spark.util.collection.Utils.createArray
+
+class VariantExpressionSuite extends SparkFunSuite with ExpressionEvalHelper {
+  // Zero-extend each byte in the array with the appropriate number of bytes.
+  // Used to manually construct variant binary values with a given offset size.
+  // E.g. padded(Array(1,2,3), 3) will produce Array(1,0,0,2,0,0,3,0,0).
+  private def padded(a: Array[Byte], size: Int): Array[Byte] = {
+    a.flatMap { b =>
+      val padding = List.fill(size - 1)(0.toByte)
+      b :: padding
+    }
+  }
+
+  test("to_json malformed") {
+    def check(
+        value: Array[Byte],
+        metadata: Array[Byte],
+        condition: String = "MALFORMED_VARIANT",
+        parameters: Map[String, String] = Map.empty): Unit = {
+      checkErrorInExpression[SparkRuntimeException](
+        ResolveTimeZone.resolveTimeZones(
+          StructsToJson(Map.empty, Literal(new VariantVal(value, metadata)))),
+        condition,
+        parameters
+      )
+    }
+
+    val emptyMetadata = Array[Byte](VERSION, 0, 0)
+    // INT8 only has 7 byte content.
+    check(Array(primitiveHeader(INT8), 0, 0, 0, 0, 0, 0, 0), emptyMetadata)
+    // DECIMAL16 only has 15 byte content.
+    check(Array(primitiveHeader(DECIMAL16)) ++ createArray[Byte](16, 0.toByte), emptyMetadata)
+    // 1e38 has a precision of 39. Even if it still fits into 16 bytes, it is not a valid decimal.
+    check(Array[Byte](primitiveHeader(DECIMAL16), 0) ++
+      BigDecimal(1e38).toBigInt.toByteArray.reverse, emptyMetadata)
+    // Short string content too short.
+    check(Array(shortStrHeader(2), 'x'), emptyMetadata)
+    // Long string length too short (requires 4 bytes).
+    check(Array(primitiveHeader(LONG_STR), 0, 0, 0), emptyMetadata)
+    // Long string content too short.
+    check(Array(primitiveHeader(LONG_STR), 1, 0, 0, 0), emptyMetadata)
+    // Size is 1 but no content.
+    check(Array(arrayHeader(false, 1),
+      /* size */ 1,
+      /* offset list */ 0), emptyMetadata)
+    // Requires 4-byte size is but the actual size only has one byte.
+    check(Array(arrayHeader(true, 1),
+      /* size */ 0,
+      /* offset list */ 0), emptyMetadata)
+    // Offset out of bound.
+    check(Array(arrayHeader(false, 1),
+      /* size */ 1,
+      /* offset list */ 1, 1), emptyMetadata)
+    // Id out of bound.
+    check(Array(objectHeader(false, 1, 1),
+      /* size */ 1,
+      /* id list */ 0,
+      /* offset list */ 0, 2,
+      /* field data */ primitiveHeader(INT1), 1), emptyMetadata)
+    // Variant version is not 1.
+    check(Array(primitiveHeader(INT1), 0), Array[Byte](3, 0, 0))
+    check(Array(primitiveHeader(INT1), 0), Array[Byte](2, 0, 0))
+
+    // Construct binary values that are over SIZE_LIMIT bytes, but otherwise valid.
+    val bigVersion = Array[Byte]((VERSION | (3 << 6)).toByte)
+    val a = createArray[Byte](SIZE_LIMIT, 'a'.toByte)
+    val hugeMetadata = bigVersion ++ Array[Byte](2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1) ++
+      a ++ Array[Byte]('b')
+    val sizeLimitParams = Map("sizeLimit" -> "16 MiB")
+    check(Array(primitiveHeader(TRUE)), hugeMetadata, "VARIANT_CONSTRUCTOR_SIZE_LIMIT",
+      sizeLimitParams)
+
+    // The keys are 'aaa....' and 'b'. Values are "yyy..." and 'true'.
+    val y = createArray[Byte](SIZE_LIMIT, 'y'.toByte)
+    val hugeObject = Array[Byte](objectHeader(true, 4, 4)) ++
+      /* size */ padded(Array(2), 4) ++
+      /* id list */ padded(Array(0, 1), 4) ++
+      // Second value starts at offset 5 + (SIZE_LIMIT), which is `5008` little-endian. The last
+      // value is 1 byte, so the one-past-the-end value is `6008`
+      /* offset list */ Array[Byte](0, 0, 0, 0, 5, 0, 0, 8, 6, 0, 0, 8) ++
+      /* field data */ Array[Byte](primitiveHeader(LONG_STR), 0, 0, 0, 1) ++ y ++ Array[Byte](
+        primitiveHeader(TRUE)
+      )
+
+    val smallMetadata = bigVersion ++ Array[Byte](2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0) ++
+      Array[Byte]('a', 'b')
+    check(hugeObject, smallMetadata, "VARIANT_CONSTRUCTOR_SIZE_LIMIT", sizeLimitParams)
+    check(hugeObject, hugeMetadata, "VARIANT_CONSTRUCTOR_SIZE_LIMIT", sizeLimitParams)
+  }
+
+  // Test valid forms of Variant that our writer would never produce.
+  test("to_json valid input") {
+    def check(expectedJson: String, value: Array[Byte], metadata: Array[Byte]): Unit = {
+      checkEvaluation(
+        StructsToJson(Map.empty, Literal(new VariantVal(value, metadata))),
+        expectedJson
+      )
+    }
+    // Some valid metadata formats. Check that they aren't rejected.
+    // Sorted string bit is set, and can be ignored.
+    val emptyMetadata2 = Array[Byte](VERSION | 1 << 4, 0, 0)
+    // Bit 5 is not defined in the spec, and can be ignored.
+    val emptyMetadata3 = Array[Byte](VERSION | 1 << 5, 0, 0)
+    // Can specify 3 bytes per size/offset, even if they aren't needed.
+    val header = (VERSION | (2 << 6)).toByte
+    val emptyMetadata4 = Array[Byte](header, 0, 0, 0, 0, 0, 0)
+    check("true", Array(primitiveHeader(TRUE)), emptyMetadata2)
+    check("true", Array(primitiveHeader(TRUE)), emptyMetadata3)
+    check("true", Array(primitiveHeader(TRUE)), emptyMetadata4)
+  }
+
+  // Test StructsToJson with manually constructed input that uses up to 4 bytes for offsets and
+  // sizes.  We never produce 4-byte offsets, since they're only needed for >16 MiB values, which we
+  // error out on, but the reader should be able to handle them if some other writer decides to use
+  // them for smaller values.
+  test("to_json with large offsets and sizes") {
+    def check(expectedJson: String, value: Array[Byte], metadata: Array[Byte]): Unit = {
+      checkEvaluation(
+        StructsToJson(Map.empty, Literal(new VariantVal(value, metadata))),
+        expectedJson
+      )
+    }
+
+    for {
+      offsetSize <- 1 to 4
+      idSize <- 1 to 4
+      metadataSize <- 1 to 4
+      largeSize <- Seq(false, true)
+    } {
+      // Test array
+      val version = Array[Byte]((VERSION | ((metadataSize - 1) << 6)).toByte)
+      val emptyMetadata = version ++ padded(Array(0, 0), metadataSize)
+      // Construct a binary with the given sizes. Regardless, to_json should produce the same
+      // result.
+      val arrayValue = Array[Byte](arrayHeader(largeSize, offsetSize)) ++
+        /* size */ padded(Array(3), if (largeSize) 4 else 1) ++
+        /* offset list */ padded(Array(0, 1, 4, 5), offsetSize) ++
+        Array[Byte](/* values */ primitiveHeader(FALSE),
+            primitiveHeader(INT2), 2, 1, primitiveHeader(NULL))
+      check("[false,258,null]", arrayValue, emptyMetadata)
+
+      // Test object
+      val metadata = version ++
+                     padded(Array(3, 0, 1, 2, 3), metadataSize) ++
+                     Array[Byte]('a', 'b', 'c')
+      val objectValue = Array[Byte](objectHeader(largeSize, idSize, offsetSize)) ++
+        /* size */ padded(Array(3), if (largeSize) 4 else 1) ++
+        /* id list */ padded(Array(0, 1, 2), idSize) ++
+        /* offset list */ padded(Array(0, 2, 4, 6), offsetSize) ++
+        /* field data */ Array[Byte](primitiveHeader(INT1), 1,
+            primitiveHeader(INT1), 2, shortStrHeader(1), '3')
+
+      check("""{"a":1,"b":2,"c":"3"}""", objectValue, metadata)
+    }
+  }
+
+  test("to_json large binary") {
+    def check(expectedJson: String, value: Array[Byte], metadata: Array[Byte]): Unit = {
+      checkEvaluation(
+        StructsToJson(Map.empty, Literal(new VariantVal(value, metadata))),
+        expectedJson
+      )
+    }
+
+    // Create a binary that uses the max 1 << 24 bytes for both metadata and value.
+    val bigVersion = Array[Byte]((VERSION | (2 << 6)).toByte)
+    // Create a single huge value, followed by a one-byte string. We'll have 1 header byte, plus 12
+    // bytes for size and offsets, plus 1 byte for the final value, so the large value is 1 << 24 -
+    // 14 bytes, or (-14, -1, -1) as a signed little-endian value.
+    val aSize = (1 << 24) - 14
+    val a = createArray[Byte](aSize, 'a'.toByte)
+    val hugeMetadata = bigVersion ++ Array[Byte](2, 0, 0, 0, 0, 0, -14, -1, -1, -13, -1, -1) ++
+      a ++ Array[Byte]('b')
+    // Validate metadata in isolation.
+    check("true", Array(primitiveHeader(TRUE)), hugeMetadata)
+
+    // The object will contain a large string, and the following bytes:
+    // - object header and size: 1+4 bytes
+    // - ID list: 6 bytes
+    // - offset list: 9 bytes
+    // - field headers and string length: 6 bytes
+    // In order to get the full binary to 1 << 24, the large string is (1 << 24) - 26 bytes. As a
+    // signed little-endian value, this is (-26, -1, -1).
+    val ySize = (1 << 24) - 26
+    val y = createArray[Byte](ySize, 'y'.toByte)
+    val hugeObject = Array[Byte](objectHeader(true, 3, 3)) ++
+      /* size */ padded(Array(2), 4) ++
+      /* id list */ padded(Array(0, 1), 3) ++
+      // Second offset is (-26,-1,-1), plus 5 bytes for string header, so (-21,-1,-1)
+      /* offset list */ Array[Byte](0, 0, 0, -21, -1, -1, -20, -1, -1) ++
+      /* field data */ Array[Byte](primitiveHeader(LONG_STR), -26, -1, -1, 0) ++ y ++ Array[Byte](
+        primitiveHeader(TRUE)
+      )
+    // Same as hugeObject, but with a short string.
+    val smallObject = Array[Byte](objectHeader(false, 1, 1)) ++
+      /* size */ Array[Byte](2) ++
+      /* id list */ Array[Byte](0, 1) ++
+      /* offset list */ Array[Byte](0, 6, 7) ++
+      /* field data */ Array[Byte](primitiveHeader(LONG_STR), 1, 0, 0, 0, 'y',
+          primitiveHeader(TRUE))
+    val smallMetadata = bigVersion ++ Array[Byte](2, 0, 0, 0, 0, 0, 1, 0, 0, 2, 0, 0) ++
+      Array[Byte]('a', 'b')
+
+    // Check all combinations of large/small value and metadata.
+    val expectedResult1 =
+      s"""{"${a.map(_.toChar).mkString}":"${y.map(_.toChar).mkString}","b":true}"""
+    check(expectedResult1, hugeObject, hugeMetadata)
+    val expectedResult2 =
+      s"""{"${a.map(_.toChar).mkString}":"y","b":true}"""
+    check(expectedResult2, smallObject, hugeMetadata)
+    val expectedResult3 =
+      s"""{"a":"${y.map(_.toChar).mkString}","b":true}"""
+    check(expectedResult3, hugeObject, smallMetadata)
+    val expectedResult4 =
+      s"""{"a":"y","b":true}"""
+    check(expectedResult4, smallObject, smallMetadata)
+  }
+
+  test("is_variant_null invalid input") {
+    checkErrorInExpression[SparkRuntimeException](
+      IsVariantNull(Literal(new VariantVal(Array(), Array(1, 2, 3)))),
+      "MALFORMED_VARIANT"
+    )
+  }
+
+  private def parseJson(input: String): VariantVal =
+    VariantExpressionEvalUtils.parseJson(UTF8String.fromString(input))
+
+  private def variantGet(input: String, path: String, dataType: DataType): VariantGet =
+    VariantGet(Literal(parseJson(input)), Literal(path), dataType, failOnError = true)
+
+  private def tryVariantGet(input: String, path: String, dataType: DataType): VariantGet =
+    VariantGet(Literal(parseJson(input)), Literal(path), dataType, failOnError = false)
+
+  private def testVariantGet(input: String, path: String, dataType: DataType, output: Any): Unit = {
+    checkEvaluation(variantGet(input, path, dataType), output)
+    checkEvaluation(
+      VariantGet(variantGet(input, path, VariantType), Literal("$"), dataType, failOnError = true),
+      output
+    )
+    checkEvaluation(tryVariantGet(input, path, dataType), output)
+  }
+
+  // If an individual element cannot be cast to the target type, `variant_get` will return an error
+  // and `try_variant_get` will only set that element to be null.
+  private def testInvalidVariantGet(
+      input: String,
+      path: String,
+      dataType: DataType,
+      parameters: Map[String, String] = null,
+      tryOutput: Any = null): Unit = {
+    checkErrorInExpression[SparkRuntimeException](
+      variantGet(input, path, dataType),
+      "INVALID_VARIANT_CAST",
+      Option(parameters).getOrElse(
+        Map("value" -> input, "dataType" -> ("\"" + dataType.sql + "\"")))
+    )
+    checkEvaluation(tryVariantGet(input, path, dataType), tryOutput)
+  }
+
+  test("variant_get cast") {
+    // Source type is string.
+    testVariantGet("\"true\"", "$", BooleanType, true)
+    testVariantGet("\"false\"", "$", BooleanType, false)
+    testVariantGet("\" t \"", "$", BooleanType, true)
+    testInvalidVariantGet("\"true\"", "$", IntegerType)
+    testVariantGet("\"1\"", "$", IntegerType, 1)
+    testVariantGet("\"9223372036854775807\"", "$", LongType, 9223372036854775807L)
+    testVariantGet("\"-0.0\"", "$", DoubleType, -0.0)
+    testVariantGet("\"inf\"", "$", DoubleType, Double.PositiveInfinity)
+    testVariantGet("\"-inf\"", "$", DoubleType, Double.NegativeInfinity)
+    testVariantGet("\"nan\"", "$", DoubleType, Double.NaN)
+    testVariantGet("\"12.34\"", "$", FloatType, 12.34f)
+    testVariantGet("\"12.34\"", "$", DecimalType(9, 4), Decimal(12.34))
+    testVariantGet("\"1970-01-01\"", "$", DateType, 0)
+    testVariantGet("\"1970-03-01\"", "$", DateType, 59)
+
+    // Source type is boolean.
+    testVariantGet("true", "$", BooleanType, true)
+    testVariantGet("false", "$", BooleanType, false)
+    testVariantGet("true", "$", ByteType, 1.toByte)
+    testVariantGet("true", "$", DoubleType, 1.0)
+    testVariantGet("true", "$", DecimalType(18, 17), Decimal(1))
+    testInvalidVariantGet("true", "$", DecimalType(18, 18))
+    testVariantGet("false", "$", DecimalType(18, 18), Decimal(0))
+
+    // Source type is integer.
+    testVariantGet("1", "$", BooleanType, true)
+    testVariantGet("0", "$", BooleanType, false)
+    testInvalidVariantGet("1", "$", BinaryType)
+    testVariantGet("127", "$", ByteType, 127.toByte)
+    testInvalidVariantGet("128", "$", ByteType)
+    testVariantGet("-32768", "$", ShortType, (-32768).toShort)
+    testInvalidVariantGet("-32769", "$", ShortType)
+    testVariantGet("2147483647", "$", IntegerType, 2147483647)
+    testInvalidVariantGet("2147483648", "$", IntegerType)
+    testVariantGet("9223372036854775807", "$", LongType, 9223372036854775807L)
+    testVariantGet("-9223372036854775808", "$", LongType, -9223372036854775808L)
+    testVariantGet("2147483647", "$", FloatType, 2147483647.0f)
+    testVariantGet("2147483647", "$", DoubleType, 2147483647.0d)
+    testVariantGet("1", "$", DecimalType(9, 4), Decimal(1))
+    testVariantGet("99999999", "$", DecimalType(38, 30), Decimal(99999999))
+    testInvalidVariantGet("100000000", "$", DecimalType(38, 30))
+    testInvalidVariantGet("12345", "$", DecimalType(6, 3))
+    testVariantGet("-1", "$", TimestampType, -1000000L)
+    testVariantGet("9223372036854", "$", TimestampType, 9223372036854000000L)
+    testInvalidVariantGet("9223372036855", "$", TimestampType)
+    testInvalidVariantGet("0", "$", TimestampNTZType)
+
+    // Source type is double. Always use scientific notation to avoid decimal.
+    testVariantGet("1E0", "$", BooleanType, true)
+    testVariantGet("0E0", "$", BooleanType, false)
+    testVariantGet("-0E0", "$", BooleanType, false)
+    testVariantGet("127E0", "$", ByteType, 127.toByte)
+    testInvalidVariantGet(
+      "128E0",
+      "$",
+      ByteType,
+      Map("value" -> "128.0", "dataType" -> "\"TINYINT\"")
+    )
+    testVariantGet("-9.223372036854776E18", "$", LongType, Long.MinValue)
+    testInvalidVariantGet("-9.223372036854778E18", "$", LongType)
+    testVariantGet("1E308", "$", FloatType, Float.PositiveInfinity)
+    testVariantGet("12345E-4", "$", DecimalType(5, 2), Decimal(1.23))
+    testVariantGet("9999999999E-2", "$", DecimalType(38, 30), Decimal(99999999.99))
+    testInvalidVariantGet(
+      "100000000E0",
+      "$",
+      DecimalType(38, 30),
+      Map("value" -> "1.0E8", "dataType" -> "\"DECIMAL(38,30)\"")
+    )
+    testVariantGet("9223372036854.5E0", "$", TimestampType, 9223372036854500352L)
+    testInvalidVariantGet(
+      "9223372036855E0",
+      "$",
+      TimestampType,
+      Map("value" -> "9.223372036855E12", "dataType" -> "\"TIMESTAMP\"")
+    )
+
+    // Source type is decimal.
+    testVariantGet("1.0", "$", BooleanType, true)
+    testVariantGet("0.0", "$", BooleanType, false)
+    testVariantGet("-0.0", "$", BooleanType, false)
+    testVariantGet("2147483647.999", "$", IntegerType, 2147483647)
+    testInvalidVariantGet("9223372036854775808", "$", LongType)
+    testVariantGet("-9223372036854775808.0", "$", LongType, -9223372036854775808L)
+    testVariantGet("123.0", "$", DecimalType(6, 3), Decimal(123000, 6, 3))
+    testVariantGet("1.14", "$", DecimalType(2, 1), Decimal(11, 2, 1))
+    testVariantGet("1.15", "$", DecimalType(2, 1), Decimal(12, 2, 1))
+    testVariantGet(
+      "0.0000000009999999994",
+      "$",
+      DecimalType(18, 18),
+      Decimal("0.000000000999999999")
+    )
+    testVariantGet("0.0000000009999999995", "$", DecimalType(18, 18), Decimal("0.000000001"))
+    testInvalidVariantGet("9.5", "$", DecimalType(1, 0))
+    testVariantGet("9999999999999999999.9999999999999999999", "$", FloatType, 1e19f)
+    testVariantGet("9999999999999999999.9999999999999999999", "$", DoubleType, 1e19)
+    testVariantGet(
+      "9999999999999999999.9999999999999999999",
+      "$",
+      StringType,
+      "9999999999999999999.9999999999999999999"
+    )
+    // Input doesn't fit into decimal, use double instead, which causes a loss of precision.
+    testVariantGet("9999999999999999999.99999999999999999999", "$", StringType, "1.0E19")
+    // Input fits into `decimal(38, 38)`.
+    testVariantGet(
+      "0.99999999999999999999999999999999999999",
+      "$",
+      DecimalType(38, 38),
+      Decimal("0.99999999999999999999999999999999999999")
+    )
+    testVariantGet("1.10", "$", StringType, "1.1")
+    testVariantGet("-1.00", "$", StringType, "-1")
+    // Test Decimal(N, 0).
+    testVariantGet("-100000000000000000000", "$", StringType, "-100000000000000000000")
+    testVariantGet(
+      "99999999999999999999000000000000000000",
+      "$",
+      StringType,
+      "99999999999999999999000000000000000000"
+    )
+
+    // Source type is null.
+    testVariantGet("null", "$", BooleanType, null)
+    testVariantGet("null", "$", IntegerType, null)
+    testVariantGet("null", "$", DoubleType, null)
+    testVariantGet("null", "$", DecimalType(18, 9), null)
+    testVariantGet("null", "$", TimestampType, null)
+    testVariantGet("null", "$", DateType, null)
+  }
+
+  test("SPARK-49985: Disable support for interval types in the variant spec") {
+    val emptyMetadata = Array[Byte](VERSION, 0, 0)
+
+    val resolver = ResolveTimeZone
+    // int to variant year-month interval
+    assert(!resolver.resolveTimeZones(variantGet(2147483647.toString, "$",
+      YearMonthIntervalType(0, 1))).resolved)
+
+    // decimal to variant day-time interval
+    assert(!resolver.resolveTimeZones(variantGet("9223372036854.775807", "$",
+      DayTimeIntervalType(0, 3))).resolved)
+
+    // year-month interval to variant
+    assert(!resolver.resolveTimeZones(Cast(Cast(Literal(0), YearMonthIntervalType(0, 0)),
+      VariantType)).resolved)
+
+    // day-time interval to variant
+    assert(!resolver.resolveTimeZones(Cast(Cast(Literal(0L), DayTimeIntervalType(0, 0)),
+      VariantType)).resolved)
+  }
+
+  test("variant_get path extraction") {
+    // Test case adapted from `JsonExpressionsSuite`.
+    val json =
+      """
+        |{"store":{"fruit":[{"weight":8,"type":"apple"},{"weight":9,"type":"pear"}],
+        |"basket":[[1,2,{"b":"y","a":"x"}],[3,4],[5,6]],"book":[{"author":"Nigel Rees",
+        |"title":"Sayings of the Century","category":"reference","price":8.95},
+        |{"author":"Herman Melville","title":"Moby Dick","category":"fiction","price":8.99,
+        |"isbn":"0-553-21311-3"},{"author":"J. R. R. Tolkien","title":"The Lord of the Rings",
+        |"category":"fiction","reader":[{"age":25,"name":"bob"},{"age":26,"name":"jack"}],
+        |"price":22.99,"isbn":"0-395-19395-8"}],"bicycle":{"price":19.95,"color":"red"}},
+        |"email":"amy@only_for_json_udf_test.net","owner":"amy","zip code":"94025",
+        |"fb:testid":"1234","":"empty string","?":"Question Mark?", " ":"Whitespace", "\t": "Tab"}
+        |""".stripMargin
+    testVariantGet(json, "$.store.bicycle", StringType, """{"color":"red","price":19.95}""")
+    checkEvaluation(
+      VariantGet(
+        tryVariantGet(json, "$.store.bicycle", VariantType),
+        Literal("$"),
+        StringType,
+        failOnError = true
+      ),
+      """{"color":"red","price":19.95}"""
+    )
+    testVariantGet(json, "$.store.bicycle.color", StringType, "red")
+    testVariantGet(json, "$.store.bicycle.price", DoubleType, 19.95)
+    testVariantGet(json, "$[\"\"]", StringType, "empty string")
+    testVariantGet(json, "$['']", StringType, "empty string")
+    testVariantGet(json, "$[\"?\"]", StringType, "Question Mark?")
+    testVariantGet(json, "$[\" \"]", StringType, "Whitespace")
+    testVariantGet(json, "$[\"\t\"]", StringType, "Tab")
+    testVariantGet(json, "$['?']", StringType, "Question Mark?")
+    testVariantGet(
+      json,
+      "$.store.book",
+      StringType,
+      """[{"author":"Nigel Rees","category":"reference","price":8.95,"title":
+        |"Sayings of the Century"},{"author":"Herman Melville","category":"fiction","isbn":
+        |"0-553-21311-3","price":8.99,"title":"Moby Dick"},{"author":"J. R. R. Tolkien","category":
+        |"fiction","isbn":"0-395-19395-8","price":22.99,"reader":[{"age":25,"name":"bob"},{"age":26,
+        |"name":"jack"}],"title":"The Lord of the Rings"}]""".stripMargin.replace("\n", "")
+    )
+    testVariantGet(
+      json,
+      "$.store.book[0]",
+      StringType,
+      """{"author":"Nigel Rees","category":"reference","price":8.95,"title":
+        |"Sayings of the Century"}""".stripMargin.replace("\n", "")
+    )
+    testVariantGet(json, "$.store.book[0].category", StringType, "reference")
+    testVariantGet(json, "$.store.book[1].price", DoubleType, 8.99)
+    testVariantGet(json, "$.store.book[2].reader[0].name", StringType, "bob")
+    testVariantGet(json, "$.store.book[2].reader[1].age", IntegerType, 26)
+    testVariantGet(json, "$.store.basket[0][1]", IntegerType, 2)
+    testVariantGet(json, "$.store.basket[0][2]", StringType, """{"a":"x","b":"y"}""")
+    testVariantGet(json, "$.zip code", IntegerType, 94025)
+    testVariantGet(json, "$.fb:testid", IntegerType, 1234)
+    testVariantGet(
+      json,
+      "$.store.fruit",
+      DataType.fromDDL("array<struct<weight int, type string>>"),
+      Array(Row(8, "apple"), Row(9, "pear"))
+    )
+    testVariantGet(
+      json,
+      "$.store.book[0]",
+      DataType.fromDDL("struct<author string, title string, category string, price decimal(4, 2)>"),
+      Row("Nigel Rees", "Sayings of the Century", "reference", Decimal(8.95))
+    )
+  }
+
+  test("variant_get negative") {
+    testVariantGet("""{"a": 1}""", "$[0]", IntegerType, null)
+    testVariantGet("""{"a": 1}""", "$.A", IntegerType, null)
+    testVariantGet("[1]", "$.a", IntegerType, null)
+    testVariantGet("[1]", "$[1]", IntegerType, null)
+    testVariantGet("1", "$.a", IntegerType, null)
+    testVariantGet("1", "$[0]", IntegerType, null)
+    testInvalidVariantGet(
+      """{"a": 1}""",
+      "$",
+      IntegerType,
+      Map("value" -> "{\"a\":1}", "dataType" -> "\"INT\"")
+    )
+    testInvalidVariantGet("[1]", "$", IntegerType)
+  }
+
+  test("variant_get large") {
+    val numKeys = 256
+
+    var json = (0 until numKeys).map(_.toString).mkString("[", ",", "]")
+    for (i <- 0 until numKeys) {
+      testVariantGet(json, "$[" + i + "]", IntegerType, i)
+    }
+    testVariantGet(json, "$[" + numKeys + "]", IntegerType, null)
+
+    json = (0 until numKeys).map(i => s""""$i": $i""").mkString("{", ",", "}")
+    for (i <- 0 until numKeys) {
+      testVariantGet(json, "$." + i, IntegerType, i)
+    }
+    testVariantGet(json, "$." + numKeys, IntegerType, null)
+  }
+
+  test("SPARK-58949: object keys use unsigned UTF-8 order") {
+    val bmpKey = new String(Character.toChars(65535))
+    val supplementaryKey = new String(Character.toChars(0x10000))
+    val quote = 34.toChar.toString
+    val asciiFields = (0 until 32).map(i => quote + i + quote + ":" + i)
+    val objectJson = (asciiFields ++ Seq(
+      quote + supplementaryKey + quote + ":99",
+      quote + bmpKey + quote + ":98")).mkString("{", ",", "}")
+
+    val variant = VariantBuilder.parseJson(objectJson, false)
+    assert(variant.getFieldAtIndex(32).key === bmpKey)
+    assert(variant.getFieldAtIndex(33).key === supplementaryKey)
+    assert(variant.getFieldByKey(bmpKey).getLong === 98L)
+    assert(variant.getFieldByKey(supplementaryKey).getLong === 99L)
+    assert(variant.getFieldByKey("missing") === null)
+
+    val nestedJson = "{" + quote + "nested" + quote + ":" + objectJson + "}"
+    val nested = VariantBuilder.parseJson(nestedJson, false)
+      .getFieldByKey("nested")
+    assert(nested.getFieldAtIndex(32).key === bmpKey)
+    assert(nested.getFieldByKey(supplementaryKey).getLong === 99L)
+
+    // Reorder the last two field entries to reproduce the UTF-16 order written by older Spark.
+    val legacyValue = variant.getValue.clone()
+    handleObject[Unit](legacyValue, 0,
+      (size, idSize, offsetSize, idStart, offsetStart, _dataStart) => {
+        def swap(start: Int, width: Int): Unit = {
+          val left = start + (size - 2) * width
+          val right = left + width
+          val leftValue = readUnsigned(legacyValue, left, width)
+          val rightValue = readUnsigned(legacyValue, right, width)
+          writeLong(legacyValue, left, rightValue, width)
+          writeLong(legacyValue, right, leftValue, width)
+        }
+        swap(idStart, idSize)
+        swap(offsetStart, offsetSize)
+      })
+    val legacy = new Variant(legacyValue, variant.getMetadata)
+    assert(legacy.getFieldAtIndex(32).key === supplementaryKey)
+    assert(legacy.getFieldByKey("31").getLong === 31L)
+    assert(legacy.getFieldByKey(bmpKey).getLong === 98L)
+    assert(legacy.getFieldByKey("missing") === null)
+
+    val expectedSchemaNames = ((0 until 32).map(_.toString).sorted ++
+      Seq(supplementaryKey, bmpKey)).toArray
+    Seq(variant, legacy).foreach { v =>
+      val schema = SchemaOfVariant.schemaOf(v).asInstanceOf[StructType]
+      assert(schema.fieldNames === expectedSchemaNames)
+    }
+  }
+
+  test("variant_get timestamp") {
+    DateTimeTestUtils.outstandingZoneIds.foreach { zid =>
+      withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> zid.getId) {
+        def toMicros(time: LocalDateTime, zoneId: ZoneId): Long = {
+          val instant = time.atZone(zoneId).toInstant
+          instant.getEpochSecond * 1000000L + instant.getNano / 1000L
+        }
+
+        val input = "\"2026-04-05 5:16:07\""
+        val expected = LocalDateTime.of(2026, 4, 5, 5, 16, 7, 0)
+        testVariantGet(input, "$", TimestampType, toMicros(expected, zid))
+        testVariantGet(input, "$", TimestampNTZType, toMicros(expected, ZoneOffset.UTC))
+      }
+    }
+  }
+
+  test("variant_get overflow") {
+    for (ansi <- Seq(false, true)) {
+      withSQLConf(SQLConf.ANSI_ENABLED.key -> ansi.toString) {
+        // `variant_get` is not affected by the ANSI flag. It doesn't have the LEGACY mode.
+        testInvalidVariantGet(
+          """{"a": 2147483648}""",
+          "$.a",
+          IntegerType,
+          Map("value" -> "2147483648", "dataType" -> "\"INT\"")
+        )
+      }
+    }
+  }
+
+  test("variant_get nested") {
+    testVariantGet("null", "$", DataType.fromDDL("a int"), null)
+    testVariantGet("{}", "$", DataType.fromDDL("a int"), Row(null))
+    testVariantGet("""{"a": 1}""", "$", DataType.fromDDL("a int"), Row(1))
+    testInvalidVariantGet("1", "$", DataType.fromDDL("a int"))
+    testVariantGet("""{"a": 1, "b": "2"}""", "$", DataType.fromDDL("a int, b string"), Row(1, "2"))
+    testVariantGet("""{"a": 1, "b": "2"}""", "$", DataType.fromDDL("a string, b int"), Row("1", 2))
+    testVariantGet("""{"b": "2", "a": 1}""", "$", DataType.fromDDL("a string, b int"), Row("1", 2))
+    testVariantGet(
+      """{"a": 1, "d": 2, "c": 3}""",
+      "$",
+      DataType.fromDDL("a int, b int, c int"),
+      Row(1, null, 3)
+    )
+    testInvalidVariantGet(
+      """{"a": 1, "b": "2"}""",
+      "$",
+      DataType.fromDDL("a int, b boolean"),
+      Map("value" -> "\"2\"", "dataType" -> "\"BOOLEAN\""),
+      Row(1, null)
+    )
+
+    testVariantGet("null", "$", DataType.fromDDL("array<int>"), null)
+    testVariantGet("[]", "$", DataType.fromDDL("array<int>"), Array())
+    testInvalidVariantGet("{}", "$", DataType.fromDDL("array<int>"))
+    testVariantGet(
+      """[1, 2, 3, null, "4", 5.0]""",
+      "$",
+      DataType.fromDDL("array<int>"),
+      Array(1, 2, 3, null, 4, 5)
+    )
+    testVariantGet(
+      """[1, 2, 3, null, "4", 5.0]""",
+      "$",
+      DataType.fromDDL("array<string>"),
+      Array("1", "2", "3", null, "4", "5")
+    )
+    testVariantGet(
+      """[[1], [2, 3], [4, 5, 6], [7, 8, 9, 10]]""",
+      "$",
+      DataType.fromDDL("array<array<int>>"),
+      Array(Array(1), Array(2, 3), Array(4, 5, 6), Array(7, 8, 9, 10))
+    )
+    testInvalidVariantGet(
+      """[1, 2, 3, "hello"]""",
+      "$",
+      DataType.fromDDL("array<int>"),
+      Map("value" -> "\"hello\"", "dataType" -> "\"INT\""),
+      Array(1, 2, 3, null)
+    )
+
+    testVariantGet("null", "$", DataType.fromDDL("map<string, int>"), null)
+    testVariantGet("{}", "$", DataType.fromDDL("map<string, int>"), Map())
+    testInvalidVariantGet("[]", "$", DataType.fromDDL("map<string, int>"))
+    testVariantGet(
+      """{"a": 1, "b": "2", "c": null}""",
+      "$",
+      DataType.fromDDL("map<string, int>"),
+      Map("a" -> 1, "b" -> 2, "c" -> null)
+    )
+    testVariantGet(
+      """{"a": {}, "b": {"c": "d"}, "e": {"f": "g"}}""",
+      "$",
+      DataType.fromDDL("map<string, map<string, string>>"),
+      Map("a" -> Map(), "b" -> Map("c" -> "d"), "e" -> Map("f" -> "g"))
+    )
+    testInvalidVariantGet(
+      """{"a": 1, "b": "2", "c": {}}""",
+      "$",
+      DataType.fromDDL("map<string, int>"),
+      Map("value" -> "{}", "dataType" -> "\"INT\""),
+      Map("a" -> 1, "b" -> 2, "c" -> null)
+    )
+
+    testVariantGet(
+      """[{"a": 1}, {"b": 2}, null, {}]""",
+      "$",
+      DataType.fromDDL("array<struct<a int, b int>>"),
+      Array(Row(1, null), Row(null, 2), null, Row(null, null))
+    )
+    testVariantGet(
+      """[{"a": 1}, {"b": 2}, null, {}]""",
+      "$",
+      DataType.fromDDL("array<map<string, int>>"),
+      Array(Map("a" -> 1), Map("b" -> 2), null, Map())
+    )
+  }
+
+  test("variant_get path") {
+    def checkInvalidPath(path: String): Unit = {
+      for ((expr, fn) <- Seq(
+          variantGet("0", path, IntegerType) -> "`variant_get`",
+          tryVariantGet("0", path, IntegerType) -> "`try_variant_get`")) {
+        checkErrorInExpression[SparkRuntimeException](
+          expr,
+          "INVALID_VARIANT_GET_PATH",
+          Map("path" -> path, "functionName" -> fn)
+        )
+      }
+    }
+
+    testVariantGet("""{"1": {"2": {"3": [4]}}}""", "$.1.2.3[0]", IntegerType, 4)
+    testVariantGet("""{"1": {"2": {"3": [4]}}}""", "$.1.2.3['0']", IntegerType, null)
+    // scalastyle:off nonascii
+    testVariantGet("""{"你好": {"世界": "hello"}}""", """$['你好']["世界"]""", StringType, "hello")
+    // scalastyle:on nonascii
+    testVariantGet("[1, 2, 3]", "$[2147483647]", IntegerType, null)
+
+    testVariantGet("""{"a'b": 1}""", """$['a\'b']""", IntegerType, 1)
+    testVariantGet("""{"a']b": 1}""", """$['a\']b']""", IntegerType, 1)
+    testVariantGet("""{"a\nb":1,"a\\nb":2}""", """$.a\nb""", IntegerType, 2)
+    testVariantGet("""{"a\"b": 2}""", """$['a"b']""", IntegerType, 2)
+    testVariantGet("""{"a\\b": 4}""", """$['a\\b']""", IntegerType, 4)
+    testVariantGet("""{"a\tb": 5}""", """$['a\tb']""", IntegerType, 5)
+    testVariantGet("""{"a\nb": 6}""", """$['a\nb']""", IntegerType, 6)
+    testVariantGet("""{"a\bb": 11}""", """$['a\bb']""", IntegerType, 11)
+    testVariantGet("""{"a\fb": 12}""", """$['a\fb']""", IntegerType, 12)
+    testVariantGet("""{"a\rb": 13}""", """$['a\rb']""", IntegerType, 13)
+    testVariantGet("""{"a/b": 14}""", """$['a\/b']""", IntegerType, 14)
+    // Split the Unicode escape so Scala does not decode it.
+    testVariantGet("{\"a\\" + "u000bb\": 7}", "$['a\\" + "u000bb']", IntegerType, 7)
+    testVariantGet("""{"a\"b": 8}""", """$["a\"b"]""", IntegerType, 8)
+    testVariantGet("""{"a'b": 9}""", """$["a'b"]""", IntegerType, 9)
+    testVariantGet("""{"a\\xb": 15}""", """$['a\xb']""", IntegerType, 15)
+    testVariantGet("""{"a\\u12G4b": 17}""", "$['a\\" + "u12G4b']", IntegerType, 17)
+    testVariantGet("""{"a\\\"b": 18}""", """$['a\"b']""", IntegerType, 18)
+    testVariantGet("""{"a\\'b": 19}""", """$["a\'b"]""", IntegerType, 19)
+    testVariantGet(
+      "{\"a\\" + "uD83D\\" + "uDE00b\": 20}",
+      "$['a\\" + "uD83D\\" + "uDE00b']",
+      IntegerType,
+      20)
+    testVariantGet(
+      "{\"\\\\" + "uD800\\" + "uD83D\\" + "uDE00\":21}",
+      "$['\\" + "uD800\\" + "uD83D\\" + "uDE00']",
+      IntegerType,
+      21)
+    testVariantGet(
+      "{\"a\\" + "uD83D\\" + "uDE00b\": 22}",
+      "$['a\\" + "ud83d\\" + "ude00b']",
+      IntegerType,
+      22)
+    testVariantGet(
+      "{\"a\\" + "uDBFF\\" + "uDFFFb\": 23}",
+      "$['a\\" + "uDBFF\\" + "uDFFFb']",
+      IntegerType,
+      23)
+    Seq("uD800", "uDC00").foreach { escape =>
+      val path = "$['\\" + escape + "']"
+      testVariantGet("""{"?":1}""", path, IntegerType, null)
+      testVariantGet("{\"?\":1,\"\\\\" + escape + "\":2}", path, IntegerType, 2)
+    }
+
+    Seq("variant_get" -> true, "try_variant_get" -> false).foreach {
+      case (name, failOnError) =>
+        checkErrorInExpression[SparkRuntimeException](
+          VariantGet(BoundReference(0, VariantType, nullable = true), Literal(".a"),
+            IntegerType, failOnError),
+          InternalRow(null),
+          "INVALID_VARIANT_GET_PATH",
+          Map("path" -> ".a", "functionName" -> s"`$name`"))
+    }
+
+    checkInvalidPath("")
+    checkInvalidPath(".a")
+    checkInvalidPath("$1")
+    checkInvalidPath("$[-1]")
+    checkInvalidPath("$[2147483648]")
+    checkInvalidPath("$[4294967296]")
+    checkInvalidPath("""$['"]""")
+
+    checkInvalidPath("$[\"\"\"]")
+    checkInvalidPath("""$['a\']""")
+    checkInvalidPath("""$["a\"]""")
+  }
+
+  test("legacy Variant paths treat backslashes literally") {
+    val input = """{"a\nb":1,"a\\nb":2}"""
+    val path = "$['a\\nb']"
+
+    withSQLConf(SQLConf.LEGACY_VARIANT_PATH_BACKSLASH_AS_LITERAL.key -> "false") {
+      testVariantGet(input, path, IntegerType, 1)
+    }
+
+    withSQLConf(SQLConf.LEGACY_VARIANT_PATH_BACKSLASH_AS_LITERAL.key -> "true") {
+      testVariantGet(input, path, IntegerType, 2)
+
+      val escapedQuote = """$['a\'b']"""
+      checkErrorInExpression[SparkRuntimeException](
+        variantGet("""{"a'b":1}""", escapedQuote, IntegerType),
+        "INVALID_VARIANT_GET_PATH",
+        Map("path" -> escapedQuote, "functionName" -> "`variant_get`"))
+    }
+  }
+
+  gridTest("Variant path functions use the captured parser mode")(Seq(false, true)) { legacy =>
+    val conf = SQLConf.LEGACY_VARIANT_PATH_BACKSLASH_AS_LITERAL.key
+    val input = Literal(parseJson("""{"a\nb":[1],"a\\nb":[2]}"""))
+    val path = "$['a\\nb']"
+    withSQLConf(conf -> legacy.toString) {
+      Seq(Literal(path), BoundReference(0, StringType, nullable = false)).foreach { pathExpr =>
+        val get = VariantGet(input, pathExpr, ArrayType(IntegerType), failOnError = true)
+        val cases = Seq(
+          VariantDelete(Seq(input, pathExpr)) ->
+            (if (legacy) """{"a\nb":[1]}""" else """{"a\\nb":[2]}"""),
+          VariantPick(Seq(input, pathExpr)) ->
+            (if (legacy) """{"a\\nb":[2]}""" else """{"a\nb":[1]}"""),
+          VariantInsert(input, Concat(Seq(pathExpr, Literal("[0]"))), Literal(3)) ->
+            (if (legacy) """{"a\nb":[1],"a\\nb":[3,2]}""" else """{"a\nb":[3,1],"a\\nb":[2]}"""),
+          VariantSet(input, pathExpr, Literal(3), Literal(true)) ->
+            (if (legacy) """{"a\nb":[1],"a\\nb":3}""" else """{"a\nb":3,"a\\nb":[2]}"""),
+          VariantArrayAppend(input, pathExpr, Literal(3)) ->
+            (if (legacy) """{"a\nb":[1],"a\\nb":[2,3]}""" else """{"a\nb":[1,3],"a\\nb":[2]}"""))
+        withSQLConf(conf -> (!legacy).toString) {
+          val row = InternalRow(UTF8String.fromString(path))
+          checkEvaluation(get, Array(if (legacy) 2 else 1), row)
+          cases.foreach { case (expr, expected) =>
+            checkEvaluation(
+              ResolveTimeZone.resolveTimeZones(Cast(expr, StringType)), expected, row)
+          }
+        }
+      }
+    }
+  }
+
+  gridTest("Variant diagnostics use the captured parser mode")(Seq(false, true)) { legacy =>
+    val conf = SQLConf.LEGACY_VARIANT_PATH_BACKSLASH_AS_LITERAL.key
+    val path = """$['a.\nb'].c"""
+    val input = Literal(parseJson("""{"a.\nb":5,"a.\\nb":6}"""))
+    val expressions = withSQLConf(conf -> legacy.toString) {
+      Seq(
+        VariantInsert(input, Literal(path), Literal(2)),
+        VariantSet(input, Literal(path), Literal(2), Literal(true)),
+        VariantArrayAppend(input, Literal(path), Literal(2)))
+    }
+    withSQLConf(conf -> (!legacy).toString) {
+      expressions.foreach { expression =>
+        checkErrorInExpression[SparkRuntimeException](
+          expression,
+          "VARIANT_PATH_TYPE_MISMATCH",
+          Map("path" -> path, "failedAt" -> """$['a.\nb']""",
+            "functionName" -> s"`${expression.prettyName}`"))
+      }
+    }
+  }
+
+  test("SPARK-58672: validate char/varchar target types in variant_get") {
+    def check(dataType: DataType, expected: Boolean): Unit = {
+      assert(
+        variantGet("""{"a": 1}""", "$", dataType)
+          .checkInputDataTypes().isSuccess == expected)
+    }
+
+    def targetTypes(stringType: StringType): Seq[DataType] = Seq(
+      stringType,
+      ArrayType(stringType),
+      MapType(stringType, IntegerType),
+      MapType(StringType, stringType),
+      StructType(Seq(StructField("v", stringType))))
+
+    targetTypes(StringType).foreach { dataType =>
+      check(dataType, expected = true)
+    }
+
+    Seq(CharType(10), VarcharType(10)).foreach { stringType =>
+      targetTypes(stringType).foreach { dataType =>
+        check(dataType, expected = false)
+      }
+    }
+  }
+
+  test("cast from variant") {
+    // We do not test too many type combinations, as the cast implementation is mostly the same as
+    // variant_get.
+
+    def checkCast(input: Any, dataType: DataType, output: Any): Unit = {
+      for (mode <- Seq(EvalMode.LEGACY, EvalMode.ANSI, EvalMode.TRY)) {
+        checkEvaluation(Cast(Literal(input), dataType, evalMode = mode), output)
+      }
+    }
+
+    def checkInvalidCast(input: Any, dataType: DataType, tryOutput: Any): Unit = {
+      // Casting from variant is not affected by the ANSI flag.
+      for (mode <- Seq(EvalMode.LEGACY, EvalMode.ANSI)) {
+        checkExceptionInExpression[SparkRuntimeException](
+          Cast(Literal(input), dataType, evalMode = mode),
+          "INVALID_VARIANT_CAST"
+        )
+      }
+      checkEvaluation(Cast(Literal(input), dataType, evalMode = EvalMode.TRY), tryOutput)
+    }
+
+    checkCast(parseJson("1"), StringType, "1")
+    // Other to-string casts never produce NULL when the input is not NULL, but variant-to-string
+    // cast can produce NULL when the input is a variant null (not NULL).
+    checkCast(parseJson("null"), StringType, null)
+    checkCast(parseJson("\"1\""), IntegerType, 1)
+
+    checkInvalidCast(parseJson("2147483648"), IntegerType, null)
+    checkInvalidCast(parseJson("[2147483648, 1]"), ArrayType(IntegerType), Array(null, 1))
+
+    checkCast(Array(null, parseJson("true")), ArrayType(BooleanType), Array(null, true))
+    checkCast(
+      Array(null, parseJson("false"), parseJson("null")),
+      ArrayType(StringType),
+      Array(null, "false", null)
+    )
+    checkCast(Array(parseJson("[1]")), ArrayType(ArrayType(IntegerType)), Array(Array(1)))
+    checkInvalidCast(
+      Array(parseJson("\"hello\""), null, parseJson("\"1\"")),
+      ArrayType(IntegerType),
+      Array(null, null, 1)
+    )
+  }
+
+  test("atomic types that are not produced by parse_json") {
+    // Dictionary size is `0` for value 0. An empty dictionary contains one offset `0` for the
+    // one-past-the-end position (i.e. the sum of all string lengths).
+    val emptyMetadata = Array[Byte](VERSION, 0, 0)
+
+    def checkToJson(value: Array[Byte], expected: String): Unit = {
+      val input = Literal(new VariantVal(value, emptyMetadata))
+      checkEvaluation(StructsToJson(Map.empty, input), expected)
+    }
+
+    def checkToJsonFail(value: Array[Byte], id: Int): Unit = {
+      val input = Literal(new VariantVal(value, emptyMetadata))
+      checkErrorInExpression[SparkRuntimeException](
+        ResolveTimeZone.resolveTimeZones(StructsToJson(Map.empty, input)),
+        "UNKNOWN_PRIMITIVE_TYPE_IN_VARIANT", Map("id" -> id.toString)
+      )
+    }
+
+    def checkCast(value: Array[Byte], dataType: DataType, expected: Any): Unit = {
+      val input = Literal(new VariantVal(value, emptyMetadata))
+      checkEvaluation(Cast(input, dataType, evalMode = EvalMode.ANSI), expected)
+    }
+
+    checkToJson(Array(primitiveHeader(DATE), 0, 0, 0, 0), "\"1970-01-01\"")
+    checkToJson(Array(primitiveHeader(DATE), -1, -1, -1, 127), "\"+5881580-07-11\"")
+    checkToJson(Array(primitiveHeader(DATE), 0, 0, 0, -128), "\"-5877641-06-23\"")
+    withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> "UTC") {
+      checkCast(Array(primitiveHeader(DATE), 0, 0, 0, 0), TimestampType, 0L)
+      checkCast(Array(primitiveHeader(DATE), 1, 0, 0, 0), TimestampType, MICROS_PER_DAY)
+    }
+    withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> "America/Los_Angeles") {
+      checkCast(Array(primitiveHeader(DATE), 0, 0, 0, 0), TimestampType, 8 * MICROS_PER_HOUR)
+      checkCast(Array(primitiveHeader(DATE), 1, 0, 0, 0), TimestampType,
+        MICROS_PER_DAY + 8 * MICROS_PER_HOUR)
+    }
+
+    checkToJsonFail(Array(primitiveHeader(25)), 25)
+
+    def littleEndianLong(value: Long): Array[Byte] =
+      BigInt(value).toByteArray.reverse.padTo(8, 0.toByte)
+
+    val time1 = littleEndianLong(0)
+    // In America/Los_Angeles timezone, timestamp value `skippedTime` is 2011-03-13 03:00:00.
+    // The next second of 2011-03-13 01:59:59 jumps to 2011-03-13 03:00:00.
+    val skippedTime = 1300010400000000L
+    val time2 = littleEndianLong(skippedTime)
+    val time3 = littleEndianLong(skippedTime - 1)
+    val time4 = littleEndianLong(Long.MinValue)
+    val time5 = littleEndianLong(Long.MaxValue)
+    val time6 = littleEndianLong(-62198755200000000L)
+    val timestampHeader = Array(primitiveHeader(TIMESTAMP))
+    val timestampNtzHeader = Array(primitiveHeader(TIMESTAMP_NTZ))
+
+    for (timeZone <- Seq("UTC", "America/Los_Angeles")) {
+      withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> timeZone) {
+        checkToJson(timestampNtzHeader ++ time1, "\"1970-01-01 00:00:00\"")
+        checkToJson(timestampNtzHeader ++ time2, "\"2011-03-13 10:00:00\"")
+        checkToJson(timestampNtzHeader ++ time3, "\"2011-03-13 09:59:59.999999\"")
+        checkToJson(timestampNtzHeader ++ time4, "\"-290308-12-21 19:59:05.224192\"")
+        checkToJson(timestampNtzHeader ++ time5, "\"+294247-01-10 04:00:54.775807\"")
+        checkToJson(timestampNtzHeader ++ time6, "\"-0001-01-01 00:00:00\"")
+
+        checkCast(timestampNtzHeader ++ time1, DateType, 0)
+        checkCast(timestampNtzHeader ++ time2, DateType, 15046)
+        checkCast(timestampNtzHeader ++ time3, DateType, 15046)
+        checkCast(timestampNtzHeader ++ time4, DateType, -106751992)
+        checkCast(timestampNtzHeader ++ time5, DateType, 106751991)
+        checkCast(timestampNtzHeader ++ time6, DateType, -719893)
+      }
+    }
+
+    withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> "UTC") {
+      checkToJson(timestampHeader ++ time1, "\"1970-01-01 00:00:00+00:00\"")
+      checkToJson(timestampHeader ++ time2, "\"2011-03-13 10:00:00+00:00\"")
+      checkToJson(timestampHeader ++ time3, "\"2011-03-13 09:59:59.999999+00:00\"")
+      checkToJson(timestampHeader ++ time4, "\"-290308-12-21 19:59:05.224192+00:00\"")
+      checkToJson(timestampHeader ++ time5, "\"+294247-01-10 04:00:54.775807+00:00\"")
+      checkToJson(timestampHeader ++ time6, "\"-0001-01-01 00:00:00+00:00\"")
+
+      checkCast(timestampHeader ++ time1, DateType, 0)
+      checkCast(timestampHeader ++ time2, DateType, 15046)
+      checkCast(timestampHeader ++ time3, DateType, 15046)
+      checkCast(timestampHeader ++ time4, DateType, -106751992)
+      checkCast(timestampHeader ++ time5, DateType, 106751991)
+      checkCast(timestampHeader ++ time6, DateType, -719893)
+    }
+
+    withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> "America/Los_Angeles") {
+      checkToJson(timestampHeader ++ time1, "\"1969-12-31 16:00:00-08:00\"")
+      checkToJson(timestampHeader ++ time2, "\"2011-03-13 03:00:00-07:00\"")
+      checkToJson(timestampHeader ++ time3, "\"2011-03-13 01:59:59.999999-08:00\"")
+      checkToJson(timestampHeader ++ time4, "\"-290308-12-21 12:06:07.224192-07:52\"")
+      checkToJson(timestampHeader ++ time5, "\"+294247-01-09 20:00:54.775807-08:00\"")
+      checkToJson(timestampHeader ++ time6, "\"-0002-12-31 16:07:02-07:52\"")
+
+      checkCast(timestampHeader ++ time1, DateType, -1)
+      checkCast(timestampHeader ++ time2, DateType, 15046)
+      checkCast(timestampHeader ++ time3, DateType, 15046)
+      checkCast(timestampHeader ++ time4, DateType, -106751992)
+      checkCast(timestampHeader ++ time5, DateType, 106751990)
+      checkCast(timestampHeader ++ time6, DateType, -719894)
+    }
+
+    checkToJson(Array(primitiveHeader(FLOAT)) ++
+      BigInt(java.lang.Float.floatToIntBits(1.23F)).toByteArray.reverse, "1.23")
+    checkToJson(Array(primitiveHeader(FLOAT)) ++
+      BigInt(java.lang.Float.floatToIntBits(-0.0F)).toByteArray.reverse, "-0.0")
+    // Note: 1.23F.toDouble != 1.23.
+    checkCast(Array(primitiveHeader(FLOAT)) ++
+      BigInt(java.lang.Float.floatToIntBits(1.23F)).toByteArray.reverse, DoubleType, 1.23F.toDouble)
+
+    checkToJson(Array(primitiveHeader(BINARY), 0, 0, 0, 0), "\"\"")
+    checkToJson(Array(primitiveHeader(BINARY), 1, 0, 0, 0, 1), "\"AQ==\"")
+    checkToJson(Array(primitiveHeader(BINARY), 2, 0, 0, 0, 1, 2), "\"AQI=\"")
+    checkToJson(Array(primitiveHeader(BINARY), 3, 0, 0, 0, 1, 2, 3), "\"AQID\"")
+    checkCast(Array(primitiveHeader(BINARY), 3, 0, 0, 0, 1, 2, 3), StringType,
+      "\u0001\u0002\u0003")
+    checkCast(Array(primitiveHeader(BINARY), 5, 0, 0, 0, 72, 101, 108, 108, 111), StringType,
+      "Hello")
+
+    // UUID
+    checkToJson(Array(primitiveHeader(UUID),
+      0, 17, 34, 51, 68, 85, 102, 119, -120, -103, -86, -69, -52, -35, -18, -1),
+      "\"00112233-4455-6677-8899-aabbccddeeff\"")
+    // Test cast to string. Incidentally, also test construction of UUID via VariantBuilder
+    // interface, since we can't currently do it as a Spark cast.
+    val uuid = java.util.UUID.fromString("01020304-0506-0708-090a-0b0c0d0e0f10")
+    val builder = new VariantBuilder(false)
+    builder.appendUuid(uuid)
+    val bytes = builder.result().getValue
+    checkCast(bytes, StringType,
+      "01020304-0506-0708-090a-0b0c0d0e0f10")
+  }
+
+  test("SPARK-48150: ParseJson expression nullability") {
+    assert(!ParseJson(Literal("["), failOnError = true).replacement.nullable)
+    assert(ParseJson(Literal("["), failOnError = false).replacement.nullable)
+    checkEvaluation(
+      ParseJson(Literal("["), failOnError = false).replacement,
+      null
+    )
+  }
+
+  test("cast to variant/to_variant_object") {
+    def check[T : TypeTag](input: T, expectedJson: String,
+                           toVariantObject: Boolean = false): Unit = {
+      val expr =
+        if (toVariantObject) ToVariantObject(Literal.create(input))
+        else Cast(Literal.create(input), VariantType, evalMode = EvalMode.ANSI)
+      checkEvaluation(StructsToJson(Map.empty, expr), expectedJson)
+    }
+
+    def checkFailure[T: TypeTag](input: T, toVariantObject: Boolean = false): Unit = {
+      val expr =
+        if (toVariantObject) ToVariantObject(Literal.create(input))
+        else Cast(Literal.create(input), VariantType, evalMode = EvalMode.ANSI)
+      val resolvedExpr = ResolveTimeZone.resolveTimeZones(expr)
+      assert(!resolvedExpr.resolved)
+    }
+
+    // cast to variant - success cases
+    check(null.asInstanceOf[String], null)
+    // The following tests cover all allowed scalar types.
+    for (input <- Seq[Any](false, true, 0.toByte, 1.toShort, 2, 3L, 4.0F, 5.0D)) {
+      check(input, input.toString)
+    }
+    for (precision <- Seq(9, 18, 38)) {
+      val input = BigDecimal("9".repeat(precision))
+      check(Literal.create(input, DecimalType(precision, 0)), input.toString)
+    }
+    check("", "\"\"")
+    check("x".repeat(128), "\"" + "x".repeat(128) + "\"")
+    check(Array[Byte](1, 2, 3), "\"AQID\"")
+    check(Literal(0, DateType), "\"1970-01-01\"")
+
+    val floatArray = Array.tabulate(25) { i => i.toFloat }
+    check(floatArray, floatArray.mkString("[", ",", "]"))
+
+    withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> "UTC") {
+      check(Literal(0L, TimestampType), "\"1970-01-01 00:00:00+00:00\"")
+      check(Literal(0L, TimestampNTZType), "\"1970-01-01 00:00:00\"")
+    }
+    withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> "America/Los_Angeles") {
+      check(Literal(0L, TimestampType), "\"1969-12-31 16:00:00-08:00\"")
+      check(Literal(0L, TimestampNTZType), "\"1970-01-01 00:00:00\"")
+    }
+
+    check(Array(null, "a", "b", "c"), """[null,"a","b","c"]""")
+    check(Array(parseJson("""{"a": 1,"b": [1, 2, 3]}"""),
+      parseJson("""{"c": true,"d": {"e": "str"}}""")),
+      """[{"a":1,"b":[1,2,3]},{"c":true,"d":{"e":"str"}}]""")
+
+    // cast to variant - failure cases - struct and map types
+    val mp = Map("z" -> 1, "y" -> 2, "x" -> 3)
+    val arrayMp = Array(Map("z" -> 1, "y" -> 2, "x" -> 3))
+    val arrayArrayMp = Array(Array(Map("z" -> 1, "y" -> 2, "x" -> 3)))
+    checkFailure(mp)
+    checkFailure(arrayMp)
+    checkFailure(arrayArrayMp)
+    val struct = Literal.create(create_row(1),
+      StructType(Array(StructField("a", IntegerType))))
+    checkFailure(struct)
+    val arrayStruct = Literal.create(
+      Array(create_row(1)),
+      ArrayType(StructType(Array(StructField("a", IntegerType)))))
+    checkFailure(arrayStruct)
+
+    // to_variant_object - success cases - nested types
+    check(Array(1, 2, 3), "[1,2,3]", toVariantObject = true)
+    check(mp, """{"x":3,"y":2,"z":1}""", toVariantObject = true)
+    check(arrayMp, """[{"x":3,"y":2,"z":1}]""", toVariantObject = true)
+    check(arrayArrayMp, """[[{"x":3,"y":2,"z":1}]]""", toVariantObject = true)
+    check(struct, """{"a":1}""", toVariantObject = true)
+    check(arrayStruct, """[{"a":1}]""", toVariantObject = true)
+    val complexStruct = Literal.create(
+      Row(
+        Seq("123", "true", "f"),
+        Map("a" -> "123", "b" -> "true", "c" -> "f"),
+        Map("a" -> Row(132)),
+        Row(0)),
+      StructType.fromDDL("c ARRAY<STRING>,b MAP<STRING, STRING>,d MAP<STRING, STRUCT<i: INT>>," +
+        "a STRUCT<i: INT>"))
+    check(complexStruct,
+      """{"a":{"i":0},"b":{"a":"123","b":"true","c":"f"},"c":["123","true","f"],""" +
+      """"d":{"a":{"i":132}}}""",
+      toVariantObject = true)
+
+    // to_variant_object - failure cases - non-nested types or map with non-string key
+    checkFailure(1, toVariantObject = true)
+    checkFailure(true, toVariantObject = true)
+    checkFailure(Literal.create(Literal.create(Period.ofMonths(0))), toVariantObject = true)
+    checkFailure(Map(1 -> 1), toVariantObject = true)
+  }
+
+  test("SPARK-58672: validate char/varchar input types in to_variant_object") {
+    def check(dataType: DataType, expected: Boolean): Unit = {
+      assert(
+        ToVariantObject(Literal.create(null, dataType))
+          .checkInputDataTypes().isSuccess == expected)
+    }
+
+    def nestedTypes(stringType: StringType): Seq[DataType] = Seq(
+      ArrayType(stringType),
+      MapType(stringType, IntegerType),
+      MapType(StringType, stringType),
+      StructType(Seq(StructField("v", stringType))))
+
+    nestedTypes(StringType).foreach { dataType =>
+      check(dataType, expected = true)
+    }
+
+    Seq(CharType(10), VarcharType(10)).foreach { stringType =>
+      nestedTypes(stringType).foreach { dataType =>
+        check(dataType, expected = false)
+      }
+    }
+  }
+
+  test("variant_from_arrays and variant_from_entries") {
+    def keysValues(keys: Any, values: Any, valueType: DataType): VariantFromArrays =
+      VariantFromArrays(
+        Literal.create(keys, ArrayType(StringType)),
+        Literal.create(values, ArrayType(valueType)))
+
+    def entriesOf(entries: Any, valueType: DataType,
+        containsNull: Boolean = false): VariantFromEntries =
+      VariantFromEntries(Literal.create(entries, ArrayType(
+        StructType(Seq(StructField("k", StringType), StructField("v", valueType))), containsNull)))
+
+    // Basic object construction; keys are sorted in the resulting variant object.
+    checkEvaluation(StructsToJson(Map.empty,
+      keysValues(Array("z", "a"), Array(1, 2), IntegerType)), """{"a":2,"z":1}""")
+    checkEvaluation(StructsToJson(Map.empty,
+      entriesOf(Array(Row("a", 1), Row("b", 2)), IntegerType)), """{"a":1,"b":2}""")
+
+    // Empty input produces an empty object.
+    checkEvaluation(StructsToJson(Map.empty,
+      keysValues(Array.empty[String], Array.empty[Int], IntegerType)), "{}")
+
+    // Null values are kept as variant null; nested values are converted recursively.
+    checkEvaluation(StructsToJson(Map.empty,
+      entriesOf(Array(Row("a", 1), Row("b", null)), IntegerType)), """{"a":1,"b":null}""")
+    checkEvaluation(StructsToJson(Map.empty,
+      keysValues(Array("a"), Array(Array(1, 2, 3)), ArrayType(IntegerType))), """{"a":[1,2,3]}""")
+    checkEvaluation(StructsToJson(Map.empty, keysValues(Array("a"), Array(Row(1)),
+      StructType(Seq(StructField("i", IntegerType))))), """{"a":{"i":1}}""")
+
+    // A null entry makes the whole result null.
+    checkEvaluation(StructsToJson(Map.empty,
+      entriesOf(Array(Row("a", 1), null), IntegerType, containsNull = true)), null)
+
+    // A null entry dominates a value-conversion failure in an earlier entry (matches
+    // map_from_entries: the null check runs for every entry before any value is converted).
+    checkEvaluation(StructsToJson(Map.empty,
+      entriesOf(Array(Row("a", Row(1, 2)), null),
+        StructType(Seq(StructField("x", IntegerType), StructField("x", IntegerType))),
+        containsNull = true)), null)
+
+    // A null array input produces null.
+    checkEvaluation(StructsToJson(Map.empty, VariantFromArrays(
+      Literal.create(null, ArrayType(StringType)),
+      Literal.create(Array(1), ArrayType(IntegerType)))), null)
+
+    // A null key is rejected.
+    checkErrorInExpression[SparkRuntimeException](
+      keysValues(Array("a", null), Array(1, 2), IntegerType),
+      "NULL_MAP_KEY", Map.empty[String, String])
+
+    // Duplicate keys are rejected for both forms.
+    checkErrorInExpression[SparkRuntimeException](
+      keysValues(Array("a", "a"), Array(1, 2), IntegerType),
+      "VARIANT_DUPLICATE_KEY", Map("key" -> "a"))
+    checkErrorInExpression[SparkRuntimeException](
+      entriesOf(Array(Row("a", 1), Row("a", 2)), IntegerType),
+      "VARIANT_DUPLICATE_KEY", Map("key" -> "a"))
+
+    // Mismatched array lengths are rejected.
+    checkErrorInExpression[SparkRuntimeException](
+      keysValues(Array("a", "b"), Array(1), IntegerType),
+      "_LEGACY_ERROR_TEMP_2128", Map.empty[String, String])
+  }
+
+  test("schema_of_variant - unknown type") {
+    val emptyMetadata = Array[Byte](VERSION, 0, 0)
+
+    def checkErrorInSchemaOf(value: Array[Byte], id: Int): Unit = {
+      val input = Literal(new VariantVal(value, emptyMetadata))
+      checkErrorInExpression[SparkRuntimeException](
+        ResolveTimeZone.resolveTimeZones(SchemaOfVariant(input).replacement),
+        "UNKNOWN_PRIMITIVE_TYPE_IN_VARIANT", Map("id" -> id.toString)
+      )
+    }
+    checkErrorInSchemaOf(Array(primitiveHeader(25)), 25)
+  }
+
+  test("schema_of_variant - non-spark types") {
+    val emptyMetadata = Array[Byte](VERSION, 0, 0)
+
+    // UUID
+    val uuidVal = Array(primitiveHeader(UUID)) ++ createArray[Byte](16, 1.toByte)
+    val uuid = Literal(new VariantVal(uuidVal, emptyMetadata))
+    checkEvaluation(SchemaOfVariant(uuid), s"UUID")
+    // Merge with variantNull retains type.
+    val variantNull = Literal(new VariantVal(Array(primitiveHeader(NULL)), emptyMetadata))
+    val array = Cast(CreateArray(Seq(uuid, variantNull)), VariantType)
+    checkEvaluation(SchemaOfVariant(array), s"ARRAY<UUID>")
+    // Merge with another type results in VARIANT.
+    val variantString = Literal(new VariantVal(Array(shortStrHeader(1), 'x'), emptyMetadata))
+    val array2 = Cast(CreateArray(Seq(uuid, variantString)), VariantType)
+    checkEvaluation(SchemaOfVariant(array2), s"ARRAY<VARIANT>")
+  }
+
+  test("schema_of_variant - schema merge") {
+    val nul = Literal(null, StringType)
+    val boolean = Literal.default(BooleanType)
+    val long = Literal.default(LongType)
+    val string = Literal.default(StringType)
+    val double = Literal.default(DoubleType)
+    val date = Literal.default(DateType)
+    val timestamp = Literal.default(TimestampType)
+    val timestampNtz = Literal.default(TimestampNTZType)
+    val float = Literal.default(FloatType)
+    val binary = Literal.default(BinaryType)
+    val decimal = Literal(Decimal("123.456"), DecimalType(6, 3))
+    val array1 = Literal(Array(0L))
+    val array2 = Literal(Array(0.0))
+    val struct1 = Literal.default(StructType.fromDDL("a string"))
+    val struct2 = Literal.default(StructType.fromDDL("a boolean, b bigint"))
+    val inputs = Seq(nul, boolean, long, string, double, date, timestamp, timestampNtz, float,
+      binary, decimal, array1, array2, struct1, struct2)
+
+    val results = mutable.HashMap.empty[(Literal, Literal), String]
+    for (i <- inputs) {
+      val inputType = if (i.value == null) "VOID" else SchemaOfVariant.printSchema(i.dataType)
+      results.put((nul, i), inputType)
+      results.put((i, i), inputType)
+    }
+    results.put((long, double), "DOUBLE")
+    results.put((long, float), "FLOAT")
+    results.put((long, decimal), "DECIMAL(23,3)")
+    results.put((double, float), "DOUBLE")
+    results.put((double, decimal), "DOUBLE")
+    results.put((date, timestamp), "TIMESTAMP")
+    results.put((date, timestampNtz), "TIMESTAMP_NTZ")
+    results.put((timestamp, timestampNtz), "TIMESTAMP")
+    results.put((float, decimal), "DOUBLE")
+    results.put((array1, array2), "ARRAY<DOUBLE>")
+    results.put((struct1, struct2), "OBJECT<a: VARIANT, b: BIGINT>")
+
+    for (i1 <- inputs) {
+      for (i2 <- inputs) {
+        val expected = results.getOrElse((i1, i2), results.getOrElse((i2, i1), "VARIANT"))
+        val elem1 =
+          if (i1.dataType.isInstanceOf[ArrayType] || i1.dataType.isInstanceOf[MapType] ||
+            i1.dataType.isInstanceOf[StructType]) {
+            ToVariantObject(i1)
+          } else Cast(i1, VariantType)
+        val elem2 =
+          if (i2.dataType.isInstanceOf[ArrayType] || i2.dataType.isInstanceOf[MapType] ||
+            i2.dataType.isInstanceOf[StructType]) {
+            ToVariantObject(i2)
+          } else Cast(i2, VariantType)
+        val array = CreateArray(Seq(elem1, elem2))
+        checkEvaluation(SchemaOfVariant(Cast(array, VariantType)).replacement, s"ARRAY<$expected>")
+      }
+    }
+  }
+
+  test("is_valid_variant") {
+    val emptyMetadata = Array[Byte](VERSION, 0, 0)
+
+    // The row cannot be converted to string because the `VariantVal` may be malformed (toString
+    // will throw an exception).
+    class NoDisplayGenericInternalRow(values: Array[Any]) extends GenericInternalRow(values) {
+      override def toString: String = "NoDisplayGenericInternalRow"
+    }
+
+    def valid(value: Array[Byte], metadata: Array[Byte] = emptyMetadata): Unit = {
+      val row = new NoDisplayGenericInternalRow(Array(new VariantVal(value, metadata)))
+      val v = BoundReference(0, VariantType, nullable = true)
+      checkEvaluation(IsValidVariant(v), true, row)
+    }
+
+    def invalid(value: Array[Byte], metadata: Array[Byte] = emptyMetadata): Unit = {
+      val row = new NoDisplayGenericInternalRow(Array(new VariantVal(value, metadata)))
+      val v = BoundReference(0, VariantType, nullable = true)
+      checkEvaluation(IsValidVariant(v), false, row)
+    }
+
+    // Valid primitives.
+    valid(Array(primitiveHeader(NULL)))
+    valid(Array(primitiveHeader(TRUE)))
+    valid(Array(primitiveHeader(FALSE)))
+    valid(Array(primitiveHeader(INT1), 1))
+    valid(Array(primitiveHeader(INT2), 1, 0))
+    valid(Array(primitiveHeader(INT4), 1, 0, 0, 0))
+    valid(Array(primitiveHeader(INT8), 1, 0, 0, 0, 0, 0, 0, 0))
+    valid(Array(primitiveHeader(DOUBLE), 0, 0, 0, 0, 0, 0, 0, 0))
+    valid(Array(primitiveHeader(DECIMAL4), 0, 1, 0, 0, 0))
+    valid(Array(primitiveHeader(FLOAT), 0, 0, 0, 0))
+    valid(Array(primitiveHeader(DATE), 0, 0, 0, 0))
+    valid(Array(primitiveHeader(TIMESTAMP), 0, 0, 0, 0, 0, 0, 0, 0))
+    valid(Array(primitiveHeader(TIMESTAMP_NTZ), 0, 0, 0, 0, 0, 0, 0, 0))
+    valid(Array(shortStrHeader(3), 'a', 'b', 'c'))
+    valid(Array(primitiveHeader(LONG_STR), 2, 0, 0, 0, 'a', 'b'))
+    valid(Array(primitiveHeader(BINARY), 2, 0, 0, 0, 1, 2))
+    valid(Array(primitiveHeader(UUID)) ++ createArray[Byte](16, 0.toByte))
+
+    // Malformed primitives: truncated content.
+    invalid(Array(primitiveHeader(INT8), 0, 0, 0, 0, 0, 0, 0))
+    invalid(Array(primitiveHeader(DECIMAL4)))
+    invalid(Array(primitiveHeader(DECIMAL8)))
+    invalid(Array(primitiveHeader(DECIMAL16)))
+    invalid(Array(primitiveHeader(DECIMAL16)) ++ createArray[Byte](16, 0.toByte))
+    invalid(Array(shortStrHeader(2), 'x'))
+    invalid(Array(primitiveHeader(LONG_STR), 0, 0, 0))
+    invalid(Array(primitiveHeader(LONG_STR), 1, 0, 0, 0))
+
+    // Valid array.
+    valid(Array(arrayHeader(false, 1),
+      /* size */ 2,
+      /* offset list */ 0, 1, 2,
+      /* element data */ primitiveHeader(TRUE), primitiveHeader(FALSE)))
+
+    // Valid empty array.
+    valid(Array(arrayHeader(false, 1),
+      /* size */ 0,
+      /* offset list */ 0))
+
+    // Malformed array: size is 1 but no content.
+    invalid(Array(arrayHeader(false, 1),
+      /* size */ 1,
+      /* offset list */ 0))
+
+    // Malformed array: requires 4-byte size but only one byte given.
+    invalid(Array(arrayHeader(true, 1),
+      /* size */ 0,
+      /* offset list */ 0))
+
+    // Malformed array: offset out of bound.
+    invalid(Array(arrayHeader(false, 1),
+      /* size */ 1,
+      /* offset list */ 1, 1))
+
+    // Malformed array: nested element is malformed.
+    invalid(Array(arrayHeader(false, 1),
+      /* size */ 1,
+      /* offset list */ 0, 2,
+      /* element data: INT8 with only 1 byte */ primitiveHeader(INT8), 0))
+
+    // Valid object.
+    val metadata = Array[Byte](VERSION, 2, 0, 1, 2) ++ Array[Byte]('a', 'b')
+    valid(Array(objectHeader(false, 1, 1),
+      /* size */ 2,
+      /* id list */ 0, 1,
+      /* offset list */ 0, 2, 4,
+      /* field data */ primitiveHeader(INT1), 1, primitiveHeader(INT1), 2), metadata)
+
+    // Valid empty object.
+    valid(Array(objectHeader(false, 1, 1),
+      /* size */ 0,
+      /* offset list */ 0))
+
+    // Malformed object: id out of bound.
+    invalid(Array(objectHeader(false, 1, 1),
+      /* size */ 1,
+      /* id list */ 0,
+      /* offset list */ 0, 2,
+      /* field data */ primitiveHeader(INT1), 1))
+
+    // Malformed object: offset out of bound.
+    invalid(Array(objectHeader(false, 1, 1),
+      /* size */ 1,
+      /* id list */ 0,
+      /* offset list */ 5, 0,
+      /* field data */ primitiveHeader(INT1), 1), metadata)
+
+    // Malformed object: nested value is malformed.
+    invalid(Array(objectHeader(false, 1, 1),
+      /* size */ 1,
+      /* id list */ 0,
+      /* offset list */ 0, 2,
+      /* field data: INT8 with only 1 byte */ primitiveHeader(INT8), 0), metadata)
+
+    // Malformed containers: the final offset is missing. A container with n children requires
+    // n + 1 offsets, so even an empty container requires one.
+    invalid(Array(arrayHeader(false, 1),
+      /* size */ 0))
+    invalid(Array(objectHeader(false, 1, 1),
+      /* size */ 0))
+    invalid(Array(arrayHeader(false, 4),
+      /* size */ 0,
+      /* truncated offset list */ 0, 0))
+    valid(Array(arrayHeader(false, 4),
+      /* size */ 0,
+      /* offset list */ 0, 0, 0, 0))
+    invalid(Array(arrayHeader(true, 1),
+      /* size */ 0, 0, 0, 0))
+    valid(Array(arrayHeader(true, 1),
+      /* size */ 0, 0, 0, 0,
+      /* offset list */ 0))
+    invalid(Array(arrayHeader(false, 1),
+      /* size */ 1,
+      /* offset list */ 0, 2,
+      /* element data: empty array without its offset list */ arrayHeader(false, 1), 0))
+
+    // Malformed containers: the final offset points past the end of the value.
+    invalid(Array(arrayHeader(false, 1),
+      /* size */ 0,
+      /* offset list */ 5))
+    invalid(Array(objectHeader(false, 1, 1),
+      /* size */ 0,
+      /* offset list */ 5))
+
+    // Malformed containers: dataStart + final offset overflows an int.
+    invalid(Array(arrayHeader(false, 4),
+      /* size */ 0,
+      /* offset list */ -1, -1, -1, 0x7F))
+    invalid(Array(objectHeader(false, 1, 4),
+      /* size */ 0,
+      /* offset list */ -1, -1, -1, 0x7F))
+    invalid(Array(arrayHeader(false, 1),
+      /* size */ 1,
+      /* offset list */ 0, 6,
+      /* element data */ arrayHeader(false, 4), 0, -1, -1, -1, 0x7F))
+
+    // Valid container: the final offset may cover unused bytes within the value.
+    valid(Array(arrayHeader(false, 1),
+      /* size */ 0,
+      /* offset list */ 2,
+      /* unused data */ 0, 0))
+
+    // Malformed containers: a child does not end within the data of its container.
+    invalid(Array(arrayHeader(false, 1),
+      /* size */ 1,
+      /* offset list */ 0, 1,
+      /* element data: 3-byte INT2 */ primitiveHeader(INT2), 1, 0))
+    invalid(Array(objectHeader(false, 1, 1),
+      /* size */ 1,
+      /* id list */ 0,
+      /* offset list */ 0, 1,
+      /* field data: 2-byte INT1 */ primitiveHeader(INT1), 1), metadata)
+    invalid(Array(arrayHeader(false, 1),
+      /* size */ 1,
+      /* offset list: the element starts at the final offset */ 1, 1,
+      /* element data */ primitiveHeader(TRUE), primitiveHeader(TRUE)))
+    invalid(Array(arrayHeader(false, 1),
+      /* size */ 1,
+      /* offset list */ 0, 1,
+      /* element data: 5-byte nested array */
+      arrayHeader(false, 1), 1, 0, 1, primitiveHeader(TRUE)))
+    invalid(Array(arrayHeader(false, 1),
+      /* size */ 1,
+      /* offset list */ 0, 2,
+      /* element data: 7-byte LONG_STR */ primitiveHeader(LONG_STR), 2, 0, 0, 0, 'a', 'b'))
+
+    // Valid container: unused bytes between children.
+    valid(Array(arrayHeader(false, 1),
+      /* size */ 2,
+      /* offset list */ 0, 2, 3,
+      /* element data */ primitiveHeader(TRUE),
+      /* unused */ 0,
+      primitiveHeader(FALSE)))
+
+    // Valid object: field data is not required to be in the order of the offset list.
+    valid(Array(objectHeader(false, 1, 1),
+      /* size */ 2,
+      /* id list */ 0, 1,
+      /* offset list */ 2, 0, 4,
+      /* field data */ primitiveHeader(INT1), 2, primitiveHeader(INT1), 1), metadata)
+
+    // Valid value: trailing bytes after the top-level value are ignored.
+    valid(Array(arrayHeader(false, 1),
+      /* size */ 0,
+      /* offset list */ 0,
+      /* trailing bytes */ 99))
+
+    // Variants built by `parse_json` are valid.
+    Seq(
+      "{}",
+      "[]",
+      """{"a": {}, "b": []}""",
+      """[[], {}, [1, [2, {"c": "d"}]]]""",
+      """{"a": 1, "b": {"c": [true, null, 1.5]}}""",
+      s"""["${"x" * 100}", {"k": "${"y" * 100}"}]"""
+    ).foreach { json =>
+      val v = parseJson(json)
+      valid(v.getValue, v.getMetadata)
+    }
+    val dedup = VariantExpressionEvalUtils.parseJson(
+      UTF8String.fromString("""{"a": 1, "a": {"b": [1, 2]}, "c": 3}"""), allowDuplicateKeys = true)
+    valid(dedup.getValue, dedup.getMetadata)
+
+    // Unknown primitive type (type info 17 is not defined).
+    invalid(Array(primitiveHeader(17)))
+
+    // Malformed metadata: version is not 1.
+    invalid(Array(primitiveHeader(INT1), 0), Array[Byte](3, 0, 0))
+    invalid(Array(primitiveHeader(INT1), 0), Array[Byte](2, 0, 0))
+
+    // Malformed metadata: offset > nextOffset for key id 0.
+    invalid(Array(objectHeader(false, 1, 1),
+      /* size */ 1,
+      /* id list */ 0,
+      /* offset list */ 0, 2,
+      /* field data */ primitiveHeader(INT1), 1),
+      Array[Byte](VERSION, 1, 2, 1) ++ Array[Byte]('a', 'b'))
+
+    // Malformed metadata: truncated offset list (declares dict size 1 but is missing nextOffset).
+    invalid(Array(objectHeader(false, 1, 1),
+      /* size */ 1,
+      /* id list */ 0,
+      /* offset list */ 0, 2,
+      /* field data */ primitiveHeader(INT1), 1),
+      Array[Byte](VERSION, 1, 0))
+
+    // Valid metadata formats: extra bits are ignored.
+    valid(Array(primitiveHeader(TRUE)), Array[Byte](VERSION | 1 << 4, 0, 0))
+    valid(Array(primitiveHeader(TRUE)), Array[Byte](VERSION | 1 << 5, 0, 0))
+
+    // Null input.
+    checkEvaluation(IsValidVariant(Literal.create(null, VariantType)), null)
+  }
+
+  test("variant_delete") {
+    def checkDelete(input: String, paths: Seq[String], expected: String): Unit = {
+      val pathLits: Seq[Expression] = paths.map(p => Literal.create(p, StringType))
+      val expr = VariantDelete(Literal(parseJson(input)) +: pathLits)
+      checkEvaluation(
+        ResolveTimeZone.resolveTimeZones(Cast(expr, StringType)),
+        expected)
+    }
+
+    checkDelete("""{"a": 1, "b": 2}""", Seq("$.a"), """{"b":2}""")
+    checkDelete("""{"a": 1, "b": 2, "c": 3}""", Seq("$.a", "$.c"), """{"b":2}""")
+    checkDelete("""{"a": 1}""", Seq("$.missing"), """{"a":1}""")
+    checkDelete("[1, 2, 3]", Seq("$[1]"), "[1,3]")
+    checkDelete("[1, 2, 3]", Seq("$[10]"), "[1,2,3]")
+
+    // Cascading deletes propagate state across paths.
+    checkDelete("[1, 2, 3]", Seq("$[0]", "$[0]", "$[0]"), "[]")
+    checkDelete("""{"a":[1,2,3]}""", Seq("$.a[0]", "$.a[0]", "$.a[0]"), """{"a":[]}""")
+
+    checkDelete("""{"a": {"b": 1, "c": 2}}""", Seq("$.a.b"), """{"a":{"c":2}}""")
+    checkDelete("""[{"b": 1, "c": 2}]""", Seq("$[0].b"), """[{"c":2}]""")
+
+    // Empty containers are preserved; the parent is never collapsed to NULL.
+    checkDelete("""{"a": 1}""", Seq("$.a"), "{}")
+    checkDelete("[1]", Seq("$[0]"), "[]")
+    checkDelete("""{"a": {"b": 1}}""", Seq("$.a.b"), """{"a":{}}""")
+    checkDelete("""{"a": []}""", Seq("$.a[0]"), """{"a":[]}""")
+
+    checkDelete(
+      """{"a": {"b": {"c": {"d": 1}}}}""",
+      Seq("$.a.b.c.d"),
+      """{"a":{"b":{"c":{}}}}""")
+
+    checkDelete("""{"a": [10, 20, 30]}""", Seq("$.a[1]"), """{"a":[10,30]}""")
+    checkDelete(
+      """{"a": [{"b": 1, "c": 2}, {"b": 3}]}""",
+      Seq("$.a[0].b"),
+      """{"a":[{"c":2},{"b":3}]}""")
+
+    checkDelete("""{"a": 1, "b": 2}""", Seq("$['a']"), """{"b":2}""")
+    checkDelete("""{"a": 1, "b": 2}""", Seq("""$["a"]"""), """{"b":2}""")
+
+    // Pure deep-array nesting: only `ArrayIndexSegment`s, never visits the `OBJECT` branch.
+    checkDelete("[[[1, 2, 3]]]", Seq("$[0][0][1]"), "[[[1,3]]]")
+    checkDelete("[[10, 20], [30, 40]]", Seq("$[0][1]"), "[[10],[30,40]]")
+
+    // All three key notations (`.k`, `['k']`, `["k"]`) alternating within a single path.
+    checkDelete(
+      """{"a": {"b": {"c": 1, "d": 2}}}""",
+      Seq("""$['a'].b["c"]"""),
+      """{"a":{"b":{"d":2}}}""")
+
+    checkDelete("""{"": 1, "a": 2}""", Seq("$['']"), """{"a":2}""")
+    checkDelete("""{"?": 1, "a": 2}""", Seq("$['?']"), """{"a":2}""")
+    checkDelete(
+      """{"key with spaces": 1, "a": 2}""", Seq("$['key with spaces']"), """{"a":2}""")
+    checkDelete("""{"fb:testid": 1, "a": 2}""", Seq("$.fb:testid"), """{"a":2}""")
+
+    checkDelete("""{"a": 1, "b": 2}""", Seq(null, "$.a"), """{"b":2}""")
+
+    // After a deletion empties the parent, a subsequent nested path is a silent no-op.
+    checkDelete("""{"a": {"b": 1}}""", Seq("$.a", "$.a.b"), "{}")
+
+    // Type mismatches between segment and value are silent no-ops.
+    checkDelete("""{"a": 5}""", Seq("$.a.b"), """{"a":5}""")
+    checkDelete("[1, 2, 3]", Seq("$.a"), "[1,2,3]")
+    checkDelete("""{"a": 1}""", Seq("$[0]"), """{"a":1}""")
+
+    checkDelete("""{"a": 1, "b": 2}""", Seq[String](null), """{"a":1,"b":2}""")
+
+    // All literal-NULL paths: `flatMap` leaves `pathArgs` empty; input is returned unchanged.
+    checkDelete("""{"a": 1, "b": 2}""", Seq(null, null, null), """{"a":1,"b":2}""")
+
+    checkDelete("""{"a": null, "b": 2}""", Seq("$.a"), """{"b":2}""")
+    checkDelete("[null, 1, null]", Seq("$[0]"), "[1,null]")
+
+    // Mixed literal + dynamic path exercises both `FoldableVariantPath` and `DynamicVariantPath`
+    // arms of `eval` in a single call.
+    val mixedLitDyn = VariantDelete(Seq(
+      Literal(parseJson("""{"a": 1, "b": 2, "c": 3}""")),
+      Literal("$.a"),
+      BoundReference(0, StringType, nullable = true)))
+    checkEvaluation(
+      ResolveTimeZone.resolveTimeZones(Cast(mixedLitDyn, StringType)),
+      """{"b":2}""",
+      InternalRow(UTF8String.fromString("$.c")))
+
+    checkEvaluation(
+      ResolveTimeZone.resolveTimeZones(
+        Cast(VariantDelete(Seq(Literal.create(null, VariantType), Literal("$.a"))), StringType)),
+      null)
+
+    checkErrorInExpression[SparkRuntimeException](
+      ResolveTimeZone.resolveTimeZones(
+        VariantDelete(Seq(Literal(parseJson("""{"a": 1}""")), Literal("$")))),
+      "INVALID_VARIANT_PATH",
+      Map("path" -> "$", "functionName" -> "`variant_delete`"))
+
+    checkErrorInExpression[SparkRuntimeException](
+      ResolveTimeZone.resolveTimeZones(
+        VariantDelete(Seq(Literal(parseJson("""{"a": 1}""")), Literal(".a")))),
+      "INVALID_VARIANT_PATH",
+      Map("path" -> ".a", "functionName" -> "`variant_delete`"))
+
+    checkErrorInExpression[SparkRuntimeException](
+      ResolveTimeZone.resolveTimeZones(
+        VariantDelete(Seq(Literal(parseJson("""{"a": 1}""")), Literal("""$['a\']""")))),
+      "INVALID_VARIANT_PATH",
+      Map("path" -> """$['a\']""", "functionName" -> "`variant_delete`"))
+
+    checkErrorInExpression[SparkRuntimeException](
+      ResolveTimeZone.resolveTimeZones(
+        VariantDelete(Seq(Literal(parseJson("""{"a": 1}""")), Literal("""$["a\"]""")))),
+      "INVALID_VARIANT_PATH",
+      Map("path" -> """$["a\"]""", "functionName" -> "`variant_delete`"))
+
+    for (path <- Seq("$[2147483648]", "$[4294967296]")) {
+      checkErrorInExpression[SparkRuntimeException](
+        ResolveTimeZone.resolveTimeZones(
+          VariantDelete(Seq(Literal(parseJson("[1, 2, 3]")), Literal(path)))),
+        "INVALID_VARIANT_PATH",
+        Map("path" -> path, "functionName" -> "`variant_delete`"))
+    }
+
+    val noPaths = VariantDelete(Seq(Literal(parseJson("""{"a": 1}"""))))
+    intercept[org.apache.spark.sql.AnalysisException] {
+      noPaths.checkInputDataTypes()
+    }
+  }
+
+  test("variant_insert") {
+    def checkInsert(input: String, path: String, value: Expression, expected: String): Unit = {
+      Seq(true, false).foreach { failOnError =>
+        val expr = VariantInsert(
+          Literal(parseJson(input)), Literal.create(path, StringType), value, failOnError)
+        checkEvaluation(
+          ResolveTimeZone.resolveTimeZones(Cast(expr, StringType)),
+          expected)
+      }
+    }
+
+    // A recoverable error: `variant_insert` throws, but `try_variant_insert` returns NULL.
+    def checkInsertRecoverableError(
+        input: String,
+        path: String,
+        value: Expression,
+        condition: String,
+        parameters: Map[String, String]): Unit = {
+      checkErrorInExpression[SparkRuntimeException](
+        VariantInsert(Literal(parseJson(input)), Literal.create(path, StringType), value),
+        condition,
+        parameters)
+      checkEvaluation(
+        VariantInsert(
+          Literal(parseJson(input)), Literal.create(path, StringType), value, failOnError = false),
+        null)
+    }
+
+    // An unrecoverable error (a malformed path or a size overflow): both functions throw, and only
+    // the `functionName` in the error message differs.
+    def checkInsertUnrecoverableError(
+        input: String,
+        path: String,
+        value: Expression,
+        condition: String,
+        parameters: String => Map[String, String]): Unit = {
+      Seq("variant_insert" -> true, "try_variant_insert" -> false).foreach {
+        case (name, failOnError) =>
+          checkErrorInExpression[SparkRuntimeException](
+            VariantInsert(
+              Literal(parseJson(input)), Literal.create(path, StringType), value, failOnError),
+            condition,
+            parameters(name))
+      }
+    }
+
+    // Object inserts.
+    checkInsert("""{"a": 1}""", "$.b", Literal(2), """{"a":1,"b":2}""")
+    checkInsert("{}", "$.a", Literal(1), """{"a":1}""")
+    checkInsert("""{"a": {"b": 1}}""", "$.a.c", Literal(3), """{"a":{"b":1,"c":3}}""")
+
+    // Missing intermediate keys are created; the next segment's kind picks the container.
+    checkInsert("{}", "$.a.b.c", Literal(99), """{"a":{"b":{"c":99}}}""")
+    checkInsert("{}", "$.a[0]", Literal(1), """{"a":[1]}""")
+
+    // Array inserts shift existing elements right.
+    checkInsert("""["a","b","c"]""", "$[1]", Literal("z"), """["a","z","b","c"]""")
+    checkInsert("""["a","b","c"]""", "$[0]", Literal("z"), """["z","a","b","c"]""")
+    checkInsert("""["a","b","c"]""", "$[3]", Literal("z"), """["a","b","c","z"]""")
+    checkInsert("""["a","b"]""", "$[5]", Literal("z"), """["a","b",null,null,null,"z"]""")
+
+    // A missing intermediate created as an array is also padded with nulls up to the index.
+    checkInsert("""{"a": []}""", "$.a[2].b", Literal(1), """{"a":[null,null,{"b":1}]}""")
+    checkInsert("""{"a": [1, 2]}""", "$.a[3].b", Literal(2), """{"a":[1,2,null,{"b":2}]}""")
+    checkInsert("{}", "$.a[2]", Literal(1), """{"a":[null,null,1]}""")
+    checkInsert("{}", "$.a[2].b", Literal(1), """{"a":[null,null,{"b":1}]}""")
+
+    // Descending through an existing container, then inserting into it.
+    checkInsert("""[{"a": 1}]""", "$[0].b", Literal(2), """[{"a":1,"b":2}]""")
+    checkInsert("""[{"x": 0}, {"a": 1}]""", "$[1].b", Literal(2), """[{"x":0},{"a":1,"b":2}]""")
+    checkInsert("""{"a": [1, 2, 3]}""", "$.a[1]", Literal(9), """{"a":[1,9,2,3]}""")
+
+    // Bracket and dot notations are interchangeable: `['k']`, `["k"]`, and `.k` in one path.
+    checkInsert(
+      """{"a": {"b": {}}}""", """$['a'].b["c"]""", Literal(1), """{"a":{"b":{"c":1}}}""")
+
+    // Special / edge-case keys.
+    checkInsert("""{"a": 1}""", "$['']", Literal(2), """{"":2,"a":1}""")
+    checkInsert("""{"a": 1}""", "$['?']", Literal(2), """{"?":2,"a":1}""")
+    Seq("uD800", "uDC00").foreach { escape =>
+      checkInsert(
+        """{"?":1}""", "$['\\" + escape + "']", Literal(2),
+        "{\"?\":1,\"\\\\" + escape + "\":2}")
+    }
+    checkInsert(
+      """{"a": 1}""", "$['key with spaces']", Literal(2), """{"a":1,"key with spaces":2}""")
+    checkInsert("""{"a": 1}""", "$.fb:testid", Literal(2), """{"a":1,"fb:testid":2}""")
+
+    // Insert a variant null (the JSON null literal) vs. a verbatim string vs. structured JSON.
+    checkInsert("""{"a": 1}""", "$.b", Literal(parseJson("null")), """{"a":1,"b":null}""")
+    checkInsert("{}", "$.a", Literal("""{"x":1}"""), """{"a":"{\"x\":1}"}""")
+    checkInsert("{}", "$.a", Literal(parseJson("""{"x":1}""")), """{"a":{"x":1}}""")
+
+    // Values of various castable types exercise the corresponding `castToVariant` branches.
+    checkInsert("{}", "$.a", Literal(true), """{"a":true}""")
+    checkInsert("{}", "$.a", Literal(7L), """{"a":7}""")
+    checkInsert("{}", "$.a", Literal(2.5), """{"a":2.5}""")
+    checkInsert(
+      "{}", "$.a", Literal.create(Array(1, 2, 3), ArrayType(IntegerType)), """{"a":[1,2,3]}""")
+
+    Seq(true, false).foreach { failOnError =>
+      checkEvaluation(
+        VariantInsert(Literal.create(null, VariantType), Literal("$.a"), Literal(1), failOnError),
+        null)
+    }
+    checkInsert("""{"a": 1}""", null, Literal(1), null)
+    checkInsert("""{"a": 1}""", "$.b", Literal.create(null, VariantType), null)
+    checkInsert("""{"a": 1}""", "$.b", Literal.create(null, NullType), null)
+
+    Seq(true, false).foreach { failOnError =>
+      val dynamic = VariantInsert(
+        Literal(parseJson("""{"a": 1}""")),
+        BoundReference(0, StringType, nullable = true),
+        Literal(2),
+        failOnError)
+      checkEvaluation(
+        ResolveTimeZone.resolveTimeZones(Cast(dynamic, StringType)),
+        """{"a":1,"b":2}""",
+        InternalRow(UTF8String.fromString("$.b")))
+    }
+
+    // Recoverable errors: `variant_insert` throws; `try_variant_insert` returns NULL. A duplicate
+    // key and every shape of path type mismatch are all recoverable.
+    checkInsertRecoverableError("""{"a": 1}""", "$.a", Literal(2),
+      "VARIANT_DUPLICATE_KEY",
+      Map("key" -> "a"))
+    checkInsertRecoverableError("""{"a": 1}""", "$.a.b", Literal(2),
+      "VARIANT_PATH_TYPE_MISMATCH",
+      Map("path" -> "$.a.b", "failedAt" -> "$.a", "functionName" -> "`variant_insert`"))
+    checkInsertRecoverableError("""{"a": 1}""", "$[0]", Literal(2),
+      "VARIANT_PATH_TYPE_MISMATCH",
+      Map("path" -> "$[0]", "failedAt" -> "$", "functionName" -> "`variant_insert`"))
+    checkInsertRecoverableError("""{"a": [1, 2]}""", "$.a.b", Literal(2),
+      "VARIANT_PATH_TYPE_MISMATCH",
+      Map("path" -> "$.a.b", "failedAt" -> "$.a", "functionName" -> "`variant_insert`"))
+    checkInsertRecoverableError("""{"a": 5}""", "$.a[0]", Literal(2),
+      "VARIANT_PATH_TYPE_MISMATCH",
+      Map("path" -> "$.a[0]", "failedAt" -> "$.a", "functionName" -> "`variant_insert`"))
+    checkInsertRecoverableError("5", "$.a", Literal(2),
+      "VARIANT_PATH_TYPE_MISMATCH",
+      Map("path" -> "$.a", "failedAt" -> "$", "functionName" -> "`variant_insert`"))
+    checkInsertRecoverableError("""{"a.b": 5}""", """$['a.b'].c""", Literal(2),
+      "VARIANT_PATH_TYPE_MISMATCH",
+      Map("path" -> "$['a.b'].c", "failedAt" -> "$['a.b']", "functionName" -> "`variant_insert`"))
+    checkInsertRecoverableError("""{"a.'b": 5}""", """$["a.'b"].c""", Literal(2),
+      "VARIANT_PATH_TYPE_MISMATCH",
+      Map("path" -> "$[\"a.'b\"].c", "failedAt" -> "$[\"a.'b\"]",
+        "functionName" -> "`variant_insert`"))
+    checkInsertRecoverableError("""{"a.'\"b": 5}""", """$['a.\'"b'].c""", Literal(2),
+      "VARIANT_PATH_TYPE_MISMATCH",
+      Map(
+        "path" -> """$['a.\'"b'].c""",
+        "failedAt" -> """$["a.'\"b"]""",
+        "functionName" -> "`variant_insert`"))
+    checkInsertRecoverableError("""{"a.\\nb": 5}""", """$['a.\\nb'].c""", Literal(2),
+      "VARIANT_PATH_TYPE_MISMATCH",
+      Map(
+        "path" -> """$['a.\\nb'].c""",
+        "failedAt" -> """$['a.\\nb']""",
+        "functionName" -> "`variant_insert`"))
+    Seq('\b' -> "\\b", '\f' -> "\\f", '\n' -> "\\n", '\r' -> "\\r", '\t' -> "\\t",
+      1.toChar -> ("\\" + "u0001")).foreach { case (control, escape) =>
+      val prefix = s"$$['a.${escape}b']"
+      checkInsertRecoverableError(s"""{"a.${escape}b":5}""", prefix + ".c", Literal(2),
+        "VARIANT_PATH_TYPE_MISMATCH",
+        Map("path" -> (prefix + ".c"), "failedAt" -> prefix,
+          "functionName" -> "`variant_insert`"))
+      assert(VariantPathParser.parse(prefix, legacyPathBackslashAsLiteral = false).get
+        .sameElements(Array(ObjectExtraction(s"a.${control}b"))))
+    }
+
+    // Structs and maps are rejected at analysis.
+    Seq(
+      Literal.create(null, MapType(StringType, IntegerType)),
+      Literal.create(null, StructType(Seq(StructField("x", IntegerType))))
+    ).foreach { v =>
+      Seq(true, false).foreach { failOnError =>
+        assert(
+          VariantInsert(Literal(parseJson("{}")), Literal("$.a"), v, failOnError)
+            .checkInputDataTypes().isFailure)
+      }
+    }
+
+    // Unrecoverable errors: both functions throw.
+    checkInsertUnrecoverableError("{}", "$", Literal(1),
+      "INVALID_VARIANT_PATH",
+      name => Map("path" -> "$", "functionName" -> s"`$name`"))
+    checkInsertUnrecoverableError("{}", "abc", Literal(1),
+      "INVALID_VARIANT_PATH",
+      name => Map("path" -> "abc", "functionName" -> s"`$name`"))
+    checkInsertUnrecoverableError("{}", """$['a\']""", Literal(1),
+      "INVALID_VARIANT_PATH",
+      name => Map("path" -> """$['a\']""", "functionName" -> s"`$name`"))
+    checkInsertUnrecoverableError("{}", """$["a\"]""", Literal(1),
+      "INVALID_VARIANT_PATH",
+      name => Map("path" -> """$["a\"]""", "functionName" -> s"`$name`"))
+
+    Seq("variant_insert" -> true, "try_variant_insert" -> false).foreach {
+      case (name, failOnError) =>
+        checkErrorInExpression[SparkRuntimeException](
+          VariantInsert(BoundReference(0, VariantType, nullable = true),
+            Literal.create("abc", StringType), Literal(1), failOnError),
+          InternalRow(null),
+          "INVALID_VARIANT_PATH",
+          Map("path" -> "abc", "functionName" -> s"`$name`"))
+    }
+
+    val tooBig = "x".repeat(16 * 1024 * 1024)
+    checkInsertUnrecoverableError("{}", "$.a[2000000000]", Literal(1),
+      "VARIANT_SIZE_LIMIT",
+      name => Map("sizeLimit" -> "16.0 MiB", "functionName" -> s"`$name`"))
+    checkInsertUnrecoverableError("{}", "$.a", Literal(tooBig),
+      "VARIANT_SIZE_LIMIT",
+      name => Map("sizeLimit" -> "16.0 MiB", "functionName" -> s"`$name`"))
+  }
+
+  test("variant_set") {
+    def checkSet(
+        input: String,
+        path: String,
+        value: Expression,
+        expected: String,
+        createIfMissing: Boolean = true): Unit = {
+      // On success `variant_set` and `try_variant_set` behave identically.
+      Seq(true, false).foreach { failOnError =>
+        val expr = VariantSet(
+          Literal(parseJson(input)),
+          Literal.create(path, StringType),
+          value,
+          Literal(createIfMissing),
+          failOnError)
+        checkEvaluation(
+          ResolveTimeZone.resolveTimeZones(Cast(expr, StringType)),
+          expected)
+      }
+    }
+
+    // A recoverable error: `variant_set` throws, but `try_variant_set` returns NULL.
+    def checkSetRecoverableError(
+        input: String,
+        path: String,
+        value: Expression,
+        condition: String,
+        parameters: Map[String, String],
+        createIfMissing: Boolean = true): Unit = {
+      checkErrorInExpression[SparkRuntimeException](
+        VariantSet(Literal(parseJson(input)), Literal.create(path, StringType), value,
+          Literal(createIfMissing)),
+        condition,
+        parameters)
+      checkEvaluation(
+        VariantSet(Literal(parseJson(input)), Literal.create(path, StringType), value,
+          Literal(createIfMissing), failOnError = false),
+        null)
+    }
+
+    // An unrecoverable error (a malformed path or a size overflow): both functions throw, and only
+    // the `functionName` in the error message differs.
+    def checkSetUnrecoverableError(
+        input: String,
+        path: String,
+        value: Expression,
+        condition: String,
+        parameters: String => Map[String, String]): Unit = {
+      Seq("variant_set" -> true, "try_variant_set" -> false).foreach {
+        case (name, failOnError) =>
+          checkErrorInExpression[SparkRuntimeException](
+            VariantSet(Literal(parseJson(input)), Literal.create(path, StringType), value,
+              Literal(true), failOnError),
+            condition,
+            parameters(name))
+      }
+    }
+
+    // Object sets: replace an existing key, or add a missing one.
+    checkSet("""{"a": 1}""", "$.a", Literal(2), """{"a":2}""")
+    checkSet("""{"a": 1}""", "$.b", Literal(3), """{"a":1,"b":3}""")
+    checkSet("""{"a": {"b": 1}}""", "$.a.b", Literal(9), """{"a":{"b":9}}""")
+    Seq("uD800", "uDC00").foreach { escape =>
+      checkSet(
+        """{"?":1}""", "$['\\" + escape + "']", Literal(2),
+        "{\"?\":1,\"\\\\" + escape + "\":2}")
+    }
+
+    // Missing intermediate keys are created when create_if_missing is true.
+    checkSet("{}", "$.a.b", Literal(1), """{"a":{"b":1}}""")
+    checkSet("{}", "$.a[0]", Literal(1), """{"a":[1]}""")
+
+    // Array sets replace the element at the index (no shifting).
+    checkSet("""["a","b","c"]""", "$[1]", Literal("z"), """["a","z","c"]""")
+    // N == length appends; N > length pads with variant nulls.
+    checkSet("""["a","b","c"]""", "$[3]", Literal("z"), """["a","b","c","z"]""")
+    checkSet("""["a","b"]""", "$[5]", Literal("z"), """["a","b",null,null,null,"z"]""")
+    checkSet("""{"a": [1, 2, 3]}""", "$.a[1]", Literal(9), """{"a":[1,9,3]}""")
+
+    // Array index as an intermediate segment.
+    checkSet("""[{"a": 1}]""", "$[0].b", Literal(2), """[{"a":1,"b":2}]""")
+    checkSet("""[{"a": 1}]""", "$[0].a", Literal(9), """[{"a":9}]""")
+    checkSet("""{"a": [1, 2]}""", "$.a[3].b", Literal(9), """{"a":[1,2,null,{"b":9}]}""")
+    // A missing intermediate array is created and padded with variant nulls up to the index.
+    checkSet("{}", "$.a[2]", Literal(1), """{"a":[null,null,1]}""")
+
+    // scalastyle:off nonascii
+    // Non-ASCII (multi-byte UTF-8).
+    checkSet("""{"你好": 1}""", """$['你好']""", Literal(2), """{"你好":2}""")
+    checkSet("""{"a": 1}""", """$['世界']""", Literal(2), """{"a":1,"世界":2}""")
+    checkSet("{}", """$['café']['über']""", Literal("naïve"), """{"café":{"über":"naïve"}}""")
+    // scalastyle:on nonascii
+
+    // create_if_missing = false.
+    checkSet("""{"a": 1, "b": 2}""", "$.a", Literal(99), """{"a":99,"b":2}""", false)
+    checkSet("""["a","b"]""", "$[1]", Literal("z"), """["a","z"]""", false)
+    checkSet("""{"a": {"b": 1}}""", "$.a.b", Literal(9), """{"a":{"b":9}}""", false)
+    checkSet("""{"a": [1, 2]}""", "$.a[1]", Literal(9), """{"a":[1,9]}""", false)
+    checkSet("""[{"a": 1}]""", "$[0].a", Literal(9), """[{"a":9}]""", false)
+    checkSet("""{"a": {"b": [1, 2]}}""", "$.a.b[0]", Literal(9), """{"a":{"b":[9,2]}}""", false)
+    checkSet("""{"a": 1}""", "$.b", Literal(2), """{"a":1}""", false)
+    checkSet("""{"a": {"b": 1}}""", "$.a.c", Literal(2), """{"a":{"b":1}}""", false)
+    checkSet("""{"a": [1, 2]}""", "$.a[5]", Literal(9), """{"a":[1,2]}""", false)
+
+    // Set a variant null vs. a verbatim string vs. structured JSON.
+    checkSet("""{"a": 1}""", "$.a", Literal(parseJson("null")), """{"a":null}""")
+    checkSet("{}", "$.a", Literal("""{"x":1}"""), """{"a":"{\"x\":1}"}""")
+    checkSet("{}", "$.a", Literal(parseJson("""{"x":1}""")), """{"a":{"x":1}}""")
+    checkSet(
+      "{}", "$.a", Literal.create(Array(1, 2, 3), ArrayType(IntegerType)), """{"a":[1,2,3]}""")
+
+    Seq(true, false).foreach { failOnError =>
+      checkEvaluation(
+        VariantSet(Literal.create(null, VariantType), Literal("$.a"), Literal(1), Literal(true),
+          failOnError),
+        null)
+      checkEvaluation(
+        VariantSet(Literal(parseJson("""{"a": 1}""")), Literal("$.a"), Literal(2),
+          Literal.create(null, BooleanType), failOnError),
+        null)
+    }
+    checkSet("""{"a": 1}""", null, Literal(1), null)
+    checkSet("""{"a": 1}""", "$.a", Literal.create(null, VariantType), null)
+    checkSet("""{"a": 1}""", "$.a", Literal.create(null, NullType), null)
+
+    Seq(true, false).foreach { failOnError =>
+      val dynamicCreate = VariantSet(
+        Literal(parseJson("""{"a": 1}""")),
+        BoundReference(0, StringType, nullable = true),
+        Literal(2),
+        Literal(true),
+        failOnError)
+      checkEvaluation(
+        ResolveTimeZone.resolveTimeZones(Cast(dynamicCreate, StringType)),
+        """{"a":1,"b":2}""",
+        InternalRow(UTF8String.fromString("$.b")))
+      val dynamicNoCreate = VariantSet(
+        Literal(parseJson("""{"a": 1}""")),
+        BoundReference(0, StringType, nullable = true),
+        Literal(2),
+        Literal(false),
+        failOnError)
+      checkEvaluation(
+        ResolveTimeZone.resolveTimeZones(Cast(dynamicNoCreate, StringType)),
+        """{"a":1}""",
+        InternalRow(UTF8String.fromString("$.b")))
+    }
+
+    // create_if_missing must be a constant, for both variant_set and try_variant_set.
+    Seq(true, false).foreach { failOnError =>
+      assert(VariantSet(
+        Literal(parseJson("""{"a": 1}""")), Literal("$.a"), Literal(2),
+        BoundReference(0, BooleanType, nullable = true), failOnError)
+        .checkInputDataTypes().isFailure)
+    }
+
+    // Recoverable errors: `variant_set` throws; `try_variant_set` returns NULL. Every shape of
+    // path type mismatch is recoverable, regardless of create_if_missing.
+    Seq(true, false).foreach { create =>
+      checkSetRecoverableError("""{"a": 1}""", "$.a.b", Literal(2),
+        "VARIANT_PATH_TYPE_MISMATCH",
+        Map("path" -> "$.a.b", "failedAt" -> "$.a", "functionName" -> "`variant_set`"),
+        create)
+    }
+    checkSetRecoverableError("5", "$.a", Literal(2),
+      "VARIANT_PATH_TYPE_MISMATCH",
+      Map("path" -> "$.a", "failedAt" -> "$", "functionName" -> "`variant_set`"))
+    // Segment kind not matching the container: array index on an object, object key on an array.
+    checkSetRecoverableError("""{"a": 1}""", "$[0]", Literal(2),
+      "VARIANT_PATH_TYPE_MISMATCH",
+      Map("path" -> "$[0]", "failedAt" -> "$", "functionName" -> "`variant_set`"))
+    checkSetRecoverableError("[1, 2]", "$.a", Literal(2),
+      "VARIANT_PATH_TYPE_MISMATCH",
+      Map("path" -> "$.a", "failedAt" -> "$", "functionName" -> "`variant_set`"))
+    // A key that needs bracket notation is rendered with brackets in `failedAt`.
+    checkSetRecoverableError("""{"a.b": 5}""", """$['a.b'].c""", Literal(2),
+      "VARIANT_PATH_TYPE_MISMATCH",
+      Map("path" -> "$['a.b'].c", "failedAt" -> "$['a.b']", "functionName" -> "`variant_set`"))
+
+    // Structs and maps are rejected at analysis; arrays of scalars remain allowed.
+    Seq(
+      Literal.create(null, MapType(StringType, IntegerType)),
+      Literal.create(null, StructType(Seq(StructField("x", IntegerType))))
+    ).foreach { v =>
+      Seq(true, false).foreach { failOnError =>
+        assert(
+          VariantSet(Literal(parseJson("{}")), Literal("$.a"), v, Literal(true), failOnError)
+            .checkInputDataTypes().isFailure)
+      }
+    }
+
+    val structVal = ToVariantObject(Literal.create(create_row(1, "x"),
+      StructType(Array(StructField("a", IntegerType), StructField("b", StringType)))))
+    val mapVal = ToVariantObject(Literal.create(Map("z" -> 1, "y" -> 2, "x" -> 3)))
+    Seq(structVal, mapVal).foreach { v =>
+      assert(
+        VariantSet(Literal(parseJson("{}")), Literal("$.k"), v, Literal(true))
+          .checkInputDataTypes().isSuccess)
+    }
+    checkSet("""{"k": 1}""", "$.k", structVal, """{"k":{"a":1,"b":"x"}}""")
+    checkSet("""{"k": 1}""", "$.k", mapVal, """{"k":{"x":3,"y":2,"z":1}}""")
+    checkSet("""{"a": {"b": 1}}""", "$.a.b", structVal, """{"a":{"b":{"a":1,"b":"x"}}}""")
+
+    // Unrecoverable errors: both functions throw.
+    checkSetUnrecoverableError("{}", "$", Literal(1),
+      "INVALID_VARIANT_PATH",
+      name => Map("path" -> "$", "functionName" -> s"`$name`"))
+    checkSetUnrecoverableError("{}", """$['a\']""", Literal(1),
+      "INVALID_VARIANT_PATH",
+      name => Map("path" -> """$['a\']""", "functionName" -> s"`$name`"))
+    checkSetUnrecoverableError("{}", """$["a\"]""", Literal(1),
+      "INVALID_VARIANT_PATH",
+      name => Map("path" -> """$["a\"]""", "functionName" -> s"`$name`"))
+    val tooBig = "x".repeat(16 * 1024 * 1024)
+    checkSetUnrecoverableError("{}", "$.a[2000000000]", Literal(1),
+      "VARIANT_SIZE_LIMIT",
+      name => Map("sizeLimit" -> "16.0 MiB", "functionName" -> s"`$name`"))
+    checkSetUnrecoverableError("{}", "$.a", Literal(tooBig),
+      "VARIANT_SIZE_LIMIT",
+      name => Map("sizeLimit" -> "16.0 MiB", "functionName" -> s"`$name`"))
+
+    Seq("variant_set" -> true, "try_variant_set" -> false).foreach {
+      case (name, failOnError) =>
+        checkErrorInExpression[SparkRuntimeException](
+          VariantSet(
+            BoundReference(0, VariantType, nullable = true),
+            Literal.create("$", StringType),
+            Literal(1),
+            Literal(true),
+            failOnError),
+          InternalRow(null),
+          "INVALID_VARIANT_PATH",
+          Map("path" -> "$", "functionName" -> s"`$name`"))
+    }
+  }
+
+  test("variant_array_append") {
+    def checkAppend(input: String, path: String, value: Expression, expected: String): Unit = {
+      Seq(true, false).foreach { failOnError =>
+        val expr = VariantArrayAppend(
+          Literal(parseJson(input)), Literal.create(path, StringType), value, failOnError)
+        checkEvaluation(
+          ResolveTimeZone.resolveTimeZones(Cast(expr, StringType)),
+          expected)
+      }
+    }
+
+    // A recoverable error: `variant_array_append` throws, but `try_variant_array_append` returns
+    // NULL.
+    def checkAppendRecoverableError(
+        input: String,
+        path: String,
+        value: Expression,
+        condition: String,
+        parameters: Map[String, String]): Unit = {
+      checkErrorInExpression[SparkRuntimeException](
+        VariantArrayAppend(Literal(parseJson(input)), Literal.create(path, StringType), value),
+        condition,
+        parameters)
+      checkEvaluation(
+        VariantArrayAppend(Literal(parseJson(input)), Literal.create(path, StringType), value,
+          failOnError = false),
+        null)
+    }
+
+    // An unrecoverable error (a malformed path or a size overflow): both functions throw, and only
+    // the `functionName` in the error message differs.
+    def checkAppendUnrecoverableError(
+        input: String,
+        path: String,
+        value: Expression,
+        condition: String,
+        parameters: String => Map[String, String]): Unit = {
+      Seq("variant_array_append" -> true, "try_variant_array_append" -> false).foreach {
+        case (name, failOnError) =>
+          checkErrorInExpression[SparkRuntimeException](
+            VariantArrayAppend(Literal(parseJson(input)), Literal.create(path, StringType), value,
+              failOnError),
+            condition,
+            parameters(name))
+      }
+    }
+
+    // Append to the root array, and to nested arrays reached through object keys / array indices.
+    checkAppend("[1, 2, 3]", "$", Literal(4), "[1,2,3,4]")
+    checkAppend("[]", "$", Literal("a"), """["a"]""")
+    checkAppend("""{"a": [1, 2]}""", "$.a", Literal(3), """{"a":[1,2,3]}""")
+    checkAppend("""{"a": [1], "b": 2}""", "$.a", Literal(9), """{"a":[1,9],"b":2}""")
+    checkAppend("""{"a": [[0], [1, 2]]}""", "$.a[1]", Literal(9), """{"a":[[0],[1,2,9]]}""")
+
+    // Non-numeric scalar values (boolean, floating point).
+    checkAppend("[1]", "$", Literal(true), "[1,true]")
+    checkAppend("[1]", "$", Literal(2.5), "[1,2.5]")
+
+    // An array value is cast to a variant and appended as a single element.
+    checkAppend("[1]", "$", Literal.create(Array(2, 3), ArrayType(IntegerType)), "[1,[2,3]]")
+    checkAppend("[1, 2]", "$", Literal(parseJson("null")), "[1,2,null]")
+    // Strings are stored verbatim; use parse_json for structured JSON.
+    checkAppend("[]", "$", Literal("""{"x":1}"""), """["{\"x\":1}"]""")
+    checkAppend("[]", "$", Literal(parseJson("""{"x":1}""")), """[{"x":1}]""")
+
+    // scalastyle:off nonascii
+    checkAppend("""{"你好": [1]}""", """$['你好']""", Literal(2), """{"你好":[1,2]}""")
+    checkAppend("[]", "$", Literal("café"), """["café"]""")
+    // scalastyle:on nonascii
+
+    // A missing key or out-of-range index leaves the variant unchanged.
+    checkAppend("""{"a": [1]}""", "$.missing", Literal(2), """{"a":[1]}""")
+    checkAppend("[[1]]", "$[5]", Literal(2), "[[1]]")
+
+    Seq(true, false).foreach { failOnError =>
+      checkEvaluation(
+        VariantArrayAppend(
+          Literal.create(null, VariantType), Literal("$"), Literal(1), failOnError),
+        null)
+    }
+    checkAppend("[1]", null, Literal(1), null)
+    checkAppend("[1]", "$", Literal.create(null, VariantType), null)
+    checkAppend("[1]", "$", Literal.create(null, NullType), null)
+
+    Seq(true, false).foreach { failOnError =>
+      val dynamic = VariantArrayAppend(
+        Literal(parseJson("""{"a": [1, 2]}""")),
+        BoundReference(0, StringType, nullable = true),
+        Literal(3),
+        failOnError)
+      checkEvaluation(
+        ResolveTimeZone.resolveTimeZones(Cast(dynamic, StringType)),
+        """{"a":[1,2,3]}""",
+        InternalRow(UTF8String.fromString("$.a")))
+    }
+
+    // Recoverable errors: `variant_array_append` throws; `try_variant_array_append` returns NULL.
+    // The target is not an array (a scalar leaf, or an object at the root).
+    checkAppendRecoverableError("""{"a": 1}""", "$.a", Literal(2),
+      "VARIANT_PATH_TYPE_MISMATCH",
+      Map("path" -> "$.a", "failedAt" -> "$.a", "functionName" -> "`variant_array_append`"))
+    checkAppendRecoverableError("""{"a": 1}""", "$", Literal(2),
+      "VARIANT_PATH_TYPE_MISMATCH",
+      Map("path" -> "$", "failedAt" -> "$", "functionName" -> "`variant_array_append`"))
+    // A segment applied to an incompatible container: descending into a scalar, an array index on
+    // an object, or an object key on an array.
+    checkAppendRecoverableError("""{"a": 1}""", "$.a.b", Literal(2),
+      "VARIANT_PATH_TYPE_MISMATCH",
+      Map("path" -> "$.a.b", "failedAt" -> "$.a", "functionName" -> "`variant_array_append`"))
+    checkAppendRecoverableError("""{"a": 1}""", "$[0]", Literal(2),
+      "VARIANT_PATH_TYPE_MISMATCH",
+      Map("path" -> "$[0]", "failedAt" -> "$", "functionName" -> "`variant_array_append`"))
+    checkAppendRecoverableError("[1, 2]", "$.a", Literal(2),
+      "VARIANT_PATH_TYPE_MISMATCH",
+      Map("path" -> "$.a", "failedAt" -> "$", "functionName" -> "`variant_array_append`"))
+
+    // Structs and maps are rejected at analysis.
+    Seq(
+      Literal.create(null, MapType(StringType, IntegerType)),
+      Literal.create(null, StructType(Seq(StructField("x", IntegerType))))
+    ).foreach { v =>
+      Seq(true, false).foreach { failOnError =>
+        assert(
+          VariantArrayAppend(Literal(parseJson("[]")), Literal("$"), v, failOnError)
+            .checkInputDataTypes().isFailure)
+      }
+    }
+
+    // Unrecoverable errors: both functions throw. The root `$` is a valid target, but a malformed
+    // path is still rejected, and a size overflow surfaces as VARIANT_SIZE_LIMIT.
+    checkAppendUnrecoverableError("[]", "abc", Literal(1),
+      "INVALID_VARIANT_PATH",
+      name => Map("path" -> "abc", "functionName" -> s"`$name`"))
+    checkAppendUnrecoverableError("[]", """$['a\']""", Literal(1),
+      "INVALID_VARIANT_PATH",
+      name => Map("path" -> """$['a\']""", "functionName" -> s"`$name`"))
+    checkAppendUnrecoverableError("[]", """$["a\"]""", Literal(1),
+      "INVALID_VARIANT_PATH",
+      name => Map("path" -> """$["a\"]""", "functionName" -> s"`$name`"))
+
+    Seq("variant_array_append" -> true, "try_variant_array_append" -> false).foreach {
+      case (name, failOnError) =>
+        checkErrorInExpression[SparkRuntimeException](
+          VariantArrayAppend(BoundReference(0, VariantType, nullable = true),
+            Literal.create("abc", StringType), Literal(1), failOnError),
+          InternalRow(null),
+          "INVALID_VARIANT_PATH",
+          Map("path" -> "abc", "functionName" -> s"`$name`"))
+    }
+    checkErrorInExpression[SparkRuntimeException](
+      VariantArrayAppend(Literal(parseJson("[]")), Literal(""), Literal(1)),
+      "INVALID_VARIANT_PATH",
+      Map("path" -> "", "functionName" -> "`variant_array_append`"))
+    val tooBig = "x".repeat(16 * 1024 * 1024)
+    checkAppendUnrecoverableError("[]", "$", Literal(tooBig),
+      "VARIANT_SIZE_LIMIT",
+      name => Map("sizeLimit" -> "16.0 MiB", "functionName" -> s"`$name`"))
+  }
+
+  test("variant_strip_nulls") {
+    // Strip `input`, render the result back to JSON, and compare. `includeArrays` defaults to true.
+    def check(input: String, expected: String, includeArrays: Boolean = true): Unit = {
+      val expr = VariantStripNulls(Literal(parseJson(input)), Literal(includeArrays))
+      val result = replace(expr).eval().asInstanceOf[VariantVal]
+      val json = if (result == null) null
+        else new Variant(result.getValue, result.getMetadata).toJson(ZoneOffset.UTC)
+      assert(json == expected)
+    }
+
+    // The optional `include_arrays` argument defaults to true in the function signature.
+    assert(VariantStripNullsExpressionBuilder.functionSignature.get.parameters.last.default
+      .contains(Literal.create(true, BooleanType)))
+
+    // include_arrays must be a constant; a non-foldable expression is rejected.
+    assert(VariantStripNulls(
+      Literal(parseJson("[1, null]")), BoundReference(0, BooleanType, nullable = true))
+      .checkInputDataTypes().isFailure)
+
+    check("""{"a": 1, "b": null, "c": 3}""", """{"a":1,"c":3}""")
+    check("[1, null, 3]", "[1,3]")
+    check("""{"user": {"name": "Alice", "age": null}}""", """{"user":{"name":"Alice"}}""")
+    check("""{"a": [1, null, {"b": null, "c": 2}]}""", """{"a":[1,{"c":2}]}""")
+    check("[[1, null], [null]]", "[[1],[]]")
+
+    // Empty containers are preserved; the parent is never collapsed.
+    check("""{"a": null}""", "{}")
+    check("[null]", "[]")
+    check("""{"a": {"b": null}}""", """{"a":{}}""")
+    check("""{"a": [null]}""", """{"a":[]}""")
+    check("{}", "{}")
+    check("[]", "[]")
+
+    // Top-level variant null and scalars are returned unchanged.
+    check("null", "null")
+    check("42", "42")
+    check("\"hi\"", "\"hi\"")
+
+    check("""{"a": {"b": {"c": null, "d": 4}}}""", """{"a":{"b":{"d":4}}}""")
+
+    check("""{"a": 300, "b": null, "c": 100000, "d": 10000000000}""",
+      """{"a":300,"c":100000,"d":10000000000}""")
+    check("""[1000000, null, "hello world", null, 10000000000]""",
+      """[1000000,"hello world",10000000000]""")
+    val bigStr = "x".repeat(300)
+    check(s"""{"k": "$bigStr", "n": null, "m": 3}""", s"""{"k":"$bigStr","m":3}""")
+    check(s"""[null, "$bigStr", null, 100000]""", s"""["$bigStr",100000]""")
+
+    // `includeArrays = false`.
+    check("""{"a": [1, null, 3], "b": null}""", """{"a":[1,null,3]}""", includeArrays = false)
+    check(
+      """[{"a": 1, "b": null}, null, {"c": null, "d": 4}]""",
+      """[{"a":1},null,{"d":4}]""",
+      includeArrays = false)
+    // `includeArrays = true` (explicit) strips array nulls.
+    check("""{"a": [1, null, 3]}""", """{"a":[1,3]}""", includeArrays = true)
+
+    // SQL NULL variant input yields SQL NULL.
+    checkEvaluation(
+      Cast(VariantStripNulls(Literal.create(null, VariantType), Literal(true)), StringType),
+      null)
+    // NULL `includeArrays` yields SQL NULL (the expression is null intolerant).
+    checkEvaluation(
+      Cast(
+        VariantStripNulls(
+          Literal(parseJson("""{"a": null}""")), Literal.create(null, BooleanType)),
+        StringType),
+      null)
+  }
+
+  test("variant_pick") {
+    def checkPick(input: String, paths: Seq[String], expected: String): Unit = {
+      val pathLits: Seq[Expression] = paths.map(p => Literal.create(p, StringType))
+      val expr = VariantPick(Literal(parseJson(input)) +: pathLits)
+      checkEvaluation(
+        ResolveTimeZone.resolveTimeZones(Cast(expr, StringType)),
+        expected)
+    }
+
+    // Keep a subset of object fields, and union paths under the same parent (parent preserved).
+    checkPick("""{"a": 1, "b": 2, "c": 3}""", Seq("$.a", "$.c"), """{"a":1,"c":3}""")
+    checkPick("""{"a": {"b": 1, "c": 2}, "d": 3}""", Seq("$.a.b"), """{"a":{"b":1}}""")
+    checkPick(
+      """{"a": {"b": 1, "c": 2, "d": 3}}""", Seq("$.a.b", "$.a.c"), """{"a":{"b":1,"c":2}}""")
+
+    // A broader path subsumes a narrower one.
+    checkPick("""{"a": {"b": 1, "c": 2}}""", Seq("$.a", "$.a.b"), """{"a":{"b":1,"c":2}}""")
+    checkPick("""{"a": {"b": 1, "c": 2}}""", Seq("$.a.b", "$.a"), """{"a":{"b":1,"c":2}}""")
+
+    // Arrays are compacted in original order; out-of-range indices are skipped.
+    checkPick("[10, 20, 30, 40]", Seq("$[2]", "$[0]"), "[10,30]")
+    checkPick("[10, 20, 30]", Seq("$[5]"), "[]")
+    checkPick("""{"a": [10, 20, 30]}""", Seq("$.a[1]"), """{"a":[20]}""")
+
+    // Array elements that are containers recurse and compact; an element that picks nothing drops.
+    checkPick("""[{"x": 1, "y": 2}, {"z": 3}]""", Seq("$[0].x"), """[{"x":1}]""")
+    checkPick("""[{"x": 1}]""", Seq("$[0].y"), "[]")
+    checkPick("[[10, 20, 30]]", Seq("$[0][1]"), "[[20]]")
+
+    // Missing keys are skipped; a parent whose picks all miss is dropped.
+    checkPick("""{"a": 1, "b": 2}""", Seq("$.a", "$.missing"), """{"a":1}""")
+    checkPick("""{"a": {"b": 1}}""", Seq("$.a.x"), "{}")
+
+    // Root path is identity; a scalar or variant-null input is returned unchanged. The variant
+    // null is compared directly, since casting it to a string yields SQL NULL, not the text "null".
+    checkPick("""{"a": 1}""", Seq("$"), """{"a":1}""")
+    checkPick("42", Seq("$.a"), "42")
+    checkEvaluation(
+      VariantPick(Seq(Literal(parseJson("null")), Literal("$.a"))),
+      parseJson("null"))
+
+    // Type mismatch matches nothing, but the top-level shape is preserved (object -> {}, array
+    // -> []); descending into a scalar, or into a container of the wrong kind, drops the parent.
+    checkPick("[1, 2, 3]", Seq("$.a"), "[]")
+    checkPick("""{"a": 1}""", Seq("$[0]"), "{}")
+    checkPick("""{"a": 1}""", Seq("$.a.b"), "{}")
+    checkPick("""{"a": [1, 2]}""", Seq("$.a.b"), "{}")
+    checkPick("""{"a": {"b": 1}}""", Seq("$.a[0]"), "{}")
+
+    // Both-maps node uses only the matching branch.
+    checkPick("""{"a": 1, "b": 2}""", Seq("$.a", "$[0]"), """{"a":1}""")
+    checkPick("[10, 20, 30]", Seq("$.a", "$[0]"), "[10]")
+    checkPick("""{"a": {"b": 1}}""", Seq("$.a.b", "$.a[0]", "$.a"), """{"a":{"b":1}}""")
+
+    // Duplicate paths are deduplicated, and bracket notation resolves like dot notation.
+    checkPick("""{"a": 1, "b": 2}""", Seq("$.a", "$.a"), """{"a":1}""")
+    checkPick("""{"a": 1, "b": 2}""", Seq("$['a']"), """{"a":1}""")
+
+    // Non-ASCII field names are matched and preserved, in both dot and bracket notation.
+    // scalastyle:off nonascii
+    checkPick("""{"café": 1, "naïve": 2}""", Seq("$.café"), """{"café":1}""")
+    checkPick(
+      """{"日本語": {"x": 1, "y": 2}}""", Seq("$['日本語'].x"), """{"日本語":{"x":1}}""")
+    checkPick("""{"ключ": [10, 20, 30]}""", Seq("$.ключ[1]"), """{"ключ":[20]}""")
+    // scalastyle:on nonascii
+
+    // Larger object trees built from several paths.
+    // Many sibling keys unioned under one parent.
+    checkPick(
+      """{"a": {"b": 1, "c": 2, "d": 3, "e": 4, "f": 5, "g": 6, "h": 7}}""",
+      Seq("$.a.b", "$.a.c", "$.a.e", "$.a.g", "$.a.h"),
+      """{"a":{"b":1,"c":2,"e":4,"g":6,"h":7}}""")
+    // Several top-level parents, each keeping a different subset of children.
+    checkPick(
+      """{"a": {"x": 1, "y": 2}, "b": {"p": 3, "q": 4}, "c": 5, "d": {"m": 6, "n": 7}}""",
+      Seq("$.a.x", "$.b.p", "$.b.q", "$.c", "$.d.m"),
+      """{"a":{"x":1},"b":{"p":3,"q":4},"c":5,"d":{"m":6}}""")
+    // A broader path subsumes a narrower sibling while other branches are kept partially.
+    checkPick(
+      """{"a": {"b": {"c": 1, "d": 2}, "e": 3}, "f": {"g": 4, "h": 5}}""",
+      Seq("$.a.b.c", "$.a.b", "$.a.e", "$.f.g"),
+      """{"a":{"b":{"c":1,"d":2},"e":3},"f":{"g":4}}""")
+    // Deep branch: multiple paths share a long prefix; an unpicked sibling is dropped.
+    checkPick(
+      """{"a": {"b": {"c": {"d": 1, "e": 2}, "f": 3, "g": 4}}}""",
+      Seq("$.a.b.c.d", "$.a.b.c.e", "$.a.b.f"),
+      """{"a":{"b":{"c":{"d":1,"e":2},"f":3}}}""")
+    // A path terminating at a genuinely empty container keeps it as-is (not dropped).
+    checkPick("""{"a": {}, "b": 1}""", Seq("$.a"), """{"a":{}}""")
+    // A picked field that matches nothing is rewound.
+    checkPick(
+      """{"a": 1, "b": {"m": 1}, "c": 2}""",
+      Seq("$.a", "$.b.x", "$.c"),
+      """{"a":1,"c":2}""")
+
+    // Larger array trees.
+    // Indices given out of order are compacted into original array order, not path order.
+    checkPick(
+      "[0, 10, 20, 30, 40, 50, 60, 70]",
+      Seq("$[5]", "$[0]", "$[7]", "$[3]"),
+      "[0,30,50,70]")
+    // A picked element that matches nothing is dropped; survivors compact around the hole.
+    checkPick(
+      """[{"x": 1}, {"y": 2}, {"z": 3}]""",
+      Seq("$[0].x", "$[1].w", "$[2].z"),
+      """[{"x":1},{"z":3}]""")
+    // Nested arrays: picks descend into multiple sub-arrays, compacting at each level.
+    checkPick(
+      "[[10, 20], [30, 40], [50, 60]]",
+      Seq("$[0][1]", "$[2][0]"),
+      "[[20],[50]]")
+    // A path ending at an array index keeps the whole element; unpicked siblings drop.
+    checkPick(
+      """[{"x": 1, "y": 2}, {"z": 3}]""",
+      Seq("$[0]"),
+      """[{"x":1,"y":2}]""")
+
+    // Mixed object/array variant with paths at different depths.
+    checkPick(
+      """{"a": [{"p": 1, "q": 2, "r": 3}, {"p": 4, "q": 5, "r": 6}], "b": {"s": 7, "t": 8}}""",
+      Seq("$.a[0].p", "$.a[0].q", "$.a[1].r", "$.b.s"),
+      """{"a":[{"p":1,"q":2},{"r":6}],"b":{"s":7}}""")
+
+    // A large variant with many paths at once.
+    checkPick(
+      """{"a": {"b": 1, "c": 2, "d": 3},
+         "e": [{"f": 10, "g": 20}, {"f": 30, "g": 40}, {"f": 50}],
+         "h": {"i": {"j": 5, "k": 6}}, "l": 7}""",
+      Seq("$.a.b", "$.a.c", "$.e[0].f", "$.e[2]", "$.h.i.j", "$.h.i", "$.l", "$.x"),
+      """{"a":{"b":1,"c":2},"e":[{"f":10},{"f":50}],"h":{"i":{"j":5,"k":6}},"l":7}""")
+
+    // Deep, branchy trie exercising many branches at once.
+    checkPick(
+      """{"a": {"b": [{"c": 1, "d": [10, 11, 12], "e": {"f": 1, "g": 2}}, {"c": 2},
+         {"e": {"f": 5}}], "h": {"i": {"j": 9}, "l": 8}}}""",
+      Seq("$.a.b[0].c", "$.a.b[0].d[1]", "$.a.b[0].e.f", "$.a.b[2].e", "$.a.b[1].z", "$.a.b.x",
+        "$.a.h.i", "$.a.h.i.j"),
+      """{"a":{"b":[{"c":1,"d":[11],"e":{"f":1}},{"e":{"f":5}}],"h":{"i":{"j":9}}}}""")
+
+    // A NULL path is skipped; the remaining paths still apply.
+    checkPick("""{"a": 1, "b": 2}""", Seq(null, "$.a"), """{"a":1}""")
+
+    // Dynamic (non-foldable) path mixed with a literal.
+    val mixedLitDyn = VariantPick(Seq(
+      Literal(parseJson("""{"a": 1, "b": 2, "c": 3}""")),
+      Literal("$.a"),
+      BoundReference(0, StringType, nullable = true)))
+    checkEvaluation(
+      ResolveTimeZone.resolveTimeZones(Cast(mixedLitDyn, StringType)),
+      """{"a":1,"c":3}""",
+      InternalRow(UTF8String.fromString("$.c")))
+
+    // A dynamic path that evaluates to NULL is skipped at runtime (unlike a constant NULL, which is
+    // dropped when the tree is built); the remaining literal path still applies.
+    checkEvaluation(
+      ResolveTimeZone.resolveTimeZones(Cast(mixedLitDyn, StringType)),
+      """{"a":1}""",
+      InternalRow(null))
+
+    // NULL variant input yields NULL.
+    checkEvaluation(
+      VariantPick(Seq(Literal.create(null, VariantType), Literal("$.a"))),
+      null)
+
+    // Malformed paths are rejected.
+    checkErrorInExpression[SparkRuntimeException](
+      VariantPick(Seq(Literal(parseJson("""{"a": 1}""")), Literal("garbage"))),
+      "INVALID_VARIANT_PATH",
+      Map("path" -> "garbage", "functionName" -> "`variant_pick`"))
+    checkErrorInExpression[SparkRuntimeException](
+      VariantPick(Seq(Literal(parseJson("""{"a": 1}""")), Literal("""$['a\']"""))),
+      "INVALID_VARIANT_PATH",
+      Map("path" -> """$['a\']""", "functionName" -> "`variant_pick`"))
+    checkErrorInExpression[SparkRuntimeException](
+      VariantPick(Seq(Literal(parseJson("""{"a": 1}""")), Literal("""$["a\"]"""))),
+      "INVALID_VARIANT_PATH",
+      Map("path" -> """$["a\"]""", "functionName" -> "`variant_pick`"))
+
+    // A malformed constant path is rejected in both interpreted and codegen modes even when the
+    // input variant is NULL: the path is parsed before the NULL short-circuit.
+    checkErrorInExpression[SparkRuntimeException](
+      VariantPick(Seq(BoundReference(0, VariantType, nullable = true), Literal("garbage"))),
+      InternalRow(null),
+      "INVALID_VARIANT_PATH",
+      Map("path" -> "garbage", "functionName" -> "`variant_pick`"))
+
+    // A malformed dynamic path is rejected at runtime (via `parsePickPath`), in both modes.
+    checkErrorInExpression[SparkRuntimeException](
+      VariantPick(Seq(
+        Literal(parseJson("""{"a": 1}""")),
+        BoundReference(0, StringType, nullable = true))),
+      InternalRow(UTF8String.fromString("garbage")),
+      "INVALID_VARIANT_PATH",
+      Map("path" -> "garbage", "functionName" -> "`variant_pick`"))
+
+    // At least one path is required.
+    val noPaths = VariantPick(Seq(Literal(parseJson("""{"a": 1}"""))))
+    intercept[org.apache.spark.sql.AnalysisException] {
+      noPaths.checkInputDataTypes()
+    }
+  }
+}

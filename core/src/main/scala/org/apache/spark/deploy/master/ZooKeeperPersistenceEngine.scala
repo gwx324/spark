@@ -17,9 +17,10 @@
 
 package org.apache.spark.deploy.master
 
+import java.io.ObjectInputFilter
 import java.nio.ByteBuffer
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import scala.reflect.ClassTag
 
 import org.apache.curator.framework.CuratorFramework
@@ -27,38 +28,45 @@ import org.apache.zookeeper.CreateMode
 
 import org.apache.spark.SparkConf
 import org.apache.spark.deploy.SparkCuratorUtil
-import org.apache.spark.internal.Logging
-import org.apache.spark.serializer.Serializer
+import org.apache.spark.internal.{Logging, LogKeys}
+import org.apache.spark.internal.config.Deploy._
+import org.apache.spark.serializer.{JavaSerializerInstance, Serializer}
+import org.apache.spark.util.ByteBufferInputStream
 
 
 private[master] class ZooKeeperPersistenceEngine(conf: SparkConf, val serializer: Serializer)
   extends PersistenceEngine
   with Logging {
 
-  private val WORKING_DIR = conf.get("spark.deploy.zookeeper.dir", "/spark") + "/master_status"
+  private val workingDir = conf.get(ZOOKEEPER_DIRECTORY).getOrElse("/spark") + "/master_status"
   private val zk: CuratorFramework = SparkCuratorUtil.newClient(conf)
 
-  SparkCuratorUtil.mkdir(zk, WORKING_DIR)
+  // Only instantiate well-known classes while reading persisted state back, so corrupted
+  // or unexpected znode contents are never instantiated in the newly elected master.
+  private val serializationFilter: ObjectInputFilter =
+    ObjectInputFilter.Config.createFilter(conf.get(RECOVERY_SERIALIZATION_FILTER))
+
+  SparkCuratorUtil.mkdir(zk, workingDir)
 
 
   override def persist(name: String, obj: Object): Unit = {
-    serializeIntoFile(WORKING_DIR + "/" + name, obj)
+    serializeIntoFile(workingDir + "/" + name, obj)
   }
 
   override def unpersist(name: String): Unit = {
-    zk.delete().forPath(WORKING_DIR + "/" + name)
+    zk.delete().forPath(workingDir + "/" + name)
   }
 
   override def read[T: ClassTag](prefix: String): Seq[T] = {
-    zk.getChildren.forPath(WORKING_DIR).asScala
-      .filter(_.startsWith(prefix)).flatMap(deserializeFromFile[T])
+    zk.getChildren.forPath(workingDir).asScala
+      .filter(_.startsWith(prefix)).flatMap(deserializeFromFile[T]).toSeq
   }
 
-  override def close() {
+  override def close(): Unit = {
     zk.close()
   }
 
-  private def serializeIntoFile(path: String, value: AnyRef) {
+  private def serializeIntoFile(path: String, value: AnyRef): Unit = {
     val serialized = serializer.newInstance().serialize(value)
     val bytes = new Array[Byte](serialized.remaining())
     serialized.get(bytes)
@@ -66,14 +74,50 @@ private[master] class ZooKeeperPersistenceEngine(conf: SparkConf, val serializer
   }
 
   private def deserializeFromFile[T](filename: String)(implicit m: ClassTag[T]): Option[T] = {
-    val fileData = zk.getData().forPath(WORKING_DIR + "/" + filename)
+    val fileData = zk.getData().forPath(workingDir + "/" + filename)
+    val recordingFilter = new RecordingFilter(serializationFilter)
     try {
-      Some(serializer.newInstance().deserialize[T](ByteBuffer.wrap(fileData)))
+      serializer.newInstance() match {
+        case javaInstance: JavaSerializerInstance =>
+          val in = javaInstance.deserializeStream(
+            new ByteBufferInputStream(ByteBuffer.wrap(fileData)), recordingFilter)
+          try {
+            Some(in.readObject[T]())
+          } finally {
+            in.close()
+          }
+        case instance =>
+          Some(instance.deserialize[T](ByteBuffer.wrap(fileData)))
+      }
     } catch {
+      case e: Exception if recordingFilter.rejected =>
+        // Rejected by the serialization filter, not found corrupt. Skip the znode without
+        // deleting it: an overly narrow filter pattern (e.g. "org.apache.spark.*", which
+        // does not match subpackages) must not wipe the whole recovery state on failover.
+        logError(log"Skipping persisted file ${MDC(LogKeys.FILE_NAME, filename)}, " +
+          log"rejected by the recovery serialization filter " +
+          log"(${MDC(LogKeys.CONFIG, RECOVERY_SERIALIZATION_FILTER.key)})", e)
+        None
       case e: Exception =>
         logWarning("Exception while reading persisted file, deleting", e)
-        zk.delete().forPath(WORKING_DIR + "/" + filename)
+        zk.delete().forPath(workingDir + "/" + filename)
         None
+    }
+  }
+
+  // Records whether the recovery serialization filter rejected anything during a read, since
+  // the JDK reports a rejection only as a generic InvalidClassException. Only this filter's
+  // rejections are recorded: a znode rejected solely by a JVM-wide jdk.serialFilter is
+  // handled like any other unreadable znode.
+  private class RecordingFilter(delegate: ObjectInputFilter) extends ObjectInputFilter {
+    var rejected = false
+
+    override def checkInput(info: ObjectInputFilter.FilterInfo): ObjectInputFilter.Status = {
+      val status = delegate.checkInput(info)
+      if (status == ObjectInputFilter.Status.REJECTED) {
+        rejected = true
+      }
+      status
     }
   }
 }

@@ -21,19 +21,16 @@ import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
 import scala.Tuple2;
 
-import com.google.common.collect.Sets;
-import org.apache.spark.api.java.JavaRDD;
-import org.apache.spark.api.java.function.Function;
-import org.apache.spark.api.java.function.VoidFunction;
 import org.apache.spark.streaming.api.java.JavaDStream;
 import org.apache.spark.util.ManualClock;
-import org.junit.Assert;
-import org.junit.Test;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Test;
 
 import org.apache.spark.HashPartitioner;
 import org.apache.spark.api.java.JavaPairRDD;
@@ -53,18 +50,14 @@ public class JavaMapWithStateSuite extends LocalJavaStreamingContext implements 
     JavaPairDStream<String, Integer> wordsDstream = null;
 
     Function4<Time, String, Optional<Integer>, State<Boolean>, Optional<Double>> mappingFunc =
-        new Function4<Time, String, Optional<Integer>, State<Boolean>, Optional<Double>>() {
-          @Override
-          public Optional<Double> call(
-              Time time, String word, Optional<Integer> one, State<Boolean> state) {
-            // Use all State's methods here
-            state.exists();
-            state.get();
-            state.isTimingOut();
-            state.remove();
-            state.update(true);
-            return Optional.of(2.0);
-          }
+        (time, word, one, state) -> {
+          // Use all State's methods here
+          state.exists();
+          state.get();
+          state.isTimingOut();
+          state.remove();
+          state.update(true);
+          return Optional.of(2.0);
         };
 
     JavaMapWithStateDStream<String, Integer, Boolean, Double> stateDstream =
@@ -78,17 +71,14 @@ public class JavaMapWithStateSuite extends LocalJavaStreamingContext implements 
     stateDstream.stateSnapshots();
 
     Function3<String, Optional<Integer>, State<Boolean>, Double> mappingFunc2 =
-        new Function3<String, Optional<Integer>, State<Boolean>, Double>() {
-          @Override
-          public Double call(String key, Optional<Integer> one, State<Boolean> state) {
-            // Use all State's methods here
-            state.exists();
-            state.get();
-            state.isTimingOut();
-            state.remove();
-            state.update(true);
-            return 2.0;
-          }
+        (key, one, state) -> {
+          // Use all State's methods here
+          state.exists();
+          state.get();
+          state.isTimingOut();
+          state.remove();
+          state.update(true);
+          return 2.0;
         };
 
     JavaMapWithStateDStream<String, Integer, Boolean, Double> stateDstream2 =
@@ -105,44 +95,41 @@ public class JavaMapWithStateSuite extends LocalJavaStreamingContext implements 
   @Test
   public void testBasicFunction() {
     List<List<String>> inputData = Arrays.asList(
-        Collections.<String>emptyList(),
+        Collections.emptyList(),
         Arrays.asList("a"),
         Arrays.asList("a", "b"),
         Arrays.asList("a", "b", "c"),
         Arrays.asList("a", "b"),
         Arrays.asList("a"),
-        Collections.<String>emptyList()
+        Collections.emptyList()
     );
 
     List<Set<Integer>> outputData = Arrays.asList(
-        Collections.<Integer>emptySet(),
-        Sets.newHashSet(1),
-        Sets.newHashSet(2, 1),
-        Sets.newHashSet(3, 2, 1),
-        Sets.newHashSet(4, 3),
-        Sets.newHashSet(5),
-        Collections.<Integer>emptySet()
+        Set.of(),
+        Set.of(1),
+        Set.of(2, 1),
+        Set.of(3, 2, 1),
+        Set.of(4, 3),
+        Set.of(5),
+        Set.of()
     );
 
     @SuppressWarnings("unchecked")
     List<Set<Tuple2<String, Integer>>> stateData = Arrays.asList(
-        Collections.<Tuple2<String, Integer>>emptySet(),
-        Sets.newHashSet(new Tuple2<>("a", 1)),
-        Sets.newHashSet(new Tuple2<>("a", 2), new Tuple2<>("b", 1)),
-        Sets.newHashSet(new Tuple2<>("a", 3), new Tuple2<>("b", 2), new Tuple2<>("c", 1)),
-        Sets.newHashSet(new Tuple2<>("a", 4), new Tuple2<>("b", 3), new Tuple2<>("c", 1)),
-        Sets.newHashSet(new Tuple2<>("a", 5), new Tuple2<>("b", 3), new Tuple2<>("c", 1)),
-        Sets.newHashSet(new Tuple2<>("a", 5), new Tuple2<>("b", 3), new Tuple2<>("c", 1))
+        Set.of(),
+        Set.of(new Tuple2<>("a", 1)),
+        Set.of(new Tuple2<>("a", 2), new Tuple2<>("b", 1)),
+        Set.of(new Tuple2<>("a", 3), new Tuple2<>("b", 2), new Tuple2<>("c", 1)),
+        Set.of(new Tuple2<>("a", 4), new Tuple2<>("b", 3), new Tuple2<>("c", 1)),
+        Set.of(new Tuple2<>("a", 5), new Tuple2<>("b", 3), new Tuple2<>("c", 1)),
+        Set.of(new Tuple2<>("a", 5), new Tuple2<>("b", 3), new Tuple2<>("c", 1))
     );
 
     Function3<String, Optional<Integer>, State<Integer>, Integer> mappingFunc =
-        new Function3<String, Optional<Integer>, State<Integer>, Integer>() {
-          @Override
-          public Integer call(String key, Optional<Integer> value, State<Integer> state) {
-            int sum = value.orElse(0) + (state.exists() ? state.get() : 0);
-            state.update(sum);
-            return sum;
-          }
+        (key, value, state) -> {
+          int sum = value.orElse(0) + (state.exists() ? state.get() : 0);
+          state.update(sum);
+          return sum;
         };
     testOperation(
         inputData,
@@ -158,37 +145,23 @@ public class JavaMapWithStateSuite extends LocalJavaStreamingContext implements 
       List<Set<Tuple2<K, S>>> expectedStateSnapshots) {
     int numBatches = expectedOutputs.size();
     JavaDStream<K> inputStream = JavaTestUtils.attachTestInputStream(ssc, input, 2);
-    JavaMapWithStateDStream<K, Integer, S, T> mapWithStateDStream =
-        JavaPairDStream.fromJavaDStream(inputStream.map(new Function<K, Tuple2<K, Integer>>() {
-          @Override
-          public Tuple2<K, Integer> call(K x) {
-            return new Tuple2<>(x, 1);
-          }
-        })).mapWithState(mapWithStateSpec);
+    JavaMapWithStateDStream<K, Integer, S, T> mapWithStateDStream = JavaPairDStream.fromJavaDStream(
+      inputStream.map(x -> new Tuple2<>(x, 1))).mapWithState(mapWithStateSpec);
 
-    final List<Set<T>> collectedOutputs =
-        Collections.synchronizedList(new ArrayList<Set<T>>());
-    mapWithStateDStream.foreachRDD(new VoidFunction<JavaRDD<T>>() {
-      @Override
-      public void call(JavaRDD<T> rdd) {
-        collectedOutputs.add(Sets.newHashSet(rdd.collect()));
-      }
-    });
-    final List<Set<Tuple2<K, S>>> collectedStateSnapshots =
-        Collections.synchronizedList(new ArrayList<Set<Tuple2<K, S>>>());
-    mapWithStateDStream.stateSnapshots().foreachRDD(new VoidFunction<JavaPairRDD<K, S>>() {
-      @Override
-      public void call(JavaPairRDD<K, S> rdd) {
-        collectedStateSnapshots.add(Sets.newHashSet(rdd.collect()));
-      }
-    });
+    List<Set<T>> collectedOutputs =
+        Collections.synchronizedList(new ArrayList<>());
+    mapWithStateDStream.foreachRDD(rdd -> collectedOutputs.add(new HashSet<>(rdd.collect())));
+    List<Set<Tuple2<K, S>>> collectedStateSnapshots =
+        Collections.synchronizedList(new ArrayList<>());
+    mapWithStateDStream.stateSnapshots().foreachRDD(rdd ->
+        collectedStateSnapshots.add(new HashSet<>(rdd.collect())));
     BatchCounter batchCounter = new BatchCounter(ssc.ssc());
     ssc.start();
     ((ManualClock) ssc.ssc().scheduler().clock())
         .advance(ssc.ssc().progressListener().batchDuration() * numBatches + 1);
     batchCounter.waitUntilBatchesCompleted(numBatches, 10000);
 
-    Assert.assertEquals(expectedOutputs, collectedOutputs);
-    Assert.assertEquals(expectedStateSnapshots, collectedStateSnapshots);
+    Assertions.assertEquals(expectedOutputs, collectedOutputs);
+    Assertions.assertEquals(expectedStateSnapshots, collectedStateSnapshots);
   }
 }

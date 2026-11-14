@@ -1,0 +1,230 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.catalyst.expressions
+
+import java.lang.reflect.Modifier
+
+import org.apache.spark.SparkFunSuite
+import org.apache.spark.sql.catalyst.optimizer.ReusableBroadcastValueProjection
+import org.apache.spark.sql.catalyst.plans.Inner
+import org.apache.spark.sql.catalyst.plans.logical.{Join, JoinHint, LocalRelation, Project}
+import org.apache.spark.sql.types.{CharType, IntegerType, TimestampType, VarcharType}
+import org.apache.spark.unsafe.types.UTF8String
+
+class DynamicPruningSubquerySuite extends SparkFunSuite {
+  private val pruningKeyExpression = Literal(1)
+
+  private val validDynamicPruningSubquery = DynamicPruningSubquery(
+    pruningKey = pruningKeyExpression,
+    buildQuery = Project(Seq(AttributeReference("id", IntegerType)()),
+      LocalRelation(AttributeReference("id", IntegerType)())),
+    buildKeys = Seq(pruningKeyExpression),
+    broadcastKeyIndices = Seq(0),
+    onlyInBroadcast = false
+  )()
+
+  test("pruningKey data type matches single buildKey") {
+    val dynamicPruningSubquery = validDynamicPruningSubquery
+      .copy(buildKeys = Seq(Literal(2023)))(None)
+    assert(dynamicPruningSubquery.resolved == true)
+  }
+
+  test("pruningKey data type is a Struct and matches with Struct buildKey") {
+    val dynamicPruningSubquery = validDynamicPruningSubquery
+      .copy(pruningKey = CreateStruct(Seq(Literal(1), Literal.FalseLiteral)),
+        buildKeys = Seq(CreateStruct(Seq(Literal(2), Literal.TrueLiteral))))(None)
+    assert(dynamicPruningSubquery.resolved == true)
+  }
+
+  test("multiple buildKeys but only one broadcastKeyIndex") {
+    val dynamicPruningSubquery = validDynamicPruningSubquery
+      .copy(buildKeys = Seq(Literal(0), Literal(2), Literal(0), Literal(9)),
+        broadcastKeyIndices = Seq(1))(None)
+    assert(dynamicPruningSubquery.resolved == true)
+  }
+
+  test("pruningKey data type does not match the single buildKey") {
+    val dynamicPruningSubquery = validDynamicPruningSubquery.copy(
+      pruningKey = Literal.TrueLiteral,
+      buildKeys = Seq(Literal(2013)))(None)
+    assert(dynamicPruningSubquery.resolved == false)
+  }
+
+  test("pruningKey data type is a Struct but mismatch with Struct buildKey") {
+    val dynamicPruningSubquery = validDynamicPruningSubquery
+      .copy(pruningKey = CreateStruct(Seq(Literal(1), Literal.FalseLiteral)),
+        buildKeys = Seq(CreateStruct(Seq(Literal.TrueLiteral, Literal(2)))))(None)
+    assert(dynamicPruningSubquery.resolved == false)
+  }
+
+  test("DynamicPruningSubquery should only have a single broadcasting key") {
+    val dynamicPruningSubquery = validDynamicPruningSubquery
+      .copy(buildKeys = Seq(Literal(2025), Literal(2), Literal(1809)),
+        broadcastKeyIndices = Seq(0, 2))(None)
+    assert(dynamicPruningSubquery.resolved == false)
+  }
+
+  test("duplicates in broadcastKeyIndices, and also should not be allowed") {
+    val dynamicPruningSubquery = validDynamicPruningSubquery
+      .copy(buildKeys = Seq(Literal(2)),
+        broadcastKeyIndices = Seq(0, 0))(None)
+    assert(dynamicPruningSubquery.resolved == false)
+  }
+
+  test("broadcastKeyIndex out of bounds") {
+    val dynamicPruningSubquery = validDynamicPruningSubquery
+      .copy(broadcastKeyIndices = Seq(1))(None)
+    assert(dynamicPruningSubquery.resolved == false)
+  }
+
+  test("SPARK-56694: Canonicalized buildKeys are consistent for identical build queries with " +
+      "different ExprIds") {
+    val attr1 = AttributeReference("key", IntegerType)()
+    val attr2 = AttributeReference("key", IntegerType)()
+    assert(attr1.exprId != attr2.exprId, "precondition: fresh attributes have distinct ExprIds")
+
+    val dpq1 = DynamicPruningSubquery(
+      pruningKey = Literal(1),
+      buildQuery = LocalRelation(attr1),
+      buildKeys = Seq(attr1),
+      broadcastKeyIndices = Seq(0),
+      onlyInBroadcast = false)()
+
+    val dpq2 = DynamicPruningSubquery(
+      pruningKey = Literal(1),
+      buildQuery = LocalRelation(attr2),
+      buildKeys = Seq(attr2),
+      broadcastKeyIndices = Seq(0),
+      onlyInBroadcast = false)()
+
+    assert(dpq1.canonicalized == dpq2.canonicalized,
+      "DynamicPruningSubquery with identical build queries but different ExprIds " +
+      "must produce identical canonicalized forms so PlanMerger can deduplicate them")
+  }
+
+  test("transient broadcast value projection survives Catalyst copies without changing identity") {
+    val key = AttributeReference("key", IntegerType)()
+    val source = LocalRelation(key)
+    val projection = BroadcastValueProjection(source, Seq(key), key)
+    val pruning = DynamicPruningSubquery(
+      key, source, Seq(key), Seq(0), onlyInBroadcast = true)(Some(projection))
+
+    assert(pruning.resolved)
+    assert(pruning.usableBroadcastValueProjection.contains(projection))
+    assert(pruning.productArity === 7)
+    assert(DynamicPruningSubquery.unapply(pruning).exists(_.productArity == 7))
+    assert(Modifier.isTransient(
+      classOf[DynamicPruningSubquery].getDeclaredField("broadcastValueProjection").getModifiers))
+
+    Seq(
+      pruning.copy()(pruning.broadcastValueProjection),
+      pruning.withNewPlan(source),
+      pruning.withNewOuterAttrs(Seq(key)),
+      pruning.withNewHint(None).asInstanceOf[DynamicPruningSubquery],
+      pruning.withNewChildren(Seq(key)).asInstanceOf[DynamicPruningSubquery],
+      pruning.makeCopy(pruning.productIterator.map(_.asInstanceOf[AnyRef]).toArray)
+        .asInstanceOf[DynamicPruningSubquery]
+    ).foreach { rewritten =>
+      assert(rewritten.broadcastValueProjection.contains(projection))
+    }
+
+    val unprojected = pruning.copy()(None)
+    assert(pruning === unprojected)
+    assert(pruning.canonicalized.asInstanceOf[DynamicPruningSubquery]
+      .broadcastValueProjection.isEmpty)
+    assert(pruning.canonicalized === unprojected.canonicalized)
+
+    val missing = AttributeReference("missing", IntegerType)()
+    Seq(
+      projection.copy(sourceHashKeys = Seq(missing)),
+      projection.copy(valueExpression = missing),
+      projection.copy(sourceHashKeys = Seq.empty),
+      projection.copy(valueExpression = Literal(1L))
+    ).foreach { invalidProjection =>
+      val rewritten = pruning.copy()(Some(invalidProjection))
+      assert(rewritten.resolved)
+      assert(rewritten.broadcastValueProjection.contains(invalidProjection))
+      assert(rewritten.usableBroadcastValueProjection.isEmpty)
+    }
+  }
+
+  test("extract broadcast hash keys without rejecting residual join predicates") {
+    val leftKey = AttributeReference("left_key", IntegerType)()
+    val leftRegion = AttributeReference("left_region", IntegerType)()
+    val leftValue = AttributeReference("left_value", IntegerType)()
+    val rightKey = AttributeReference("right_key", IntegerType)()
+    val rightRegion = AttributeReference("right_region", IntegerType)()
+    val rightValue = AttributeReference("right_value", IntegerType)()
+    val left = LocalRelation(leftKey, leftRegion, leftValue)
+    val right = LocalRelation(rightKey, rightRegion, rightValue)
+    val excluded = LocalRelation(AttributeReference("excluded", IntegerType)())
+    val residual = LessThanOrEqual(leftValue, rightValue)
+    val condition = And(
+      And(EqualTo(leftKey, rightKey), EqualTo(rightRegion, leftRegion)), residual)
+    val join = Join(left, right, Inner, Some(condition), JoinHint.NONE)
+
+    assert(ReusableBroadcastValueProjection.find(leftValue, join, excluded).contains(
+      BroadcastValueProjection(left, Seq(leftKey, leftRegion), leftValue)))
+    assert(ReusableBroadcastValueProjection.find(rightValue, join, excluded).contains(
+      BroadcastValueProjection(right, Seq(rightKey, rightRegion), rightValue)))
+
+    val nullSafeJoin = Join(
+      left, right, Inner, Some(And(EqualNullSafe(leftKey, rightKey), residual)), JoinHint.NONE)
+    assert(ReusableBroadcastValueProjection.find(leftValue, nullSafeJoin, excluded).isEmpty)
+  }
+
+  test("SPARK-59112: extract broadcast values from CHAR/VARCHAR attributes") {
+    Seq(CharType(4), VarcharType(4)).foreach { stringType =>
+      val leftKey = AttributeReference("left_key", IntegerType)()
+      val leftValue = AttributeReference("left_value", stringType)()
+      val rightKey = AttributeReference("right_key", IntegerType)()
+      val rightValue = AttributeReference("right_value", stringType)()
+      val left = LocalRelation(leftKey, leftValue)
+      val right = LocalRelation(rightKey, rightValue)
+      val excluded = LocalRelation(AttributeReference("excluded", IntegerType)())
+      val join = Join(
+        left,
+        right,
+        Inner,
+        Some(And(EqualTo(leftKey, rightKey), LessThanOrEqual(leftValue, rightValue))),
+        JoinHint.NONE)
+
+      assert(ReusableBroadcastValueProjection.find(leftValue, join, excluded).contains(
+        BroadcastValueProjection(left, Seq(leftKey), leftValue)))
+      assert(ReusableBroadcastValueProjection.find(rightValue, join, excluded).contains(
+        BroadcastValueProjection(right, Seq(rightKey), rightValue)))
+    }
+  }
+
+  test("SPARK-59112: extract date formats with CHAR/VARCHAR format literals") {
+    Seq(CharType(4), VarcharType(4)).foreach { stringType =>
+      val leftKey = AttributeReference("left_key", IntegerType)()
+      val timestamp = AttributeReference("timestamp", TimestampType)()
+      val rightKey = AttributeReference("right_key", IntegerType)()
+      val left = LocalRelation(leftKey, timestamp)
+      val right = LocalRelation(rightKey)
+      val excluded = LocalRelation(AttributeReference("excluded", IntegerType)())
+      val join = Join(left, right, Inner, Some(EqualTo(leftKey, rightKey)), JoinHint.NONE)
+      val format = Literal.create(UTF8String.fromString("yyyy"), stringType)
+      val value = DateFormatClass(timestamp, format, Some("UTC"))
+
+      assert(ReusableBroadcastValueProjection.find(value, join, excluded).contains(
+        BroadcastValueProjection(left, Seq(leftKey), value)))
+    }
+  }
+}

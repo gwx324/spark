@@ -18,8 +18,7 @@
 package org.apache.spark.api.java;
 
 import java.io.Serializable;
-
-import com.google.common.base.Preconditions;
+import java.util.Objects;
 
 /**
  * <p>Like {@code java.util.Optional} in Java 8, {@code scala.Option} in Scala, and
@@ -52,8 +51,8 @@ import com.google.common.base.Preconditions;
  *   <li>{@link #isPresent()}</li>
  * </ul>
  *
- * <p>{@code java.util.Optional} itself is not used at this time because the
- * project does not require Java 8. Using {@code com.google.common.base.Optional}
+ * <p>{@code java.util.Optional} itself was not used because at the time, the
+ * project did not require Java 8. Using {@code com.google.common.base.Optional}
  * has in the past caused serious library version conflicts with Guava that can't
  * be resolved by shading. Hence this work-alike clone.</p>
  *
@@ -70,8 +69,7 @@ public final class Optional<T> implements Serializable {
   }
 
   private Optional(T value) {
-    Preconditions.checkNotNull(value);
-    this.value = value;
+    this.value = Objects.requireNonNull(value);
   }
 
   // java.util.Optional API (subset)
@@ -111,8 +109,7 @@ public final class Optional<T> implements Serializable {
    * @throws NullPointerException if this is empty (contains no value)
    */
   public T get() {
-    Preconditions.checkNotNull(value);
-    return value;
+    return Objects.requireNonNull(value);
   }
 
   /**
@@ -167,11 +164,10 @@ public final class Optional<T> implements Serializable {
 
   @Override
   public boolean equals(Object obj) {
-    if (!(obj instanceof Optional)) {
+    if (!(obj instanceof Optional<?> other)) {
       return false;
     }
-    Optional<?> other = (Optional<?>) obj;
-    return value == null ? other.value == null : value.equals(other.value);
+    return Objects.equals(value, other.value);
   }
 
   @Override

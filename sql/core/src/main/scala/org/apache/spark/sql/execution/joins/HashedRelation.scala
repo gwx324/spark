@@ -22,14 +22,18 @@ import java.io._
 import com.esotericsoftware.kryo.{Kryo, KryoSerializable}
 import com.esotericsoftware.kryo.io.{Input, Output}
 
-import org.apache.spark.{SparkConf, SparkEnv, SparkException}
-import org.apache.spark.memory.{MemoryConsumer, MemoryMode, StaticMemoryManager, TaskMemoryManager}
+import org.apache.spark.{SparkConf, SparkEnv, SparkUnsupportedOperationException}
+import org.apache.spark.internal.config.{BUFFER_PAGESIZE, MEMORY_OFFHEAP_ENABLED}
+import org.apache.spark.memory._
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.physical.BroadcastMode
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.types.LongType
 import org.apache.spark.unsafe.Platform
+import org.apache.spark.unsafe.array.LongArray
 import org.apache.spark.unsafe.map.BytesToBytesMap
+import org.apache.spark.unsafe.memory.MemoryBlock
 import org.apache.spark.util.{KnownSizeEstimation, Utils}
 
 /**
@@ -50,7 +54,7 @@ private[execution] sealed trait HashedRelation extends KnownSizeEstimation {
    * Returns null if there is no matched rows.
    */
   def get(key: Long): Iterator[InternalRow] = {
-    throw new UnsupportedOperationException
+    throw SparkUnsupportedOperationException()
   }
 
   /**
@@ -62,13 +66,51 @@ private[execution] sealed trait HashedRelation extends KnownSizeEstimation {
    * Returns the matched single row with key that have only one column of LongType.
    */
   def getValue(key: Long): InternalRow = {
-    throw new UnsupportedOperationException
+    throw SparkUnsupportedOperationException()
+  }
+
+  /**
+   * Returns an iterator for key index and matched rows.
+   *
+   * Returns null if there is no matched rows.
+   */
+  def getWithKeyIndex(key: InternalRow): Iterator[ValueRowWithKeyIndex] = {
+    throw SparkUnsupportedOperationException()
+  }
+
+  /**
+   * Returns key index and matched single row.
+   * This is for unique key case.
+   *
+   * Returns null if there is no matched rows.
+   */
+  def getValueWithKeyIndex(key: InternalRow): ValueRowWithKeyIndex = {
+    throw SparkUnsupportedOperationException()
+  }
+
+  /**
+   * Returns an iterator for keys index and rows of InternalRow type.
+   */
+  def valuesWithKeyIndex(): Iterator[ValueRowWithKeyIndex] = {
+    throw SparkUnsupportedOperationException()
+  }
+
+  /**
+   * Returns the maximum number of allowed keys index.
+   */
+  def maxNumKeysIndex: Int = {
+    throw SparkUnsupportedOperationException()
   }
 
   /**
    * Returns true iff all the keys are unique.
    */
   def keyIsUnique: Boolean
+
+  /**
+   * Returns an iterator for keys of InternalRow type.
+   */
+  def keys(): Iterator[InternalRow]
 
   /**
    * Returns a read-only copy of this, to be safely used in current thread.
@@ -85,27 +127,75 @@ private[execution] object HashedRelation {
 
   /**
    * Create a HashedRelation from an Iterator of InternalRow.
+   *
+   * @param allowsNullKey        Allow NULL keys in HashedRelation.
+   * @param ignoresDuplicatedKey Ignore rows with duplicated keys in HashedRelation.
+   *                             This is only used for semi and anti join without join condition in
+   *                             `ShuffledHashJoinExec` only.
    */
   def apply(
       input: Iterator[InternalRow],
       key: Seq[Expression],
       sizeEstimate: Int = 64,
-      taskMemoryManager: TaskMemoryManager = null): HashedRelation = {
+      taskMemoryManager: TaskMemoryManager = null,
+      isNullAware: Boolean = false,
+      allowsNullKey: Boolean = false,
+      ignoresDuplicatedKey: Boolean = false): HashedRelation = {
     val mm = Option(taskMemoryManager).getOrElse {
       new TaskMemoryManager(
-        new StaticMemoryManager(
-          new SparkConf().set("spark.memory.offHeap.enabled", "false"),
-          Long.MaxValue,
-          Long.MaxValue,
+        new UnifiedMemoryManager(
+          new SparkConf().set(MEMORY_OFFHEAP_ENABLED.key, "false"),
+          Runtime.getRuntime.maxMemory,
+          Runtime.getRuntime.maxMemory / 2,
           1),
         0)
     }
 
-    if (key.length == 1 && key.head.dataType == LongType) {
-      LongHashedRelation(input, key, sizeEstimate, mm)
+    if (!input.hasNext && !allowsNullKey) {
+      EmptyHashedRelation
+    } else if (key.length == 1 && key.head.dataType == LongType && !allowsNullKey) {
+      // NOTE: LongHashedRelation does not support NULL keys.
+      LongHashedRelation(input, key, sizeEstimate, mm, isNullAware, ignoresDuplicatedKey)
     } else {
-      UnsafeHashedRelation(input, key, sizeEstimate, mm)
+      UnsafeHashedRelation(input, key, sizeEstimate, mm, isNullAware, allowsNullKey,
+        ignoresDuplicatedKey)
     }
+  }
+}
+
+/**
+ * A wrapper for key index and value in InternalRow type.
+ * Designed to be instantiated once per thread and reused.
+ */
+private[execution] class ValueRowWithKeyIndex {
+  private var keyIndex: Int = _
+  private var value: InternalRow = _
+
+  /** Updates this ValueRowWithKeyIndex by updating its key index.  Returns itself. */
+  def withNewKeyIndex(newKeyIndex: Int): ValueRowWithKeyIndex = {
+    keyIndex = newKeyIndex
+    this
+  }
+
+  /** Updates this ValueRowWithKeyIndex by updating its value.  Returns itself. */
+  def withNewValue(newValue: InternalRow): ValueRowWithKeyIndex = {
+    value = newValue
+    this
+  }
+
+  /** Updates this ValueRowWithKeyIndex.  Returns itself. */
+  def update(newKeyIndex: Int, newValue: InternalRow): ValueRowWithKeyIndex = {
+    keyIndex = newKeyIndex
+    value = newValue
+    this
+  }
+
+  def getKeyIndex: Int = {
+    keyIndex
+  }
+
+  def getValue: InternalRow = {
+    value
   }
 }
 
@@ -113,26 +203,33 @@ private[execution] object HashedRelation {
  * A HashedRelation for UnsafeRow, which is backed BytesToBytesMap.
  *
  * It's serialized in the following format:
- *  [number of keys]
+ *  [number of keys] [number of fields]
  *  [size of key] [size of value] [key bytes] [bytes for value]
  */
 private[joins] class UnsafeHashedRelation(
+    private var numKeys: Int,
     private var numFields: Int,
     private var binaryMap: BytesToBytesMap)
   extends HashedRelation with Externalizable with KryoSerializable {
 
-  private[joins] def this() = this(0, null)  // Needed for serialization
+  private[joins] def this() = this(0, 0, null)  // Needed for serialization
 
   override def keyIsUnique: Boolean = binaryMap.numKeys() == binaryMap.numValues()
 
   override def asReadOnlyCopy(): UnsafeHashedRelation = {
-    new UnsafeHashedRelation(numFields, binaryMap)
+    new UnsafeHashedRelation(numKeys, numFields, binaryMap)
   }
 
   override def estimatedSize: Long = binaryMap.getTotalMemoryConsumption
 
-  // re-used in get()/getValue()
+  // Visible for testing: the page size that the map grows its data pages up to.
+  private[joins] def mapPageSizeBytes: Long = binaryMap.getPageSizeBytes
+
+  // re-used in get()/getValue()/getWithKeyIndex()/getValueWithKeyIndex()/valuesWithKeyIndex()
   var resultRow = new UnsafeRow(numFields)
+
+  // re-used in getWithKeyIndex()/getValueWithKeyIndex()/valuesWithKeyIndex()
+  val valueRowWithKeyIndex = new ValueRowWithKeyIndex
 
   override def get(key: InternalRow): Iterator[InternalRow] = {
     val unsafeKey = key.asInstanceOf[UnsafeRow]
@@ -169,6 +266,85 @@ private[joins] class UnsafeHashedRelation(
     }
   }
 
+  override def getWithKeyIndex(key: InternalRow): Iterator[ValueRowWithKeyIndex] = {
+    val unsafeKey = key.asInstanceOf[UnsafeRow]
+    val map = binaryMap  // avoid the compiler error
+    val loc = new map.Location  // this could be allocated in stack
+    binaryMap.safeLookup(unsafeKey.getBaseObject, unsafeKey.getBaseOffset,
+      unsafeKey.getSizeInBytes, loc, unsafeKey.hashCode())
+    if (loc.isDefined) {
+      valueRowWithKeyIndex.withNewKeyIndex(loc.getKeyIndex)
+      new Iterator[ValueRowWithKeyIndex] {
+        private var _hasNext = true
+        override def hasNext: Boolean = _hasNext
+        override def next(): ValueRowWithKeyIndex = {
+          resultRow.pointTo(loc.getValueBase, loc.getValueOffset, loc.getValueLength)
+          _hasNext = loc.nextValue()
+          valueRowWithKeyIndex.withNewValue(resultRow)
+        }
+      }
+    } else {
+      null
+    }
+  }
+
+  override def getValueWithKeyIndex(key: InternalRow): ValueRowWithKeyIndex = {
+    val unsafeKey = key.asInstanceOf[UnsafeRow]
+    val map = binaryMap  // avoid the compiler error
+    val loc = new map.Location  // this could be allocated in stack
+    binaryMap.safeLookup(unsafeKey.getBaseObject, unsafeKey.getBaseOffset,
+      unsafeKey.getSizeInBytes, loc, unsafeKey.hashCode())
+    if (loc.isDefined) {
+      resultRow.pointTo(loc.getValueBase, loc.getValueOffset, loc.getValueLength)
+      valueRowWithKeyIndex.update(loc.getKeyIndex, resultRow)
+    } else {
+      null
+    }
+  }
+
+  override def valuesWithKeyIndex(): Iterator[ValueRowWithKeyIndex] = {
+    val iter = binaryMap.iteratorWithKeyIndex()
+
+    new Iterator[ValueRowWithKeyIndex] {
+      override def hasNext: Boolean = iter.hasNext
+
+      override def next(): ValueRowWithKeyIndex = {
+        if (!hasNext) {
+          throw QueryExecutionErrors.endOfIteratorError()
+        }
+        val loc = iter.next()
+        resultRow.pointTo(loc.getValueBase, loc.getValueOffset, loc.getValueLength)
+        valueRowWithKeyIndex.update(loc.getKeyIndex, resultRow)
+      }
+    }
+  }
+
+  override def maxNumKeysIndex: Int = {
+    binaryMap.maxNumKeysIndex
+  }
+
+  override def keys(): Iterator[InternalRow] = {
+    val iter = binaryMap.iterator()
+
+    new Iterator[InternalRow] {
+      val unsafeRow = new UnsafeRow(numKeys)
+
+      override def hasNext: Boolean = {
+        iter.hasNext
+      }
+
+      override def next(): InternalRow = {
+        if (!hasNext) {
+          throw QueryExecutionErrors.endOfIteratorError()
+        } else {
+          val loc = iter.next()
+          unsafeRow.pointTo(loc.getKeyBase, loc.getKeyOffset, loc.getKeyLength)
+          unsafeRow
+        }
+      }
+    }
+  }
+
   override def close(): Unit = {
     binaryMap.free()
   }
@@ -185,6 +361,7 @@ private[joins] class UnsafeHashedRelation(
       writeInt: (Int) => Unit,
       writeLong: (Long) => Unit,
       writeBuffer: (Array[Byte], Int, Int) => Unit) : Unit = {
+    writeInt(numKeys)
     writeInt(numFields)
     // TODO: move these into BytesToBytesMap
     writeLong(binaryMap.numKeys())
@@ -211,13 +388,14 @@ private[joins] class UnsafeHashedRelation(
   }
 
   override def readExternal(in: ObjectInput): Unit = Utils.tryOrIOException {
-    read(in.readInt, in.readLong, in.readFully)
+    read(() => in.readInt(), () => in.readLong(), in.readFully)
   }
 
   private def read(
       readInt: () => Int,
       readLong: () => Long,
       readBuffer: (Array[Byte], Int, Int) => Unit): Unit = {
+    numKeys = readInt()
     numFields = readInt()
     resultRow = new UnsafeRow(numFields)
     val nKeys = readLong()
@@ -226,15 +404,15 @@ private[joins] class UnsafeHashedRelation(
     // TODO(josh): This needs to be revisited before we merge this patch; making this change now
     // so that tests compile:
     val taskMemoryManager = new TaskMemoryManager(
-      new StaticMemoryManager(
-        new SparkConf().set("spark.memory.offHeap.enabled", "false"),
-        Long.MaxValue,
-        Long.MaxValue,
+      new UnifiedMemoryManager(
+        new SparkConf().set(MEMORY_OFFHEAP_ENABLED.key, "false"),
+        Runtime.getRuntime.maxMemory,
+        Runtime.getRuntime.maxMemory / 2,
         1),
       0)
 
     val pageSizeBytes = Option(SparkEnv.get).map(_.memoryManager.pageSizeBytes)
-      .getOrElse(new SparkConf().getSizeAsBytes("spark.buffer.pageSize", "16m"))
+      .getOrElse(new SparkConf().get(BUFFER_PAGESIZE).getOrElse(16L * 1024 * 1024))
 
     // TODO(josh): We won't need this dummy memory manager after future refactorings; revisit
     // during code review
@@ -242,7 +420,8 @@ private[joins] class UnsafeHashedRelation(
     binaryMap = new BytesToBytesMap(
       taskMemoryManager,
       (nKeys * 1.5 + 1).toInt, // reduce hash collision
-      pageSizeBytes)
+      pageSizeBytes,
+      UnsafeHashedRelation.INITIAL_PAGE_SIZE_BYTES)
 
     var i = 0
     var keyBuffer = new Array[Byte](1024)
@@ -260,37 +439,56 @@ private[joins] class UnsafeHashedRelation(
       readBuffer(valuesBuffer, 0, valuesSize)
 
       val loc = binaryMap.lookup(keyBuffer, Platform.BYTE_ARRAY_OFFSET, keySize)
-      val putSuceeded = loc.append(keyBuffer, Platform.BYTE_ARRAY_OFFSET, keySize,
+      val putSucceeded = loc.append(keyBuffer, Platform.BYTE_ARRAY_OFFSET, keySize,
         valuesBuffer, Platform.BYTE_ARRAY_OFFSET, valuesSize)
-      if (!putSuceeded) {
+      if (!putSucceeded) {
         binaryMap.free()
-        throw new IOException("Could not allocate memory to grow BytesToBytesMap")
+        throw QueryExecutionErrors.cannotAllocateMemoryToGrowBytesToBytesMapError()
       }
       i += 1
     }
   }
 
   override def read(kryo: Kryo, in: Input): Unit = Utils.tryOrIOException {
-    read(in.readInt, in.readLong, in.readBytes)
+    read(() => in.readInt(), () => in.readLong(), in.readBytes)
   }
 }
 
 private[joins] object UnsafeHashedRelation {
 
+  /**
+   * The size of the first data page of the map. Later pages double in size until they add up to
+   * the page size, and then all pages have the page size. If the page size leaves room for the
+   * header of an on-heap page, so does each growing page, and these sizes include that header (see
+   * `TaskMemoryManager.growingPageHeaderBytes`).
+   *
+   * Otherwise `BytesToBytesMap` rounds its first page up to the page size (`spark.buffer.pageSize`
+   * or a default of up to 64 MiB), so even a few rows reserve a full page. A task that keeps many
+   * relations alive at once, e.g. a stage with a chain of shuffled hash joins, then runs out of
+   * execution memory long before the relations hold that much data. Each broadcast relation would
+   * also allocate a full page on the heap of the driver and of every executor.
+   */
+  val INITIAL_PAGE_SIZE_BYTES: Long = 1L << 20
+
   def apply(
       input: Iterator[InternalRow],
       key: Seq[Expression],
       sizeEstimate: Int,
-      taskMemoryManager: TaskMemoryManager): HashedRelation = {
+      taskMemoryManager: TaskMemoryManager,
+      isNullAware: Boolean = false,
+      allowsNullKey: Boolean = false,
+      ignoresDuplicatedKey: Boolean = false): HashedRelation = {
+    require(!(isNullAware && allowsNullKey),
+      "isNullAware and allowsNullKey cannot be enabled at same time")
 
     val pageSizeBytes = Option(SparkEnv.get).map(_.memoryManager.pageSizeBytes)
-      .getOrElse(new SparkConf().getSizeAsBytes("spark.buffer.pageSize", "16m"))
-
+      .getOrElse(new SparkConf().get(BUFFER_PAGESIZE).getOrElse(16L * 1024 * 1024))
     val binaryMap = new BytesToBytesMap(
       taskMemoryManager,
       // Only 70% of the slots can be used before growing, more capacity help to reduce collision
       (sizeEstimate * 1.5 + 1).toInt,
-      pageSizeBytes)
+      pageSizeBytes,
+      INITIAL_PAGE_SIZE_BYTES)
 
     // Create a mapping of buildKeys -> rows
     val keyGenerator = UnsafeProjection.create(key)
@@ -299,19 +497,24 @@ private[joins] object UnsafeHashedRelation {
       val row = input.next().asInstanceOf[UnsafeRow]
       numFields = row.numFields()
       val key = keyGenerator(row)
-      if (!key.anyNull) {
+      if (!key.anyNull || allowsNullKey) {
         val loc = binaryMap.lookup(key.getBaseObject, key.getBaseOffset, key.getSizeInBytes)
-        val success = loc.append(
-          key.getBaseObject, key.getBaseOffset, key.getSizeInBytes,
-          row.getBaseObject, row.getBaseOffset, row.getSizeInBytes)
-        if (!success) {
-          binaryMap.free()
-          throw new SparkException("There is no enough memory to build hash map")
+        if (!(ignoresDuplicatedKey && loc.isDefined)) {
+          val success = loc.append(
+            key.getBaseObject, key.getBaseOffset, key.getSizeInBytes,
+            row.getBaseObject, row.getBaseOffset, row.getSizeInBytes)
+          if (!success) {
+            binaryMap.free()
+            throw QueryExecutionErrors.cannotAcquireMemoryToBuildUnsafeHashedRelationError()
+          }
         }
+      } else if (isNullAware) {
+        binaryMap.free()
+        return HashedRelationWithAllNullKeys
       }
     }
 
-    new UnsafeHashedRelation(numFields, binaryMap)
+    new UnsafeHashedRelation(key.size, numFields, binaryMap)
   }
 }
 
@@ -344,13 +547,18 @@ private[joins] object UnsafeHashedRelation {
  *  determined by `key1 - minKey`.
  *
  * The map is created as sparse mode, then key-value could be appended into it. Once finish
- * appending, caller could all optimize() to try to turn the map into dense mode, which is faster
+ * appending, caller could call optimize() to try to turn the map into dense mode, which is faster
  * to probe.
  *
  * see http://java-performance.info/implementing-world-fastest-java-int-to-int-hash-map/
  */
-private[execution] final class LongToUnsafeRowMap(val mm: TaskMemoryManager, capacity: Int)
-  extends MemoryConsumer(mm) with Externalizable with KryoSerializable {
+private[execution] final class LongToUnsafeRowMap private (
+    val mm: TaskMemoryManager,
+    capacity: Int,
+    ignoresDuplicatedKey: Boolean,
+    allocateOnInit: Boolean)
+  extends MemoryConsumer(mm, LongToUnsafeRowMap.MIN_PAGE_SIZE_BYTES, mm.getTungstenMemoryMode)
+  with Externalizable with KryoSerializable {
 
   // Whether the keys are stored in dense mode or not.
   private var isDense = false
@@ -358,22 +566,26 @@ private[execution] final class LongToUnsafeRowMap(val mm: TaskMemoryManager, cap
   // The minimum key
   private var minKey = Long.MaxValue
 
-  // The maxinum key
+  // The maximum key
   private var maxKey = Long.MinValue
 
   // The array to store the key and offset of UnsafeRow in the page.
   //
   // Sparse mode: [key1] [offset1 | size1] [key2] [offset | size2] ...
   // Dense mode: [offset1 | size1] [offset2 | size2]
-  private var array: Array[Long] = null
+  private var array: LongArray = null
   private var mask: Int = 0
 
   // The page to store all bytes of UnsafeRow and the pointer to next rows.
   // [row1][pointer1] [row2][pointer2]
-  private var page: Array[Long] = null
+  private var page: MemoryBlock = null
 
   // Current write cursor in the page.
-  private var cursor: Long = Platform.LONG_ARRAY_OFFSET
+  private var cursor: Long = -1
+
+  // The bytes that the page leaves for the header of an on-heap page while it grows, see
+  // `TaskMemoryManager.growingPageHeaderBytes`.
+  private val pageHeaderBytes = TaskMemoryManager.growingPageHeaderBytes(mm.pageSizeBytes())
 
   // The number of bits for size in address
   private val SIZE_BITS = 28
@@ -385,42 +597,39 @@ private[execution] final class LongToUnsafeRowMap(val mm: TaskMemoryManager, cap
   // The number of unique keys.
   private var numKeys = 0L
 
-  // needed by serializer
+  def this(mm: TaskMemoryManager, capacity: Int, ignoresDuplicatedKey: Boolean = false) =
+    this(mm, capacity, ignoresDuplicatedKey, allocateOnInit = true)
+
+  // needed by serializer. `read()` allocates `array` and `page` with the serialized sizes,
+  // so skip the allocations in `init()`.
   def this() = {
     this(
       new TaskMemoryManager(
-        new StaticMemoryManager(
-          new SparkConf().set("spark.memory.offHeap.enabled", "false"),
-          Long.MaxValue,
-          Long.MaxValue,
+        new UnifiedMemoryManager(
+          new SparkConf().set(MEMORY_OFFHEAP_ENABLED.key, "false"),
+          Runtime.getRuntime.maxMemory,
+          Runtime.getRuntime.maxMemory / 2,
           1),
         0),
-      0)
-  }
-
-  private def ensureAcquireMemory(size: Long): Unit = {
-    // do not support spilling
-    val got = acquireMemory(size)
-    if (got < size) {
-      freeMemory(got)
-      throw new SparkException(s"Can't acquire $size bytes memory to build hash relation, " +
-        s"got $got bytes")
-    }
+      0,
+      ignoresDuplicatedKey = false,
+      allocateOnInit = false)
   }
 
   private def init(): Unit = {
     if (mm != null) {
-      require(capacity < 512000000, "Cannot broadcast more than 512 millions rows")
+      require(capacity < 512000000, "Cannot broadcast 512 million or more rows")
       var n = 1
       while (n < capacity) n *= 2
-      ensureAcquireMemory(n * 2L * 8 + (1 << 20))
-      array = new Array[Long](n * 2)
+      array = allocateArray(n * 2)
+      array.zeroOut()
       mask = n * 2 - 2
-      page = new Array[Long](1 << 17)  // 1M bytes
+      page = allocatePage(LongToUnsafeRowMap.INITIAL_PAGE_SIZE_BYTES - pageHeaderBytes)
+      cursor = page.getBaseOffset
     }
   }
 
-  init()
+  if (allocateOnInit) init()
 
   def spill(size: Long, trigger: MemoryConsumer): Long = 0L
 
@@ -432,7 +641,7 @@ private[execution] final class LongToUnsafeRowMap(val mm: TaskMemoryManager, cap
   /**
    * Returns total memory consumption.
    */
-  def getTotalMemoryConsumption: Long = array.length * 8L + page.length * 8L
+  def getTotalMemoryConsumption: Long = array.size() * 8L + page.size()
 
   /**
    * Returns the first slot of array that store the keys (sparse mode).
@@ -447,10 +656,20 @@ private[execution] final class LongToUnsafeRowMap(val mm: TaskMemoryManager, cap
    */
   private def nextSlot(pos: Int): Int = (pos + 2) & mask
 
+  private[this] def toAddress(offset: Long, size: Int): Long = {
+    (offset << SIZE_BITS) | size
+  }
+
+  private[this] def toOffset(address: Long): Long = {
+    (address >>> SIZE_BITS)
+  }
+
+  private[this] def toSize(address: Long): Int = {
+    (address & SIZE_MASK).toInt
+  }
+
   private def getRow(address: Long, resultRow: UnsafeRow): UnsafeRow = {
-    val offset = address >>> SIZE_BITS
-    val size = address & SIZE_MASK
-    resultRow.pointTo(page, offset, size.toInt)
+    resultRow.pointTo(page.getBaseObject, page.getBaseOffset + toOffset(address), toSize(address))
     resultRow
   }
 
@@ -460,16 +679,16 @@ private[execution] final class LongToUnsafeRowMap(val mm: TaskMemoryManager, cap
   def getValue(key: Long, resultRow: UnsafeRow): UnsafeRow = {
     if (isDense) {
       if (key >= minKey && key <= maxKey) {
-        val value = array((key - minKey).toInt)
+        val value = array.get((key - minKey).toInt)
         if (value > 0) {
           return getRow(value, resultRow)
         }
       }
     } else {
       var pos = firstSlot(key)
-      while (array(pos + 1) != 0) {
-        if (array(pos) == key) {
-          return getRow(array(pos + 1), resultRow)
+      while (array.get(pos + 1) != 0) {
+        if (array.get(pos) == key) {
+          return getRow(array.get(pos + 1), resultRow)
         }
         pos = nextSlot(pos)
       }
@@ -485,10 +704,10 @@ private[execution] final class LongToUnsafeRowMap(val mm: TaskMemoryManager, cap
       var addr = address
       override def hasNext: Boolean = addr != 0
       override def next(): UnsafeRow = {
-        val offset = addr >>> SIZE_BITS
-        val size = addr & SIZE_MASK
-        resultRow.pointTo(page, offset, size.toInt)
-        addr = Platform.getLong(page, offset + size)
+        val offset = toOffset(addr)
+        val size = toSize(addr)
+        resultRow.pointTo(page.getBaseObject, page.getBaseOffset + offset, size)
+        addr = Platform.getLong(page.getBaseObject, page.getBaseOffset + offset + size)
         resultRow
       }
     }
@@ -500,16 +719,16 @@ private[execution] final class LongToUnsafeRowMap(val mm: TaskMemoryManager, cap
   def get(key: Long, resultRow: UnsafeRow): Iterator[UnsafeRow] = {
     if (isDense) {
       if (key >= minKey && key <= maxKey) {
-        val value = array((key - minKey).toInt)
+        val value = array.get((key - minKey).toInt)
         if (value > 0) {
           return valueIter(value, resultRow)
         }
       }
     } else {
       var pos = firstSlot(key)
-      while (array(pos + 1) != 0) {
-        if (array(pos) == key) {
-          return valueIter(array(pos + 1), resultRow)
+      while (array.get(pos + 1) != 0) {
+        if (array.get(pos) == key) {
+          return valueIter(array.get(pos + 1), resultRow)
         }
         pos = nextSlot(pos)
       }
@@ -518,12 +737,58 @@ private[execution] final class LongToUnsafeRowMap(val mm: TaskMemoryManager, cap
   }
 
   /**
+   * Builds an iterator on a sparse array.
+   */
+  def keys(): Iterator[InternalRow] = {
+    val row = new GenericInternalRow(1)
+    // a) in dense mode the array stores the address
+    //  => (k, v) = (minKey + index, array(index))
+    // b) in sparse mode the array stores both the key and the address
+    //  => (k, v) = (array(index), array(index+1))
+    new Iterator[InternalRow] {
+      // cursor that indicates the position of the next key which was not read by a next() call
+      var pos = 0
+      // when we iterate in dense mode we need to jump two positions at a time
+      val step = if (isDense) 0 else 1
+
+      override def hasNext: Boolean = {
+        // go to the next key if the current key slot is empty
+        while (pos + step < array.size()) {
+          if (array.get(pos + step) > 0) {
+            return true
+          }
+          pos += step + 1
+        }
+        false
+      }
+
+      override def next(): InternalRow = {
+        if (!hasNext) {
+          throw QueryExecutionErrors.endOfIteratorError()
+        } else {
+          // the key is retrieved based on the map mode
+          val ret = if (isDense) minKey + pos else array.get(pos)
+          // advance the cursor to the next index
+          pos += step + 1
+          row.setLong(0, ret)
+          row
+        }
+      }
+    }
+  }
+
+  /**
    * Appends the key and row into this map.
    */
   def append(key: Long, row: UnsafeRow): Unit = {
     val sizeInBytes = row.getSizeInBytes
     if (sizeInBytes >= (1 << SIZE_BITS)) {
-      sys.error("Does not support row that is larger than 256M")
+      throw QueryExecutionErrors.rowLargerThan256MUnsupportedError()
+    }
+
+    val pos = findKeyPosition(key)
+    if (ignoresDuplicatedKey && array.get(pos + 1) != 0) {
+      return
     }
 
     if (key < minKey) {
@@ -533,77 +798,98 @@ private[execution] final class LongToUnsafeRowMap(val mm: TaskMemoryManager, cap
       maxKey = key
     }
 
-    // There is 8 bytes for the pointer to next value
-    if (cursor + 8 + row.getSizeInBytes > page.length * 8L + Platform.LONG_ARRAY_OFFSET) {
-      val used = page.length
-      if (used >= (1 << 30)) {
-        sys.error("Can not build a HashedRelation that is larger than 8G")
-      }
-      ensureAcquireMemory(used * 8L * 2)
-      val newPage = new Array[Long](used * 2)
-      Platform.copyMemory(page, Platform.LONG_ARRAY_OFFSET, newPage, Platform.LONG_ARRAY_OFFSET,
-        cursor - Platform.LONG_ARRAY_OFFSET)
-      page = newPage
-      freeMemory(used * 8L)
-    }
+    grow(row.getSizeInBytes)
 
     // copy the bytes of UnsafeRow
     val offset = cursor
-    Platform.copyMemory(row.getBaseObject, row.getBaseOffset, page, cursor, row.getSizeInBytes)
+    Platform.copyMemory(row.getBaseObject, row.getBaseOffset, page.getBaseObject, cursor,
+      row.getSizeInBytes)
     cursor += row.getSizeInBytes
-    Platform.putLong(page, cursor, 0)
+    Platform.putLong(page.getBaseObject, cursor, 0)
     cursor += 8
     numValues += 1
-    updateIndex(key, (offset.toLong << SIZE_BITS) | row.getSizeInBytes)
+    updateIndex(key, pos, toAddress(offset - page.getBaseOffset, row.getSizeInBytes))
+  }
+
+  private def findKeyPosition(key: Long): Int = {
+    var pos = firstSlot(key)
+    assert(numKeys < array.size() / 2)
+    while (array.get(pos) != key && array.get(pos + 1) != 0) {
+      pos = nextSlot(pos)
+    }
+    pos
   }
 
   /**
    * Update the address in array for given key.
    */
-  private def updateIndex(key: Long, address: Long): Unit = {
-    var pos = firstSlot(key)
-    while (array(pos) != key && array(pos + 1) != 0) {
-      pos = nextSlot(pos)
-    }
-    if (array(pos + 1) == 0) {
+  private def updateIndex(key: Long, pos: Int, address: Long): Unit = {
+    if (array.get(pos + 1) == 0) {
       // this is the first value for this key, put the address in array.
-      array(pos) = key
-      array(pos + 1) = address
+      array.set(pos, key)
+      array.set(pos + 1, address)
       numKeys += 1
-      if (numKeys * 4 > array.length) {
+      if (numKeys * 4 > array.size()) {
         // reach half of the capacity
-        if (array.length < (1 << 30)) {
+        if (array.size() < (1 << 30)) {
           // Cannot allocate an array with 2G elements
           growArray()
-        } else if (numKeys > array.length / 2 * 0.75) {
+        } else if (numKeys > array.size() / 2 * 0.75) {
           // The fill ratio should be less than 0.75
-          sys.error("Cannot build HashedRelation with more than 1/3 billions unique keys")
+          throw QueryExecutionErrors.cannotBuildHashedRelationWithUniqueKeysExceededError()
         }
       }
     } else {
       // there are some values for this key, put the address in the front of them.
-      val pointer = (address >>> SIZE_BITS) + (address & SIZE_MASK)
-      Platform.putLong(page, pointer, array(pos + 1))
-      array(pos + 1) = address
+      val pointer = toOffset(address) + toSize(address)
+      Platform.putLong(page.getBaseObject, page.getBaseOffset + pointer, array.get(pos + 1))
+      array.set(pos + 1, address)
+    }
+  }
+
+  private def grow(inputRowSize: Int): Unit = {
+    // There is 8 bytes for the pointer to next value
+    val usedBytes = cursor - page.getBaseOffset
+    val neededNumWords = (usedBytes + 8 + inputRowSize + 7) / 8
+    if (neededNumWords > page.size() / 8) {
+      if (neededNumWords > (1 << 30)) {
+        throw QueryExecutionErrors.cannotBuildHashedRelationLargerThan8GError()
+      }
+      // The page doubles together with its header.
+      val doubledNumWords = ((page.size() + pageHeaderBytes) * 2 - pageHeaderBytes) / 8
+      val newNumWords = math.max(neededNumWords, math.min(doubledNumWords, 1 << 30))
+      // newNumWords is a Long up to 1 << 30. Multiplying by 8 must stay in Long
+      // arithmetic; `newNumWords.toInt * 8` (Int * Int) overflows to 0 at the
+      // upper bound, causing `allocatePage(0)` to return a page of only
+      // `MIN_PAGE_SIZE_BYTES` while subsequent writes still advance `cursor`
+      // past the new page's end (heap corruption observed as a
+      // `forward_copy_longs` SEGV during BHJ build on aarch64).
+      val newPage = allocatePage(newNumWords * 8L)
+      Platform.copyMemory(page.getBaseObject, page.getBaseOffset, newPage.getBaseObject,
+        newPage.getBaseOffset, usedBytes)
+      freePage(page)
+      page = newPage
+      cursor = page.getBaseOffset + usedBytes
     }
   }
 
   private def growArray(): Unit = {
     var old_array = array
-    val n = array.length
+    val n = Math.toIntExact(array.size())
     numKeys = 0
-    ensureAcquireMemory(n * 2 * 8L)
-    array = new Array[Long](n * 2)
+    array = allocateArray(n * 2)
+    array.zeroOut()
     mask = n * 2 - 2
     var i = 0
-    while (i < old_array.length) {
-      if (old_array(i + 1) > 0) {
-        updateIndex(old_array(i), old_array(i + 1))
+    while (i < old_array.size()) {
+      if (old_array.get(i + 1) > 0) {
+        val key = old_array.get(i)
+        updateIndex(key, findKeyPosition(key), old_array.get(i + 1))
       }
       i += 2
     }
+    freeArray(old_array)
     old_array = null  // release the reference to old array
-    freeMemory(n * 8L)
   }
 
   /**
@@ -613,27 +899,28 @@ private[execution] final class LongToUnsafeRowMap(val mm: TaskMemoryManager, cap
     val range = maxKey - minKey
     // Convert to dense mode if it does not require more memory or could fit within L1 cache
     // SPARK-16740: Make sure range doesn't overflow if minKey has a large negative value
-    if (range >= 0 && (range < array.length || range < 1024)) {
-      try {
-        ensureAcquireMemory((range + 1) * 8L)
+    if (range >= 0 && (range < array.size() || range < 1024)) {
+      val denseArray = try {
+        allocateArray((range + 1).toInt)
       } catch {
-        case e: SparkException =>
-          // there is no enough memory to convert
+        case e: SparkOutOfMemoryError if e.getCondition == "UNABLE_TO_ACQUIRE_MEMORY" =>
+          // There is not enough memory to convert, so keep the map sparse. `allocateArray`
+          // releases any memory it acquired before throwing. Other errors, such as a failed
+          // spill of another consumer, still fail the task.
           return
       }
-      val denseArray = new Array[Long]((range + 1).toInt)
+      denseArray.zeroOut()
       var i = 0
-      while (i < array.length) {
-        if (array(i + 1) > 0) {
-          val idx = (array(i) - minKey).toInt
-          denseArray(idx) = array(i + 1)
+      while (i < array.size()) {
+        if (array.get(i + 1) > 0) {
+          val idx = (array.get(i) - minKey).toInt
+          denseArray.set(idx, array.get(i + 1))
         }
         i += 2
       }
-      val old_length = array.length
+      freeArray(array)
       array = denseArray
       isDense = true
-      freeMemory(old_length * 8L)
     }
   }
 
@@ -642,26 +929,27 @@ private[execution] final class LongToUnsafeRowMap(val mm: TaskMemoryManager, cap
    */
   def free(): Unit = {
     if (page != null) {
-      freeMemory(page.length * 8L)
+      freePage(page)
       page = null
     }
     if (array != null) {
-      freeMemory(array.length * 8L)
+      freeArray(array)
       array = null
     }
   }
 
-  private def writeLongArray(
+  private def writeBytes(
       writeBuffer: (Array[Byte], Int, Int) => Unit,
-      arr: Array[Long],
+      baseObject: Object,
+      baseOffset: Long,
       len: Int): Unit = {
     val buffer = new Array[Byte](4 << 10)
-    var offset: Long = Platform.LONG_ARRAY_OFFSET
-    val end = len * 8L + Platform.LONG_ARRAY_OFFSET
+    var offset: Long = baseOffset
+    val end = len * 8L + offset
     while (offset < end) {
-      val size = Math.min(buffer.length, (end - offset).toInt)
-      Platform.copyMemory(arr, offset, buffer, Platform.BYTE_ARRAY_OFFSET, size)
-      writeBuffer(buffer, 0, size)
+      val size = Math.min(buffer.length, end - offset)
+      Platform.copyMemory(baseObject, offset, buffer, Platform.BYTE_ARRAY_OFFSET, size)
+      writeBuffer(buffer, 0, size.toInt)
       offset += size
     }
   }
@@ -676,11 +964,12 @@ private[execution] final class LongToUnsafeRowMap(val mm: TaskMemoryManager, cap
     writeLong(numKeys)
     writeLong(numValues)
 
-    writeLong(array.length)
-    writeLongArray(writeBuffer, array, array.length)
-    val used = ((cursor - Platform.LONG_ARRAY_OFFSET) / 8).toInt
+    writeLong(array.size())
+    writeBytes(writeBuffer, array.memoryBlock.getBaseObject, array.memoryBlock.getBaseOffset,
+      Math.toIntExact(array.size()))
+    val used = ((cursor - page.getBaseOffset) / 8).toInt
     writeLong(used)
-    writeLongArray(writeBuffer, page, used)
+    writeBytes(writeBuffer, page.getBaseObject, page.getBaseOffset, used)
   }
 
   override def writeExternal(output: ObjectOutput): Unit = {
@@ -691,20 +980,20 @@ private[execution] final class LongToUnsafeRowMap(val mm: TaskMemoryManager, cap
     write(out.writeBoolean, out.writeLong, out.write)
   }
 
-  private def readLongArray(
+  private def readData(
       readBuffer: (Array[Byte], Int, Int) => Unit,
-      length: Int): Array[Long] = {
-    val array = new Array[Long](length)
+      baseObject: Object,
+      baseOffset: Long,
+      length: Int): Unit = {
     val buffer = new Array[Byte](4 << 10)
-    var offset: Long = Platform.LONG_ARRAY_OFFSET
-    val end = length * 8L + Platform.LONG_ARRAY_OFFSET
+    var offset: Long = baseOffset
+    val end = length * 8L + baseOffset
     while (offset < end) {
-      val size = Math.min(buffer.length, (end - offset).toInt)
-      readBuffer(buffer, 0, size)
-      Platform.copyMemory(buffer, Platform.BYTE_ARRAY_OFFSET, array, offset, size)
+      val size = Math.min(buffer.length, end - offset)
+      readBuffer(buffer, 0, size.toInt)
+      Platform.copyMemory(buffer, Platform.BYTE_ARRAY_OFFSET, baseObject, offset, size)
       offset += size
     }
-    array
   }
 
   private def read(
@@ -719,24 +1008,54 @@ private[execution] final class LongToUnsafeRowMap(val mm: TaskMemoryManager, cap
 
     val length = readLong().toInt
     mask = length - 2
-    array = readLongArray(readBuffer, length)
+    if (array != null) freeArray(array)
+    array = allocateArray(length)
+    readData(readBuffer, array.memoryBlock.getBaseObject, array.memoryBlock.getBaseOffset, length)
     val pageLength = readLong().toInt
-    page = readLongArray(readBuffer, pageLength)
+    if (page != null) freePage(page)
+    // Use Long multiplication: pageLength can be up to 1 << 30 (8 GiB page / 8),
+    // and `Int * Int` overflows at that bound, leading to a 0-byte allocatePage
+    // and a subsequent cursor that runs past the page's end.
+    page = allocatePage(pageLength * 8L)
+    readData(readBuffer, page.getBaseObject, page.getBaseOffset, pageLength)
+    // Restore cursor variable to make this map able to be serialized again on executors.
+    cursor = pageLength * 8L + page.getBaseOffset
   }
 
   override def readExternal(in: ObjectInput): Unit = {
-    read(in.readBoolean, in.readLong, in.readFully)
+    read(() => in.readBoolean(), () => in.readLong(), in.readFully)
   }
 
   override def read(kryo: Kryo, in: Input): Unit = {
-    read(in.readBoolean, in.readLong, in.readBytes)
+    read(() => in.readBoolean(), () => in.readLong(), in.readBytes)
   }
 }
 
-private[joins] class LongHashedRelation(
+private[execution] object LongToUnsafeRowMap {
+  /**
+   * The size of the page that a new map starts with. The page grows by doubling from here. If the
+   * page size of the `TaskMemoryManager` leaves room for the header of an on-heap page, so does the
+   * page, and these sizes include that header (see `TaskMemoryManager.growingPageHeaderBytes`).
+   */
+  val INITIAL_PAGE_SIZE_BYTES: Long = 1L << 20
+
+  /**
+   * The page size passed to `MemoryConsumer`, which rounds every `allocatePage` request up to it.
+   *
+   * With the default page size (`spark.buffer.pageSize`, up to 64 MiB), even an empty map would
+   * reserve 64 MiB of execution memory. A task that keeps many maps alive at once, e.g. a stage
+   * with a chain of shuffled hash joins, then runs out of execution memory long before the maps
+   * hold that much data. With a floor of one word, a new map reserves `INITIAL_PAGE_SIZE_BYTES`,
+   * the page grows by doubling, and a deserialized map allocates exactly what it reads. The floor
+   * is not 0 because `TaskMemoryManager` does not allocate a page of 0 bytes, which an empty
+   * deserialized map would ask for.
+   */
+  val MIN_PAGE_SIZE_BYTES: Long = 8L
+}
+
+class LongHashedRelation(
     private var nFields: Int,
     private var map: LongToUnsafeRowMap) extends HashedRelation with Externalizable {
-
   private var resultRow: UnsafeRow = new UnsafeRow(nFields)
 
   // Needed for serialization (it is public to make Java serialization work)
@@ -782,6 +1101,27 @@ private[joins] class LongHashedRelation(
     resultRow = new UnsafeRow(nFields)
     map = in.readObject().asInstanceOf[LongToUnsafeRowMap]
   }
+
+  /**
+   * Returns an iterator for keys of InternalRow type.
+   */
+  override def keys(): Iterator[InternalRow] = map.keys()
+
+  override def getWithKeyIndex(key: InternalRow): Iterator[ValueRowWithKeyIndex] = {
+    throw SparkUnsupportedOperationException()
+  }
+
+  override def getValueWithKeyIndex(key: InternalRow): ValueRowWithKeyIndex = {
+    throw SparkUnsupportedOperationException()
+  }
+
+  override def valuesWithKeyIndex(): Iterator[ValueRowWithKeyIndex] = {
+    throw SparkUnsupportedOperationException()
+  }
+
+  override def maxNumKeysIndex: Int = {
+    throw SparkUnsupportedOperationException()
+  }
 }
 
 /**
@@ -792,9 +1132,11 @@ private[joins] object LongHashedRelation {
       input: Iterator[InternalRow],
       key: Seq[Expression],
       sizeEstimate: Int,
-      taskMemoryManager: TaskMemoryManager): LongHashedRelation = {
+      taskMemoryManager: TaskMemoryManager,
+      isNullAware: Boolean = false,
+      ignoresDuplicatedKey: Boolean = false): HashedRelation = {
 
-    val map = new LongToUnsafeRowMap(taskMemoryManager, sizeEstimate)
+    val map = new LongToUnsafeRowMap(taskMemoryManager, sizeEstimate, ignoresDuplicatedKey)
     val keyGenerator = UnsafeProjection.create(key)
 
     // Create a mapping of key -> rows
@@ -806,6 +1148,9 @@ private[joins] object LongHashedRelation {
       if (!rowKey.isNullAt(0)) {
         val key = rowKey.getLong(0)
         map.append(key, unsafeRow)
+      } else if (isNullAware) {
+        map.free()
+        return HashedRelationWithAllNullKeys
       }
     }
     map.optimize()
@@ -813,20 +1158,79 @@ private[joins] object LongHashedRelation {
   }
 }
 
+/**
+ * A special HashedRelation indicating that it's built from a empty input:Iterator[InternalRow].
+ * get & getValue will return null just like
+ * empty LongHashedRelation or empty UnsafeHashedRelation does.
+ */
+case object EmptyHashedRelation extends HashedRelation {
+  override def get(key: Long): Iterator[InternalRow] = null
+
+  override def get(key: InternalRow): Iterator[InternalRow] = null
+
+  override def getValue(key: Long): InternalRow = null
+
+  override def getValue(key: InternalRow): InternalRow = null
+
+  override def asReadOnlyCopy(): EmptyHashedRelation.type = this
+
+  override def keyIsUnique: Boolean = true
+
+  override def keys(): Iterator[InternalRow] = {
+    Iterator.empty
+  }
+
+  override def close(): Unit = {}
+
+  override def estimatedSize: Long = 0
+}
+
+/**
+ * A special HashedRelation indicating that it's built from a non-empty input:Iterator[InternalRow]
+ * with all the keys to be null.
+ */
+case object HashedRelationWithAllNullKeys extends HashedRelation {
+  override def get(key: InternalRow): Iterator[InternalRow] = {
+    throw SparkUnsupportedOperationException()
+  }
+
+  override def getValue(key: InternalRow): InternalRow = {
+    throw SparkUnsupportedOperationException()
+  }
+
+  override def asReadOnlyCopy(): HashedRelationWithAllNullKeys.type = this
+
+  override def keyIsUnique: Boolean = true
+
+  override def keys(): Iterator[InternalRow] = {
+    throw SparkUnsupportedOperationException()
+  }
+
+  override def close(): Unit = {}
+
+  override def estimatedSize: Long = 0
+}
+
 /** The HashedRelationBroadcastMode requires that rows are broadcasted as a HashedRelation. */
-private[execution] case class HashedRelationBroadcastMode(key: Seq[Expression])
+case class HashedRelationBroadcastMode(key: Seq[Expression], isNullAware: Boolean = false)
   extends BroadcastMode {
 
   override def transform(rows: Array[InternalRow]): HashedRelation = {
-    HashedRelation(rows.iterator, canonicalizedKey, rows.length)
+    transform(rows.iterator, Some(rows.length))
   }
 
-  private lazy val canonicalizedKey: Seq[Expression] = {
-    key.map { e => e.canonicalized }
+  override def transform(
+      rows: Iterator[InternalRow],
+      sizeHint: Option[Long]): HashedRelation = {
+    sizeHint match {
+      case Some(numRows) =>
+        HashedRelation(rows, key, numRows.toInt, isNullAware = isNullAware)
+      case None =>
+        HashedRelation(rows, key, isNullAware = isNullAware)
+    }
   }
 
-  override def compatibleWith(other: BroadcastMode): Boolean = other match {
-    case m: HashedRelationBroadcastMode => canonicalizedKey == m.canonicalizedKey
-    case _ => false
+  override lazy val canonicalized: HashedRelationBroadcastMode = {
+    this.copy(key = key.map(_.canonicalized))
   }
 }

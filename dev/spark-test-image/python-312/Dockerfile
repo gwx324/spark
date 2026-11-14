@@ -1,0 +1,98 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# Reads the JEP and CDI versions from this checkout, just as the Spark build does. Only the
+# version files reach the image below, so its layers change only when a version does.
+FROM ubuntu:noble AS spark-versions
+COPY --from=root pom.xml /pom.xml
+RUN mkdir /versions && \
+    for name in jep arrow; do \
+      sed -n "s:.*<${name}.version>\(.*\)</${name}.version>.*:\1:p" /pom.xml | head -n 1 \
+        > "/versions/${name}" && \
+      test -s "/versions/${name}" || exit 1; \
+    done
+
+# Image for building and testing Spark branches. Based on Ubuntu 24.04.
+# See also in https://hub.docker.com/_/ubuntu
+FROM ubuntu:noble
+LABEL org.opencontainers.image.authors="Apache Spark project <dev@spark.apache.org>"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+LABEL org.opencontainers.image.ref.name="Apache Spark Infra Image For PySpark with Python 3.12"
+# Overwrite this label to avoid exposing the underlying Ubuntu OS version label
+LABEL org.opencontainers.image.version=""
+
+ENV FULL_REFRESH_DATE=20260210
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV DEBCONF_NONINTERACTIVE_SEEN=true
+
+RUN printf 'Types: deb\nURIs: https://mirrors.edge.kernel.org/ubuntu\nSuites: noble noble-updates noble-security\nComponents: main restricted universe multiverse\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n' > /etc/apt/sources.list.d/mirror.sources
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    ca-certificates \
+    curl \
+    gfortran \
+    git \
+    gnupg \
+    libgit2-dev \
+    liblapack-dev \
+    libopenblas-dev \
+    libssl-dev \
+    openjdk-21-jdk-headless \
+    python3.12 \
+    python3.12-dev \
+    python3.12-venv \
+    pkg-config \
+    tzdata \
+    software-properties-common \
+    zstd \
+    zlib1g-dev \
+    && apt-get autoremove --purge -y \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Setup virtual environment
+ENV VIRTUAL_ENV=/opt/spark-venv
+RUN python3.12 -m venv $VIRTUAL_ENV
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+COPY --from=root pyproject.toml ./pyproject.toml
+
+RUN python3.12 -m pip install -U pip
+
+RUN python3.12 -m pip install --group ml_torch --index-url https://download.pytorch.org/whl/cpu && \
+    python3.12 -m pip install --group ci_classic_standard --group ci_connect_standard && \
+    python3.12 -m pip cache purge
+
+# Exercise in-process UDFs in the existing pyspark-sql job. JEP needs Python
+# headers and a JDK when building its JNI library; no separate test job is needed.
+COPY --from=spark-versions /versions/jep /tmp/spark-jep-version
+RUN JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")" \
+    python3.12 -m pip install --no-cache-dir "jep==$(cat /tmp/spark-jep-version)" cffi && \
+    rm /tmp/spark-jep-version
+# Keep the provided CDI dependency outside Spark's distribution JAR directory.
+COPY --from=spark-versions /versions/arrow /tmp/spark-arrow-version
+RUN ARROW_VERSION="$(cat /tmp/spark-arrow-version)" && \
+    mkdir -p /opt/spark-test-jars && \
+    curl --fail --location --retry 3 \
+      "https://repo.maven.apache.org/maven2/org/apache/arrow/arrow-c-data/${ARROW_VERSION}/arrow-c-data-${ARROW_VERSION}.jar" \
+      --output /opt/spark-test-jars/arrow-c-data.jar && \
+    rm /tmp/spark-arrow-version
+ENV ARROW_C_DATA_JAR=/opt/spark-test-jars/arrow-c-data.jar
+# Missing or broken JEP must fail this CI image's tests instead of skipping them.
+ENV INPROCESS_TESTS=1

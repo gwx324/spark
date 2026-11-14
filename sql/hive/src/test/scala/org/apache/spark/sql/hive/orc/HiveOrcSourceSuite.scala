@@ -1,0 +1,696 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.hive.orc
+
+import java.io.File
+import java.time.{Instant, LocalDateTime}
+
+import org.apache.spark.sql.{AnalysisException, Row}
+import org.apache.spark.sql.TestingUDT.{IntervalData, IntervalUDT}
+import org.apache.spark.sql.catalyst.util.DateTimeTestUtils
+import org.apache.spark.sql.catalyst.util.TimestampNanosTestUtils.foreachNanosPrecision
+import org.apache.spark.sql.execution.datasources.orc.OrcSuite
+import org.apache.spark.sql.hive.HiveUtils
+import org.apache.spark.sql.hive.test.TestHiveSingleton
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.types._
+import org.apache.spark.util.Utils
+
+class HiveOrcSourceSuite extends OrcSuite with TestHiveSingleton {
+
+  override val orcImp: String = "hive"
+
+  override def beforeAll(): Unit = {
+    super.beforeAll()
+
+    sql(
+      s"""CREATE EXTERNAL TABLE normal_orc(
+         |  intField INT,
+         |  stringField STRING
+         |)
+         |STORED AS ORC
+         |LOCATION '${orcTableAsDir.toURI}'
+       """.stripMargin)
+
+    sql(
+      s"""INSERT INTO TABLE normal_orc
+         |SELECT intField, stringField FROM orc_temp_table
+       """.stripMargin)
+
+    spark.sql(
+      s"""CREATE TEMPORARY VIEW normal_orc_source
+         |USING org.apache.spark.sql.hive.orc
+         |OPTIONS (
+         |  PATH '${new File(orcTableAsDir.getAbsolutePath).toURI}'
+         |)
+       """.stripMargin)
+
+    spark.sql(
+      s"""CREATE TEMPORARY VIEW normal_orc_as_source
+         |USING org.apache.spark.sql.hive.orc
+         |OPTIONS (
+         |  PATH '${new File(orcTableAsDir.getAbsolutePath).toURI}'
+         |)
+       """.stripMargin)
+  }
+
+  test("SPARK-19459/SPARK-18220: read char/varchar column written by Hive") {
+    val location = Utils.createTempDir()
+    val uri = location.toURI
+    try {
+      hiveClient.runSqlHive("USE default")
+      hiveClient.runSqlHive(
+        """
+          |CREATE EXTERNAL TABLE hive_orc(
+          |  a STRING,
+          |  b CHAR(10),
+          |  c VARCHAR(10),
+          |  d ARRAY<CHAR(3)>)
+          |STORED AS orc""".stripMargin)
+      // Hive throws an exception if I assign the location in the create table statement.
+      hiveClient.runSqlHive(
+        s"ALTER TABLE hive_orc SET LOCATION '$uri'")
+      hiveClient.runSqlHive(
+        """
+          |INSERT INTO TABLE hive_orc
+          |SELECT 'a', 'b', 'c', ARRAY(CAST('d' AS CHAR(3)))
+          |FROM (SELECT 1) t""".stripMargin)
+
+      // We create a different table in Spark using the same schema which points to
+      // the same location.
+      spark.sql(
+        s"""
+           |CREATE EXTERNAL TABLE spark_orc(
+           |  a STRING,
+           |  b CHAR(10),
+           |  c VARCHAR(10),
+           |  d ARRAY<CHAR(3)>)
+           |STORED AS orc
+           |LOCATION '$uri'""".stripMargin)
+      val result = Row("a", "b         ", "c", Seq("d  "))
+      checkAnswer(spark.table("hive_orc"), result)
+      checkAnswer(spark.table("spark_orc"), result)
+    } finally {
+      hiveClient.runSqlHive("DROP TABLE IF EXISTS hive_orc")
+      hiveClient.runSqlHive("DROP TABLE IF EXISTS spark_orc")
+      Utils.deleteRecursively(location)
+    }
+  }
+
+  test("SPARK-24204 error handling for unsupported data types") {
+    withTempDir { dir =>
+      val orcDir = new File(dir, "orc").getCanonicalPath
+
+      // write path
+      checkError(
+        exception = intercept[AnalysisException] {
+          sql("select interval 1 days").write.mode("overwrite").orc(orcDir)
+        },
+        condition = "UNSUPPORTED_DATA_TYPE_FOR_DATASOURCE",
+        parameters = Map(
+          "columnName" -> "`INTERVAL '1' DAY`",
+          "columnType" -> "\"INTERVAL DAY\"",
+          "format" -> "ORC")
+      )
+
+      checkError(
+        exception = intercept[AnalysisException] {
+          sql("select null").write.mode("overwrite").orc(orcDir)
+        },
+        condition = "UNSUPPORTED_DATA_TYPE_FOR_DATASOURCE",
+        parameters = Map(
+          "columnName" -> "`NULL`",
+          "columnType" -> "\"VOID\"",
+          "format" -> "ORC")
+      )
+
+      checkError(
+        exception = intercept[AnalysisException] {
+          spark.udf.register("testType", () => new IntervalData())
+          sql("select testType()").write.mode("overwrite").orc(orcDir)
+        },
+        condition = "UNSUPPORTED_DATA_TYPE_FOR_DATASOURCE",
+        parameters = Map(
+          "columnName" -> "`testType()`",
+          "columnType" -> "UDT(\"INTERVAL\")",
+          "format" -> "ORC")
+      )
+
+      // read path
+      checkError(
+        exception = intercept[AnalysisException] {
+          val schema = StructType(StructField("a", CalendarIntervalType, true) :: Nil)
+          spark.range(1).write.mode("overwrite").orc(orcDir)
+          spark.read.schema(schema).orc(orcDir).collect()
+        },
+        condition = "UNSUPPORTED_DATA_TYPE_FOR_DATASOURCE",
+        parameters = Map(
+          "columnName" -> "`a`",
+          "columnType" -> "\"INTERVAL\"",
+          "format" -> "ORC")
+      )
+
+      checkError(
+        exception = intercept[AnalysisException] {
+          val schema = StructType(StructField("a", new IntervalUDT(), true) :: Nil)
+          spark.range(1).write.mode("overwrite").orc(orcDir)
+          spark.read.schema(schema).orc(orcDir).collect()
+        },
+        condition = "UNSUPPORTED_DATA_TYPE_FOR_DATASOURCE",
+        parameters = Map(
+          "columnName" -> "`a`",
+          "columnType" -> "UDT(\"INTERVAL\")",
+          "format" -> "ORC")
+      )
+    }
+  }
+
+  test("Check BloomFilter creation") {
+    Seq(true, false).foreach { convertMetastore =>
+      withSQLConf(HiveUtils.CONVERT_METASTORE_ORC.key -> s"$convertMetastore") {
+        testBloomFilterCreation(org.apache.orc.OrcProto.Stream.Kind.BLOOM_FILTER_UTF8)
+      }
+    }
+  }
+
+  test("Enforce direct encoding column-wise selectively") {
+    Seq(true, false).foreach { convertMetastore =>
+      withSQLConf(HiveUtils.CONVERT_METASTORE_ORC.key -> s"$convertMetastore") {
+        testSelectiveDictionaryEncoding(isSelective = false, isHiveOrc = true)
+      }
+    }
+  }
+
+  test("SPARK-11412 read and merge orc schemas in parallel") {
+    testMergeSchemasInParallel(OrcFileOperator.readOrcSchemasInParallel)
+  }
+
+  test("SPARK-25993 CREATE EXTERNAL TABLE with subdirectories") {
+    Seq(true, false).foreach { convertMetastore =>
+      withSQLConf(HiveUtils.CONVERT_METASTORE_ORC.key -> s"$convertMetastore") {
+        withTempDir { dir =>
+          withTable("orc_tbl1", "orc_tbl2", "orc_tbl3") {
+            val orcTblStatement1 =
+              s"""
+                 |CREATE EXTERNAL TABLE orc_tbl1(
+                 |  c1 int,
+                 |  c2 int,
+                 |  c3 string)
+                 |STORED AS orc
+                 |LOCATION '${s"${dir.getCanonicalPath}/l1/"}'""".stripMargin
+            sql(orcTblStatement1)
+
+            val orcTblInsertL1 =
+              s"INSERT INTO TABLE orc_tbl1 VALUES (1, 1, 'orc1'), (2, 2, 'orc2')".stripMargin
+            sql(orcTblInsertL1)
+
+            val orcTblStatement2 =
+            s"""
+               |CREATE EXTERNAL TABLE orc_tbl2(
+               |  c1 int,
+               |  c2 int,
+               |  c3 string)
+               |STORED AS orc
+               |LOCATION '${s"${dir.getCanonicalPath}/l1/l2/"}'""".stripMargin
+            sql(orcTblStatement2)
+
+            val orcTblInsertL2 =
+              s"INSERT INTO TABLE orc_tbl2 VALUES (3, 3, 'orc3'), (4, 4, 'orc4')".stripMargin
+            sql(orcTblInsertL2)
+
+            val orcTblStatement3 =
+            s"""
+               |CREATE EXTERNAL TABLE orc_tbl3(
+               |  c1 int,
+               |  c2 int,
+               |  c3 string)
+               |STORED AS orc
+               |LOCATION '${s"${dir.getCanonicalPath}/l1/l2/l3/"}'""".stripMargin
+            sql(orcTblStatement3)
+
+            val orcTblInsertL3 =
+              s"INSERT INTO TABLE orc_tbl3 VALUES (5, 5, 'orc5'), (6, 6, 'orc6')".stripMargin
+            sql(orcTblInsertL3)
+
+            withTable("tbl1", "tbl2", "tbl3", "tbl4", "tbl5", "tbl6") {
+              val topDirStatement =
+                s"""
+                   |CREATE EXTERNAL TABLE tbl1(
+                   |  c1 int,
+                   |  c2 int,
+                   |  c3 string)
+                   |STORED AS orc
+                   |LOCATION '${s"${dir.getCanonicalPath}"}'""".stripMargin
+              sql(topDirStatement)
+              val topDirSqlStatement = s"SELECT * FROM tbl1"
+              if (convertMetastore) {
+                checkAnswer(sql(topDirSqlStatement), Nil)
+              } else {
+                checkAnswer(sql(topDirSqlStatement), (1 to 6).map(i => Row(i, i, s"orc$i")))
+              }
+
+              val l1DirStatement =
+                s"""
+                   |CREATE EXTERNAL TABLE tbl2(
+                   |  c1 int,
+                   |  c2 int,
+                   |  c3 string)
+                   |STORED AS orc
+                   |LOCATION '${s"${dir.getCanonicalPath}/l1/"}'""".stripMargin
+              sql(l1DirStatement)
+              val l1DirSqlStatement = s"SELECT * FROM tbl2"
+              if (convertMetastore) {
+                checkAnswer(sql(l1DirSqlStatement), (1 to 2).map(i => Row(i, i, s"orc$i")))
+              } else {
+                checkAnswer(sql(l1DirSqlStatement), (1 to 6).map(i => Row(i, i, s"orc$i")))
+              }
+
+              val l2DirStatement =
+                s"""
+                   |CREATE EXTERNAL TABLE tbl3(
+                   |  c1 int,
+                   |  c2 int,
+                   |  c3 string)
+                   |STORED AS orc
+                   |LOCATION '${s"${dir.getCanonicalPath}/l1/l2/"}'""".stripMargin
+              sql(l2DirStatement)
+              val l2DirSqlStatement = s"SELECT * FROM tbl3"
+              if (convertMetastore) {
+                checkAnswer(sql(l2DirSqlStatement), (3 to 4).map(i => Row(i, i, s"orc$i")))
+              } else {
+                checkAnswer(sql(l2DirSqlStatement), (3 to 6).map(i => Row(i, i, s"orc$i")))
+              }
+
+              val wildcardTopDirStatement =
+                s"""
+                   |CREATE EXTERNAL TABLE tbl4(
+                   |  c1 int,
+                   |  c2 int,
+                   |  c3 string)
+                   |STORED AS orc
+                   |LOCATION '${new File(s"${dir}/*").toURI}'""".stripMargin
+              sql(wildcardTopDirStatement)
+              val wildcardTopDirSqlStatement = s"SELECT * FROM tbl4"
+              if (convertMetastore) {
+                checkAnswer(sql(wildcardTopDirSqlStatement), (1 to 2).map(i => Row(i, i, s"orc$i")))
+              } else {
+                checkAnswer(sql(wildcardTopDirSqlStatement), Nil)
+              }
+
+              val wildcardL1DirStatement =
+                s"""
+                   |CREATE EXTERNAL TABLE tbl5(
+                   |  c1 int,
+                   |  c2 int,
+                   |  c3 string)
+                   |STORED AS orc
+                   |LOCATION '${new File(s"${dir}/l1/*").toURI}'""".stripMargin
+              sql(wildcardL1DirStatement)
+              val wildcardL1DirSqlStatement = s"SELECT * FROM tbl5"
+              if (convertMetastore) {
+                checkAnswer(sql(wildcardL1DirSqlStatement), (1 to 4).map(i => Row(i, i, s"orc$i")))
+              } else {
+                checkAnswer(sql(wildcardL1DirSqlStatement), Nil)
+              }
+
+              val wildcardL2Statement =
+                s"""
+                   |CREATE EXTERNAL TABLE tbl6(
+                   |  c1 int,
+                   |  c2 int,
+                   |  c3 string)
+                   |STORED AS orc
+                   |LOCATION '${new File(s"${dir}/l1/l2/*").toURI}'""".stripMargin
+              sql(wildcardL2Statement)
+              val wildcardL2SqlStatement = s"SELECT * FROM tbl6"
+              if (convertMetastore) {
+                checkAnswer(sql(wildcardL2SqlStatement), (3 to 6).map(i => Row(i, i, s"orc$i")))
+              } else {
+                checkAnswer(sql(wildcardL2SqlStatement), Nil)
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  test("SPARK-57166: nanosecond timestamp types are supported in Hive ORC") {
+    withSQLConf(SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "true") {
+      val wallClock = Seq(LocalDateTime.of(1970, 1, 1, 0, 0, 0, 0))
+      Seq(true, false).foreach { convertMetastore =>
+        withSQLConf(HiveUtils.CONVERT_METASTORE_ORC.key -> s"$convertMetastore") {
+          foreachNanosPrecision { precision =>
+            Seq(TimestampNTZNanosType(precision), TimestampLTZNanosType(precision)).foreach {
+              nanosType =>
+                withTempDir { dir =>
+                  val df = nanosTimestampDf(nanosType, wallClock)
+                  val path = new File(dir, "nanos").getCanonicalPath
+                  df.write.format("orc").mode("overwrite").save(path)
+
+                  val readBack = spark.read.schema(new StructType().add("ts", nanosType))
+                    .format("orc").load(path)
+                  checkAnswer(readBack, df)
+                }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  test("SPARK-57455: Hive ORC serde nanos round-trip; NTZ time-zone independent") {
+    // Force spark.sql.orc.impl=hive so the Hive serde write/read conversion is exercised
+    // (HiveInspectors.wrapperFor on write, the hive OrcFileFormat unwrappers on read) rather
+    // than the native datasource that the other nanos tests use.
+    withSQLConf(
+        SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "true",
+        SQLConf.ORC_IMPLEMENTATION.key -> "hive") {
+      // A mid-range value plus the documented min/max ends
+      // [0001-01-01T00:00:00, 9999-12-31T23:59:59.999999999] (at UTC for LTZ).
+      val wallClocks = Seq(
+        LocalDateTime.of(1970, 1, 1, 0, 20, 34, 567890123),
+        LocalDateTime.of(1, 1, 1, 0, 0, 0, 0),
+        LocalDateTime.of(9999, 12, 31, 23, 59, 59, 999999999))
+      foreachNanosPrecision { precision =>
+        // Same-zone round trip through the Hive serde path for both nanos types, including the
+        // min and max of the documented range.
+        Seq(TimestampNTZNanosType(precision), TimestampLTZNanosType(precision)).foreach {
+          nanosType =>
+            val input = nanosTimestampDf(nanosType, wallClocks)
+            withTempDir { dir =>
+              val path = new File(dir, "nanos").getCanonicalPath
+              input.write.format("orc").mode("overwrite").save(path)
+              checkAnswer(
+                spark.read.schema(new StructType().add("ts", nanosType)).format("orc").load(path),
+                input)
+            }
+        }
+
+        // The NTZ wall clock stays zone-independent across a JVM default time-zone change. Hive
+        // ORC stores zone-naive wall-clock fields, so the instant-based LTZ type is not
+        // zone-stable through the Hive serde path -- the same caveat as the legacy TimestampType
+        // -- so LTZ is only round-tripped within a single zone above.
+        val ntzType = TimestampNTZNanosType(precision)
+        val ntzInput = nanosTimestampDf(ntzType, wallClocks.take(1))
+        val ntzExpected = ntzInput.collect()
+        withTempDir { dir =>
+          val path = new File(dir, "ntz-tz").getCanonicalPath
+          DateTimeTestUtils.withDefaultTimeZone(DateTimeTestUtils.LA) {
+            ntzInput.write.format("orc").mode("overwrite").save(path)
+          }
+          DateTimeTestUtils.withDefaultTimeZone(DateTimeTestUtils.UTC) {
+            checkAnswer(
+              spark.read.schema(new StructType().add("ts", ntzType)).format("orc").load(path),
+              ntzExpected)
+          }
+        }
+      }
+    }
+  }
+
+  test("SPARK-57455: Hive ORC serde round-trips nanos timestamps in nested/complex types") {
+    withSQLConf(
+      SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "true",
+      SQLConf.ORC_IMPLEMENTATION.key -> "hive") {
+      val wallClocks = Seq(LocalDateTime.of(1970, 1, 1, 0, 20, 34, 567890123))
+      foreachNanosPrecision { precision =>
+        Seq(TimestampNTZNanosType(precision), TimestampLTZNanosType(precision)).foreach {
+          nanosType =>
+            withTempView("nanos_input") {
+              nanosTimestampDf(nanosType, wallClocks).createOrReplaceTempView("nanos_input")
+              val nested = sql(
+                """SELECT
+                  |  named_struct('ts', ts) AS struct_ts,
+                  |  array(ts) AS array_ts,
+                  |  map('k', ts) AS map_ts
+                  |FROM nanos_input
+                  |""".stripMargin)
+              withTempDir { dir =>
+                val path = new File(dir, "nanos-nested").getCanonicalPath
+                nested.write.format("orc").mode("overwrite").save(path)
+                val readBack = spark.read.schema(nested.schema).format("orc").load(path)
+                checkAnswer(readBack, nested)
+              }
+            }
+        }
+      }
+    }
+  }
+
+  test("SPARK-60396: Hive ORC filter pushdown on nanosecond timestamps") {
+    // A pushed down predicate on a nanosecond timestamp reaches the Hive ORC reader with a wrong
+    // value: the Kryo round trip of the search argument truncates it to milliseconds, and a
+    // TIMESTAMP_LTZ(p) value is also shifted by the offset of the JVM time zone. For example,
+    // `ts = 1970-01-01 00:00:00.123456789` skips the stripe that holds the matching row.
+    withSQLConf(
+        SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "true",
+        SQLConf.ORC_IMPLEMENTATION.key -> "hive",
+        SQLConf.ORC_FILTER_PUSHDOWN_ENABLED.key -> "true",
+        SQLConf.SESSION_LOCAL_TIMEZONE.key -> "UTC") {
+      Seq(
+        "TIMESTAMP_LTZ" -> ((s: String) => Instant.parse(s"1970-01-01T${s}Z")),
+        "TIMESTAMP_NTZ" -> ((s: String) => LocalDateTime.parse(s"1970-01-01T$s"))
+      ).foreach { case (tsType, toValue) =>
+        foreachNanosPrecision { p =>
+          withTempPath { dir =>
+            sql(s"SELECT ts, named_struct('ts', ts) AS s FROM (SELECT CAST(c AS $tsType($p)) " +
+              "AS ts FROM VALUES ('1970-01-01 00:00:00.123456789'), ('1970-01-01 00:00:01'), " +
+              "(NULL) AS t(c))").coalesce(1).write.orc(dir.getCanonicalPath)
+            val df = spark.read.schema(s"ts $tsType($p), s STRUCT<ts: $tsType($p)>")
+              .orc(dir.getCanonicalPath)
+            // The stored value, e.g. 00:00:00.1234567 for p = 7.
+            val v = "00:00:00." + "123456789".take(p)
+            def lit(s: String): String = s"CAST('1970-01-01 $s' AS $tsType($p))"
+            def check(condition: String, expected: Seq[String]): Unit = {
+              checkAnswer(df.where(condition).select("ts"), expected.map(s => Row(toValue(s))))
+            }
+            // Both the top-level column and the nested field.
+            Seq("ts", "s.ts").foreach { c =>
+              check(s"$c = ${lit(v)}", Seq(v))
+              check(s"$c <=> ${lit(v)}", Seq(v))
+              check(s"$c != ${lit(v)}", Seq("00:00:01"))
+              check(s"$c < ${lit("00:00:00.1239")}", Seq(v))
+              check(s"$c <= ${lit(v)}", Seq(v))
+              check(s"$c > ${lit(v)}", Seq("00:00:01"))
+              check(s"$c >= ${lit(v)}", Seq(v, "00:00:01"))
+              check(s"$c IN (${lit(v)}, ${lit("00:00:02")})", Seq(v))
+              checkAnswer(df.where(s"$c IS NULL").select("ts"), Row(null))
+              check(s"$c IS NOT NULL", Seq(v, "00:00:01"))
+            }
+          }
+        }
+      }
+    }
+  }
+
+  test("SPARK-60423: Hive ORC filter pushdown on timestamps with sub-millisecond digits") {
+    // Each value is written to its own file, so a pushed down predicate that skips a file with a
+    // matching row changes the result. The Kryo round trip of the search argument truncates
+    // `00:00:00.123456` to `00:00:00.123`, the first value.
+    def ts(time: String): String = s"TIMESTAMP'2020-01-01 $time'"
+    val value = ts("00:00:00.123456")
+    withSQLConf(
+        SQLConf.ORC_IMPLEMENTATION.key -> "hive",
+        SQLConf.ORC_FILTER_PUSHDOWN_ENABLED.key -> "true") {
+      val input = sql(s"SELECT ${ts("00:00:00.123")} AS ts UNION ALL SELECT $value " +
+        s"UNION ALL SELECT ${ts("00:00:01")}")
+      withTempPath { dir =>
+        val path = dir.getCanonicalPath
+        input.coalesce(1).write.option("maxRecordsPerFile", 1).orc(path)
+        // The filter value is a java.sql.Timestamp or a java.time.Instant.
+        Seq(false, true).foreach { java8Api =>
+          withSQLConf(SQLConf.DATETIME_JAVA8API_ENABLED.key -> java8Api.toString) {
+            val df = spark.read.schema(input.schema).orc(path)
+            Seq(
+              s"ts = $value",
+              s"ts <=> $value",
+              s"ts IN ($value, ${ts("00:00:01")})",
+              s"ts < $value",
+              s"ts <= $value",
+              s"ts > $value",
+              s"ts >= $value",
+              s"ts != $value",
+              s"ts NOT IN ($value, ${ts("00:00:01")})",
+              s"ts = $value OR ts > ${ts("00:00:01")}"
+            ).foreach { condition =>
+              checkAnswer(df.where(condition), input.where(condition))
+            }
+            // A predicate with a millisecond value is still pushed down and skips the other files.
+            val condition = s"ts = ${ts("00:00:00.123")}"
+            checkAnswer(stripSparkFilter(df.where(condition)), input.where(condition))
+          }
+        }
+      }
+    }
+  }
+
+  test("SPARK-31580: Read a file written before ORC-569") {
+    // Test ORC file came from ORC-621
+    val df = readResourceOrcFile("test-data/TestStringDictionary.testRowIndex.orc")
+    assert(df.where("str < 'row 001000'").count() === 1000)
+  }
+
+  Seq("NONE", "SNAPPY", "ZLIB", "LZ4", "LZO", "ZSTD").foreach { compression =>
+    test(s"SPARK-46742: Read and write with $compression compressions") {
+      Seq(true, false).foreach { convertMetastore =>
+        withSQLConf(HiveUtils.CONVERT_METASTORE_ORC.key -> s"$convertMetastore") {
+          withTempDir { dir =>
+            withTable("orc_tbl1") {
+              val orcTblStatement1 =
+                s"""
+                   |CREATE TABLE orc_tbl1(
+                   |  c1 int,
+                   |  c2 string)
+                   |STORED AS orc
+                   |TBLPROPERTIES ("orc.compress"="$compression")
+                   |LOCATION '${s"${dir.getCanonicalPath}"}'""".stripMargin
+              sql(orcTblStatement1)
+              sql("INSERT INTO TABLE orc_tbl1 VALUES (1, 'orc1'), (2, 'orc2')")
+              checkAnswer(sql("SELECT * FROM orc_tbl1"), (1 to 2).map(i => Row(i, s"orc$i")))
+            }
+          }
+        }
+      }
+    }
+  }
+
+  test("SPARK-60424: ORC TIMESTAMP is inferred as TIMESTAMP_LTZ regardless of " +
+      "spark.sql.timestampType") {
+    withSQLConf(SQLConf.ORC_IMPLEMENTATION.key -> "hive") {
+      withTempPath { dir =>
+        val df = sql("SELECT ts, named_struct('ts', ts) AS s, array(ts) AS a, map('k', ts) AS m " +
+          "FROM VALUES (TIMESTAMP_LTZ'1970-01-01 00:00:01') AS t(ts)")
+        df.write.orc(dir.getCanonicalPath)
+        withSQLConf(SQLConf.TIMESTAMP_TYPE.key -> "TIMESTAMP_NTZ") {
+          Seq("false", "true").foreach { mergeSchema =>
+            val readDf = spark.read.option("mergeSchema", mergeSchema).orc(dir.getCanonicalPath)
+            assert(readDf.schema === df.schema.asNullable)
+            checkAnswer(readDf, df)
+          }
+        }
+      }
+    }
+  }
+
+  test("SPARK-60642: Hive ORC writes and reads collated strings") {
+    // The Hive type parser rejects `string collate <name>`, which `catalogString` produces for a
+    // collated string, so the serializer must not put a collation in the type string.
+    val collations = Seq("UTF8_BINARY", "UTF8_LCASE", "UNICODE_CI")
+    withSQLConf(SQLConf.ORC_IMPLEMENTATION.key -> "hive") {
+      collations.foreach { collation =>
+        withTable("t") {
+          sql(s"CREATE TABLE t (i INT, c STRING COLLATE $collation) USING ORC")
+          sql("INSERT INTO t SELECT 1, 'a'")
+          checkAnswer(spark.table("t"), Row(1, "a"))
+          // The collation is kept by the catalog, not by the file.
+          assert(spark.table("t").schema("c").dataType === StringType(collation))
+          checkAnswer(
+            sql("SELECT i FROM t WHERE c = 'A'"),
+            if (collation == "UTF8_BINARY") Nil else Seq(Row(1)))
+        }
+      }
+    }
+  }
+
+  test("SPARK-60642: Hive ORC writes and reads collated strings in nested types") {
+    withSQLConf(SQLConf.ORC_IMPLEMENTATION.key -> "hive") {
+      withTable("t") {
+        sql(
+          """CREATE TABLE t (
+            |  a ARRAY<STRING COLLATE UNICODE_CI>,
+            |  s STRUCT<f: STRING COLLATE UTF8_LCASE, g: ARRAY<STRING COLLATE UNICODE_CI>>,
+            |  m MAP<STRING, STRING COLLATE UNICODE_CI>,
+            |  b MAP<STRING COLLATE UTF8_BINARY, ARRAY<STRING COLLATE UNICODE_CI>>
+            |) USING ORC""".stripMargin)
+        sql(
+          """INSERT INTO t SELECT
+            |  array('a'),
+            |  named_struct('f', 'b', 'g', array('c')),
+            |  map('k', 'd'),
+            |  map('k', array('e'))""".stripMargin)
+        checkAnswer(
+          spark.table("t"),
+          Row(Seq("a"), Row("b", Seq("c")), Map("k" -> "d"), Map("k" -> Seq("e"))))
+        checkAnswer(sql("SELECT a[0], s.f, s.g[0], m['k'], b['k'][0] FROM t"),
+          Row("a", "b", "c", "d", "e"))
+      }
+    }
+  }
+
+  test("SPARK-60642: Hive ORC data source writes collated strings through DataFrame") {
+    withSQLConf(SQLConf.ORC_IMPLEMENTATION.key -> "hive") {
+      withTempPath { dir =>
+        val path = dir.getCanonicalPath
+        // `StringType("UTF8_BINARY")` prints as `string collate UTF8_BINARY` unlike `StringType`.
+        // A DDL `COLLATE UTF8_BINARY` becomes the default `StringType`, so only this test covers
+        // an explicit `UTF8_BINARY` map key.
+        val schema = new StructType()
+          .add("b", StringType("UTF8_BINARY"))
+          .add("c", StringType("UNICODE_CI"))
+          .add("a", ArrayType(StringType("UTF8_LCASE")))
+          .add("s", new StructType().add("f", StringType("UNICODE_CI")))
+          .add("m", MapType(StringType("UTF8_BINARY"), StringType("UNICODE_CI")))
+        val rows = Seq(Row("a", "b", Seq("c"), Row("d"), Map("k" -> "v")))
+        val df = spark.createDataFrame(spark.sparkContext.parallelize(rows), schema)
+        df.write.orc(path)
+        // The file stores plain strings.
+        assert(spark.read.orc(path).schema === StructType.fromDDL(
+          "b STRING, c STRING, a ARRAY<STRING>, s STRUCT<f: STRING>, m MAP<STRING, STRING>"))
+        // A read with a collated schema decodes the same values.
+        checkAnswer(spark.read.schema(df.schema).orc(path), df)
+      }
+    }
+  }
+
+  test("SPARK-60642: Hive ORC writes and reads collated CHAR and VARCHAR") {
+    // CHAR and VARCHAR with a collation print as `char(3) collate <name>` under the last two
+    // confs, and as `string collate <name>` by default.
+    Seq(
+      Seq.empty[(String, String)],
+      Seq(SQLConf.PRESERVE_CHAR_VARCHAR_TYPE_INFO.key -> "true"),
+      Seq(SQLConf.CHAR_VARCHAR_STANDARD_SEMANTICS.key -> "true")).foreach { confs =>
+      withSQLConf((SQLConf.ORC_IMPLEMENTATION.key -> "hive") +: confs: _*) {
+        withTable("t") {
+          sql(
+            """CREATE TABLE t (
+              |  c CHAR(3) COLLATE UNICODE_CI,
+              |  v VARCHAR(3) COLLATE UTF8_LCASE,
+              |  b CHAR(3) COLLATE UTF8_BINARY,
+              |  a ARRAY<VARCHAR(3) COLLATE UNICODE_CI>
+              |) USING ORC""".stripMargin)
+          sql("INSERT INTO t SELECT 'a', 'b', 'c', array('d')")
+          checkAnswer(spark.table("t"), Row("a  ", "b", "c  ", Seq("d")))
+        }
+      }
+    }
+  }
+
+  test("SPARK-60642: Hive ORC writes collated strings through a converted Hive serde table") {
+    withSQLConf(
+        SQLConf.ORC_IMPLEMENTATION.key -> "hive",
+        HiveUtils.CONVERT_METASTORE_ORC.key -> "true") {
+      withTable("t") {
+        sql("CREATE TABLE t (i INT, c STRING COLLATE UNICODE_CI) STORED AS ORC")
+        sql("INSERT INTO t SELECT 1, 'a'")
+        checkAnswer(spark.table("t"), Row(1, "a"))
+        checkAnswer(sql("SELECT i FROM t WHERE c = 'A'"), Row(1))
+      }
+    }
+  }
+}

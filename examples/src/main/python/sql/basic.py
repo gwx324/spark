@@ -15,29 +15,25 @@
 # limitations under the License.
 #
 
-from __future__ import print_function
-
-# $example on:init_session$
-from pyspark.sql import SparkSession
-# $example off:init_session$
-
-# $example on:schema_inferring$
-from pyspark.sql import Row
-# $example off:schema_inferring$
-
-# $example on:programmatic_schema$
-# Import data types
-from pyspark.sql.types import *
-# $example off:programmatic_schema$
-
 """
 A simple example demonstrating basic Spark SQL features.
 Run with:
   ./bin/spark-submit examples/src/main/python/sql/basic.py
 """
+# $example on:init_session$
+# $example off:init_session$
+# $example on:schema_inferring$
+from pyspark.sql import Row, SparkSession
+
+# $example off:schema_inferring$
+# $example on:programmatic_schema$
+# Import data types
+from pyspark.sql.types import StringType, StructField, StructType
+
+# $example off:programmatic_schema$
 
 
-def basic_df_example(spark):
+def basic_df_example(spark: SparkSession) -> None:
     # $example on:create_df$
     # spark is an existing SparkSession
     df = spark.read.json("examples/src/main/resources/people.json")
@@ -114,8 +110,33 @@ def basic_df_example(spark):
     # +----+-------+
     # $example off:run_sql$
 
+    # $example on:global_temp_view$
+    # Register the DataFrame as a global temporary view
+    df.createGlobalTempView("people")
 
-def schema_inference_example(spark):
+    # Global temporary view is tied to a system preserved database `global_temp`
+    spark.sql("SELECT * FROM global_temp.people").show()
+    # +----+-------+
+    # | age|   name|
+    # +----+-------+
+    # |null|Michael|
+    # |  30|   Andy|
+    # |  19| Justin|
+    # +----+-------+
+
+    # Global temporary view is cross-session
+    spark.newSession().sql("SELECT * FROM global_temp.people").show()
+    # +----+-------+
+    # | age|   name|
+    # +----+-------+
+    # |null|Michael|
+    # |  30|   Andy|
+    # |  19| Justin|
+    # +----+-------+
+    # $example off:global_temp_view$
+
+
+def schema_inference_example(spark: SparkSession) -> None:
     # $example on:schema_inferring$
     sc = spark.sparkContext
 
@@ -140,7 +161,7 @@ def schema_inference_example(spark):
     # $example off:schema_inferring$
 
 
-def programmatic_schema_example(spark):
+def programmatic_schema_example(spark: SparkSession) -> None:
     # $example on:programmatic_schema$
     sc = spark.sparkContext
 
@@ -162,9 +183,6 @@ def programmatic_schema_example(spark):
     # Creates a temporary view using the DataFrame
     schemaPeople.createOrReplaceTempView("people")
 
-    # Creates a temporary view using the DataFrame
-    schemaPeople.createOrReplaceTempView("people")
-
     # SQL can be run over DataFrames that have been registered as a table.
     results = spark.sql("SELECT name FROM people")
 
@@ -177,6 +195,7 @@ def programmatic_schema_example(spark):
     # | Justin|
     # +-------+
     # $example off:programmatic_schema$
+
 
 if __name__ == "__main__":
     # $example on:init_session$

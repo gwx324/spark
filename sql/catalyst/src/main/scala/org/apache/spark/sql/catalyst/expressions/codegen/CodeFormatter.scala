@@ -27,14 +27,25 @@ import java.util.regex.Matcher
  */
 object CodeFormatter {
   val commentHolder = """\/\*(.+?)\*\/""".r
+  val commentRegexp =
+    ("""([ |\t]*?\/\*[\s|\S]*?\*\/[ |\t]*?)|""" + // strip /*comment*/
+      """([ |\t]*?\/\/[\s\S]*?\n)""").r           // strip //comment
+  val extraNewLinesRegexp = """\n\s*\n""".r       // strip extra newlines
 
-  def format(code: CodeAndComment): String = {
+  def format(code: CodeAndComment, maxLines: Int = -1): String = {
     val formatter = new CodeFormatter
-    code.body.split("\n").foreach { line =>
+    val lines = code.body.split("\n")
+    val needToTruncate = maxLines >= 0 && lines.length > maxLines
+    val filteredLines = if (needToTruncate) lines.take(maxLines) else lines
+    filteredLines.foreach { line =>
       val commentReplaced = commentHolder.replaceAllIn(
         line.trim,
         m => code.comment.get(m.group(1)).map(Matcher.quoteReplacement).getOrElse(m.group(0)))
-      formatter.addLine(commentReplaced)
+      val comments = commentReplaced.split("\n")
+      comments.foreach(formatter.addLine)
+    }
+    if (needToTruncate) {
+      formatter.addLine(s"[truncated to $maxLines lines (total lines is ${lines.length})]")
     }
     formatter.result()
   }
@@ -83,6 +94,10 @@ object CodeFormatter {
     }
     new CodeAndComment(code.result().trim(), map)
   }
+
+  def stripExtraNewLinesAndComments(input: String): String = {
+    extraNewLinesRegexp.replaceAllIn(commentRegexp.replaceAllIn(input, ""), "\n")
+  }
 }
 
 private class CodeFormatter {
@@ -129,7 +144,7 @@ private class CodeFormatter {
     // Lines starting with '}' should be de-indented even if they contain '{' after;
     // in addition, lines ending with ':' are typically labels
     val thisLineIndent = if (line.startsWith("}") || line.startsWith(")") || line.endsWith(":")) {
-      " " * (indentSize * (indentLevel - 1))
+      " ".repeat(indentSize * (indentLevel - 1))
     } else {
       indentString
     }
@@ -142,7 +157,7 @@ private class CodeFormatter {
     }
     code.append("\n")
     indentLevel = newIndentLevel
-    indentString = " " * (indentSize * newIndentLevel)
+    indentString = " ".repeat(indentSize * newIndentLevel)
     currentLine += 1
   }
 

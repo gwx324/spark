@@ -17,14 +17,17 @@
 
 package org.apache.spark
 
-import java.io.Serializable
+import java.io.Closeable
 import java.util.Properties
 
-import org.apache.spark.annotation.DeveloperApi
+import org.apache.spark.annotation.{DeveloperApi, Evolving, Since}
 import org.apache.spark.executor.TaskMetrics
 import org.apache.spark.memory.TaskMemoryManager
 import org.apache.spark.metrics.source.Source
-import org.apache.spark.util.{AccumulatorV2, TaskCompletionListener, TaskFailureListener}
+import org.apache.spark.resource.ResourceInformation
+import org.apache.spark.scheduler.Task
+import org.apache.spark.shuffle.FetchFailedException
+import org.apache.spark.util.{AccumulatorV2, PostStatusUpdateListener, TaskCompletionListener, TaskFailureListener, TaskInterruptListener}
 
 
 object TaskContext {
@@ -47,6 +50,15 @@ object TaskContext {
     }
   }
 
+  def withTaskContext[T](context: TaskContext)(task: => T): T = {
+    try {
+      TaskContext.setTaskContext(context)
+      task
+    } finally {
+      TaskContext.unset()
+    }
+  }
+
   private[this] val taskContext: ThreadLocal[TaskContext] = new ThreadLocal[TaskContext]
 
   // Note: protected[spark] instead of private[spark] to prevent the following two from
@@ -65,7 +77,8 @@ object TaskContext {
    * An empty task context that does not represent an actual task.  This is only used in tests.
    */
   private[spark] def empty(): TaskContextImpl = {
-    new TaskContextImpl(0, 0, 0, 0, null, new Properties, null)
+    new TaskContextImpl(0, 0, 0, 0, 0, 1,
+      null, new Properties, null, TaskMetrics.empty, 1)
   }
 }
 
@@ -91,20 +104,25 @@ abstract class TaskContext extends Serializable {
   def isCompleted(): Boolean
 
   /**
+   * Returns true if the task has failed.
+   */
+  def isFailed(): Boolean
+
+  /**
    * Returns true if the task has been killed.
    */
   def isInterrupted(): Boolean
 
   /**
-   * Returns true if the task is running locally in the driver program.
-   * @return false
-   */
-  @deprecated("Local execution was removed, so this always returns false", "2.0.0")
-  def isRunningLocally(): Boolean
-
-  /**
    * Adds a (Java friendly) listener to be executed on task completion.
-   * This will be called in all situation - success, failure, or cancellation.
+   * This will be called in all situations - success, failure, or cancellation. Adding a listener
+   * to an already completed task will result in that listener being called immediately.
+   *
+   * Two listeners registered in the same thread will be invoked in reverse order of registration if
+   * the task completes after both are registered. There are no ordering guarantees for listeners
+   * registered in different threads, or for listeners registered after the task completes.
+   * Listeners are guaranteed to execute sequentially.
+   *
    * An example use is for HadoopRDD to register a callback to close the input stream.
    *
    * Exceptions thrown by the listener will result in failure of the task.
@@ -113,26 +131,54 @@ abstract class TaskContext extends Serializable {
 
   /**
    * Adds a listener in the form of a Scala closure to be executed on task completion.
-   * This will be called in all situations - success, failure, or cancellation.
+   * This will be called in all situations - success, failure, or cancellation. Adding a listener
+   * to an already completed task will result in that listener being called immediately.
+   *
    * An example use is for HadoopRDD to register a callback to close the input stream.
    *
    * Exceptions thrown by the listener will result in failure of the task.
    */
-  def addTaskCompletionListener(f: (TaskContext) => Unit): TaskContext = {
+  def addTaskCompletionListener[U](f: (TaskContext) => U): TaskContext = {
+    // Note that due to this scala bug: https://github.com/scala/bug/issues/11016, we need to make
+    // this function polymorphic for every scala version >= 2.12, otherwise an overloaded method
+    // resolution error occurs at compile time.
     addTaskCompletionListener(new TaskCompletionListener {
       override def onTaskCompletion(context: TaskContext): Unit = f(context)
     })
   }
 
   /**
-   * Adds a listener to be executed on task failure.
-   * Operations defined here must be idempotent, as `onTaskFailure` can be called multiple times.
+   * Adds a listener to be executed on task completion before every listener added with
+   * `addTaskCompletionListener`, from any thread and even if that listener was added later, as
+   * long as this listener is added before the task completes. The thread that marks the task
+   * completed runs these listeners first, in reverse order of registration, and only then marks
+   * the task completed (`isCompleted()` becomes true) and runs the completion listeners. While
+   * these listeners run, a completion listener added from another thread is only queued. A
+   * listener added after the task completes, including while the completion listeners run, is
+   * handled like one added with `addTaskCompletionListener` at that point: it runs after the
+   * completion listeners that have already run.
+   *
+   * This is for stopping helper threads that read task resources owned by completion
+   * listeners: the helper thread itself can add such listeners lazily (e.g. when it first
+   * pulls from an upstream iterator), and those would otherwise run first.
+   */
+  private[spark] def addTaskPreCompletionListener(listener: TaskCompletionListener): TaskContext
+
+  /**
+   * Adds a listener to be executed on task failure (which includes completion listener failure, if
+   * the task body did not already fail). Adding a listener to an already failed task will result in
+   * that listener being called immediately.
+   *
+   * Note: Prior to Spark 3.4.0, failure listeners were only invoked if the main task body failed.
    */
   def addTaskFailureListener(listener: TaskFailureListener): TaskContext
 
   /**
-   * Adds a listener to be executed on task failure.
-   * Operations defined here must be idempotent, as `onTaskFailure` can be called multiple times.
+   * Adds a listener to be executed on task failure (which includes completion listener failure, if
+   * the task body did not already fail). Adding a listener to an already failed task will result in
+   * that listener being called immediately.
+   *
+   * Note: Prior to Spark 3.4.0, failure listeners were only invoked if the main task body failed.
    */
   def addTaskFailureListener(f: (TaskContext, Throwable) => Unit): TaskContext = {
     addTaskFailureListener(new TaskFailureListener {
@@ -141,14 +187,103 @@ abstract class TaskContext extends Serializable {
   }
 
   /**
+   * Adds a listener to be executed when the task is interrupted.
+   *
+   * Adding a listener to an already interrupted task will result in that listener being called
+   * immediately.
+   *
+   * There are no ordering guarantees for task interrupt listeners. Listeners are guaranteed to
+   * execute sequentially with other task completion, failure, or interrupt listeners. Listeners may
+   * be invoked concurrently with the task itself.
+   *
+   * Exceptions thrown by the listener will mark the task as failed; they are not propagated from
+   * `markInterrupted` (for example when interruption is delivered on the executor kill thread).
+   */
+  def addTaskInterruptListener(listener: TaskInterruptListener): TaskContext
+
+  /**
+   * Adds a listener to be executed when the task is interrupted (Scala closure form).
+   * Behavior matches `addTaskInterruptListener` with TaskInterruptListener.
+   */
+  def addTaskInterruptListener(f: (TaskContext, String) => Unit): TaskContext = {
+    addTaskInterruptListener(new TaskInterruptListener {
+      override def onTaskInterrupted(context: TaskContext, reason: String): Unit =
+        f(context, reason)
+    })
+  }
+
+  /**
+   * Adds a listener to be invoked after the task's status update has been sent to the driver.
+   * This is useful for operations that should only begin after the driver has been notified
+   * of the task's result. For example, push-based shuffle block push can use this to
+   * ensure the driver processes the task result before any push data reaches the merger,
+   * avoiding stale data being merged without detection.
+   *
+   * The callback runs on the same executor thread that sends the status update.
+   *
+   * Exceptions thrown by the listener are only logged by the executor. They do not mark the task
+   * as failed, since the driver has already been told that it succeeded.
+   */
+  private[spark] def addPostStatusUpdateListener(listener: PostStatusUpdateListener): TaskContext
+
+  /**
+   * Invokes all registered post-status-update listeners. Called by Executor after sending
+   * the task's status update to the driver.
+   */
+  private[spark] def invokePostStatusUpdateListeners(): Unit
+
+  /** Runs a task with this context, ensuring failure and completion listeners get triggered. */
+  private[spark] def runTaskWithListeners[T](task: Task[T]): T = {
+    try {
+      // SPARK-44818 - Its possible that taskThread has not been initialized when kill is initially
+      // called with interruptThread=true. We do set the reason and eventually will set it on the
+      // context too within run(). If that's the case, kill the thread before it starts executing
+      // the actual task.
+      killTaskIfInterrupted()
+      task.runTask(this)
+    } catch {
+      case e: Throwable =>
+        // Catch all errors; run task failure and completion callbacks, and rethrow the exception.
+        try {
+          markTaskFailed(e)
+        } catch {
+          case t: Throwable =>
+            e.addSuppressed(t)
+        }
+        try {
+          markTaskCompleted(Some(e))
+        } catch {
+          case t: Throwable =>
+            e.addSuppressed(t)
+        }
+        throw e
+    } finally {
+      // Call the task completion callbacks. No-op if "markTaskCompleted" was already called.
+      markTaskCompleted(None)
+    }
+  }
+
+  /**
    * The ID of the stage that this task belong to.
    */
   def stageId(): Int
 
   /**
+   * How many times the stage that this task belongs to has been attempted. The first stage attempt
+   * will be assigned stageAttemptNumber = 0, and subsequent attempts will have increasing attempt
+   * numbers.
+   */
+  def stageAttemptNumber(): Int
+
+  /**
    * The ID of the RDD partition that is computed by this task.
    */
   def partitionId(): Int
+
+  /**
+   * Total number of partitions in the stage that this task belongs to.
+   */
+  def numPartitions(): Int
 
   /**
    * How many times this task has been attempted.  The first task attempt will be assigned
@@ -164,9 +299,42 @@ abstract class TaskContext extends Serializable {
 
   /**
    * Get a local property set upstream in the driver, or null if it is missing. See also
-   * [[org.apache.spark.SparkContext.setLocalProperty]].
+   * `org.apache.spark.SparkContext.setLocalProperty`.
    */
   def getLocalProperty(key: String): String
+
+  /**
+   * CPUs allocated to the task, rounded up to a whole number.
+   *
+   * @note when `spark.task.cpus` is fractional (e.g. `0.2`) this rounds up to the next integer and
+   *       so cannot represent the fractional amount; use [[cpuAmount]] for the exact value.
+   */
+  @deprecated("use cpuAmount() instead, which supports a fractional spark.task.cpus", "4.3.0")
+  @Since("3.3.0")
+  def cpus(): Int = cpuAmount().setScale(0, BigDecimal.RoundingMode.CEILING).intValue
+
+  /**
+   * CPUs allocated to the task as an exact, possibly fractional amount, carried as a
+   * [[scala.math.BigDecimal]] (e.g. `BigDecimal("0.2")` when `spark.task.cpus` is `0.2`).
+   */
+  @Since("4.3.0")
+  def cpuAmount(): BigDecimal
+
+  /**
+   * Resources allocated to the task. The key is the resource name and the value is information
+   * about the resource. Please refer to [[org.apache.spark.resource.ResourceInformation]] for
+   * specifics.
+   */
+  @Evolving
+  def resources(): Map[String, ResourceInformation]
+
+  /**
+   * (java-specific) Resources allocated to the task. The key is the resource name and the value
+   * is information about the resource. Please refer to
+   * [[org.apache.spark.resource.ResourceInformation]] for specifics.
+   */
+  @Evolving
+  def resourcesJMap(): java.util.Map[String, ResourceInformation]
 
   @DeveloperApi
   def taskMetrics(): TaskMetrics
@@ -174,10 +342,20 @@ abstract class TaskContext extends Serializable {
   /**
    * ::DeveloperApi::
    * Returns all metrics sources with the given name which are associated with the instance
-   * which runs the task. For more information see [[org.apache.spark.metrics.MetricsSystem!]].
+   * which runs the task. For more information see `org.apache.spark.metrics.MetricsSystem`.
    */
   @DeveloperApi
   def getMetricsSources(sourceName: String): Seq[Source]
+
+  /**
+   * If the task is interrupted, throws TaskKilledException with the reason for the interrupt.
+   */
+  private[spark] def killTaskIfInterrupted(): Unit
+
+  /**
+   * If the task is interrupted, the reason this task was killed, otherwise None.
+   */
+  private[spark] def getKillReason(): Option[String]
 
   /**
    * Returns the manager for this task's managed memory.
@@ -190,4 +368,47 @@ abstract class TaskContext extends Serializable {
    */
   private[spark] def registerAccumulator(a: AccumulatorV2[_, _]): Unit
 
+  /**
+   * Record that this task has failed due to a fetch failure from a remote host.  This allows
+   * fetch-failure handling to get triggered by the driver, regardless of intervening user-code.
+   */
+  private[spark] def setFetchFailed(fetchFailed: FetchFailedException): Unit
+
+  /** Marks the task for interruption, i.e. cancellation. */
+  private[spark] def markInterrupted(reason: String): Unit
+
+  /** Marks the task as failed and triggers the failure listeners. */
+  private[spark] def markTaskFailed(error: Throwable): Unit
+
+  /** Marks the task as completed and triggers the completion listeners. */
+  private[spark] def markTaskCompleted(error: Option[Throwable]): Unit
+
+  /** If the task fails, the exception that caused it, otherwise None. */
+  private[spark] def getTaskFailure: Option[Throwable] = None
+
+  /** Optionally returns the stored fetch failure in the task. */
+  private[spark] def fetchFailed: Option[FetchFailedException]
+
+  /** Gets local properties set upstream in the driver. */
+  private[spark] def getLocalProperties: Properties
+
+  /** Whether the current task is allowed to interrupt. */
+  private[spark] def interruptible(): Boolean
+
+  /**
+   * Pending the interruption request until the task is able to
+   * interrupt after creating the resource uninterruptibly.
+   */
+  private[spark] def pendingInterrupt(threadToInterrupt: Option[Thread], reason: String): Unit
+
+  /**
+   * Creating a closeable resource uninterruptibly. A task is not allowed to interrupt in this
+   * state until the resource creation finishes. E.g.,
+   * {{{
+   *  val linesReader = TaskContext.get().createResourceUninterruptibly {
+   *    new HadoopFileLinesReader(file, parser.options.lineSeparatorInRead, conf)
+   *  }
+   * }}}
+   */
+  private[spark] def createResourceUninterruptibly[T <: Closeable](resourceBuilder: => T): T
 }

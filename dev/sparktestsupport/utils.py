@@ -1,0 +1,149 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+import itertools
+import os
+import subprocess
+from collections.abc import Sequence
+
+from sparktestsupport import modules
+from sparktestsupport.shellutils import run_cmd
+from sparktestsupport.toposort import toposort_flatten
+
+# -------------------------------------------------------------------------------------------------
+# Functions for traversing module dependency graph
+# -------------------------------------------------------------------------------------------------
+
+
+def determine_modules_for_files(filenames):
+    """
+    Given a list of filenames, return the set of modules that contain those files.
+    If a file is not associated with a more specific submodule, then this method will consider that
+    file to belong to the 'root' module. `.github` directory is counted only in GitHub Actions.
+
+    >>> sorted(x.name for x in determine_modules_for_files(["python/pyspark/a.py", "sql/core/foo"]))
+    ['pyspark-core', 'pyspark-periodic', 'sql']
+    >>> [x.name for x in determine_modules_for_files(["file_not_matched_by_any_subproject"])]
+    ['root']
+    >>> [x.name for x in determine_modules_for_files(["python/README.md"])]
+    []
+    """
+    changed_modules = set()
+    for filename in filenames:
+        if modules.is_ignored_file(filename):
+            continue
+        if ("GITHUB_ACTIONS" not in os.environ) and filename.startswith(".github"):
+            continue
+        matched_at_least_one_module = False
+        for module in modules.all_modules:
+            if module.contains_file(filename):
+                changed_modules.add(module)
+                matched_at_least_one_module = True
+        if not matched_at_least_one_module:
+            changed_modules.add(modules.root)
+    return changed_modules
+
+
+def identify_changed_files_from_git_commits(patch_sha, target_branch=None, target_ref=None):
+    """
+    Given a git commit and target ref, use the set of files changed in the diff in order to
+    determine which modules' tests should be run.
+    """
+    if target_branch is None and target_ref is None:
+        raise AttributeError("must specify either target_branch or target_ref")
+    elif target_branch is not None and target_ref is not None:
+        raise AttributeError("must specify either target_branch or target_ref, not both")
+    if target_branch is not None:
+        diff_target = target_branch
+        run_cmd(["git", "fetch", "origin", str(target_branch + ":" + target_branch)])
+    else:
+        diff_target = target_ref
+    raw_output = subprocess.check_output(
+        ["git", "diff", "--name-only", patch_sha, diff_target], universal_newlines=True
+    )
+    # Remove any empty strings
+    return [f for f in raw_output.split("\n") if f]
+
+
+def determine_modules_to_test(changed_modules, deduplicated=True):
+    """
+    Given a set of modules that have changed, compute the transitive closure of those modules'
+    dependent modules in order to determine the set of modules that should be tested.
+
+    Returns a topologically-sorted list of modules (ties are broken by sorting on module names).
+    If ``deduplicated`` is disabled, the modules are returned without tacking the deduplication
+    by dependencies into account.
+
+    >>> [x.name for x in determine_modules_to_test([modules.core])]
+    ['root']
+    >>> [x.name for x in determine_modules_to_test([modules.graphx])]
+    ['graphx', 'examples']
+    """
+    modules_to_test = set()
+    for module in changed_modules:
+        modules_to_test = modules_to_test.union(
+            determine_modules_to_test(module.dependent_modules, deduplicated)
+        )
+    modules_to_test = modules_to_test.union(set(changed_modules))
+
+    if not deduplicated:
+        return modules_to_test
+
+    # If we need to run all of the tests, then we should short-circuit and return 'root'
+    if modules.root in modules_to_test:
+        return [modules.root]
+    return toposort_flatten(
+        {m: set(m.dependencies).intersection(modules_to_test) for m in modules_to_test}, sort=True
+    )
+
+
+def determine_shell_script_test_goals(
+    test_modules: Sequence[modules.Module], stage: modules.TestStage
+) -> tuple[modules.ShellScriptTestGoal, ...]:
+    """
+    Return the shell script test goals that the given modules declare for a stage.
+
+    Goals are returned in the order determined by the modules passed in,
+    preserving each module's declaration order. Each goal is returned only once.
+    """
+    declared_goals = itertools.chain.from_iterable(m.shell_script_test_goals for m in test_modules)
+    stage_goals = (goal for goal in declared_goals if goal.stage == stage)
+    # `dict.fromkeys` preserves order, unlike `set`.
+    return tuple(dict.fromkeys(stage_goals))
+
+
+def determine_dangling_python_tests(changed_files):
+    """
+    Given a list of changed files, return the set of Python tests that are not associated with any
+    module.
+    """
+    dangling_tests = set()
+    for filename in changed_files:
+        # Module test goals only cover PySpark tests; other suites have their own runners.
+        if not filename.startswith("python/"):
+            continue
+        if os.path.exists(filename) and modules.root.missing_potential_python_test(filename):
+            dangling_tests.add(filename)
+    return dangling_tests
+
+
+def determine_tags_to_exclude(changed_modules):
+    tags = []
+    for m in modules.all_modules:
+        if m not in changed_modules:
+            tags += m.test_tags
+    return tags

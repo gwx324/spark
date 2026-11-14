@@ -15,17 +15,16 @@
 # limitations under the License.
 #
 
-from __future__ import print_function
-
 import sys
+from typing import Tuple
 
+from pyspark import RDD
 from pyspark.sql import SparkSession
-
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
         print("Usage: sort <file>", file=sys.stderr)
-        exit(-1)
+        sys.exit(-1)
 
     spark = SparkSession\
         .builder\
@@ -33,7 +32,7 @@ if __name__ == "__main__":
         .getOrCreate()
 
     lines = spark.read.text(sys.argv[1]).rdd.map(lambda r: r[0])
-    sortedCount = lines.flatMap(lambda x: x.split(' ')) \
+    sortedCount: RDD[Tuple[int, int]] = lines.flatMap(lambda x: x.split(' ')) \
         .map(lambda x: (int(x), 1)) \
         .sortByKey()
     # This is just a demo on how to bring all the sorted data back to a single node.

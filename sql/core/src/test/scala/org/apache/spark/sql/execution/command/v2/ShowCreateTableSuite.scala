@@ -1,0 +1,333 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.execution.command.v2
+
+import org.apache.spark.SparkConf
+import org.apache.spark.sql.AnalysisException
+import org.apache.spark.sql.catalyst.util.FieldMetadataUtils
+import org.apache.spark.sql.connector.catalog.InMemoryBaseTable
+import org.apache.spark.sql.execution.command
+
+/**
+ * The class contains tests for the `SHOW CREATE TABLE` command to check V2 table catalogs.
+ */
+class ShowCreateTableSuite extends command.ShowCreateTableSuiteBase with CommandSuiteBase {
+
+  override def sparkConf: SparkConf = super.sparkConf
+    .set(InMemoryBaseTable.ASSIGN_COLUMN_IDS, "true")
+
+  override def fullName: String = s"$catalog.$ns.$table"
+
+  test("show create table excludes display-only properties") {
+    withNamespaceAndTable(ns, table) { t =>
+      createTableWithDisplayProperties(ns, table, withLocation = true)
+
+      assert(getShowCreateDDL(t, false) === Array(
+        s"CREATE TABLE $t (",
+        "id BIGINT)",
+        defaultUsing,
+        "COMMENT 'table comment'",
+        "LOCATION 'file:/tmp/display-properties'",
+        "TBLPROPERTIES (",
+        "'persisted' = 'stored')"))
+    }
+  }
+
+  test("SPARK-33898: show create table as serde") {
+    withNamespaceAndTable(ns, table) { t =>
+      spark.sql(s"CREATE TABLE $t (id bigint, data string) $defaultUsing")
+      val e = intercept[AnalysisException] {
+        sql(s"SHOW CREATE TABLE $t AS SERDE")
+      }
+      assert(e.message.contains(s"SHOW CREATE TABLE AS SERDE is not supported for v2 tables."))
+    }
+  }
+
+  test("SPARK-33898: show create table[CTAS]") {
+    // does not work with hive, also different order between v2 with v1/hive
+    withNamespaceAndTable(ns, table) { t =>
+      sql(
+        s"""CREATE TABLE $t
+           |$defaultUsing
+           |PARTITIONED BY (a)
+           |COMMENT 'This is a comment'
+           |TBLPROPERTIES ('a' = '1')
+           |AS SELECT 1 AS a, "foo" AS b
+         """.stripMargin
+      )
+      val showDDL = getShowCreateDDL(t, false)
+      assert(showDDL === Array(
+        s"CREATE TABLE $t (",
+        "a INT,",
+        "b STRING COLLATE UTF8_BINARY)",
+        defaultUsing,
+        "PARTITIONED BY (a)",
+        "COMMENT 'This is a comment'",
+        "TBLPROPERTIES (",
+        "'a' = '1')"
+      ))
+    }
+  }
+
+  test("SPARK-33898: show create table[simple]") {
+    // TODO: After SPARK-37517, we can move the test case to base to test for v2/v1/hive
+    val db = "ns1"
+    val table = "tbl"
+    withNamespaceAndTable(db, table) { t =>
+      sql(
+        s"""
+           |CREATE TABLE $t (
+           |  a bigint NOT NULL,
+           |  b bigint,
+           |  c bigint,
+           |  `extraCol` ARRAY<INT>,
+           |  `<another>` STRUCT<x: INT, y: ARRAY<BOOLEAN>>
+           |)
+           |$defaultUsing
+           |OPTIONS (
+           |  from = 0,
+           |  to = 1,
+           |  via = 2)
+           |COMMENT 'This is a comment'
+           |TBLPROPERTIES (
+           |  'prop1' = '1',
+           |  'prop2' = '2',
+           |  'prop3' = 3,
+           |  'prop4' = 4,
+           |  'password' = 'password')
+           |PARTITIONED BY (a)
+           |LOCATION '/tmp'
+        """.stripMargin)
+      val showDDL = getShowCreateDDL(t, false)
+      assert(showDDL === Array(
+        s"CREATE TABLE $t (",
+        "a BIGINT NOT NULL,",
+        "b BIGINT,",
+        "c BIGINT,",
+        "extraCol ARRAY<INT>,",
+        "`<another>` STRUCT<x: INT, y: ARRAY<BOOLEAN>>)",
+        defaultUsing,
+        "OPTIONS (",
+        "'from' = '0',",
+        "'to' = '1',",
+        "'via' = '2')",
+        "PARTITIONED BY (a)",
+        "COMMENT 'This is a comment'",
+        "LOCATION 'file:/tmp'",
+        "TBLPROPERTIES (",
+        "'password' = '*********(redacted)',",
+        "'prop1' = '1',",
+        "'prop2' = '2',",
+        "'prop3' = '3',",
+        "'prop4' = '4')"
+      ))
+    }
+  }
+
+  test("SPARK-33898: show create table[multi-partition]") {
+    withNamespaceAndTable(ns, table) { t =>
+      sql(
+        s"""
+           |CREATE TABLE $t (a INT, b STRING, ts TIMESTAMP) $defaultUsing
+           |PARTITIONED BY (
+           |    a,
+           |    bucket(16, b),
+           |    years(ts),
+           |    months(ts),
+           |    days(ts),
+           |    hours(ts))
+         """.stripMargin)
+      // V1 transforms cannot be converted to partition columns: bucket,year,...)
+      val showDDL = getShowCreateDDL(t, false)
+      assert(showDDL === Array(
+        s"CREATE TABLE $t (",
+        "a INT,",
+        "b STRING COLLATE UTF8_BINARY,",
+        "ts TIMESTAMP)",
+        defaultUsing,
+        "PARTITIONED BY (a, bucket(16, b), years(ts), months(ts), days(ts), hours(ts))"
+      ))
+    }
+  }
+
+  test("SPARK-56755: show create table[partitioned by multi bucket transforms]") {
+    withNamespaceAndTable(ns, table) { t =>
+      sql(
+        s"""
+           |CREATE TABLE $t (a INT, b STRING, ts TIMESTAMP) $defaultUsing
+           |PARTITIONED BY (bucket(4, a), bucket(8, b), years(ts))
+         """.stripMargin)
+      val showDDL = getShowCreateDDL(t, false)
+      assert(showDDL === Array(
+        s"CREATE TABLE $t (",
+        "a INT,",
+        "b STRING COLLATE UTF8_BINARY,",
+        "ts TIMESTAMP)",
+        defaultUsing,
+        "PARTITIONED BY (bucket(4, a), bucket(8, b), years(ts))"
+      ))
+    }
+  }
+
+  test("should quote identifiers with special characters") {
+    withNamespaceAndTable("`a_schema-with+special^chars`", "`a_table-with+special^chars`") { t =>
+      sql(s"""
+           |CREATE TABLE $t (
+           |  a bigint NOT NULL,
+           |  b bigint
+           |) $defaultUsing
+        """.stripMargin)
+      val showDDL = getShowCreateDDL(t)
+      assert(
+        showDDL(0) == s"CREATE TABLE test_catalog.`a_schema-with+special^chars`." +
+        s"`a_table-with+special^chars` ("
+      )
+    }
+  }
+
+  test("SPARK-46629: show struct fields with NOT NULL and comment") {
+    withNamespaceAndTable(ns, table) { t =>
+      sql(s"""
+             |CREATE TABLE $t (
+             |  a struct<b: bigint COMMENT 'comment', c: struct<d: string NOT NULL, e: string>>
+             |)
+             |USING parquet
+             |COMMENT 'This is a comment'
+        """.stripMargin)
+      val showDDL = getShowCreateDDL(t)
+      assert(
+        showDDL === Array(
+          s"CREATE TABLE $fullName (",
+          "a STRUCT<b: BIGINT COMMENT 'comment'," +
+            " c: STRUCT<d: STRING COLLATE UTF8_BINARY NOT NULL, e: STRING COLLATE UTF8_BINARY>>)",
+          "USING parquet",
+          "COMMENT 'This is a comment'"
+        )
+      )
+    }
+  }
+
+  test("SPARK-57544: show create table does not expose column IDs; schema does") {
+    withNamespaceAndTable(ns, table) { t =>
+      sql(s"CREATE TABLE $t (id INT, salary INT) $defaultUsing")
+
+      // Column IDs assigned by the catalog must NOT appear in SHOW CREATE TABLE output.
+      val showDDL = getShowCreateDDL(t)
+      assert(!showDDL.exists(_.contains(FieldMetadataUtils.FIELD_ID_METADATA_KEY)))
+
+      // Column IDs must be accessible via df.schema.
+      val fields = spark.table(t).schema.fields
+      assert(fields.forall(_.id.isDefined))
+    }
+  }
+
+  test("show table constraints") {
+    withNamespaceAndTable("ns", "tbl", nonPartitionCatalog) { t =>
+      withNamespaceAndTable("ns", "other_table", nonPartitionCatalog) { otherTable =>
+        sql(
+          s"""
+             |CREATE TABLE $otherTable (
+             |  id STRING PRIMARY KEY
+             |)
+             |$defaultUsing
+        """.stripMargin)
+        sql(
+          s"""
+             |CREATE TABLE $t (
+             |  a INT,
+             |  b STRING,
+             |  c STRING,
+             |  PRIMARY KEY (a),
+             |  CONSTRAINT uk_b UNIQUE (b),
+             |  CONSTRAINT fk_c FOREIGN KEY (c) REFERENCES $otherTable(id) RELY,
+             |  CONSTRAINT c1 CHECK (c IS NOT NULL),
+             |  CONSTRAINT c2 CHECK (a > 0)
+             |)
+             |$defaultUsing
+        """.stripMargin)
+        var showDDL = getShowCreateDDL(t)
+        val expectedDDLPrefix = Array(
+          s"CREATE TABLE $nonPartitionCatalog.ns.tbl (",
+          "a INT NOT NULL,",
+          "b STRING COLLATE UTF8_BINARY,",
+          "c STRING COLLATE UTF8_BINARY,",
+          "CONSTRAINT tbl_pk PRIMARY KEY (a) NOT ENFORCED NORELY,",
+          "CONSTRAINT uk_b UNIQUE (b) NOT ENFORCED NORELY,",
+          s"CONSTRAINT fk_c FOREIGN KEY (c) REFERENCES $otherTable (id) NOT ENFORCED RELY,",
+          "CONSTRAINT c1 CHECK (c IS NOT NULL) ENFORCED NORELY,"
+        )
+        assert(showDDL === expectedDDLPrefix ++ Array(
+          "CONSTRAINT c2 CHECK (a > 0) ENFORCED NORELY)",
+          defaultUsing))
+
+        sql(s"ALTER TABLE $t ADD CONSTRAINT c3 CHECK (b IS NOT NULL) ENFORCED RELY")
+        showDDL = getShowCreateDDL(t)
+        val expectedDDLArrayWithNewConstraint = expectedDDLPrefix ++ Array(
+          "CONSTRAINT c2 CHECK (a > 0) ENFORCED NORELY,",
+          "CONSTRAINT c3 CHECK (b IS NOT NULL) ENFORCED RELY)",
+          defaultUsing
+        )
+        assert(showDDL === expectedDDLArrayWithNewConstraint)
+        sql(s"ALTER TABLE $t DROP CONSTRAINT c1")
+        showDDL = getShowCreateDDL(t)
+        val expectedDDLArrayAfterDrop = expectedDDLArrayWithNewConstraint.filterNot(
+          _.contains("c1 CHECK (c IS NOT NULL) ENFORCED NORELY"))
+        assert(showDDL === expectedDDLArrayAfterDrop)
+      }
+    }
+  }
+
+  test("SPARK-60344: show table constraints whose names need quoting") {
+    withNamespaceAndTable("ns", "`tbl-1`", nonPartitionCatalog) { t =>
+      withNamespaceAndTable("ns", "other_table", nonPartitionCatalog) { otherTable =>
+        sql(s"CREATE TABLE $otherTable (id STRING PRIMARY KEY) $defaultUsing")
+        sql(
+          s"""
+             |CREATE TABLE $t (
+             |  a INT,
+             |  b STRING,
+             |  c STRING,
+             |  PRIMARY KEY (a),
+             |  CONSTRAINT `uk b` UNIQUE (b),
+             |  CONSTRAINT `fk.c` FOREIGN KEY (c) REFERENCES $otherTable(id) RELY,
+             |  CONSTRAINT `c``1` CHECK (c IS NOT NULL)
+             |)
+             |$defaultUsing
+        """.stripMargin)
+        val showDDL = getShowCreateDDL(t)
+        assert(showDDL === Array(
+          s"CREATE TABLE $t (",
+          "a INT NOT NULL,",
+          "b STRING COLLATE UTF8_BINARY,",
+          "c STRING COLLATE UTF8_BINARY,",
+          // The generated name of the primary key starts with the table name.
+          "CONSTRAINT `tbl-1_pk` PRIMARY KEY (a) NOT ENFORCED NORELY,",
+          "CONSTRAINT `uk b` UNIQUE (b) NOT ENFORCED NORELY,",
+          s"CONSTRAINT `fk.c` FOREIGN KEY (c) REFERENCES $otherTable (id) NOT ENFORCED RELY,",
+          "CONSTRAINT `c``1` CHECK (c IS NOT NULL) ENFORCED NORELY)",
+          defaultUsing))
+
+        // The output can be run again.
+        val ddl = sql(s"SHOW CREATE TABLE $t").head().getString(0)
+        sql(s"DROP TABLE $t")
+        sql(ddl)
+        assert(getShowCreateDDL(t) === showDDL)
+      }
+    }
+  }
+}

@@ -1,0 +1,315 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.catalyst.optimizer
+
+import org.apache.spark.SparkException
+import org.apache.spark.sql.catalyst.expressions.{Alias, And, ArrayTransform, CaseWhen, Coalesce, CreateArray, CreateMap, CreateNamedStruct, EqualTo, ExpectsInputTypes, Expression, GetStructField, If, IsNull, KnownFloatingPointNormalized, LambdaFunction, Literal, NamedExpression, NamedLambdaVariable, Or, PythonUDAF, TransformValues, UnaryExpression}
+import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
+import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, ExprCode}
+import org.apache.spark.sql.catalyst.planning.{ExtractEquiJoinKeys, ExtractSingleColumnNullAwareAntiJoin}
+import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, LogicalPlan, Window}
+import org.apache.spark.sql.catalyst.rules.Rule
+import org.apache.spark.sql.catalyst.trees.TreePattern._
+import org.apache.spark.sql.types._
+import org.apache.spark.util.ArrayImplicits._
+
+/**
+ * Certain pairs of floating point numbers require special handling:
+ *   1. 0.0 / -0.0
+ *   2. NaN / NaN
+ * That's because we want to treat each of these pairs of numbers as equal, even though they have
+ * different binary representations. (Note that IEEE 754 allows multiple distinct bit patterns for
+ * NaN.)
+ *
+ * There are multiple ways we compare values that require careful handling of the above floating
+ * point pairs:
+ *   1. Directly, via `==` or via methods of `java.lang.{type}`
+ *   2. Via raw bytes in instances of [[org.apache.spark.sql.catalyst.expressions.UnsafeRow]]
+ *   3. Via hash sets
+ *
+ * This special handling is required in several places where we compare values via one of the above
+ * methods:
+ *   1. When comparing values (direct)
+ *   2. When grouping keys for aggregates (`UnsafeRow`)
+ *   3. When joining on keys (`UnsafeRow`)
+ *   4. When partitioning keys for windows (`UnsafeRow`)
+ *   5. When executing array set operations (hash sets)
+ *
+ * Case 1 is handled in [[org.apache.spark.sql.catalyst.util.SQLOrderingUtil]] and in the
+ *  `genEqual` method of [[org.apache.spark.sql.catalyst.expressions.codegen.CodegenContext]].
+ * Case 2 is handled during planning in the `Aggregation` and `StatefulAggregationStrategy` objects
+ *  of [[org.apache.spark.sql.execution.SparkStrategies]].
+ * Cases 3 and 4 are handled by this optimizer rule. Array set operations handle case 5 in their
+ * expression evaluation.
+ *
+ * Ideally we should do the normalization in the physical operators that compare the binary
+ * `UnsafeRow` directly. We don't need this normalization if the Spark SQL execution engine is not
+ * optimized to run on binary data. Array set operations normalize values during expression
+ * evaluation instead, where values enter hash-based comparisons or result arrays.
+ *
+ * Note that, this rule must be executed at the end of optimizer, because the optimizer may create
+ * new joins(the subquery rewrite) and new join conditions(the join reorder).
+ */
+object NormalizeFloatingNumbers extends Rule[LogicalPlan] {
+
+  def apply(plan: LogicalPlan): LogicalPlan =
+    plan.transformWithPruning(_.containsAnyPattern(WINDOW, JOIN)) {
+      case w: Window if w.partitionSpec.exists(p => needNormalize(p)) =>
+        // Although the `windowExpressions` may refer to `partitionSpec` expressions, we don't need
+        // to normalize the `windowExpressions`, as they are executed per input row and should take
+        // the input row as it is.
+        w.copy(partitionSpec = w.partitionSpec.map(normalize))
+
+      // Only hash join and sort merge join need the normalization. Here we catch all Joins with
+      // join keys, assuming Joins with join keys are always planned as hash join or sort merge
+      // join. It's very unlikely that we will break this assumption in the near future.
+      case j @ ExtractEquiJoinKeys(_, leftKeys, rightKeys, condition, _, _, _, _)
+          // The analyzer guarantees left and right join keys are of the same data type, but a key
+          // can already be normalized on one side only (e.g. a filter pushed below an Aggregate
+          // reads the normalized grouping key, and a subquery rewrite turns it into a join key),
+          // so check both sides.
+          if leftKeys.exists(needNormalize) || rightKeys.exists(needNormalize) =>
+        val newLeftJoinKeys = leftKeys.map(normalize)
+        val newRightJoinKeys = rightKeys.map(normalize)
+        val newConditions = newLeftJoinKeys.zip(newRightJoinKeys).map {
+          case (l, r) => EqualTo(l, r)
+        } ++ condition
+        j.copy(condition = Some(newConditions.reduce(And)))
+
+      // The specialized NAAJ is a hash join, but its OR condition is not an equi-join shape.
+      case j @ ExtractSingleColumnNullAwareAntiJoin(leftKeys, rightKeys)
+          if leftKeys.exists(needNormalize) || rightKeys.exists(needNormalize) =>
+        val equality = EqualTo(normalize(leftKeys.head), normalize(rightKeys.head))
+        j.copy(condition = Some(Or(equality, IsNull(equality))))
+
+      // TODO: ideally Aggregate should also be handled here, but its grouping expressions are
+      // mixed in its aggregate expressions. It's unreliable to change the grouping expressions
+      // here. For now we normalize grouping expressions during planning. See Case 2 in the
+      // Scaladoc just above.
+    }
+
+  /**
+   * Whether `aggregate` outputs its float/double grouping keys normalized. The planner normalizes
+   * the grouping keys of every Aggregate (see `SparkStrategies.Aggregation`), except one whose
+   * aggregate functions are all grouped-agg pandas UDFs, planned as `ArrowAggregatePythonExec` on
+   * the raw keys. Rules that replace an Aggregate with a Project check [[readsNormalizedKeys]].
+   * The answer can still change during optimization, see [[mayChangeKeyForm]].
+   */
+  private[sql] def outputsNormalizedKeys(aggregate: Aggregate): Boolean = {
+    val aggregateFunctions = aggregate.aggregateExpressions.flatMap(_.collect {
+      case ae: AggregateExpression => ae.aggregateFunction
+    })
+    aggregateFunctions.isEmpty || !aggregateFunctions.forall(_.isInstanceOf[PythonUDAF])
+  }
+
+  /**
+   * Whether the form of the keys `aggregate` outputs may still change during optimization, so that
+   * a filter pushed below it must not depend on it. This is the case for an Aggregate with a
+   * grouped-agg pandas UDF: `ColumnPruning` can remove its other aggregate functions, so that it
+   * outputs the raw keys, or all of them, so that it becomes group-only and outputs normalized
+   * keys.
+   */
+  private[sql] def mayChangeKeyForm(aggregate: Aggregate): Boolean = {
+    aggregate.aggregateExpressions.exists(_.exists {
+      case ae: AggregateExpression => ae.aggregateFunction.isInstanceOf[PythonUDAF]
+      case _ => false
+    })
+  }
+
+  /**
+   * The float/double grouping expressions that `aggregate` outputs normalized, without aliases.
+   */
+  private[sql] def normalizedKeys(aggregate: Aggregate): Seq[Expression] = {
+    if (outputsNormalizedKeys(aggregate)) {
+      aggregate.groupingExpressions
+        .map {
+          case a: Alias => a.child
+          case e => e
+        }
+        .filter(e => needNormalize(e.dataType))
+    } else {
+      Nil
+    }
+  }
+
+  /**
+   * Whether a rule must not replace `aggregate` with a Project of `outputs` (a subset of
+   * `aggregate.aggregateExpressions`) over its child, because one of them reads a float/double
+   * grouping key that `aggregate` outputs normalized: the Project would output the raw key,
+   * unlike the Aggregate and unlike what a filter pushed below the Aggregate has read. Streaming
+   * Aggregates are exempt and keep the previous behavior: keeping one that such a rule used to
+   * remove would add a stateful operator, which a query restarted from an existing checkpoint
+   * rejects. Filters are not normalized below streaming Aggregates either (see
+   * `PushPredicateThroughNonJoin.pushBelowAggregate`).
+   */
+  private[sql] def readsNormalizedKeys(
+      aggregate: Aggregate,
+      outputs: Seq[NamedExpression]): Boolean = {
+    val keys = normalizedKeys(aggregate)
+    !aggregate.isStreaming && keys.nonEmpty &&
+      outputs.exists(_.exists(e => keys.exists(_.semanticEquals(e))))
+  }
+
+  /**
+   * Short circuit if the underlying expression is already normalized
+   */
+  private def needNormalize(expr: Expression): Boolean = expr match {
+    case KnownFloatingPointNormalized(_) => false
+    case _ => needNormalize(expr.dataType)
+  }
+
+  private[sql] def needNormalize(dt: DataType): Boolean = dt match {
+    case FloatType | DoubleType => true
+    case StructType(fields) => fields.exists(f => needNormalize(f.dataType))
+    case ArrayType(et, _) => needNormalize(et)
+    case MapType(_, vt, _) => needNormalize(vt)
+    case _ => false
+  }
+
+  private[sql] def normalize(expr: Expression): Expression = expr match {
+    case _ if !needNormalize(expr) => expr
+
+    case a: Alias =>
+      a.withNewChildren(Seq(normalize(a.child)))
+
+    case CreateNamedStruct(children) =>
+      CreateNamedStruct(children.map(normalize))
+
+    case CreateArray(children, useStringTypeWhenEmpty) =>
+      CreateArray(children.map(normalize), useStringTypeWhenEmpty)
+
+    case CreateMap(children, useStringTypeWhenEmpty) =>
+      CreateMap(children.map(normalize), useStringTypeWhenEmpty)
+
+    case _ if expr.dataType == FloatType || expr.dataType == DoubleType =>
+      KnownFloatingPointNormalized(NormalizeNaNAndZero(expr))
+
+    case If(cond, trueValue, falseValue) =>
+      If(cond, normalize(trueValue), normalize(falseValue))
+
+    case CaseWhen(branches, elseVale) =>
+      CaseWhen(branches.map(br => (br._1, normalize(br._2))), elseVale.map(normalize))
+
+    case Coalesce(children) =>
+      Coalesce(children.map(normalize))
+
+    case _ if expr.dataType.isInstanceOf[StructType] =>
+      val fields = expr.dataType.asInstanceOf[StructType].fieldNames.zipWithIndex.map {
+        case (name, i) => Seq(Literal(name), normalize(GetStructField(expr, i)))
+      }
+      val struct = CreateNamedStruct(fields.flatten.toImmutableArraySeq)
+      // For nested structs (and other complex types), this branch is called again with either a
+      // `GetStructField` or a `NamedLambdaVariable` expression. Even if the field for which this
+      // has been recursively called might have `nullable = false`, directly creating an `If`
+      // predicate would end up creating an expression with `nullable = true` (as the trueBranch is
+      // nullable). Hence, use the `expr.nullable` to create an `If` predicate only when the column
+      // is nullable.
+      if (expr.nullable) {
+        KnownFloatingPointNormalized(If(IsNull(expr), Literal(null, struct.dataType), struct))
+      } else {
+        KnownFloatingPointNormalized(struct)
+      }
+
+    case _ if expr.dataType.isInstanceOf[ArrayType] =>
+      val ArrayType(et, containsNull) = expr.dataType
+      val lv = NamedLambdaVariable("arg", et, containsNull)
+      val function = normalize(lv)
+      KnownFloatingPointNormalized(ArrayTransform(expr, LambdaFunction(function, Seq(lv))))
+
+    case _ if expr.dataType.isInstanceOf[MapType] =>
+      val MapType(kt, vt, containsNull) = expr.dataType
+      val keys = NamedLambdaVariable("arg", kt, containsNull)
+      val values = NamedLambdaVariable("arg", vt, containsNull)
+      val function = normalize(values)
+      KnownFloatingPointNormalized(TransformValues(expr,
+        LambdaFunction(function, Seq(keys, values))))
+
+    case _ => throw SparkException.internalError(s"fail to normalize $expr")
+  }
+
+  val FLOAT_NORMALIZER: Any => Any = (input: Any) => {
+    val f = input.asInstanceOf[Float]
+    if (f.isNaN) {
+      Float.NaN
+    } else if (f == -0.0f) {
+      0.0f
+    } else {
+      f
+    }
+  }
+
+  val DOUBLE_NORMALIZER: Any => Any = (input: Any) => {
+    val d = input.asInstanceOf[Double]
+    if (d.isNaN) {
+      Double.NaN
+    } else if (d == -0.0d) {
+      0.0d
+    } else {
+      d
+    }
+  }
+}
+
+case class NormalizeNaNAndZero(child: Expression) extends UnaryExpression with ExpectsInputTypes {
+
+  override def dataType: DataType = child.dataType
+
+  override def inputTypes: Seq[AbstractDataType] = Seq(TypeCollection(FloatType, DoubleType))
+
+  private lazy val normalizer: Any => Any = child.dataType match {
+    case FloatType => NormalizeFloatingNumbers.FLOAT_NORMALIZER
+    case DoubleType => NormalizeFloatingNumbers.DOUBLE_NORMALIZER
+  }
+
+  override def nullSafeEval(input: Any): Any = {
+    normalizer(input)
+  }
+
+  override protected def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
+    val codeToNormalize = child.dataType match {
+      case FloatType => (f: String) => {
+        s"""
+           |if (Float.isNaN($f)) {
+           |  ${ev.value} = Float.NaN;
+           |} else if ($f == -0.0f) {
+           |  ${ev.value} = 0.0f;
+           |} else {
+           |  ${ev.value} = $f;
+           |}
+         """.stripMargin
+      }
+
+      case DoubleType => (d: String) => {
+        s"""
+           |if (Double.isNaN($d)) {
+           |  ${ev.value} = Double.NaN;
+           |} else if ($d == -0.0d) {
+           |  ${ev.value} = 0.0d;
+           |} else {
+           |  ${ev.value} = $d;
+           |}
+         """.stripMargin
+      }
+    }
+
+    nullSafeCodeGen(ctx, ev, codeToNormalize)
+  }
+
+  override protected def withNewChildInternal(newChild: Expression): NormalizeNaNAndZero =
+    copy(child = newChild)
+}

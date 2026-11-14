@@ -15,11 +15,10 @@
 # limitations under the License.
 #
 
-from __future__ import print_function
-
 # $example on$
 from pyspark.ml.feature import MinMaxScaler
 from pyspark.ml.linalg import Vectors
+
 # $example off$
 from pyspark.sql import SparkSession
 

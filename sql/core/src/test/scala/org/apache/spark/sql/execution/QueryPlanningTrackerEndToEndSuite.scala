@@ -1,0 +1,108 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.execution
+
+import org.apache.spark.sql.execution.streaming.runtime.{MemoryStream, StreamExecution}
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.streaming.StreamTest
+
+class QueryPlanningTrackerEndToEndSuite extends StreamTest {
+  import testImplicits._
+
+  test("programmatic API") {
+    val df = spark.range(1000).selectExpr("count(*)")
+    df.collect()
+    val tracker = df.queryExecution.tracker
+    assert(tracker.phases.keySet == Set("analysis", "optimization", "planning"))
+    assert(tracker.rules.nonEmpty)
+  }
+
+  test("sql") {
+    val df = spark.sql("select * from range(1)")
+    df.collect()
+
+    val tracker = df.queryExecution.tracker
+    assert(tracker.phases.keySet == Set("parsing", "analysis", "optimization", "planning"))
+    assert(tracker.rules.nonEmpty)
+  }
+
+  test("SPARK-29227: Track rule info in optimization phase in streaming") {
+    val inputData = MemoryStream[Int]
+    val df = inputData.toDF()
+
+    def assertStatus(stream: StreamExecution): Unit = {
+      stream.processAllAvailable()
+      val tracker = stream.lastExecution.tracker
+      assert(tracker.phases.keys == Set("analysis", "optimization", "planning"))
+      assert(tracker.rules.nonEmpty)
+    }
+
+    testStream(df)(
+      StartStream(),
+      AddData(inputData, 1, 2, 3),
+      Execute(assertStatus),
+      StopStream)
+  }
+
+  test("SPARK-57212: Track preparation rules") {
+    withSQLConf(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
+      val df = spark.range(1000).selectExpr("count(*)")
+      df.collect()
+      val ruleNames = df.queryExecution.tracker.rules.keySet
+      assert(ruleNames.contains(classOf[
+        org.apache.spark.sql.execution.exchange.EnsureRequirements].getName))
+      assert(ruleNames.contains(classOf[
+        org.apache.spark.sql.execution.CollapseCodegenStages].getName))
+    }
+  }
+
+  test("SPARK-57212: Track AQE-internal preparation rules") {
+    // Run a query with a shuffle so AQE creates a query stage and runs preparation rules.
+    val df = spark.range(1000).repartition(4).selectExpr("count(*)")
+    df.collect()
+    val ruleNames = df.queryExecution.tracker.rules.keySet
+    // AQE-only rules in queryStagePreparationRules; only reachable via
+    // AdaptiveSparkPlanExec.applyPhysicalRules.
+    assert(ruleNames.contains(
+      "org.apache.spark.sql.execution.adaptive.AdjustShuffleExchangePosition"))
+    assert(ruleNames.contains(
+      "org.apache.spark.sql.execution.adaptive.ValidateSparkPlan"))
+  }
+
+  test("SPARK-57212: Track sub-query AQE rules") {
+    // The main query has no shuffle, so its AQE never re-optimizes and thus never runs the AQE
+    // logical optimizer. The scalar sub-query does have a shuffle, so its sub-AQE (planned on a
+    // separate thread) re-optimizes and runs `DemoteBroadcastHashJoin`. That rule is only visible
+    // in the query tracker if every `AdaptiveSparkPlanExec` records into the shared query tracker.
+    val df = spark.sql("SELECT id FROM range(10) WHERE id > (SELECT count(*) FROM range(1000))")
+    df.collect()
+    val ruleNames = df.queryExecution.tracker.rules.keySet
+    assert(ruleNames.contains(
+      "org.apache.spark.sql.execution.adaptive.DemoteBroadcastHashJoin"))
+  }
+
+  test("The start times should be in order: parsing <= analysis <= optimization <= planning") {
+    val df = spark.sql("select count(*) from range(1)")
+    df.queryExecution.executedPlan
+    val phases = df.queryExecution.tracker.phases
+    assert(phases("parsing").startTimeMs <= phases("analysis").startTimeMs)
+    assert(phases("analysis").startTimeMs <= phases("optimization").startTimeMs)
+    assert(phases("optimization").startTimeMs <= phases("planning").startTimeMs)
+  }
+
+}

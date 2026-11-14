@@ -15,7 +15,7 @@
 # limitations under the License.
 #
 
-"""
+r"""
  Shows the most positive words in UTF8 encoded, '\n' delimited text directly received the network
  every 5 seconds. The streaming data is joined with a static RDD of the AFINN word list
  (http://neuro.imm.dtu.dk/wiki/AFINN)
@@ -30,32 +30,39 @@
     localhost 9999`
 """
 
-from __future__ import print_function
-
 import sys
+from typing import Tuple
 
-from pyspark import SparkContext
-from pyspark.streaming import StreamingContext
+from pyspark import RDD, SparkContext
+from pyspark.streaming import DStream, StreamingContext
 
 
-def print_happiest_words(rdd):
+def print_happiest_words(rdd: RDD[Tuple[float, str]]) -> None:
     top_list = rdd.take(5)
     print("Happiest topics in the last 5 seconds (%d total):" % rdd.count())
     for tuple in top_list:
         print("%s (%d happiness)" % (tuple[1], tuple[0]))
 
+
 if __name__ == "__main__":
     if len(sys.argv) != 3:
         print("Usage: network_wordjoinsentiments.py <hostname> <port>", file=sys.stderr)
-        exit(-1)
+        sys.exit(-1)
 
     sc = SparkContext(appName="PythonStreamingNetworkWordJoinSentiments")
     ssc = StreamingContext(sc, 5)
 
+    def line_to_tuple(line: str) -> Tuple[str, str]:
+        try:
+            k, v = line.split(" ")
+            return k, v
+        except ValueError:
+            return "", ""
+
     # Read in the word-sentiment list and create a static RDD from it
     word_sentiments_file_path = "data/streaming/AFINN-111.txt"
     word_sentiments = ssc.sparkContext.textFile(word_sentiments_file_path) \
-        .map(lambda line: tuple(line.split("\t")))
+        .map(line_to_tuple)
 
     lines = ssc.socketTextStream(sys.argv[1], int(sys.argv[2]))
 
@@ -66,9 +73,10 @@ if __name__ == "__main__":
     # Determine the words with the highest sentiment values by joining the streaming RDD
     # with the static RDD inside the transform() method and then multiplying
     # the frequency of the words by its sentiment value
-    happiest_words = word_counts.transform(lambda rdd: word_sentiments.join(rdd)) \
-        .map(lambda (word, tuple): (word, float(tuple[0]) * tuple[1])) \
-        .map(lambda (word, happiness): (happiness, word)) \
+    happiest_words: DStream[Tuple[float, str]] = word_counts \
+        .transform(lambda rdd: word_sentiments.join(rdd)) \
+        .map(lambda word_tuples: (word_tuples[0], float(word_tuples[1][0]) * word_tuples[1][1])) \
+        .map(lambda word_happiness: (word_happiness[1], word_happiness[0])) \
         .transform(lambda rdd: rdd.sortByKey(False))
 
     happiest_words.foreachRDD(print_happiest_words)

@@ -18,12 +18,12 @@
 """
 Random Forest Classification Example.
 """
-from __future__ import print_function
-
 from pyspark import SparkContext
+
 # $example on$
 from pyspark.mllib.tree import RandomForest, RandomForestModel
 from pyspark.mllib.util import MLUtils
+
 # $example off$
 
 if __name__ == "__main__":
@@ -45,7 +45,8 @@ if __name__ == "__main__":
     # Evaluate model on test instances and compute test error
     predictions = model.predict(testData.map(lambda x: x.features))
     labelsAndPredictions = testData.map(lambda lp: lp.label).zip(predictions)
-    testErr = labelsAndPredictions.filter(lambda (v, p): v != p).count() / float(testData.count())
+    testErr = labelsAndPredictions.filter(
+        lambda lp: lp[0] != lp[1]).count() / float(testData.count())
     print('Test Error = ' + str(testErr))
     print('Learned classification forest model:')
     print(model.toDebugString())

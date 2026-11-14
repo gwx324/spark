@@ -1,0 +1,176 @@
+---
+layout: global
+title: "Migration Guide: Spark Core"
+displayTitle: "Migration Guide: Spark Core"
+license: |
+  Licensed to the Apache Software Foundation (ASF) under one or more
+  contributor license agreements.  See the NOTICE file distributed with
+  this work for additional information regarding copyright ownership.
+  The ASF licenses this file to You under the Apache License, Version 2.0
+  (the "License"); you may not use this file except in compliance with
+  the License.  You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+---
+
+* Table of contents
+{:toc}
+
+## Upgrading from Core 4.3 to 4.4
+
+- Since Spark 4.4, reading an RDD checkpoint ignores names beginning with `part-` unless the suffix consists of one or more ASCII digits. Previously, names such as `part-00000.bak`, `part-backup`, or `part-` caused checkpoint recovery to fail with `NumberFormatException`. Validation of numeric partition names and the contiguous partition sequence is unchanged.
+
+- Since Spark 4.4, an executor pod template that names a service account in `serviceAccountName` keeps it: Spark applies `spark.kubernetes.authenticate.executor.serviceAccountName`, or `spark.kubernetes.authenticate.driver.serviceAccountName` as a fallback, only when the template names no account in either `serviceAccount` or `serviceAccountName`. Earlier versions decided by reading the deprecated `serviceAccount` field alone, so with either configuration set, a template that named the account in `serviceAccountName` had it overwritten; with neither set, the template's account was kept already. Spark logs a warning when `spark.kubernetes.authenticate.executor.serviceAccountName` named an account the template displaced.
+
+- Since Spark 4.4, an empty service account name in an executor pod template counts as naming no account, which is how Kubernetes itself defaults the two fields. A template whose deprecated `serviceAccount` field is present but empty, with `serviceAccountName` empty or absent, used to count as naming an account: the configured account was dropped and the executor pods ran as the namespace's default account. They now run as `spark.kubernetes.authenticate.executor.serviceAccountName` or, failing that, `spark.kubernetes.authenticate.driver.serviceAccountName`, which can widen what they are allowed to do, since the [RBAC](running-on-kubernetes.html#rbac) setup binds the driver's account to the `edit` role. To keep the executor pods on the namespace's default account, name it explicitly, either in the template's `serviceAccountName` or in `spark.kubernetes.authenticate.executor.serviceAccountName`; Kubernetes creates it as `default` in every namespace.
+
+- Since Spark 4.4, Spark accurately records skewed shuffle block sizes in `HighlyCompressedMapStatus`, so that adaptive query execution can still detect skewed partitions in shuffles with more than 2000 partitions. The default of `spark.shuffle.accurateBlockSkewedFactor` changed from `-1.0` to `5.0`, matching `spark.sql.adaptive.skewJoin.skewedPartitionFactor`. This can change query plans, since such skewed partitions are now split by skew join optimization, and it costs driver memory: up to `spark.shuffle.maxAccurateSkewedBlockNumber` (100 by default) block sizes per map task, plus a bitmap holding the reduce ids of the blocks tied at the cutoff of that selection. The tied blocks are not capped, so in the worst case, where they are scattered across the reduce id space, that bitmap costs a bit per reduce partition per map task, about 8 KiB per map task at 50000 reduce partitions, or roughly 80 MiB across a stage with 10000 map tasks. To restore the legacy behavior, you can set `spark.shuffle.accurateBlockSkewedFactor` to `-1.0`.
+
+- Since Spark 4.4, Spark no longer adds the jar that contains its own classes to the `PYTHONPATH` of the Python processes it launches, such as Python workers and the driver process started by `spark-submit`. Spark's jars have contained no Python code since Spark 1.4, so this only matters to an application that bundles Spark's classes into its own jar, such as a shaded uber-jar launched with `java -cp app.jar`, and also bundles Python modules in that jar: those modules are no longer importable and fail with `ModuleNotFoundError`. To keep importing them, add the jar to the `PYTHONPATH` environment variable of the JVM process, and also to `spark.executorEnv.PYTHONPATH` when executors run in separate processes.
+
+## Upgrading from Core 4.2 to 4.3
+
+- Since Spark 4.3, when submitting to a standalone cluster in cluster mode through the RPC submission gateway, which is what `spark-submit` uses unless `spark.master.rest.enabled` is set to `true`, Spark forwards to the driver only the environment variables whose name starts with `SPARK_`, excluding `SPARK_ENV_LOADED`, `SPARK_HOME`, `SPARK_CONF_DIR`, `SPARK_LOCAL_IP`, and `SPARK_LOCAL_HOSTNAME`, matching the REST submission gateway. Previously the full environment of the submitting process was forwarded, so variables such as `JAVA_HOME`, `HADOOP_CONF_DIR`, `YARN_CONF_DIR`, and `LD_LIBRARY_PATH` no longer reach the driver. To restore the legacy behavior, you can set `spark.standalone.submit.filterEnvironment` to `false`; `SPARK_LOCAL_IP` and `SPARK_LOCAL_HOSTNAME` are never forwarded regardless, since they describe the submitting host rather than the worker the driver runs on.
+
+- Spark 4.3 adds pre-fetch filtering and CSRF tokens to side-effect causing Spark UI actions, _except for_ `/workers/kill` which is used by decomissioning, and requires POST requests for non-YARN deployments. You can re-enable GET request handling by setting `spark.ui.actionsViaGetEnabled=true`, however CSRF token validation remains even with GET requests enabled. If you have scripted actions outside of Spark to kill running jobs you will need to fetch the previous page and grab the CSRF token first.
+
+- Since Spark 4.3, Spark compresses serialized RDD partitions by default. To restore the legacy behavior, you can set `spark.rdd.compress` to `false`.
+
+- Since Spark 4.3, Spark executor pods connect to the driver via the driver pod IP directly instead of the driver's Kubernetes Service. To restore the legacy behavior, you can set `spark.kubernetes.executor.useDriverPodIP` to `false`.
+
+- Since Spark 4.3, Spark sets `allowPrivilegeEscalation` to `false` on the driver and executor containers' security context by default. To restore the legacy behavior, you can set `spark.kubernetes.securityContext.allowPrivilegeEscalation` to `true`.
+
+- Since Spark 4.3, Spark sets the HTTP `Content-Security-Policy` (CSP) response header for the Spark UI by default, restricting the sources from which the browser is allowed to load resources. To restore the legacy behavior, you can set `spark.ui.contentSecurityPolicy.enabled` to `false`.
+
+- Since Spark 4.3, the default value of `spark.ui.xXssProtection` has been changed from `1; mode=block` to `0`. The XSS Auditor has been removed from Chrome and Edge, and was never implemented in Firefox. It can introduce side-channel vulnerabilities in browsers that still support it (Safari). To restore the legacy behavior, you can set `spark.ui.xXssProtection` to `1; mode=block`.
+
+- Since Spark 4.3, `spark.ui.allowFramingFrom` now uses CSP `frame-ancestors` instead of the deprecated `X-Frame-Options: ALLOW-FROM` (which was ignored by all modern browsers). This setting only takes effect when `spark.ui.contentSecurityPolicy.enabled=true` (the default). When CSP is disabled, `X-Frame-Options: SAMEORIGIN` is always used regardless of the `allowFramingFrom` value.
+
+- Since Spark 4.3, the Spark Master REST API rejects a submission whose request body exceeds `spark.master.rest.maxRequestBodySize` (default `100m`) with HTTP 413. To allow larger request bodies, increase `spark.master.rest.maxRequestBodySize`.
+
+- Since Spark 4.3, `spark.task.cpus` accepts fractional values, and the executor-wide `spark.executor.pyspark.memory` allocation is split across the executor's concurrent task capacity instead of its raw core count. Each Python worker's memory limit can therefore change for existing configurations: with `spark.task.cpus` greater than 1 each worker receives a proportionally larger share, and with dynamic allocation enabled, when a custom resource (e.g. GPUs) limits concurrency the fewer concurrently running workers share the whole allocation. With dynamic allocation disabled, shares stay proportional to each task's cpus so that mixed workloads sharing one executor stay within the budget. In addition, a stage whose resource profile does not request `pysparkMemory` explicitly now inherits the default profile's allocation, matching how its executors are sized; Python workers that previously ran without any memory limit under such profiles are now capped. The aggregate limit across concurrently running workers stays within the configured allocation.
+
+- Since Spark 4.3, a positive `spark.executor.pyspark.memory` allocation that is too small to give each concurrent task slot at least 1 MiB fails the Python task with an error instead of silently running the workers without any memory limit. Setting `spark.executor.pyspark.memory=0` still disables the limit. To restore a working memory limit, increase `spark.executor.pyspark.memory` or reduce the executor's concurrent task capacity.
+
+## Upgrading from Core 4.1 to 4.2
+
+- Since Spark 4.2, Spark Master REST API uses Java 21 virtual threads by default when running on Java 21 or later. To restore the legacy behavior, you can set `spark.master.rest.virtualThread.enabled` to `false`.
+
+- Since Spark 4.2, Spark will allocate executor pods with a batch size of `20`. To restore the legacy behavior, you can set `spark.kubernetes.allocation.batch.size` to `10`.
+
+- Since Spark 4.2, Spark configures a `NetworkPolicy` by default so that executor pods only accept ingress traffic from the driver and peer executors within the same job. To disable this and restore the legacy behavior, set `spark.kubernetes.driver.pod.excludedFeatureSteps` to `org.apache.spark.deploy.k8s.features.NetworkPolicyFeatureStep`.
+
+## Upgrading from Core 4.0 to 4.1
+
+- Since Spark 4.1, Spark Master daemon provides REST API by default. To restore the behavior before Spark 4.1, you can set `spark.master.rest.enabled` to `false`.
+- Since Spark 4.1, Spark will compress RDD checkpoints by default. To restore the behavior before Spark 4.1, you can set `spark.checkpoint.compress` to `false`.
+- Since Spark 4.1, Spark uses Apache Hadoop Magic Committer for all S3 buckets by default. To restore the behavior before Spark 4.0, you can set `spark.hadoop.fs.s3a.committer.magic.enabled=false`.
+- Since Spark 4.1, `java.lang.InternalError` encountered during file reading will no longer fail the task if the configuration `spark.sql.files.ignoreCorruptFiles` or the data source option `ignoreCorruptFiles` is set to `true`. 
+- Since Spark 4.1, Spark ignores `*.blacklist.*` alternative configuration names. To restore the behavior before Spark 4.1, you can use the corresponding configuration names instead which exists since Spark 3.1.0.
+- Since Spark 4.1, Spark will use multiple threads for LZF compression to compress data in parallel. To restore the behavior before Spark 4.1, you can set `spark.io.compression.lzf.parallel.enabled` to `false`.
+- Since Spark 4.1, Spark uses native Netty IO mode by default. To restore the behavior before Spark 4.1, you can set `spark.io.mode.default` to `NIO`.
+
+## Upgrading from Core 3.5 to 4.0
+
+- Since Spark 4.0, Spark migrated all its internal reference of servlet API from `javax` to `jakarta` 
+
+- Since Spark 4.0, Spark will roll event logs to archive them incrementally. To restore the behavior before Spark 4.0, you can set `spark.eventLog.rolling.enabled` to `false`.
+
+- Since Spark 4.0, Spark will compress event logs. To restore the behavior before Spark 4.0, you can set `spark.eventLog.compress` to `false`.
+
+- Since Spark 4.0, Spark workers will clean up worker and stopped application directories periodically. To restore the behavior before Spark 4.0, you can set `spark.worker.cleanup.enabled` to `false`.
+
+- Since Spark 4.0, `spark.shuffle.service.db.backend` is set to `ROCKSDB` by default which means Spark will use RocksDB store for shuffle service. To restore the behavior before Spark 4.0, you can set `spark.shuffle.service.db.backend` to `LEVELDB`.
+
+- In Spark 4.0, support for Apache Mesos as a resource manager was removed.
+
+- Since Spark 4.0, Spark will allocate executor pods with a batch size of `10`. To restore the legacy behavior, you can set `spark.kubernetes.allocation.batch.size` to `5`.
+
+- Since Spark 4.0, Spark uses `ReadWriteOncePod` instead of `ReadWriteOnce` access mode in persistence volume claims. To restore the legacy behavior, you can set `spark.kubernetes.legacy.useReadWriteOnceAccessMode` to `true`.
+
+- Since Spark 4.0, Spark reports its executor pod status by checking all containers of that pod. To restore the legacy behavior, you can set `spark.kubernetes.executor.checkAllContainers` to `false`.
+
+- Since Spark 4.0, Spark uses `~/.ivy2.5.2` as Ivy user directory by default to isolate the existing systems from Apache Ivy's incompatibility. To restore the legacy behavior, you can set `spark.jars.ivy` to `~/.ivy2`.
+
+- Since Spark 4.0, Spark uses the external shuffle service for deleting shuffle blocks for deallocated executors when the shuffle is no longer needed. To restore the legacy behavior, you can set `spark.shuffle.service.removeShuffle` to `false`.
+
+- Since Spark 4.0, the MDC (Mapped Diagnostic Context) key for Spark task names in Spark logs has been changed from `mdc.taskName` to `task_name`. To use the key `mdc.taskName`, you can set `spark.log.legacyTaskNameMdc.enabled` to `true`.
+
+- Since Spark 4.0, Spark performs speculative executions less aggressively with `spark.speculation.multiplier=3` and `spark.speculation.quantile=0.9`. To restore the legacy behavior, you can set `spark.speculation.multiplier=1.5` and `spark.speculation.quantile=0.75`.
+
+- Since Spark 4.0, `spark.shuffle.unsafe.file.output.buffer` is deprecated though still works. Use `spark.shuffle.localDisk.file.output.buffer` instead.
+
+- Since Spark 4.0, `org.apache.hadoop.security.AccessControlException` or `org.apache.hadoop.hdfs.BlockMissingException` encountered during file reading will fail the task even if the configuration `spark.sql.files.ignoreCorruptFiles` or the data source option `ignoreCorruptFiles` is set to `true`.
+
+## Upgrading from Core 3.5.3 to 3.5.4
+
+- Since Spark 3.5.4, when reading files hits `org.apache.hadoop.security.AccessControlException` and `org.apache.hadoop.hdfs.BlockMissingException`, the exception will be thrown and fail the task, even if `spark.files.ignoreCorruptFiles` is set to `true`.
+
+## Upgrading from Core 3.4 to 3.5
+
+- Since Spark 3.5, `spark.yarn.executor.failuresValidityInterval` is deprecated. Use `spark.executor.failuresValidityInterval` instead.
+
+- Since Spark 3.5, `spark.yarn.max.executor.failures` is deprecated. Use `spark.executor.maxNumFailures` instead.
+
+## Upgrading from Core 3.3 to 3.4
+
+- Since Spark 3.4, Spark driver will own `PersistentVolumeClaim`s and try to reuse if they are not assigned to live executors. To restore the behavior before Spark 3.4, you can set `spark.kubernetes.driver.ownPersistentVolumeClaim` to `false` and `spark.kubernetes.driver.reusePersistentVolumeClaim` to `false`.
+
+- Since Spark 3.4, Spark driver will track shuffle data when dynamic allocation is enabled without shuffle service. To restore the behavior before Spark 3.4, you can set `spark.dynamicAllocation.shuffleTracking.enabled` to `false`.
+
+- Since Spark 3.4, Spark will try to decommission cached RDD and shuffle blocks if both `spark.decommission.enabled` and `spark.storage.decommission.enabled` are true. To restore the behavior before Spark 3.4, you can set both `spark.storage.decommission.rddBlocks.enabled` and `spark.storage.decommission.shuffleBlocks.enabled` to `false`.
+
+- Since Spark 3.4, Spark will use RocksDB store if `spark.history.store.hybridStore.enabled` is true. To restore the behavior before Spark 3.4, you can set `spark.history.store.hybridStore.diskBackend` to `LEVELDB`.
+
+## Upgrading from Core 3.2 to 3.3
+
+- Since Spark 3.3, Spark migrates its log4j dependency from 1.x to 2.x because log4j 1.x has reached end of life and is no longer supported by the community. Vulnerabilities reported after August 2015 against log4j 1.x were not checked and will not be fixed. Users should rewrite original log4j properties files using log4j2 syntax (XML, JSON, YAML, or properties format). Spark rewrites the `conf/log4j.properties.template` which is included in Spark distribution, to `conf/log4j2.properties.template` with log4j2 properties format.
+
+## Upgrading from Core 3.1 to 3.2
+
+- Since Spark 3.2, `spark.scheduler.allocation.file` supports read remote file using hadoop filesystem which means if the path has no scheme Spark will respect hadoop configuration to read it. To restore the behavior before Spark 3.2, you can specify the local scheme for `spark.scheduler.allocation.file` e.g. `file:///path/to/file`.
+
+- Since Spark 3.2, `spark.hadoopRDD.ignoreEmptySplits` is set to `true` by default which means Spark will not create empty partitions for empty input splits. To restore the behavior before Spark 3.2, you can set `spark.hadoopRDD.ignoreEmptySplits` to `false`.
+
+- Since Spark 3.2, `spark.eventLog.compression.codec` is set to `zstd` by default which means Spark will not fallback to use `spark.io.compression.codec` anymore.
+
+- Since Spark 3.2, `spark.storage.replication.proactive` is enabled by default which means Spark tries to replenish in case of the loss of cached RDD block replicas due to executor failures. To restore the behavior before Spark 3.2, you can set `spark.storage.replication.proactive` to `false`.
+
+- In Spark 3.2, `spark.launcher.childConectionTimeout` is deprecated (typo) though still works. Use `spark.launcher.childConnectionTimeout` instead.
+
+- In Spark 3.2, support for Apache Mesos as a resource manager is deprecated and will be removed in a future version. 
+
+- In Spark 3.2, Spark will delete K8s driver service resource when the application terminates by itself. To restore the behavior before Spark 3.2, you can set `spark.kubernetes.driver.service.deleteOnTermination` to `false`.
+
+## Upgrading from Core 3.0 to 3.1
+
+- In Spark 3.0 and below, `SparkContext` can be created in executors. Since Spark 3.1, an exception will be thrown when creating `SparkContext` in executors. You can allow it by setting the configuration `spark.executor.allowSparkContext` when creating `SparkContext` in executors.
+
+- In Spark 3.0 and below, Spark propagated the Hadoop classpath from `yarn.application.classpath` and `mapreduce.application.classpath` into the Spark application submitted to YARN when Spark distribution is with the built-in Hadoop. Since Spark 3.1, it does not propagate anymore when the Spark distribution is with the built-in Hadoop in order to prevent the failure from the different transitive dependencies picked up from the Hadoop cluster such as Guava and Jackson. To restore the behavior before Spark 3.1, you can set `spark.yarn.populateHadoopClasspath` to `true`.
+
+## Upgrading from Core 2.4 to 3.0
+
+- The `org.apache.spark.ExecutorPlugin` interface and related configuration has been replaced with
+  `org.apache.spark.api.plugin.SparkPlugin`, which adds new functionality. Plugins using the old
+  interface must be modified to extend the new interfaces. Check the
+  [Monitoring](monitoring.html) guide for more details.
+
+- Deprecated method `TaskContext.isRunningLocally` has been removed. Local execution was removed and it always has returned `false`.
+
+- Deprecated method `shuffleBytesWritten`, `shuffleWriteTime` and `shuffleRecordsWritten` in `ShuffleWriteMetrics` have been removed. Instead, use `bytesWritten`, `writeTime ` and `recordsWritten` respectively.
+
+- Deprecated method `AccumulableInfo.apply` have been removed because creating `AccumulableInfo` is disallowed.
+
+- Deprecated accumulator v1 APIs have been removed and please use v2 APIs instead.
+
+- Event log file will be written as UTF-8 encoding, and Spark History Server will replay event log files as UTF-8 encoding. Previously Spark wrote the event log file as default charset of driver JVM process, so Spark History Server of Spark 2.x is needed to read the old event log files in case of incompatible encoding.
+
+- A new protocol for fetching shuffle blocks is used. It's recommended that external shuffle services be upgraded when running Spark 3.0 apps. You can still use old external shuffle services by setting the configuration `spark.shuffle.useOldFetchProtocol` to `true`. Otherwise, Spark may run into errors with messages like `IllegalArgumentException: Unexpected message type: <number>`.
+
+- `SPARK_WORKER_INSTANCES` is deprecated in Standalone mode. It's recommended to launch multiple executors in one worker and launch one worker per node instead of launching multiple workers per node and launching one executor per worker.

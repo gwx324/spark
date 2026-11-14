@@ -1,0 +1,175 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.streaming
+
+import scala.concurrent.duration._
+
+import org.apache.spark.SparkIllegalArgumentException
+import org.apache.spark.sql.execution.streaming.sources.LowLatencyMemoryStream
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.internal.SQLConf
+
+class StreamRealTimeModeAllowlistSuite extends StreamRealTimeModeE2ESuiteBase {
+  import testImplicits._
+
+  test("rtm source allowlist") {
+    val query = spark.readStream
+      .format("rate")
+      .option("numPartitions", 1)
+      .load()
+      .writeStream
+      .format("console")
+      .outputMode("update")
+      .trigger(defaultTrigger)
+      .start()
+
+    eventually(timeout(60.seconds)) {
+      checkError(
+        exception = query.exception.get.getCause.asInstanceOf[SparkIllegalArgumentException],
+        condition = "STREAMING_REAL_TIME_MODE.INPUT_STREAM_NOT_SUPPORTED",
+        parameters = Map(
+          "className" ->
+            "org.apache.spark.sql.execution.streaming.sources.RateStreamMicroBatchStream")
+      )
+    }
+  }
+
+  test("rtm operator allowlist") {
+    withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "0") {
+      val inputData = LowLatencyMemoryStream[Int](2)
+      val staticDf = spark.range(1, 31, 1, 10).selectExpr("id AS join_key", "id AS join_value")
+
+      val df = inputData.toDF()
+        .select(col("value").as("key"), col("value").as("value"))
+        .join(staticDf, col("value") === col("join_key"))
+        .select(
+          concat(col("key"), lit("-"), col("value"), lit("-"), col("join_value")).as("output"))
+
+      val query = runStreamingQuery("operation_allowlist", df)
+
+      eventually(timeout(60.seconds)) {
+        checkError(
+          exception = query.exception.get.getCause.asInstanceOf[SparkIllegalArgumentException],
+          condition = "STREAMING_REAL_TIME_MODE.OPERATOR_OR_SINK_NOT_IN_ALLOWLIST",
+          parameters = Map(
+            "errorType" -> "operator",
+            "message" -> (
+              "org.apache.spark.sql.execution.SortExec, " +
+                "org.apache.spark.sql.execution.joins.SortMergeJoinExec are"
+              )
+          )
+        )
+      }
+    }
+  }
+
+  test("rtm does not support stream-static ASOF join") {
+    withSQLConf(SQLConf.SQL_ASOF_JOIN_ENABLED.key -> "true") {
+      withTempView("trades", "quotes") {
+        val inputData = LowLatencyMemoryStream[(Int, String)](2)
+        inputData.toDF().toDF("trade_time", "symbol").createOrReplaceTempView("trades")
+        Seq((1, "AAPL", 18010), (3, "AAPL", 18015))
+          .toDF("quote_time", "symbol", "bid_price")
+          .createOrReplaceTempView("quotes")
+
+        val df = sql(
+          """
+            |SELECT concat(t.trade_time, '-', t.symbol, '-', q.bid_price) AS output
+            |FROM trades t ASOF JOIN quotes q
+            |  MATCH_CONDITION (t.trade_time >= q.quote_time)
+            |  ON t.symbol = q.symbol
+            |""".stripMargin)
+        val query = runStreamingQuery("asof_join_allowlist", df)
+
+        eventually(timeout(60.seconds)) {
+          checkError(
+            exception = query.exception.get.getCause.asInstanceOf[SparkIllegalArgumentException],
+            condition = "STREAMING_REAL_TIME_MODE.OPERATOR_OR_SINK_NOT_IN_ALLOWLIST",
+            parameters = Map(
+              "errorType" -> "operator",
+              "message" -> (
+                "org.apache.spark.sql.execution.SortExec, " +
+                  "org.apache.spark.sql.execution.joins.SortMergeAsOfJoinExec are"
+                )
+            )
+          )
+        }
+      }
+    }
+  }
+
+  test("rtm sink allowlist") {
+    val read = LowLatencyMemoryStream[Int](2)
+
+    val query = read
+      .toDF()
+      .writeStream
+      .format("noop")
+      .outputMode(OutputMode.Update())
+      .trigger(defaultTrigger)
+      .queryName("rtm_sink_allowlist")
+
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        query.start()
+      },
+      condition = "STREAMING_REAL_TIME_MODE.OPERATOR_OR_SINK_NOT_IN_ALLOWLIST",
+      parameters = Map(
+        "errorType" -> "sink",
+        "message" -> "org.apache.spark.sql.execution.datasources.noop.NoopTable$ is"
+      ))
+
+    withSQLConf(SQLConf.STREAMING_REAL_TIME_MODE_ALLOWLIST_CHECK.key -> "false") {
+      val tmp = query.start()
+      Thread.sleep(5000)
+      tmp.stop()
+    }
+  }
+
+  // A repartitionByRange produces a range-partitioned shuffle. Building its RangePartitioner runs a
+  // separate job that samples the input to compute range bounds, which cannot complete while the
+  // source keeps producing, so it must be rejected up front rather than stalling the query.
+  test("range-partitioned shuffle not allowed") {
+    val inputData = LowLatencyMemoryStream[Int](2)
+
+    val df = inputData.toDF()
+      .select(col("value").as("key"))
+      .repartitionByRange(3, col("key"))
+      .select(col("key"))
+
+    val query = runStreamingQuery("range_shuffle_allowlist", df)
+
+    eventually(timeout(60.seconds)) {
+      checkError(
+        exception = query.exception.get.getCause.asInstanceOf[SparkIllegalArgumentException],
+        condition = "STREAMING_REAL_TIME_MODE.OPERATOR_OR_SINK_NOT_IN_ALLOWLIST",
+        parameters = Map(
+          "errorType" -> "operator",
+          "message" -> "org.apache.spark.sql.execution.exchange.ShuffleExchangeExec is"
+        )
+      )
+    }
+  }
+
+  // The "stateful queries not allowed" test that used to live here asserted that a streaming
+  // aggregation was rejected, because it planned into the micro-batch aggregation operators and
+  // HashAggregateExec is not allowlisted. A Real-Time Mode aggregation is now planned as the
+  // streamline aggregate operator, which is allowlisted, so there is no rejection left to assert.
+  // StreamlineStreamingAggregationRealTimeSuite covers the aggregation itself end to end, and the
+  // generic operator-allowlist test above still guards the operators that remain unsupported.
+}

@@ -1,0 +1,114 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.catalyst.util;
+
+import org.apache.spark.sql.errors.QueryExecutionErrors;
+import org.apache.spark.unsafe.types.UTF8String;
+
+public class CharVarcharCodegenUtils {
+  private static final UTF8String SPACE = UTF8String.fromString(" ");
+
+  private static UTF8String trimTrailingSpaces(
+      UTF8String inputStr, int numChars, int limit) {
+    int numTailSpacesToTrim = numChars - limit;
+    UTF8String trimmed = inputStr.trimTrailingSpaces(numTailSpacesToTrim);
+    if (trimmed.numChars() > limit) {
+      throw QueryExecutionErrors.exceedMaxLimit(limit);
+    } else {
+      return trimmed;
+    }
+  }
+
+  public static UTF8String charTypeWriteSideCheck(UTF8String inputStr, int limit) {
+    int numChars = inputStr.numChars();
+    if (numChars == limit) {
+      return inputStr;
+    } else if (numChars < limit) {
+      return inputStr.rpad(limit, SPACE);
+    } else {
+      return trimTrailingSpaces(inputStr, numChars, limit);
+    }
+  }
+
+  public static UTF8String varcharTypeWriteSideCheck(UTF8String inputStr, int limit) {
+    int numChars = inputStr.numChars();
+    if (numChars <= limit) {
+      return inputStr;
+    } else {
+      return trimTrailingSpaces(inputStr, numChars, limit);
+    }
+  }
+
+  /**
+   * Applies the SQL explicit-cast rules for a character string source and CHAR target.
+   *
+   * Unlike store assignment, an explicit character-to-character cast truncates non-space
+   * characters instead of raising a right-truncation exception.
+   */
+  public static UTF8String charTypeCast(UTF8String inputStr, int limit) {
+    int numChars = inputStr.numChars();
+    if (numChars == limit) {
+      return inputStr;
+    } else if (numChars < limit) {
+      return inputStr.rpad(limit, SPACE);
+    } else {
+      return inputStr.substring(0, limit);
+    }
+  }
+
+  /**
+   * Applies the SQL explicit-cast rules for a character string source and VARCHAR target.
+   */
+  public static UTF8String varcharTypeCast(UTF8String inputStr, int limit) {
+    return inputStr.numChars() > limit ? inputStr.substring(0, limit) : inputStr;
+  }
+
+  public static UTF8String readSidePadding(UTF8String inputStr, int limit) {
+    int numChars = inputStr.numChars();
+    if (numChars == limit) {
+      return inputStr;
+    } else if (numChars < limit) {
+      return inputStr.rpad(limit, SPACE);
+    } else {
+      return inputStr;
+    }
+  }
+
+  /**
+   * Read-side CHAR check under standard semantics: pad to limit, or trim trailing
+   * spaces then error if still longer than limit.
+   *
+   * Standard semantics require a read to observe the same value a write would have
+   * produced, so this is deliberately the write-side check rather than
+   * {@link #readSidePadding}, which tolerates over-long values. Keep the two sides
+   * identical: a fix to one is a fix to both.
+   */
+  public static UTF8String charTypeReadSideCheck(UTF8String inputStr, int limit) {
+    return charTypeWriteSideCheck(inputStr, limit);
+  }
+
+  /**
+   * Read-side VARCHAR check under standard semantics: allow up to limit characters,
+   * or trim trailing spaces then error if still longer than limit.
+   *
+   * Identical to the write-side check by design; see {@link #varcharTypeWriteSideCheck}.
+   */
+  public static UTF8String varcharTypeReadSideCheck(UTF8String inputStr, int limit) {
+    return varcharTypeWriteSideCheck(inputStr, limit);
+  }
+}

@@ -17,27 +17,23 @@
 
 package org.apache.spark.deploy
 
-import java.io.{File, OutputStream, PrintStream}
+import java.io.{File, FileOutputStream, IOException, OutputStream, PrintStream}
 import java.net.URI
-import java.util.jar.{JarFile, Manifest}
+import java.nio.charset.StandardCharsets
+import java.util.jar.{JarFile, JarOutputStream, Manifest}
 import java.util.jar.Attributes.Name
-import java.util.zip.ZipFile
+import java.util.zip.{ZipEntry, ZipFile}
 
-import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
-
-import com.google.common.io.Files
-import org.apache.commons.io.FileUtils
-import org.scalatest.BeforeAndAfterEach
+import scala.jdk.CollectionConverters._
 
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.api.r.RUtils
-import org.apache.spark.deploy.SparkSubmitUtils.MavenCoordinate
-import org.apache.spark.util.ResetSystemProperties
+import org.apache.spark.util.{IvyTestUtils, ResetSystemProperties, Utils}
+import org.apache.spark.util.MavenUtils.MavenCoordinate
 
 class RPackageUtilsSuite
   extends SparkFunSuite
-  with BeforeAndAfterEach
   with ResetSystemProperties {
 
   private val main = MavenCoordinate("a", "b", "c")
@@ -58,7 +54,7 @@ class RPackageUtilsSuite
   /** Simple PrintStream that reads data into a buffer */
   private class BufferPrintStream extends PrintStream(noOpOutputStream) {
     // scalastyle:off println
-    override def println(line: String) {
+    override def println(line: String): Unit = {
     // scalastyle:on println
       lineBuffer += line
     }
@@ -66,7 +62,6 @@ class RPackageUtilsSuite
 
   override def beforeEach(): Unit = {
     super.beforeEach()
-    System.setProperty("spark.testing", "true")
     lineBuffer.clear()
   }
 
@@ -74,9 +69,13 @@ class RPackageUtilsSuite
     val deps = Seq(dep1, dep2).mkString(",")
     IvyTestUtils.withRepository(main, Some(deps), None, withR = true) { repo =>
       val jars = Seq(main, dep1, dep2).map(c => new JarFile(getJarPath(c, new File(new URI(repo)))))
-      assert(RPackageUtils.checkManifestForR(jars(0)), "should have R code")
-      assert(!RPackageUtils.checkManifestForR(jars(1)), "should not have R code")
-      assert(!RPackageUtils.checkManifestForR(jars(2)), "should not have R code")
+      Utils.tryWithSafeFinally {
+        assert(RPackageUtils.checkManifestForR(jars(0)), "should have R code")
+        assert(!RPackageUtils.checkManifestForR(jars(1)), "should not have R code")
+        assert(!RPackageUtils.checkManifestForR(jars(2)), "should not have R code")
+      } {
+        jars.foreach(_.close())
+      }
     }
   }
 
@@ -102,7 +101,7 @@ class RPackageUtilsSuite
     val deps = Seq(dep1, dep2).mkString(",")
     IvyTestUtils.withRepository(main, Some(deps), None, withR = true) { repo =>
       val jars = Seq(main, dep1, dep2).map { c =>
-        getJarPath(c, new File(new URI(repo))) + "dummy"
+        getJarPath(c, new File(new URI(repo))).toString + "dummy"
       }.mkString(",")
       RPackageUtils.checkAndBuildRPackage(jars, new BufferPrintStream, verbose = true)
       val individualJars = jars.split(",")
@@ -125,34 +124,72 @@ class RPackageUtilsSuite
       RPackageUtils.checkAndBuildRPackage(jar.getAbsolutePath, new BufferPrintStream,
         verbose = true)
       val output = lineBuffer.mkString("\n")
-      assert(output.contains(RPackageUtils.RJarDoc))
+      assert(output.contains(RPackageUtils.RJarDoc.message))
+    }
+  }
+
+  test("jars without manifest return false") {
+    IvyTestUtils.withRepository(main, None, None) { repo =>
+      val jar = IvyTestUtils.packJar(new File(new URI(repo)), dep1, Nil,
+        useIvyLayout = false, withR = false, None)
+      Utils.tryWithResource(new JarFile(jar)) { jarFile =>
+        assert(jarFile.getManifest == null, "jar file should have null manifest")
+        assert(!RPackageUtils.checkManifestForR(jarFile), "null manifest should return false")
+      }
+    }
+  }
+
+  test("SPARK-58153: jar entries escaping the extraction directory are rejected") {
+    val tempDir = Utils.createTempDir()
+    Utils.tryWithSafeFinally {
+      val manifest = new Manifest
+      val attr = manifest.getMainAttributes
+      attr.put(Name.MANIFEST_VERSION, "1.0")
+      attr.put(new Name("Spark-HasRPackage"), "true")
+      val jar = new File(tempDir, "malicious.jar")
+      Utils.tryWithResource(new JarOutputStream(new FileOutputStream(jar), manifest)) { out =>
+        out.putNextEntry(new ZipEntry("R/pkg/../../../../evil.txt"))
+        out.write("evil".getBytes(StandardCharsets.UTF_8))
+        out.closeEntry()
+      }
+      val e = intercept[IOException] {
+        RPackageUtils.checkAndBuildRPackage(jar.getAbsolutePath, new BufferPrintStream)
+      }
+      assert(e.getMessage.contains("Malicious zip entry"))
+    } {
+      Utils.deleteRecursively(tempDir)
     }
   }
 
   test("SparkR zipping works properly") {
-    val tempDir = Files.createTempDir()
-    try {
+    val tempDir = Utils.createTempDir()
+    Utils.tryWithSafeFinally {
       IvyTestUtils.writeFile(tempDir, "test.R", "abc")
       val fakeSparkRDir = new File(tempDir, "SparkR")
-      assert(fakeSparkRDir.mkdirs())
+      assert(Utils.createDirectory(fakeSparkRDir))
       IvyTestUtils.writeFile(fakeSparkRDir, "abc.R", "abc")
       IvyTestUtils.writeFile(fakeSparkRDir, "DESCRIPTION", "abc")
       IvyTestUtils.writeFile(tempDir, "package.zip", "abc") // fake zip file :)
       val fakePackageDir = new File(tempDir, "packageTest")
-      assert(fakePackageDir.mkdirs())
+      assert(Utils.createDirectory(fakePackageDir))
       IvyTestUtils.writeFile(fakePackageDir, "def.R", "abc")
       IvyTestUtils.writeFile(fakePackageDir, "DESCRIPTION", "abc")
       val finalZip = RPackageUtils.zipRLibraries(tempDir, "sparkr.zip")
       assert(finalZip.exists())
-      val entries = new ZipFile(finalZip).entries().asScala.map(_.getName).toSeq
-      assert(entries.contains("/test.R"))
-      assert(entries.contains("/SparkR/abc.R"))
-      assert(entries.contains("/SparkR/DESCRIPTION"))
-      assert(!entries.contains("/package.zip"))
-      assert(entries.contains("/packageTest/def.R"))
-      assert(entries.contains("/packageTest/DESCRIPTION"))
-    } finally {
-      FileUtils.deleteDirectory(tempDir)
+      val zipFile = new ZipFile(finalZip)
+      Utils.tryWithSafeFinally {
+        val entries = zipFile.entries().asScala.map(_.getName).toSeq
+        assert(entries.contains("/test.R"))
+        assert(entries.contains("/SparkR/abc.R"))
+        assert(entries.contains("/SparkR/DESCRIPTION"))
+        assert(!entries.contains("/package.zip"))
+        assert(entries.contains("/packageTest/def.R"))
+        assert(entries.contains("/packageTest/DESCRIPTION"))
+      } {
+        zipFile.close()
+      }
+    } {
+      Utils.deleteRecursively(tempDir)
     }
   }
 }

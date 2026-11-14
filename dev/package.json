@@ -1,0 +1,14 @@
+{
+  "devDependencies": {
+    "eslint": "^7.25.0",
+    "ansi-regex": "^5.0.1",
+    "minimatch": "^3.1.2",
+    "brace-expansion": "^1.1.12"
+  },
+  "resolutions": {
+    "optionator": "^0.9.3"
+  },
+  "overrides": {
+    "js-yaml": "^4.2.0"
+  }
+}

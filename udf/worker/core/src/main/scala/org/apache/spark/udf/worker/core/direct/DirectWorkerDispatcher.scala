@@ -1,0 +1,701 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.spark.udf.worker.core.direct
+
+import java.io.{BufferedReader, File, FileInputStream, InputStreamReader}
+import java.nio.charset.StandardCharsets
+import java.nio.file.{Files, Path}
+import java.util.UUID
+import java.util.concurrent.{ConcurrentHashMap, TimeUnit}
+import java.util.concurrent.atomic.AtomicBoolean
+
+import scala.collection.mutable.{Queue => MQueue}
+import scala.jdk.CollectionConverters._
+import scala.util.control.NonFatal
+
+import org.apache.spark.annotation.Experimental
+import org.apache.spark.udf.worker.{ProcessCallable, UDFWorkerSpecification}
+import org.apache.spark.udf.worker.core.{WorkerConnection, WorkerDispatcher, WorkerLogger,
+  WorkerSecurityScope, WorkerSession}
+import org.apache.spark.udf.worker.core.direct.DirectWorkerDispatcher.{CallableResult,
+  DEFAULT_CALLABLE_TIMEOUT_MS, DEFAULT_GRACEFUL_TIMEOUT_MS, DEFAULT_INIT_TIMEOUT_MS,
+  ENGINE_MAX_TIMEOUT_MS, EnvironmentState, MAX_OUTPUT_SCAN_BYTES,
+  PROCESS_OUTPUT_TAIL_LINES}
+
+/**
+ * :: Experimental ::
+ * A [[WorkerDispatcher]] that creates workers by spawning local OS processes
+ * ("direct" creation mode from the worker specification).
+ *
+ * On the first [[createSession]], the dispatcher ensures the environment is
+ * ready (verify / install) and registers the cleanup hook. Each session
+ * currently gets a fresh worker that is terminated when the session closes
+ * (the single-reference case of the future pooling policy).
+ *
+ * Subclasses pick the transport and protocol: they allocate the endpoint
+ * address, establish a verified [[WorkerConnection]], and build the
+ * per-session [[WorkerSession]]. See [[newEndpointAddress]],
+ * [[connectWorker]], and [[newSession]].
+ *
+ * For workers obtained through a provisioning service or daemon (indirect
+ * creation), see the `indirect` package (TODO).
+ *
+ * @param workerSpec worker specification (proto).
+ * @param logger     [[WorkerLogger]] for dispatcher-internal messages.
+ *                   Defaults to [[WorkerLogger.NoOp]].
+ */
+@Experimental
+abstract class DirectWorkerDispatcher(
+    override val workerSpec: UDFWorkerSpecification,
+    protected val logger: WorkerLogger = WorkerLogger.NoOp)
+  extends WorkerDispatcher {
+
+  // TODO: Connection pooling -- reuse idle workers across sessions.
+  // TODO: Security scope isolation -- partition pool by WorkerSecurityScope.
+
+  // Pre-flight spec validation. Per convention in this dispatcher, all
+  // spec-shape validation throws `IllegalArgumentException` (via `require`
+  // in the validators below); runtime failures during environment
+  // preparation throw `DirectWorkerException`. Callers can rely on this
+  // split to decide between programmer-error and operational-error paths.
+  // `workerSpec` is passed explicitly to `validateTransportSupport` so
+  // subclass implementations cannot read partially-initialized subclass
+  // fields: at this point in construction, the parent constructor body is
+  // still running and subclass `val`s have not yet been assigned.
+  validateTransportSupport(workerSpec)
+  validateEnvironmentCallables()
+  // Transport-specific setup runs only after validation passes, so an
+  // invalid spec allocates no resources. Subclasses override [[initialize]]
+  // rather than relying on field-initialiser ordering relative to this
+  // constructor.
+  initialize()
+
+  /**
+   * Maximum time to wait for a setup/verify/cleanup callable to finish.
+   * Subclasses may override this to accommodate slow installation steps
+   * (e.g., a large dependency install). Defaults to 120 seconds.
+   */
+  protected def callableTimeoutMs: Long = DEFAULT_CALLABLE_TIMEOUT_MS
+
+  // Proto-provided timeouts are clamped to ENGINE_MAX_TIMEOUT_MS. The
+  // dispatcher-internal callableTimeoutMs above is subclass-controlled and
+  // not subject to the cap.
+  // Package-private for test access.
+  private[worker] val initTimeoutMs: Long = {
+    val props = workerSpec.getDirect.getProperties
+    val raw = if (props.hasInitializationTimeoutMs && props.getInitializationTimeoutMs > 0) {
+      props.getInitializationTimeoutMs.toLong
+    } else {
+      DEFAULT_INIT_TIMEOUT_MS
+    }
+    clampTimeout("initialization_timeout_ms", raw)
+  }
+
+  private val gracefulTimeoutMs: Long = {
+    val props = workerSpec.getDirect.getProperties
+    val raw = if (props.hasGracefulTerminationTimeoutMs &&
+      props.getGracefulTerminationTimeoutMs > 0) {
+      props.getGracefulTerminationTimeoutMs.toLong
+    } else {
+      DEFAULT_GRACEFUL_TIMEOUT_MS
+    }
+    clampTimeout("graceful_termination_timeout_ms", raw)
+  }
+
+  private def clampTimeout(field: String, raw: Long): Long = {
+    if (raw > ENGINE_MAX_TIMEOUT_MS) {
+      logger.warn(
+        s"Worker-provided $field=${raw}ms exceeds engine maximum " +
+          s"${ENGINE_MAX_TIMEOUT_MS}ms; using ${ENGINE_MAX_TIMEOUT_MS}ms instead")
+      ENGINE_MAX_TIMEOUT_MS
+    } else {
+      raw
+    }
+  }
+
+  private[this] val workers = new ConcurrentHashMap[String, DirectWorkerProcess]()
+  private[this] val closed = new AtomicBoolean(false)
+  private[this] val lifecycleLock = new Object
+  private[this] var inFlightSessionCreations = 0
+  private[this] var inFlightWorkerReleases = 0
+
+  // TODO [SPARK-55278]: extract the env state machine + JVM shutdown hook
+  //   into a standalone EnvironmentManager once the gRPC dispatcher work has
+  //   landed; the env machinery is unrelated to the gRPC protocol and
+  //   only lives here for historical reasons.
+  @volatile private var environmentState: EnvironmentState = EnvironmentState.Pending
+  private val environmentLock = new Object
+  private[this] var cleanupHook: Option[Thread] = None
+
+  /**
+   * Allocates a fresh endpoint address for a new worker. The string is
+   * passed to the worker binary as `--connection <address>`.
+   */
+  protected def newEndpointAddress(workerId: String): String
+
+  /**
+   * Establishes and verifies the transport connection to a spawned worker.
+   * Implementations may construct the connection before or after the worker
+   * binds its endpoint, as required by the transport.
+   *
+   * @throws DirectWorkerTimeoutException if the worker does not become ready.
+   * @throws DirectWorkerException if the worker exits before becoming ready.
+   */
+  protected def connectWorker(
+      address: String,
+      process: Process,
+      outputFile: File): WorkerConnection
+
+  /**
+   * Best-effort per-endpoint cleanup, called from the spawn-failure path
+   * before a [[WorkerArtifacts]] bundle owns the connection.
+   */
+  protected def cleanupEndpointAddress(address: String): Unit
+
+  /**
+   * Cleans up dispatcher-level transport state (e.g., a UDS socket
+   * directory). Called from [[close]].
+   */
+  protected def closeTransport(): Unit
+
+  /**
+   * Validates the worker spec from the dispatcher's point of view -- both
+   * the transport choice (which transports can this dispatcher provision?)
+   * and the protocol's spec-level requirements (e.g. capabilities flags).
+   *
+   * Invoked from the base-class constructor BEFORE subclass `val`s have
+   * been initialised. Implementations MUST validate against `spec` only;
+   * reading subclass fields will see uninitialised values.
+   *
+   * Convention: throw `IllegalArgumentException` (via `require`) for spec
+   * problems. Operational/install failures are reported separately via
+   * `DirectWorkerException` from `ensureEnvironmentReady`.
+   *
+   * @param spec the worker specification to validate. Identical to the
+   *             `workerSpec` field but passed explicitly to make the
+   *             "constructor-time validation" contract obvious at call
+   *             sites and prevent subclass-state reads.
+   */
+  protected def validateTransportSupport(spec: UDFWorkerSpecification): Unit
+
+  /**
+   * Transport-specific one-time setup, invoked from the base-class
+   * constructor exactly once, AFTER spec validation has passed and BEFORE
+   * any session is created. Subclasses override this to allocate
+   * transport resources (e.g. a private socket directory) instead of
+   * relying on the ordering of subclass field initialisers relative to
+   * the base constructor. Overrides MUST call `super.initialize()`.
+   *
+   * The base implementation does nothing.
+   */
+  protected def initialize(): Unit = ()
+
+  /**
+   * Constructs the per-invocation [[WorkerSession]] for a worker.
+   * Subclasses build the concrete session implementation (e.g.
+   * `GrpcWorkerSession` for gRPC over UDS) from the process and its
+   * worker-owned transport connection.
+   */
+  protected def newSession(worker: DirectWorkerProcess): WorkerSession
+
+  /**
+   * Test-only hook: invoked once per [[createSession]] after the worker
+   * has been spawned and registered in the dispatcher's `workers` map,
+   * but before [[newSession]] has been called. The default is a no-op.
+   *
+   * Tests override to capture the worker reference or to inject a
+   * deliberate block to drive race conditions between `createSession`
+   * and `close`. Production code should not override this -- the
+   * production path provides no useful extension point here and the
+   * race-window control it offers is only meaningful for unit tests.
+   *
+   * Implementations MAY block. They run on the createSession caller's
+   * thread.
+   *
+   * Visible for testing only: `protected` so tests in this package can
+   * override it; production code should not. (The Guava annotation for this
+   * is banned by scalastyle per SPARK-11615, so the intent is noted here.)
+   */
+  protected def afterWorkerRegistered(worker: DirectWorkerProcess): Unit = ()
+
+  override def createSession(
+      securityScope: Option[WorkerSecurityScope]): WorkerSession = {
+    require(securityScope.isEmpty,
+      "securityScope is not supported yet; pass None until pooling lands")
+    beginSessionCreation()
+    var creationInFlight = true
+    try {
+      ensureEnvironmentReady()
+      if (closed.get()) throwClosed()
+      val worker = spawnWorker()
+      // Acquire before publish: a concurrent close() iterating `workers` must
+      // not tear down this worker before we hand it to the caller.
+      worker.acquireSession()
+      workers.put(worker.id, worker)
+      // Re-check for close() that ran concurrently. Releasing fires the
+      // ref-count callback, which removes and tears down the worker.
+      if (closed.get()) {
+        worker.releaseSession()
+        throwClosed()
+      }
+      try {
+        afterWorkerRegistered(worker)
+        // The test hook may block, so close could have started since the
+        // first post-publication check.
+        if (closed.get()) throwClosed()
+        val session = newSession(worker)
+        // Atomically publish the completed session relative to close(). If
+        // close started while newSession was constructing it, reject the
+        // session and let the catch block release its worker.
+        val dispatcherOpen = endSessionCreation()
+        creationInFlight = false
+        if (!dispatcherOpen) throwClosed()
+        session
+      } catch {
+        case e: InterruptedException =>
+          Thread.currentThread().interrupt()
+          worker.releaseSession()
+          throw e
+        case NonFatal(e) =>
+          worker.releaseSession()
+          throw e
+      }
+    } finally {
+      if (creationInFlight) endSessionCreation()
+    }
+  }
+
+  /**
+   * Invoked when a worker's last session closes. Terminates the worker
+   * today; future pooling can reuse it here instead. Once dispatcher close
+   * starts, it owns every worker still in the map and performs the teardown.
+   */
+  private def releaseWorker(worker: DirectWorkerProcess): Unit = {
+    // Once close starts, it owns every worker still in the map. A release that
+    // started earlier is tracked so close waits for its teardown to finish.
+    if (!beginWorkerRelease()) return
+    try {
+      workers.remove(worker.id)
+      try {
+        worker.close()
+      } catch {
+        case NonFatal(e) =>
+          logger.warn(s"Error closing worker ${worker.id}", e)
+      }
+    } finally {
+      endWorkerRelease()
+    }
+  }
+
+  private def throwClosed(): Nothing =
+    throw new IllegalStateException("Dispatcher is closed")
+
+  private def beginSessionCreation(): Unit = lifecycleLock.synchronized {
+    if (closed.get()) throwClosed()
+    inFlightSessionCreations += 1
+  }
+
+  /** Returns whether this creation linearized before dispatcher close. */
+  private def endSessionCreation(): Boolean = lifecycleLock.synchronized {
+    inFlightSessionCreations -= 1
+    val dispatcherOpen = !closed.get()
+    notifyIfDrained()
+    dispatcherOpen
+  }
+
+  private def beginWorkerRelease(): Boolean = lifecycleLock.synchronized {
+    if (closed.get()) {
+      false
+    } else {
+      inFlightWorkerReleases += 1
+      true
+    }
+  }
+
+  private def endWorkerRelease(): Unit = lifecycleLock.synchronized {
+    inFlightWorkerReleases -= 1
+    notifyIfDrained()
+  }
+
+  private def notifyIfDrained(): Unit = {
+    if (inFlightSessionCreations == 0 && inFlightWorkerReleases == 0) {
+      lifecycleLock.notifyAll()
+    }
+  }
+
+  private def beginClose(): Boolean = lifecycleLock.synchronized {
+    closed.compareAndSet(false, true)
+  }
+
+  /**
+   * Waits uninterruptibly so cleanup cannot race an in-flight lifecycle operation.
+   * Returns whether interruption must be restored after cleanup completes.
+   */
+  private def awaitInFlightOperations(): Boolean = {
+    var interrupted = Thread.interrupted()
+    lifecycleLock.synchronized {
+      while (inFlightSessionCreations != 0 || inFlightWorkerReleases != 0) {
+        try {
+          lifecycleLock.wait()
+        } catch {
+          case _: InterruptedException => interrupted = true
+        }
+      }
+    }
+    interrupted = Thread.interrupted() || interrupted
+    interrupted
+  }
+
+  /**
+   * Terminates tracked workers, removes the socket directory, and runs
+   * environment cleanup. Idempotent via CAS. In-flight [[createSession]]
+   * calls and worker releases are drained before cleanup, so they cannot
+   * publish or tear down a worker concurrently with transport or environment
+   * cleanup.
+   */
+  override def close(): Unit = {
+    if (!beginClose()) {
+      return
+    }
+    val interrupted = awaitInFlightOperations()
+    try {
+      // TODO [SPARK-55278]: Cleanup sessions as well?
+      // TODO [SPARK-55278]: close workers in parallel -- today shutdown is serialised at
+      //   N * gracefulTimeoutMs worst case.
+      workers.values().iterator().asScala.foreach { w =>
+        try {
+          w.close()
+        } catch {
+          case NonFatal(e) =>
+            logger.warn(s"Error closing worker ${w.id}", e)
+        }
+      }
+      workers.clear()
+      try closeTransport() catch {
+        case NonFatal(e) =>
+          logger.warn("Error cleaning up transport state", e)
+      }
+      deregisterEnvironmentCleanupHook()
+      runEnvironmentCleanup()
+    } finally {
+      if (interrupted) Thread.currentThread().interrupt()
+    }
+  }
+
+  // -- Environment lifecycle -------------------------------------------------
+
+  // TODO: distinguish retriable vs permanent environment failures.
+  private def ensureEnvironmentReady(): Unit = {
+    environmentLock.synchronized {
+      environmentState match {
+        case EnvironmentState.Ready | EnvironmentState.CleanedUp =>
+        case EnvironmentState.Failed(msg) =>
+          throw new DirectWorkerException(s"Environment setup previously failed: $msg")
+        case EnvironmentState.Pending =>
+          val env = workerSpec.getEnvironment
+          // Register up front so a partially-successful install still gets
+          // torn down at JVM shutdown if dispatcher.close is never called.
+          // No-op when environment_cleanup is not configured.
+          registerEnvironmentCleanupHook()
+          val verified = env.hasEnvironmentVerification &&
+            runCallable(env.getEnvironmentVerification).exitCode == 0
+          if (!verified && env.hasInstallation) {
+            // Treat any install failure (timeout or non-zero exit) as
+            // permanent. A partially-completed install can leave files on
+            // disk that a retry would race with; retry policy belongs in
+            // the future predicate (see TODO above).
+            val result = try {
+              runCallable(env.getInstallation)
+            } catch {
+              case e: DirectWorkerException =>
+                environmentState = EnvironmentState.Failed(
+                  s"installation failed: ${e.getMessage}")
+                throw e
+            }
+            if (result.exitCode != 0) {
+              val detail = s"exit code ${result.exitCode}\n${result.outputTail}"
+              environmentState = EnvironmentState.Failed(detail)
+              throw new DirectWorkerException(
+                s"Environment installation failed with $detail")
+            }
+          }
+          environmentState = EnvironmentState.Ready
+      }
+    }
+  }
+
+  // TODO: share one JVM shutdown hook across all dispatchers in the
+  //   process. Each live dispatcher is retained by the JVM until shutdown.
+
+  /** Registers the JVM shutdown hook that runs the cleanup callable. */
+  private def registerEnvironmentCleanupHook(): Unit = {
+    if (!Thread.holdsLock(environmentLock)) {
+      throw new IllegalStateException(
+        "registerEnvironmentCleanupHook must be called while holding environmentLock")
+    }
+    if (cleanupHook.isDefined) return
+    if (workerSpec.getEnvironment.hasEnvironmentCleanup) {
+      val hook = new Thread(() => runEnvironmentCleanup(), "udf-env-cleanup")
+      cleanupHook = Some(hook)
+      // scalastyle:off runtimeaddshutdownhook
+      Runtime.getRuntime.addShutdownHook(hook)
+      // scalastyle:on runtimeaddshutdownhook
+    }
+  }
+
+  private def deregisterEnvironmentCleanupHook(): Unit = {
+    environmentLock.synchronized {
+      cleanupHook.foreach { hook =>
+        try {
+          Runtime.getRuntime.removeShutdownHook(hook)
+        } catch {
+          case _: IllegalStateException => // JVM already shutting down
+        }
+        cleanupHook = None
+      }
+    }
+  }
+
+  private def runEnvironmentCleanup(): Unit = {
+    environmentLock.synchronized {
+      environmentState match {
+        case EnvironmentState.CleanedUp =>
+        case _ =>
+          if (workerSpec.getEnvironment.hasEnvironmentCleanup) {
+            try {
+              val result = runCallable(workerSpec.getEnvironment.getEnvironmentCleanup)
+              if (result.exitCode != 0) {
+                logger.warn(s"Environment cleanup exited with code ${result.exitCode}" +
+                  s"\n${result.outputTail}")
+              }
+            } catch {
+              case NonFatal(e) => logger.warn("Environment cleanup failed", e)
+            }
+          }
+          environmentState = EnvironmentState.CleanedUp
+      }
+    }
+  }
+
+  // -- Process helpers -------------------------------------------------------
+
+  /**
+   * Runs a [[ProcessCallable]] synchronously and returns the result.
+   * Always throws on timeout; callers check `exitCode` for non-timeout failures.
+   */
+  private[worker] def runCallable(callable: ProcessCallable): CallableResult = {
+    val cmd = (callable.getCommandList.asScala ++ callable.getArgumentsList.asScala).toSeq
+    require(cmd.nonEmpty,
+      "ProcessCallable must have at least one entry in command or arguments")
+    val outputFile = Files.createTempFile("udf-callable-", ".log")
+    try {
+      val process = launchProcess(
+        cmd, callable.getEnvironmentVariablesMap.asScala.toMap, outputFile.toFile)
+      val timeoutMs = callableTimeoutMs
+      if (!process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)) {
+        DirectWorkerDispatcher.destroyForciblyAndReap(
+          process, logger, s"callable timeout: ${cmd.head}")
+        val tail = readOutputTail(outputFile.toFile)
+        throw new DirectWorkerTimeoutException(
+          s"Callable timed out after ${timeoutMs}ms: " +
+            s"${cmd.mkString(" ")}\n$tail")
+      }
+      val tail = readOutputTail(outputFile.toFile)
+      CallableResult(process.exitValue(), tail)
+    } finally {
+      Files.deleteIfExists(outputFile)
+    }
+  }
+
+  private def spawnWorker(): DirectWorkerProcess = {
+    val runner = workerSpec.getDirect.getRunner
+    val baseCmd = (runner.getCommandList.asScala ++ runner.getArgumentsList.asScala).toSeq
+    require(baseCmd.nonEmpty,
+      "DirectWorker.runner must have at least one entry in command or arguments")
+    val workerId = UUID.randomUUID().toString
+    val address = newEndpointAddress(workerId)
+    // The engine injects --connection (the socket address it manages) and
+    // --id (an internal correlation identifier) into the worker command.
+    val cmd = baseCmd ++ Seq("--id", workerId, "--connection", address)
+    val env = runner.getEnvironmentVariablesMap.asScala.toMap
+    val outputFile = Files.createTempFile("udf-worker-", ".log")
+    val process = launchProcess(cmd, env, outputFile.toFile)
+    var connection: WorkerConnection = null
+
+    try {
+      connection = connectWorker(address, process, outputFile.toFile)
+      val artifacts = new WorkerArtifacts(process, connection, outputFile, logger)
+      // Remove the worker's endpoint artifact (its UDS socket file) on close;
+      // the worker creates it, the dispatcher owns its deletion.
+      artifacts.registerCleanup(() => cleanupEndpointAddress(address))
+      new DirectWorkerProcess(
+        workerId, artifacts, gracefulTimeoutMs, logger,
+        onLastSessionReleased = releaseWorker)
+    } catch {
+      case e: InterruptedException =>
+        Thread.currentThread().interrupt()
+        cleanupRawSpawn(process, connection, address, outputFile)
+        throw e
+      case NonFatal(e) =>
+        cleanupRawSpawn(process, connection, address, outputFile)
+        throw e
+    }
+  }
+
+  // Pre-WorkerArtifacts cleanup. Each step is independent.
+  private def cleanupRawSpawn(
+      p: Process,
+      connection: WorkerConnection,
+      address: String,
+      outputFile: Path): Unit = {
+    if (connection != null) {
+      try connection.close() catch {
+        case NonFatal(e) => logger.debug("Failed to close worker connection", e)
+      }
+    }
+    DirectWorkerDispatcher.destroyForciblyAndReap(p, logger, "failed spawn")
+    try cleanupEndpointAddress(address) catch {
+      case NonFatal(e) =>
+        logger.debug(s"Failed to clean up endpoint address $address", e)
+    }
+    try Files.deleteIfExists(outputFile) catch {
+      case NonFatal(e) =>
+        logger.debug(s"Failed to clean up worker output file $outputFile", e)
+    }
+  }
+
+  /**
+   * Starts an OS process. stdout and stderr are merged and redirected to the
+   * given file so that output can be read back for error reporting.
+   */
+  private def launchProcess(
+      command: Seq[String],
+      env: Map[String, String],
+      outputFile: File): Process = {
+    val builder = new ProcessBuilder(command: _*)
+    env.foreach { case (k, v) => builder.environment().put(k, v) }
+    builder.redirectErrorStream(true)
+    builder.redirectOutput(outputFile)
+    builder.start()
+  }
+
+  // Bounded scan so a runaway worker that writes gigabytes of output does
+  // not OOM the caller during error reporting.
+  protected def readOutputTail(file: File): String = {
+    if (!file.exists() || file.length() == 0) return ""
+    val fileLen = file.length()
+    val startPos = math.max(0L, fileLen - MAX_OUTPUT_SCAN_BYTES)
+    val fis = new FileInputStream(file)
+    try {
+      if (startPos > 0) fis.getChannel.position(startPos)
+      val reader = new BufferedReader(
+        new InputStreamReader(fis, StandardCharsets.UTF_8))
+      // Discard the first (partial) line when we seeked into the middle.
+      if (startPos > 0) reader.readLine()
+      val buffer = new MQueue[String]()
+      var line = reader.readLine()
+      while (line != null) {
+        if (buffer.size >= PROCESS_OUTPUT_TAIL_LINES) buffer.dequeue()
+        buffer.enqueue(line)
+        line = reader.readLine()
+      }
+      if (buffer.isEmpty) ""
+      else "Process output (last lines):\n" + buffer.mkString("\n")
+    } catch {
+      case NonFatal(e) =>
+        logger.debug(s"Failed to read process output from $file", e)
+        ""
+    } finally {
+      fis.close()
+    }
+  }
+
+  // -- Spec validation -------------------------------------------------------
+
+  // Verification exists to short-circuit installation when the environment
+  // is already prepared, so requiring installation alongside verification
+  // catches user errors at spec-validation time.
+  private def validateEnvironmentCallables(): Unit = {
+    val env = workerSpec.getEnvironment
+    require(!env.hasEnvironmentVerification || env.hasInstallation,
+      "WorkerEnvironment.environment_verification requires installation to be set")
+  }
+}
+
+// Visible to `core` (and the sibling `grpc` module) so concrete dispatchers in
+// the `grpc` module can call shared helpers like `destroyForciblyAndReap`.
+private[worker] object DirectWorkerDispatcher {
+  private[worker] val READY_POLL_INTERVAL_MS = 100L
+  private[direct] val DEFAULT_INIT_TIMEOUT_MS = 10000L
+  private[direct] val DEFAULT_CALLABLE_TIMEOUT_MS = 120000L
+  private[direct] val DEFAULT_GRACEFUL_TIMEOUT_MS = 5000L
+  // Engine-side cap on proto-provided worker timeouts. The defaults below
+  // must stay at or under this cap so the clamp only fires on
+  // user-provided values.
+  private[direct] val ENGINE_MAX_TIMEOUT_MS = 30000L
+  require(DEFAULT_INIT_TIMEOUT_MS <= ENGINE_MAX_TIMEOUT_MS &&
+    DEFAULT_GRACEFUL_TIMEOUT_MS <= ENGINE_MAX_TIMEOUT_MS,
+    "default timeouts must not exceed ENGINE_MAX_TIMEOUT_MS")
+  private[direct] val PROCESS_OUTPUT_TAIL_LINES = 50
+  private[direct] val MAX_OUTPUT_SCAN_BYTES = 1024L * 1024L // 1 MiB
+  // 5s bounds the wait for the kernel to reap a SIGKILL'd child. SIGKILL
+  // is unblockable, so exceeding this usually means the process is stuck
+  // in uninterruptible I/O (D-state) and further waiting will not help.
+  private[direct] val SIGKILL_REAP_TIMEOUT_MS = 5000L
+
+  /**
+   * SIGKILL `process` and wait up to [[SIGKILL_REAP_TIMEOUT_MS]] for the
+   * kernel to reap it. `destroyForcibly()` alone returns before the child
+   * is reaped, which leaks a zombie until JVM exit. On reap-timeout logs
+   * a warning; on interrupt re-raises the interrupt and returns.
+   *
+   * @param context short tag included in the timeout warning so operators
+   *                can correlate a stuck child with its source.
+   */
+  private[worker] def destroyForciblyAndReap(
+      process: Process,
+      logger: WorkerLogger,
+      context: String = ""): Unit = {
+    if (!process.isAlive) return
+    process.destroyForcibly()
+    val reaped = try {
+      process.waitFor(SIGKILL_REAP_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+    } catch {
+      case _: InterruptedException =>
+        Thread.currentThread().interrupt()
+        return
+    }
+    if (!reaped && process.isAlive) {
+      val suffix = if (context.nonEmpty) s" [$context]" else ""
+      logger.warn(
+        s"Process ${process.pid()}$suffix still alive ${SIGKILL_REAP_TIMEOUT_MS}ms " +
+          s"after SIGKILL; leaving behind as zombie " +
+          s"(likely stuck in uninterruptible kernel state)")
+    }
+  }
+
+  /** Result of running a [[ProcessCallable]]. */
+  private[worker] case class CallableResult(exitCode: Int, outputTail: String)
+
+  private[direct] sealed trait EnvironmentState
+  private[direct] object EnvironmentState {
+    case object Pending extends EnvironmentState
+    case object Ready extends EnvironmentState
+    case class Failed(detail: String) extends EnvironmentState
+    case object CleanedUp extends EnvironmentState
+  }
+}

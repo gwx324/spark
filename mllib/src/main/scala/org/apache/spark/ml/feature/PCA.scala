@@ -17,6 +17,8 @@
 
 package org.apache.spark.ml.feature
 
+import java.io.{DataInputStream, DataOutputStream}
+
 import org.apache.hadoop.fs.Path
 
 import org.apache.spark.annotation.Since
@@ -26,14 +28,11 @@ import org.apache.spark.ml.param._
 import org.apache.spark.ml.param.shared._
 import org.apache.spark.ml.util._
 import org.apache.spark.mllib.feature
-import org.apache.spark.mllib.linalg.{DenseMatrix => OldDenseMatrix, DenseVector => OldDenseVector,
-  Matrices => OldMatrices, Vector => OldVector, Vectors => OldVectors}
-import org.apache.spark.mllib.linalg.MatrixImplicits._
-import org.apache.spark.mllib.linalg.VectorImplicits._
-import org.apache.spark.rdd.RDD
+import org.apache.spark.mllib.linalg.{DenseMatrix => OldDenseMatrix, Vectors => OldVectors}
 import org.apache.spark.sql._
 import org.apache.spark.sql.functions._
-import org.apache.spark.sql.types.{StructField, StructType}
+import org.apache.spark.sql.types.StructType
+import org.apache.spark.util.VersionUtils.majorVersion
 
 /**
  * Params for [[PCA]] and [[PCAModel]].
@@ -44,24 +43,23 @@ private[feature] trait PCAParams extends Params with HasInputCol with HasOutputC
    * The number of principal components.
    * @group param
    */
-  final val k: IntParam = new IntParam(this, "k", "the number of principal components")
+  final val k: IntParam = new IntParam(this, "k", "the number of principal components (> 0)",
+    ParamValidators.gt(0))
 
   /** @group getParam */
   def getK: Int = $(k)
 
   /** Validates and transforms the input schema. */
   protected def validateAndTransformSchema(schema: StructType): StructType = {
-    SchemaUtils.checkColumnType(schema, $(inputCol), new VectorUDT)
+    SchemaUtils.checkColumnType(schema, $(inputCol), SQLDataTypes.VectorType)
     require(!schema.fieldNames.contains($(outputCol)),
       s"Output column ${$(outputCol)} already exists.")
-    val outputFields = schema.fields :+ StructField($(outputCol), new VectorUDT, false)
-    StructType(outputFields)
+    SchemaUtils.updateAttributeGroupSize(schema, $(outputCol), $(k))
   }
-
 }
 
 /**
- * PCA trains a model to project vectors to a lower dimensional space of the top [[PCA!.k]]
+ * PCA trains a model to project vectors to a lower dimensional space of the top `PCA!.k`
  * principal components.
  */
 @Since("1.5.0")
@@ -90,12 +88,13 @@ class PCA @Since("1.5.0") (
   @Since("2.0.0")
   override def fit(dataset: Dataset[_]): PCAModel = {
     transformSchema(dataset.schema, logging = true)
-    val input: RDD[OldVector] = dataset.select($(inputCol)).rdd.map {
+    val input = dataset.select($(inputCol)).rdd.map {
       case Row(v: Vector) => OldVectors.fromML(v)
     }
     val pca = new feature.PCA(k = $(k))
     val pcaModel = pca.fit(input)
-    copyValues(new PCAModel(uid, pcaModel.pc, pcaModel.explainedVariance).setParent(this))
+    copyValues(new PCAModel(uid, pcaModel.pc.asML, pcaModel.explainedVariance.asML)
+      .setParent(this))
   }
 
   @Since("1.5.0")
@@ -130,6 +129,20 @@ class PCAModel private[ml] (
 
   import PCAModel._
 
+  // For ml connect only
+  private[ml] def this() = this("", Matrices.empty, Vectors.empty)
+
+  private[spark] override def estimatedSize: Long = {
+    var size = estimateMatadataSize
+    if (pc != null) {
+      size += pc.getSizeInBytes
+    }
+    if (explainedVariance != null) {
+      size += explainedVariance.getSizeInBytes
+    }
+    size
+  }
+
   /** @group setParam */
   @Since("1.5.0")
   def setInputCol(value: String): this.type = set(inputCol, value)
@@ -140,26 +153,28 @@ class PCAModel private[ml] (
 
   /**
    * Transform a vector by computed Principal Components.
-   * NOTE: Vectors to be transformed must be the same length
-   * as the source vectors given to [[PCA.fit()]].
+   *
+   * @note Vectors to be transformed must be the same length as the source vectors given
+   * to `PCA.fit()`.
    */
   @Since("2.0.0")
   override def transform(dataset: Dataset[_]): DataFrame = {
-    transformSchema(dataset.schema, logging = true)
-    val pcaModel = new feature.PCAModel($(k),
-      OldMatrices.fromML(pc).asInstanceOf[OldDenseMatrix],
-      OldVectors.fromML(explainedVariance).asInstanceOf[OldDenseVector])
+    val outputSchema = transformSchema(dataset.schema, logging = true)
 
-    // TODO: Make the transformer natively in ml framework to avoid extra conversion.
-    val transformer: Vector => Vector = v => pcaModel.transform(OldVectors.fromML(v)).asML
-
-    val pcaOp = udf(transformer)
-    dataset.withColumn($(outputCol), pcaOp(col($(inputCol))))
+    val transposed = pc.transpose
+    val transformer = udf { vector: Vector => transposed.multiply(vector) }
+    dataset.withColumn($(outputCol), transformer(col($(inputCol))),
+      outputSchema($(outputCol)).metadata)
   }
 
   @Since("1.5.0")
   override def transformSchema(schema: StructType): StructType = {
-    validateAndTransformSchema(schema)
+    var outputSchema = validateAndTransformSchema(schema)
+    if ($(outputCol).nonEmpty) {
+      outputSchema = SchemaUtils.updateAttributeGroupSize(outputSchema,
+        $(outputCol), $(k))
+    }
+    outputSchema
   }
 
   @Since("1.5.0")
@@ -170,20 +185,37 @@ class PCAModel private[ml] (
 
   @Since("1.6.0")
   override def write: MLWriter = new PCAModelWriter(this)
+
+  @Since("3.0.0")
+  override def toString: String = {
+    s"PCAModel: uid=$uid, k=${$(k)}"
+  }
 }
 
 @Since("1.6.0")
 object PCAModel extends MLReadable[PCAModel] {
+  private[ml] case class Data(pc: Matrix, explainedVariance: Vector)
+
+  private[ml] def serializeData(data: Data, dos: DataOutputStream): Unit = {
+    import ReadWriteUtils._
+    serializeMatrix(data.pc, dos)
+    serializeVector(data.explainedVariance, dos)
+  }
+
+  private[ml] def deserializeData(dis: DataInputStream): Data = {
+    import ReadWriteUtils._
+    val pc = deserializeMatrix(dis)
+    val explainedVariance = deserializeVector(dis)
+    Data(pc, explainedVariance)
+  }
 
   private[PCAModel] class PCAModelWriter(instance: PCAModel) extends MLWriter {
 
-    private case class Data(pc: DenseMatrix, explainedVariance: DenseVector)
-
     override protected def saveImpl(path: String): Unit = {
-      DefaultParamsWriter.saveMetadata(instance, path, sc)
+      DefaultParamsWriter.saveMetadata(instance, path, sparkSession)
       val data = Data(instance.pc, instance.explainedVariance)
       val dataPath = new Path(path, "data").toString
-      sparkSession.createDataFrame(Seq(data)).repartition(1).write.parquet(dataPath)
+      ReadWriteUtils.saveObject[Data](dataPath, data, sparkSession, serializeData)
     }
   }
 
@@ -201,26 +233,19 @@ object PCAModel extends MLReadable[PCAModel] {
      * @return a [[PCAModel]]
      */
     override def load(path: String): PCAModel = {
-      val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
-
-      val versionRegex = "([0-9]+)\\.(.+)".r
-      val versionRegex(major, _) = metadata.sparkVersion
+      val metadata = DefaultParamsReader.loadMetadata(path, sparkSession, className)
 
       val dataPath = new Path(path, "data").toString
-      val model = if (major.toInt >= 2) {
-        val Row(pc: DenseMatrix, explainedVariance: DenseVector) =
-          sparkSession.read.parquet(dataPath)
-            .select("pc", "explainedVariance")
-            .head()
-        new PCAModel(metadata.uid, pc, explainedVariance)
+      val model = if (majorVersion(metadata.sparkVersion) >= 2) {
+        val data = ReadWriteUtils.loadObject[Data](dataPath, sparkSession, deserializeData)
+        new PCAModel(metadata.uid, data.pc.toDense, data.explainedVariance.toDense)
       } else {
         // pc field is the old matrix format in Spark <= 1.6
         // explainedVariance field is not present in Spark <= 1.6
         val Row(pc: OldDenseMatrix) = sparkSession.read.parquet(dataPath).select("pc").head()
-        new PCAModel(metadata.uid, pc.asML,
-          Vectors.dense(Array.empty[Double]).asInstanceOf[DenseVector])
+        new PCAModel(metadata.uid, pc.asML, new DenseVector(Array.emptyDoubleArray))
       }
-      DefaultParamsReader.getAndSetParams(model, metadata)
+      metadata.getAndSetParams(model)
       model
     }
   }

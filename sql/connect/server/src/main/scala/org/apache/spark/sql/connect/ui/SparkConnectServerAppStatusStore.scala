@@ -1,0 +1,152 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.connect.ui
+
+import scala.collection.mutable
+import scala.collection.mutable.ArrayBuffer
+
+import com.fasterxml.jackson.annotation.JsonIgnore
+
+import org.apache.spark.status.KVUtils
+import org.apache.spark.status.KVUtils.KVIndexParam
+import org.apache.spark.util.kvstore.{KVIndex, KVStore}
+
+class SparkConnectServerAppStatusStore(store: KVStore) {
+  def getSessionList: Seq[SessionInfo] = {
+    KVUtils.viewToSeq(store.view(classOf[SessionInfo]))
+  }
+
+  def getSessionList(offset: Int, length: Int): Seq[SessionInfo] = {
+    KVUtils.viewToSeq(store.view(classOf[SessionInfo]).skip(offset).max(length))
+  }
+
+  def getExecutionList: Seq[ExecutionInfo] = {
+    KVUtils.viewToSeq(store.view(classOf[ExecutionInfo]))
+  }
+
+  def getExecutionList(offset: Int, length: Int): Seq[ExecutionInfo] = {
+    KVUtils.viewToSeq(store.view(classOf[ExecutionInfo]).skip(offset).max(length))
+  }
+
+  def getOnlineSessionNum: Int = {
+    KVUtils.count(store.view(classOf[SessionInfo]))(_.finishTimestamp == 0)
+  }
+
+  def getSession(userId: String, sessionId: String): Option[SessionInfo] = {
+    try {
+      Some(store.read(classOf[SessionInfo], SessionInfo.uniqueId(userId, sessionId)))
+    } catch {
+      case _: NoSuchElementException =>
+        // Fall back for legacy stores keyed on sessionId alone (e.g. a History Server disk store
+        // from an older Spark). Collapsed same-UUID rows cannot be recovered.
+        getSessionList.find(s => s.userId == userId && s.sessionId == sessionId)
+    }
+  }
+
+  def getExecution(executionId: String): Option[ExecutionInfo] = {
+    try {
+      Some(store.read(classOf[ExecutionInfo], executionId))
+    } catch {
+      case _: NoSuchElementException => None
+    }
+  }
+
+  /**
+   * When an error or a cancellation occurs, we set the finishTimestamp of the statement.
+   * Therefore, when we count the number of running statements, we need to exclude errors and
+   * cancellations and count all statements that have not been closed so far.
+   */
+  def getTotalRunning: Int = {
+    KVUtils.count(store.view(classOf[ExecutionInfo]))(_.isExecutionActive)
+  }
+
+  def getSessionCount: Long = {
+    store.count(classOf[SessionInfo])
+  }
+
+  def getExecutionCount: Long = {
+    store.count(classOf[ExecutionInfo])
+  }
+}
+
+private[spark] class SessionInfo(
+    val sessionId: String,
+    val startTimestamp: Long,
+    val userId: String,
+    val finishTimestamp: Long,
+    val totalExecution: Long) {
+  // Natural key. A session is identified by (userId, sessionId), since two users may share the
+  // same session UUID; keying on sessionId alone would merge them into one record.
+  @KVIndexParam
+  def uniqueId: String = SessionInfo.uniqueId(userId, sessionId)
+
+  @JsonIgnore @KVIndex("finishTime")
+  private def finishTimeIndex: Long = if (finishTimestamp > 0L) finishTimestamp else -1L
+  def totalTime: Long = {
+    if (finishTimestamp == 0L) {
+      System.currentTimeMillis - startTimestamp
+    } else {
+      finishTimestamp - startTimestamp
+    }
+  }
+}
+
+private[connect] object SessionInfo {
+  // sessionId is a UUID, so joining with '/' yields a key that is unique per (userId, sessionId).
+  def uniqueId(userId: String, sessionId: String): String = s"$userId/$sessionId"
+}
+
+private[spark] class ExecutionInfo(
+    @KVIndexParam val jobTag: String,
+    val statement: String,
+    val sessionId: String,
+    val startTimestamp: Long,
+    val userId: String,
+    val operationId: String,
+    val sparkSessionTags: Set[String],
+    val finishTimestamp: Long,
+    val closeTimestamp: Long,
+    val detail: String,
+    val state: ExecutionState.Value,
+    val jobId: ArrayBuffer[String],
+    val sqlExecId: mutable.Set[String]) {
+  @JsonIgnore @KVIndex("finishTime")
+  private def finishTimeIndex: Long = if (finishTimestamp > 0L && !isExecutionActive) {
+    finishTimestamp
+  } else -1L
+
+  @JsonIgnore @KVIndex("isExecutionActive")
+  def isExecutionActive: Boolean = {
+    state == ExecutionState.STARTED ||
+    state == ExecutionState.COMPILED ||
+    state == ExecutionState.READY
+  }
+
+  def totalTime(endTime: Long): Long = {
+    if (endTime == 0L) {
+      System.currentTimeMillis - startTimestamp
+    } else {
+      endTime - startTimestamp
+    }
+  }
+}
+
+private[spark] object ExecutionState extends Enumeration {
+  val STARTED, COMPILED, READY, CANCELED, FAILED, FINISHED, CLOSED = Value
+  type ExecutionState = Value
+}

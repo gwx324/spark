@@ -20,21 +20,32 @@ package org.apache.spark.sql.execution.columnar.compression
 import java.nio.ByteBuffer
 
 import org.apache.spark.SparkFunSuite
-import org.apache.spark.sql.catalyst.expressions.GenericMutableRow
+import org.apache.spark.sql.catalyst.expressions.GenericInternalRow
+import org.apache.spark.sql.catalyst.types.PhysicalDataType
 import org.apache.spark.sql.execution.columnar._
 import org.apache.spark.sql.execution.columnar.ColumnarTestUtils._
-import org.apache.spark.sql.types.AtomicType
+import org.apache.spark.sql.execution.vectorized.OnHeapColumnVector
+import org.apache.spark.sql.types.StringType
 
 class DictionaryEncodingSuite extends SparkFunSuite {
+  val nullValue = -1
   testDictionaryEncoding(new IntColumnStats, INT)
   testDictionaryEncoding(new LongColumnStats, LONG)
-  testDictionaryEncoding(new StringColumnStats, STRING)
+  Seq(
+    "UTF8_BINARY", "UTF8_LCASE", "UNICODE", "UNICODE_CI"
+  ).foreach(collation => {
+    val dt = StringType(collation)
+    val typeName = if (collation == "UTF8_BINARY") "STRING" else s"STRING($collation)"
+    testDictionaryEncoding(new StringColumnStats(dt), STRING(dt), false, Some(typeName))
+  })
 
-  def testDictionaryEncoding[T <: AtomicType](
+  def testDictionaryEncoding[T <: PhysicalDataType](
       columnStats: ColumnStats,
-      columnType: NativeColumnType[T]) {
+      columnType: NativeColumnType[T],
+      testDecompress: Boolean = true,
+      testTypeName: Option[String] = None): Unit = {
 
-    val typeName = columnType.getClass.getSimpleName.stripSuffix("$")
+    val typeName = testTypeName.getOrElse(columnType.getClass.getSimpleName.stripSuffix("$"))
 
     def buildDictionary(buffer: ByteBuffer) = {
       (0 until buffer.getInt()).map(columnType.extract(buffer) -> _.toShort).toMap
@@ -46,7 +57,7 @@ class DictionaryEncodingSuite extends SparkFunSuite {
       seq.head +: seq.tail.filterNot(_ == seq.head)
     }
 
-    def skeleton(uniqueValueCount: Int, inputSeq: Seq[Int]) {
+    def skeleton(uniqueValueCount: Int, inputSeq: Seq[Int]): Unit = {
       // -------------
       // Tests encoder
       // -------------
@@ -97,7 +108,7 @@ class DictionaryEncodingSuite extends SparkFunSuite {
         buffer.rewind().position(headerSize + 4)
 
         val decoder = DictionaryEncoding.decoder(buffer, columnType)
-        val mutableRow = new GenericMutableRow(1)
+        val mutableRow = new GenericInternalRow(1)
 
         if (inputSeq.nonEmpty) {
           inputSeq.foreach { i =>
@@ -113,6 +124,59 @@ class DictionaryEncodingSuite extends SparkFunSuite {
       }
     }
 
+    def skeletonForDecompress(uniqueValueCount: Int, inputSeq: Seq[Int]): Unit = {
+      if (!testDecompress) return
+      val builder = TestCompressibleColumnBuilder(columnStats, columnType, DictionaryEncoding)
+      val (values, rows) = makeUniqueValuesAndSingleValueRows(columnType, uniqueValueCount)
+      val dictValues = stableDistinct(inputSeq)
+
+      val nullRow = new GenericInternalRow(1)
+      nullRow.setNullAt(0)
+      inputSeq.foreach { i =>
+        if (i == nullValue) {
+          builder.appendFrom(nullRow, 0)
+        } else {
+          builder.appendFrom(rows(i), 0)
+        }
+      }
+      val buffer = builder.build()
+
+      // ----------------
+      // Tests decompress
+      // ----------------
+      // Rewinds, skips column header and 4 more bytes for compression scheme ID
+      val headerSize = CompressionScheme.columnHeaderSize(buffer)
+      buffer.position(headerSize)
+      assertResult(DictionaryEncoding.typeId, "Wrong compression scheme ID")(buffer.getInt())
+
+      val decoder = DictionaryEncoding.decoder(buffer, columnType)
+      val columnVector = new OnHeapColumnVector(inputSeq.length,
+        ColumnarDataTypeUtils.toLogicalDataType(columnType.dataType))
+      decoder.decompress(columnVector, inputSeq.length)
+
+      if (inputSeq.nonEmpty) {
+        inputSeq.zipWithIndex.foreach { case (i: Any, index: Int) =>
+          if (i == nullValue) {
+            assertResult(true, s"Wrong null ${index}-th position") {
+              columnVector.isNullAt(index)
+            }
+          } else {
+            columnType match {
+              case INT =>
+                assertResult(values(i), s"Wrong ${index}-th decoded int value") {
+                  columnVector.getInt(index)
+                }
+              case LONG =>
+                assertResult(values(i), s"Wrong ${index}-th decoded long value") {
+                  columnVector.getLong(index)
+                }
+              case _ => fail("Unsupported type")
+            }
+          }
+        }
+      }
+    }
+
     test(s"$DictionaryEncoding with $typeName: empty") {
       skeleton(0, Seq.empty)
     }
@@ -123,6 +187,19 @@ class DictionaryEncodingSuite extends SparkFunSuite {
 
     test(s"$DictionaryEncoding with $typeName: dictionary overflow") {
       skeleton(DictionaryEncoding.MAX_DICT_SIZE + 1, 0 to DictionaryEncoding.MAX_DICT_SIZE)
+    }
+
+    test(s"$DictionaryEncoding with $typeName: empty for decompress()") {
+      skeletonForDecompress(0, Seq.empty)
+    }
+
+    test(s"$DictionaryEncoding with $typeName: simple case for decompress()") {
+      skeletonForDecompress(2, Seq(0, nullValue, 0, nullValue))
+    }
+
+    test(s"$DictionaryEncoding with $typeName: dictionary overflow for decompress()") {
+      skeletonForDecompress(DictionaryEncoding.MAX_DICT_SIZE + 2,
+        Seq(nullValue) ++ (0 to DictionaryEncoding.MAX_DICT_SIZE - 1) ++ Seq(nullValue))
     }
   }
 }

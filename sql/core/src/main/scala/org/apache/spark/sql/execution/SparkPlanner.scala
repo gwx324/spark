@@ -17,31 +17,53 @@
 
 package org.apache.spark.sql.execution
 
-import org.apache.spark.SparkContext
-import org.apache.spark.sql._
+import org.apache.spark.sql.ExperimentalMethods
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.classic.SparkSession
+import org.apache.spark.sql.execution.{SparkStrategy => Strategy}
+import org.apache.spark.sql.execution.adaptive.LogicalQueryStageStrategy
+import org.apache.spark.sql.execution.command.v2.V2CommandStrategy
 import org.apache.spark.sql.execution.datasources.{DataSourceStrategy, FileSourceStrategy}
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Strategy
+import org.apache.spark.sql.execution.joins.ExternalLookupJoinStrategy
 import org.apache.spark.sql.internal.SQLConf
 
-class SparkPlanner(
-    val sparkContext: SparkContext,
-    val conf: SQLConf,
-    val extraStrategies: Seq[Strategy])
+class SparkPlanner(val session: SparkSession, val experimentalMethods: ExperimentalMethods)
   extends SparkStrategies {
+
+  def conf: SQLConf = session.sessionState.conf
 
   def numPartitions: Int = conf.numShufflePartitions
 
-  def strategies: Seq[Strategy] =
-      extraStrategies ++ (
+  override def strategies: Seq[Strategy] =
+    experimentalMethods.extraStrategies ++
+      extraPlanningStrategies ++ (
+      LogicalQueryStageStrategy ::
+      PythonEvals ::
+      ExternalLookupJoinStrategy ::
+      new DataSourceV2Strategy(session) ::
+      V2CommandStrategy ::
       FileSourceStrategy ::
       DataSourceStrategy ::
-      DDLStrategy ::
       SpecialLimits ::
       Aggregation ::
+      Window ::
+      WindowGroupLimit ::
       JoinSelection ::
+      AsOfJoinSelection ::
       InMemoryScans ::
-      BasicOperators :: Nil)
+      SparkScripts ::
+      Pipelines ::
+      BasicOperators ::
+      // Need to be here since users can specify withWatermark in stateless streaming query.
+      EventTimeWatermarkStrategy :: Nil)
+
+  /**
+   * Override to add extra planning strategies to the planner. These strategies are tried after
+   * the strategies defined in [[ExperimentalMethods]], and before the regular strategies.
+   */
+  def extraPlanningStrategies: Seq[Strategy] = Nil
 
   override protected def collectPlaceholders(plan: SparkPlan): Seq[(SparkPlan, LogicalPlan)] = {
     plan.collect {
@@ -77,7 +99,7 @@ class SparkPlanner(
     val projectSet = AttributeSet(projectList.flatMap(_.references))
     val filterSet = AttributeSet(filterPredicates.flatMap(_.references))
     val filterCondition: Option[Expression] =
-      prunePushedDownFilters(filterPredicates).reduceLeftOption(catalyst.expressions.And)
+      prunePushedDownFilters(filterPredicates).reduceLeftOption(And)
 
     // Right now we still use a projection even if the only evaluation is applying an alias
     // to a column.  Since this is a no-op, it could be avoided. However, using this

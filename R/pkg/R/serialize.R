@@ -30,14 +30,17 @@
 # POSIXct,POSIXlt -> Time
 #
 # list[T] -> Array[T], where T is one of above mentioned types
+# Multi-element vector of any of the above (except raw) -> Array[T]
 # environment -> Map[String, T], where T is a native type
 # jobj -> Object, where jobj is an object created in the backend
 # nolint end
 
 getSerdeType <- function(object) {
   type <- class(object)[[1]]
-  if (type != "list") {
-    type
+  if (is.atomic(object) & !is.raw(object) & length(object) > 1) {
+    "array"
+  } else if (type != "list") {
+     type
   } else {
     # Check if all elements are of same type
     elemType <- unique(sapply(object, function(elem) { getSerdeType(elem) }))
@@ -50,14 +53,17 @@ getSerdeType <- function(object) {
 }
 
 writeObject <- function(con, object, writeType = TRUE) {
-  # NOTE: In R vectors have same type as objects. So we don't support
-  # passing in vectors as arrays and instead require arrays to be passed
-  # as lists.
+  # NOTE: In R vectors have same type as objects
   type <- class(object)[[1]]  # class of POSIXlt is c("POSIXlt", "POSIXt")
   # Checking types is needed here, since 'is.na' only handles atomic vectors,
   # lists and pairlists
   if (type %in% c("integer", "character", "logical", "double", "numeric")) {
-    if (is.na(object)) {
+    if (is.na(object[[1]])) {
+      # Uses the first element for now to keep the behavior same as R before
+      # 4.2.0. This is wrong because we should differentiate c(NA) from a
+      # single NA as the former means array(null) and the latter means null
+      # in Spark SQL. However, it requires non-trivial comparison to distinguish
+      # both in R. We should ideally fix this.
       object <- NULL
       type <- "NULL"
     }
@@ -83,7 +89,7 @@ writeObject <- function(con, object, writeType = TRUE) {
          Date = writeDate(con, object),
          POSIXlt = writeTime(con, object),
          POSIXct = writeTime(con, object),
-         stop(paste("Unsupported type for serialization", type)))
+         stop("Unsupported type for serialization ", type))
 }
 
 writeVoid <- function(con) {
@@ -157,7 +163,7 @@ writeType <- function(con, class) {
                  Date = "D",
                  POSIXlt = "t",
                  POSIXct = "t",
-                 stop(paste("Unsupported type for serialization", class)))
+                 stop("Unsupported type for serialization ", class))
   writeBin(charToRaw(type), con)
 }
 
@@ -202,7 +208,11 @@ writeEnv <- function(con, env) {
 }
 
 writeDate <- function(con, date) {
-  writeString(con, as.character(date))
+  if (is.na(date)) {
+    writeString(con, "NA")
+  } else {
+    writeString(con, as.character(date))
+  }
 }
 
 writeTime <- function(con, time) {
@@ -217,5 +227,16 @@ writeArgs <- function(con, args) {
     for (a in args) {
       writeObject(con, a)
     }
+  }
+}
+
+writeSerializeInArrow <- function(conn, df) {
+  if (requireNamespace("arrow", quietly = TRUE)) {
+    # There looks no way to send each batch in streaming format via socket
+    # connection. See ARROW-4512.
+    # So, it writes the whole Arrow streaming-formatted binary at once for now.
+    writeRaw(conn, arrow::write_to_raw(df))
+  } else {
+    stop("'arrow' package should be installed.")
   }
 }

@@ -17,16 +17,79 @@
 
 package org.apache.spark.launcher;
 
+import java.time.Duration;
+
+import org.junit.jupiter.api.AfterEach;
 import org.slf4j.bridge.SLF4JBridgeHandler;
+import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Handles configuring the JUL -> SLF4J bridge.
+ * Handles configuring the JUL -> SLF4J bridge, and provides some utility methods for tests.
  */
 class BaseSuite {
 
   static {
     SLF4JBridgeHandler.removeHandlersForRootLogger();
     SLF4JBridgeHandler.install();
+  }
+
+  @AfterEach
+  public void postChecks() {
+    LauncherServer server = LauncherServer.getServer();
+    if (server != null) {
+      // Shut down the server to clean things up for the next test.
+      try {
+        server.close();
+      } catch (Exception e) {
+        // Ignore.
+      }
+    }
+    // Re-fetch after close(): close() sets the static serverInstance to null, but the
+    // local variable above still holds the old non-null reference, so assertNull(server)
+    // would always fail here if the server was alive at cleanup time.
+    assertNull(LauncherServer.getServer());
+  }
+
+  protected void waitFor(final SparkAppHandle handle) throws Exception {
+    try {
+      eventually(Duration.ofSeconds(10), Duration.ofMillis(10), () -> {
+        assertTrue(handle.getState().isFinal(), "Handle is not in final state.");
+      });
+    } finally {
+      if (!handle.getState().isFinal()) {
+        handle.kill();
+      }
+    }
+
+    // Wait until the handle has been marked as disposed, to make sure all cleanup tasks
+    // have been performed.
+    AbstractAppHandle ahandle = (AbstractAppHandle) handle;
+    eventually(Duration.ofSeconds(10), Duration.ofMillis(10), () -> {
+      assertTrue(ahandle.isDisposed(), "Handle is still not marked as disposed.");
+    });
+  }
+
+  /**
+   * Call a closure that performs a check every "period" until it succeeds, or the timeout
+   * elapses.
+   */
+  protected void eventually(Duration timeout, Duration period, Runnable check) throws Exception {
+    assertTrue(timeout.compareTo(period) > 0, "Timeout needs to be larger than period.");
+    long deadline = System.nanoTime() + timeout.toNanos();
+    int count = 0;
+    while (true) {
+      try {
+        count++;
+        check.run();
+        return;
+      } catch (Throwable t) {
+        if (System.nanoTime() >= deadline) {
+          String msg = String.format("Failed check after %d tries: %s.", count, t.getMessage());
+          throw new IllegalStateException(msg, t);
+        }
+        Thread.sleep(period.toMillis());
+      }
+    }
   }
 
 }

@@ -1,0 +1,3449 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.connector
+
+import java.io.File
+import java.util
+import java.util.Optional
+import java.util.OptionalLong
+
+import scala.jdk.CollectionConverters._
+
+import org.apache.logging.log4j.Level
+import test.org.apache.spark.sql.connector._
+
+import org.apache.spark.{SparkException, SparkUnsupportedOperationException}
+import org.apache.spark.sql.{AnalysisException, DataFrame, Row, SQLContext}
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.expressions.{
+  And => CatalystAnd, AttributeReference, BindReferences, EqualTo => CatalystEqualTo,
+  Expression => CatalystExpression, GreaterThan => CatalystGreaterThan,
+  GreaterThanOrEqual => CatalystGreaterThanOrEqual, LessThan => CatalystLessThan,
+  LessThanOrEqual => CatalystLessThanOrEqual, Literal => CatalystLiteral,
+  Predicate => CatalystPredicate, ScalarSubquery}
+import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
+import org.apache.spark.sql.catalyst.plans.logical.{
+  Aggregate, Filter => LogicalFilter, GlobalLimit, Join, LocalLimit, Project}
+import org.apache.spark.sql.catalyst.plans.logical.statsEstimation.EstimationUtils
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
+import org.apache.spark.sql.connector.catalog.{PartitionInternalRow, SupportsRead, SupportsWrite, Table, TableCapability, TableProvider}
+import org.apache.spark.sql.connector.catalog.TableCapability._
+import org.apache.spark.sql.connector.expressions.{Expression, FieldReference, Literal, NamedReference, NullOrdering, SortDirection, SortOrder, Transform}
+import org.apache.spark.sql.connector.expressions.filter.Predicate
+import org.apache.spark.sql.connector.join.{JoinType => V2JoinType}
+import org.apache.spark.sql.connector.read._
+import org.apache.spark.sql.connector.read.Scan.ColumnarSupportMode
+import org.apache.spark.sql.connector.read.SupportsPushDownJoin.ColumnWithAlias
+import org.apache.spark.sql.connector.read.colstats.ColumnStatistics
+import org.apache.spark.sql.connector.read.partitioning.{KeyGroupedPartitioning, Partitioning, UnknownPartitioning}
+import org.apache.spark.sql.connector.write.{BatchWrite, DataWriter, DataWriterFactory, LogicalWriteInfo, PhysicalWriteInfo, Write, WriteBuilder, WriterCommitMessage}
+import org.apache.spark.sql.execution.{FilterExec, SortExec}
+import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
+import org.apache.spark.sql.execution.datasources.v2.{
+  BatchScanExec, DataSourceV2Relation, DataSourceV2ScanRelation, PushedDownOperators,
+  V1ScanWrapper, V2ScanPartitioningAndOrdering}
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Implicits._
+import org.apache.spark.sql.execution.exchange.{Exchange, ShuffleExchangeExec}
+import org.apache.spark.sql.execution.vectorized.OnHeapColumnVector
+import org.apache.spark.sql.expressions.Window
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.internal.connector.{SimpleTableProvider, SupportsPushDownCatalystFilters}
+import org.apache.spark.sql.sources.{BaseRelation, Filter, GreaterThan, TableScan}
+import org.apache.spark.sql.test.SharedSparkSession
+import org.apache.spark.sql.types.{IntegerType, StructField, StructType}
+import org.apache.spark.sql.util.CaseInsensitiveStringMap
+import org.apache.spark.sql.vectorized.ColumnarBatch
+import org.apache.spark.util.ArrayImplicits._
+
+class DataSourceV2Suite extends SharedSparkSession with AdaptiveSparkPlanHelper {
+  import testImplicits._
+
+  private def getBatch(query: DataFrame): AdvancedBatch = {
+    query.queryExecution.executedPlan.collect {
+      case d: BatchScanExec =>
+        d.batch.asInstanceOf[AdvancedBatch]
+    }.head
+  }
+
+  private def getBatchWithV2Filter(query: DataFrame): AdvancedBatchWithV2Filter = {
+    query.queryExecution.executedPlan.collect {
+      case d: BatchScanExec =>
+        d.batch.asInstanceOf[AdvancedBatchWithV2Filter]
+    }.head
+  }
+
+  private def getJavaBatch(query: DataFrame): JavaAdvancedDataSourceV2.AdvancedBatch = {
+    query.queryExecution.executedPlan.collect {
+      case d: BatchScanExec =>
+        d.batch.asInstanceOf[JavaAdvancedDataSourceV2.AdvancedBatch]
+    }.head
+  }
+
+  private def getJavaBatchWithV2Filter(
+      query: DataFrame): JavaAdvancedDataSourceV2WithV2Filter.AdvancedBatchWithV2Filter = {
+    query.queryExecution.executedPlan.collect {
+      case d: BatchScanExec =>
+        d.batch.asInstanceOf[JavaAdvancedDataSourceV2WithV2Filter.AdvancedBatchWithV2Filter]
+    }.head
+  }
+
+  test("invalid data source") {
+    intercept[IllegalArgumentException] {
+      spark.read.format(classOf[InvalidDataSource].getName).load()
+    }
+  }
+
+  test("simplest implementation") {
+    Seq(classOf[SimpleDataSourceV2], classOf[JavaSimpleDataSourceV2]).foreach { cls =>
+      withClue(cls.getName) {
+        val df = spark.read.format(cls.getName).load()
+        checkAnswer(df, (0 until 10).map(i => Row(i, -i)))
+        checkAnswer(df.select($"j"), (0 until 10).map(i => Row(-i)))
+        checkAnswer(df.filter($"i" > 5), (6 until 10).map(i => Row(i, -i)))
+      }
+    }
+  }
+
+  test("advanced implementation") {
+    Seq(classOf[AdvancedDataSourceV2], classOf[JavaAdvancedDataSourceV2]).foreach { cls =>
+      withClue(cls.getName) {
+        val df = spark.read.format(cls.getName).load()
+        checkAnswer(df, (0 until 10).map(i => Row(i, -i)))
+
+        val q1 = df.select($"j")
+        checkAnswer(q1, (0 until 10).map(i => Row(-i)))
+        if (cls == classOf[AdvancedDataSourceV2]) {
+          val batch = getBatch(q1)
+          assert(batch.filters.isEmpty)
+          assert(batch.requiredSchema.fieldNames === Seq("j"))
+        } else {
+          val batch = getJavaBatch(q1)
+          assert(batch.filters.isEmpty)
+          assert(batch.requiredSchema.fieldNames === Seq("j"))
+        }
+
+        val q2 = df.filter($"i" > 3)
+        checkAnswer(q2, (4 until 10).map(i => Row(i, -i)))
+        if (cls == classOf[AdvancedDataSourceV2]) {
+          val batch = getBatch(q2)
+          assert(batch.filters.flatMap(_.references).toSet == Set("i"))
+          assert(batch.requiredSchema.fieldNames === Seq("i", "j"))
+        } else {
+          val batch = getJavaBatch(q2)
+          assert(batch.filters.flatMap(_.references).toSet == Set("i"))
+          assert(batch.requiredSchema.fieldNames === Seq("i", "j"))
+        }
+
+        val q3 = df.select($"i").filter($"i" > 6)
+        checkAnswer(q3, (7 until 10).map(i => Row(i)))
+        if (cls == classOf[AdvancedDataSourceV2]) {
+          val batch = getBatch(q3)
+          assert(batch.filters.flatMap(_.references).toSet == Set("i"))
+          assert(batch.requiredSchema.fieldNames === Seq("i"))
+        } else {
+          val batch = getJavaBatch(q3)
+          assert(batch.filters.flatMap(_.references).toSet == Set("i"))
+          assert(batch.requiredSchema.fieldNames === Seq("i"))
+        }
+
+        val q4 = df.select($"j").filter($"j" < -10)
+        checkAnswer(q4, Nil)
+        if (cls == classOf[AdvancedDataSourceV2]) {
+          val batch = getBatch(q4)
+          // $"j" < 10 is not supported by the testing data source.
+          assert(batch.filters.isEmpty)
+          assert(batch.requiredSchema.fieldNames === Seq("j"))
+        } else {
+          val batch = getJavaBatch(q4)
+          // $"j" < 10 is not supported by the testing data source.
+          assert(batch.filters.isEmpty)
+          assert(batch.requiredSchema.fieldNames === Seq("j"))
+        }
+      }
+    }
+  }
+
+  test("advanced implementation with V2 Filter") {
+    Seq(classOf[AdvancedDataSourceV2WithV2Filter], classOf[JavaAdvancedDataSourceV2WithV2Filter])
+      .foreach { cls =>
+      withClue(cls.getName) {
+        val df = spark.read.format(cls.getName).load()
+        checkAnswer(df, (0 until 10).map(i => Row(i, -i)))
+
+        val q1 = df.select($"j")
+        checkAnswer(q1, (0 until 10).map(i => Row(-i)))
+        if (cls == classOf[AdvancedDataSourceV2WithV2Filter]) {
+          val batch = getBatchWithV2Filter(q1)
+          assert(batch.predicates.isEmpty)
+          assert(batch.requiredSchema.fieldNames === Seq("j"))
+        } else {
+          val batch = getJavaBatchWithV2Filter(q1)
+          assert(batch.predicates.isEmpty)
+          assert(batch.requiredSchema.fieldNames === Seq("j"))
+        }
+
+        val q2 = df.filter($"i" > 3)
+        checkAnswer(q2, (4 until 10).map(i => Row(i, -i)))
+        if (cls == classOf[AdvancedDataSourceV2WithV2Filter]) {
+          val batch = getBatchWithV2Filter(q2)
+          assert(batch.predicates.flatMap(_.references.map(_.describe)).toSet == Set("i"))
+          assert(batch.requiredSchema.fieldNames === Seq("i", "j"))
+        } else {
+          val batch = getJavaBatchWithV2Filter(q2)
+          assert(batch.predicates.flatMap(_.references.map(_.describe)).toSet == Set("i"))
+          assert(batch.requiredSchema.fieldNames === Seq("i", "j"))
+        }
+
+        val q3 = df.select($"i").filter($"i" > 6)
+        checkAnswer(q3, (7 until 10).map(i => Row(i)))
+        if (cls == classOf[AdvancedDataSourceV2WithV2Filter]) {
+          val batch = getBatchWithV2Filter(q3)
+          assert(batch.predicates.flatMap(_.references.map(_.describe)).toSet == Set("i"))
+          assert(batch.requiredSchema.fieldNames === Seq("i"))
+        } else {
+          val batch = getJavaBatchWithV2Filter(q3)
+          assert(batch.predicates.flatMap(_.references.map(_.describe)).toSet == Set("i"))
+          assert(batch.requiredSchema.fieldNames === Seq("i"))
+        }
+
+        val q4 = df.select($"j").filter($"j" < -10)
+        checkAnswer(q4, Nil)
+        if (cls == classOf[AdvancedDataSourceV2WithV2Filter]) {
+          val batch = getBatchWithV2Filter(q4)
+          // $"j" < 10 is not supported by the testing data source.
+          assert(batch.predicates.isEmpty)
+          assert(batch.requiredSchema.fieldNames === Seq("j"))
+        } else {
+          val batch = getJavaBatchWithV2Filter(q4)
+          // $"j" < 10 is not supported by the testing data source.
+          assert(batch.predicates.isEmpty)
+          assert(batch.requiredSchema.fieldNames === Seq("j"))
+        }
+      }
+    }
+  }
+
+  test("columnar batch scan implementation") {
+    Seq(classOf[ColumnarDataSourceV2], classOf[JavaColumnarDataSourceV2]).foreach { cls =>
+      withClue(cls.getName) {
+        val df = spark.read.format(cls.getName).load()
+        checkAnswer(df, (0 until 90).map(i => Row(i, -i)))
+        checkAnswer(df.select($"j"), (0 until 90).map(i => Row(-i)))
+        checkAnswer(df.filter($"i" > 50), (51 until 90).map(i => Row(i, -i)))
+      }
+    }
+  }
+
+  test("schema required data source") {
+    Seq(classOf[SchemaRequiredDataSource], classOf[JavaSchemaRequiredDataSource]).foreach { cls =>
+      withClue(cls.getName) {
+        val e = intercept[IllegalArgumentException](spark.read.format(cls.getName).load())
+        assert(e.getMessage.contains("requires a user-supplied schema"))
+
+        val schema = new StructType().add("i", "int").add("j", "int")
+        val df = spark.read.format(cls.getName).schema(schema).load()
+
+        assert(df.schema == schema)
+        checkAnswer(df, Seq(Row(0, 0), Row(1, -1)))
+      }
+    }
+  }
+
+  test("SPARK-33369: Skip schema inference in DataframeWriter.save() if table provider " +
+    "supports external metadata") {
+    withTempDir { dir =>
+      val cls = classOf[SupportsExternalMetadataWritableDataSource].getName
+      spark.range(10).select($"id" as Symbol("i"), -$"id" as Symbol("j"))
+        .write.format(cls).option("path", dir.getCanonicalPath).mode("append").save()
+      val schema = new StructType().add("i", "long").add("j", "long")
+        checkAnswer(
+          spark.read.format(cls).option("path", dir.getCanonicalPath).schema(schema).load(),
+          spark.range(10).select($"id", -$"id"))
+    }
+  }
+
+  test("partitioning reporting") {
+    import org.apache.spark.sql.functions.{count, sum}
+    withSQLConf(SQLConf.V2_BUCKETING_ENABLED.key -> "true") {
+      Seq(classOf[PartitionAwareDataSource], classOf[JavaPartitionAwareDataSource]).foreach { cls =>
+        withClue(cls.getName) {
+          val df = spark.read.format(cls.getName).load()
+          checkAnswer(df, Seq(Row(1, 4), Row(1, 4), Row(3, 6), Row(2, 6), Row(4, 2), Row(4, 2)))
+
+          val groupByColI = df.groupBy($"i").agg(sum($"j"))
+          checkAnswer(groupByColI, Seq(Row(1, 8), Row(2, 6), Row(3, 6), Row(4, 4)))
+          assert(collectFirst(groupByColI.queryExecution.executedPlan) {
+            case e: ShuffleExchangeExec => e
+          }.isEmpty)
+
+          val groupByColIJ = df.groupBy($"i", $"j").agg(count("*"))
+          checkAnswer(groupByColIJ, Seq(Row(1, 4, 2), Row(2, 6, 1), Row(3, 6, 1), Row(4, 2, 2)))
+          assert(collectFirst(groupByColIJ.queryExecution.executedPlan) {
+            case e: ShuffleExchangeExec => e
+          }.isEmpty)
+
+          val groupByColJ = df.groupBy($"j").agg(sum($"i"))
+          checkAnswer(groupByColJ, Seq(Row(2, 8), Row(4, 2), Row(6, 5)))
+          assert(collectFirst(groupByColJ.queryExecution.executedPlan) {
+            case e: ShuffleExchangeExec => e
+          }.isDefined)
+
+          val groupByIPlusJ = df.groupBy($"i" + $"j").agg(count("*"))
+          checkAnswer(groupByIPlusJ, Seq(Row(5, 2), Row(6, 2), Row(8, 1), Row(9, 1)))
+          assert(collectFirst(groupByIPlusJ.queryExecution.executedPlan) {
+            case e: ShuffleExchangeExec => e
+          }.isDefined)
+        }
+      }
+    }
+  }
+
+  test("ordering and partitioning reporting") {
+    withSQLConf(SQLConf.V2_BUCKETING_ENABLED.key -> "true") {
+      Seq(
+        classOf[OrderAndPartitionAwareDataSource],
+        classOf[JavaOrderAndPartitionAwareDataSource]
+      ).foreach { cls =>
+        withClue(cls.getName) {
+          // we test report ordering (together with report partitioning) with these transformations:
+          // - groupBy("i").flatMapGroups:
+          //   hash-partitions by "i" and sorts each partition by "i"
+          //   requires partitioning and sort by "i"
+          // - aggregation function over window partitioned by "i" and ordered by "j":
+          //   hash-partitions by "i" and sorts each partition by "j"
+          //   requires partitioning by "i" and sort by "i" and "j"
+          Seq(
+            // with no partitioning and no order, we expect shuffling AND sorting
+            (None, None, (true, true), (true, true)),
+            // partitioned by i and no order, we expect NO shuffling BUT sorting
+            (Some("i"), None, (false, true), (false, true)),
+            // partitioned by i and in-partition sorted by i,
+            // we expect NO shuffling AND sorting for groupBy but sorting for window function
+            (Some("i"), Some("i"), (false, false), (false, true)),
+            // partitioned by i and in-partition sorted by j, we expect NO shuffling BUT sorting
+            (Some("i"), Some("j"), (false, true), (false, true)),
+            // partitioned by i and in-partition sorted by i,j, we expect NO shuffling NOR sorting
+            (Some("i"), Some("i,j"), (false, false), (false, false)),
+            // partitioned by j and in-partition sorted by i, we expect shuffling AND sorting
+            (Some("j"), Some("i"), (true, true), (true, true)),
+            // partitioned by j and in-partition sorted by i,j, we expect shuffling and sorting
+            (Some("j"), Some("i,j"), (true, true), (true, true))
+          ).foreach { testParams =>
+            val (partitionKeys, orderKeys, groupByExpects, windowFuncExpects) = testParams
+
+            // With partitioning on `i` and no order keys, the source reports an empty ordering.
+            // So the scan would derive `[i]` from its keys and drop the sort this case expects.
+            // That ordering only holds by accident. The source breaks the `KeyGroupedPartitioning`
+            // contract, as its partition with the key 1 holds `i` values 1, 1 and 3. So the
+            // derivation is turned off for this case.
+            val derive = !(partitionKeys.contains("i") && orderKeys.isEmpty)
+            withClue(f"${partitionKeys.orNull} ${orderKeys.orNull}") {
+              withSQLConf(
+                  SQLConf.V2_BUCKETING_PARTITION_KEY_ORDERING_ENABLED.key -> derive.toString) {
+                val df = spark.read
+                  .option("partitionKeys", partitionKeys.orNull)
+                  .option("orderKeys", orderKeys.orNull)
+                  .format(cls.getName)
+                  .load()
+                checkAnswer(df,
+                  Seq(Row(1, 4), Row(1, 5), Row(3, 5), Row(2, 6), Row(4, 1), Row(4, 2)))
+
+                // groupBy(i).flatMapGroups
+                {
+                  val groupBy = df.groupBy($"i").as[Int, (Int, Int)]
+                    .flatMapGroups { (i: Int, it: Iterator[(Int, Int)]) =>
+                      Iterator.single((i, it.length)) }
+                  checkAnswer(
+                    groupBy.toDF(),
+                    Seq(Row(1, 2), Row(2, 1), Row(3, 1), Row(4, 2))
+                  )
+
+                  val (shuffleExpected, sortExpected) = groupByExpects
+                  assert(collectFirst(groupBy.queryExecution.executedPlan) {
+                    case e: ShuffleExchangeExec => e
+                  }.isDefined === shuffleExpected)
+                  assert(collectFirst(groupBy.queryExecution.executedPlan) {
+                    case e: SortExec => e
+                  }.isDefined === sortExpected)
+                }
+
+                // aggregation function over window partitioned by i and ordered by j
+                {
+                  val windowPartByColIOrderByColJ = df.withColumn("no",
+                    row_number() over Window.partitionBy(Symbol("i")).orderBy(Symbol("j"))
+                  )
+                  checkAnswer(windowPartByColIOrderByColJ, Seq(
+                    Row(1, 4, 1), Row(1, 5, 2), Row(2, 6, 1), Row(3, 5, 1), Row(4, 1, 1),
+                    Row(4, 2, 2)
+                  ))
+
+                  val (shuffleExpected, sortExpected) = windowFuncExpects
+                  assert(collectFirst(windowPartByColIOrderByColJ.queryExecution.executedPlan) {
+                    case e: ShuffleExchangeExec => e
+                  }.isDefined === shuffleExpected)
+                  assert(collectFirst(windowPartByColIOrderByColJ.queryExecution.executedPlan) {
+                    case e: SortExec => e
+                  }.isDefined === sortExpected)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  test("SPARK-59721: ignore an unresolvable ordering reported with connector-defined classes") {
+    Seq(
+      classOf[OrderAndPartitionAwareDataSource],
+      classOf[JavaOrderAndPartitionAwareDataSource]
+    ).foreach { cls =>
+      withClue(cls.getName) {
+        val df = spark.read
+          .option("partitionKeys", "i")
+          .option("orderKeys", "missing")
+          .format(cls.getName)
+          .load()
+        val logAppender = new LogAppender("unresolvable reported ordering")
+        withLogAppender(logAppender, level = Some(Level.WARN)) {
+          checkAnswer(df, Seq(Row(1, 4), Row(1, 5), Row(3, 5), Row(2, 6), Row(4, 1), Row(4, 2)))
+        }
+        val scanRelation = getScanRelation(df)
+        val expectedWarning =
+          s"Spark ignores the ordering reported by ${scanRelation.name} " +
+            s"(scan ${scanRelation.scan.getClass.getName}) because the ordering columns " +
+            "cannot be resolved: missing."
+        val warnings = logAppender.loggingEvents.map(_.getMessage.getFormattedMessage)
+          .filter(_.contains("columns cannot be resolved"))
+        assert(warnings.toSet == Set(expectedWarning), warnings)
+        assert(scanRelation.ordering.isEmpty)
+      }
+    }
+  }
+
+  test ("statistics report data source") {
+    Seq(classOf[ReportStatisticsDataSource], classOf[JavaReportStatisticsDataSource]).foreach {
+      cls =>
+        withClue(cls.getName) {
+          def scanStats: org.apache.spark.sql.catalyst.plans.logical.Statistics = {
+            val df = spark.read.format(cls.getName).load()
+            df.queryExecution.optimizedPlan.collect {
+              case d: DataSourceV2ScanRelation => d
+            }.head.computeStats()
+          }
+
+          withSQLConf(
+              SQLConf.CBO_ENABLED.key -> "false",
+              SQLConf.PLAN_STATS_ENABLED.key -> "false") {
+            val statics = scanStats
+            assert(statics.rowCount.isEmpty,
+              "Row count statics should not be reported when Spark only needs size")
+            assert(statics.sizeInBytes === 80,
+              "Size in bytes statics should be reported by data source")
+          }
+
+          withSQLConf(SQLConf.CBO_ENABLED.key -> "true") {
+            val statics = scanStats
+            assert(statics.rowCount.isDefined && statics.rowCount.get === 10,
+              "Row count statics should be reported by data source")
+            assert(statics.sizeInBytes === 80,
+              "Size in bytes statics should be reported by data source")
+          }
+        }
+    }
+  }
+
+  test("SPARK-23574: no shuffle exchange with single partition") {
+    val df = spark.read.format(classOf[SimpleSinglePartitionSource].getName).load().agg(count("*"))
+    assert(df.queryExecution.executedPlan.collect { case e: Exchange => e }.isEmpty)
+  }
+
+  test("SPARK-44505: should not call planInputPartitions() on explain") {
+    val df = spark.read.format(classOf[ScanDefinedColumnarSupport].getName)
+      .option("columnar", "PARTITION_DEFINED").load()
+    // Default mode will throw an exception on explain.
+    var ex = intercept[IllegalArgumentException](df.explain())
+    assert(ex.getMessage == "planInputPartitions must not be called")
+
+    Seq("SUPPORTED", "UNSUPPORTED").foreach { o =>
+      val dfScan = spark.read.format(classOf[ScanDefinedColumnarSupport].getName)
+        .option("columnar", o).load()
+      dfScan.explain()
+      //  Will fail during regular execution.
+      ex = intercept[IllegalArgumentException](dfScan.count())
+      assert(ex.getMessage == "planInputPartitions must not be called")
+    }
+  }
+
+  test("simple writable data source") {
+    Seq(classOf[SimpleWritableDataSource], classOf[JavaSimpleWritableDataSource]).foreach { cls =>
+      withTempPath { file =>
+        val path = file.getCanonicalPath
+        assert(spark.read.format(cls.getName).option("path", path).load().collect().isEmpty)
+
+        spark.range(10).select($"id" as Symbol("i"), -$"id" as Symbol("j"))
+          .write.format(cls.getName)
+          .option("path", path).mode("append").save()
+        checkAnswer(
+          spark.read.format(cls.getName).option("path", path).load(),
+          spark.range(10).select($"id", -$"id"))
+
+        // default save mode is ErrorIfExists
+        intercept[AnalysisException] {
+          spark.range(10).select($"id" as Symbol("i"), -$"id" as Symbol("j"))
+            .write.format(cls.getName)
+            .option("path", path).save()
+        }
+        spark.range(10).select($"id" as Symbol("i"), -$"id" as Symbol("j"))
+          .write.mode("append").format(cls.getName)
+          .option("path", path).save()
+        checkAnswer(
+          spark.read.format(cls.getName).option("path", path).load(),
+          spark.range(10).union(spark.range(10)).select($"id", -Symbol("id")))
+
+        spark.range(5).select($"id" as Symbol("i"), -$"id" as Symbol("j"))
+          .write.format(cls.getName)
+          .option("path", path).mode("overwrite").save()
+        checkAnswer(
+          spark.read.format(cls.getName).option("path", path).load(),
+          spark.range(5).select($"id", -$"id"))
+
+        checkError(
+          exception = intercept[AnalysisException] {
+            spark.range(5).select($"id" as Symbol("i"), -$"id" as Symbol("j"))
+              .write.format(cls.getName)
+              .option("path", path).mode("ignore").save()
+          },
+          condition = "UNSUPPORTED_DATA_SOURCE_SAVE_MODE",
+          parameters = Map(
+            "source" -> cls.getName,
+            "createMode" -> "\"Ignore\""
+          )
+        )
+
+        checkError(
+          exception = intercept[AnalysisException] {
+            spark.range(5).select($"id" as Symbol("i"), -$"id" as Symbol("j"))
+              .write.format(cls.getName)
+              .option("path", path).mode("error").save()
+          },
+          condition = "UNSUPPORTED_DATA_SOURCE_SAVE_MODE",
+          parameters = Map(
+            "source" -> cls.getName,
+            "createMode" -> "\"ErrorIfExists\""
+          )
+        )
+      }
+    }
+  }
+
+  test("SPARK-58352: WRITING_JOB_FAILED when batch write commit and abort both fail") {
+    val cls = classOf[CommitAndAbortFailingDataSource]
+    checkError(
+      exception = intercept[SparkException] {
+        spark.range(1).select($"id" as Symbol("i"), -$"id" as Symbol("j"))
+          .write.format(cls.getName).mode("append").save()
+      },
+      condition = "WRITING_JOB_FAILED",
+      parameters = Map.empty[String, String])
+  }
+
+  test("simple counter in writer with onDataWriterCommit") {
+    Seq(classOf[SimpleWritableDataSource]).foreach { cls =>
+      withTempPath { file =>
+        val path = file.getCanonicalPath
+        assert(spark.read.format(cls.getName).option("path", path).load().collect().isEmpty)
+
+        val numPartition = 6
+        spark.range(0, 10, 1, numPartition)
+          .select($"id" as Symbol("i"), -$"id" as Symbol("j"))
+          .write.format(cls.getName)
+          .mode("append").option("path", path).save()
+        checkAnswer(
+          spark.read.format(cls.getName).option("path", path).load(),
+          spark.range(10).select($"id", -$"id"))
+
+        assert(SimpleCounter.getCounter == numPartition,
+          "method onDataWriterCommit should be called as many as the number of partitions")
+      }
+    }
+  }
+
+  test("SPARK-23293: data source v2 self join") {
+    val df = spark.read.format(classOf[SimpleDataSourceV2].getName).load()
+    val df2 = df.select(($"i" + 1).as("k"), $"j")
+    checkAnswer(df.join(df2, "j"), (0 until 10).map(i => Row(-i, i, i + 1)))
+  }
+
+  test("SPARK-23301: column pruning with arbitrary expressions") {
+    val df = spark.read.format(classOf[AdvancedDataSourceV2].getName).load()
+
+    val q1 = df.select($"i" + 1)
+    checkAnswer(q1, (1 until 11).map(i => Row(i)))
+    val batch1 = getBatch(q1)
+    assert(batch1.requiredSchema.fieldNames === Seq("i"))
+
+    val q2 = df.select(lit(1))
+    checkAnswer(q2, (0 until 10).map(i => Row(1)))
+    val batch2 = getBatch(q2)
+    assert(batch2.requiredSchema.isEmpty)
+
+    // 'j === 1 can't be pushed down, but we should still be able do column pruning
+    val q3 = df.filter($"j" === -1).select($"j" * 2)
+    checkAnswer(q3, Row(-2))
+    val batch3 = getBatch(q3)
+    assert(batch3.filters.isEmpty)
+    assert(batch3.requiredSchema.fieldNames === Seq("j"))
+
+    // column pruning should work with other operators.
+    val q4 = df.sort($"i").limit(1).select($"i" + 1)
+    checkAnswer(q4, Row(1))
+    val batch4 = getBatch(q4)
+    assert(batch4.requiredSchema.fieldNames === Seq("i"))
+  }
+
+  test("SPARK-23315: get output from canonicalized data source v2 related plans") {
+    def checkCanonicalizedOutput(
+        df: DataFrame, logicalNumOutput: Int, physicalNumOutput: Int): Unit = {
+      val logical = df.queryExecution.analyzed.collect {
+        case d: DataSourceV2Relation => d
+      }.head
+      assert(logical.canonicalized.output.length == logicalNumOutput)
+
+      val physical = df.queryExecution.executedPlan.collect {
+        case d: BatchScanExec => d
+      }.head
+      assert(physical.canonicalized.output.length == physicalNumOutput)
+    }
+
+    val df = spark.read.format(classOf[AdvancedDataSourceV2].getName).load()
+    checkCanonicalizedOutput(df, 2, 2)
+    checkCanonicalizedOutput(df.select($"i"), 2, 1)
+  }
+
+  test("SPARK-25425: extra options should override sessions options during reading") {
+    val prefix = "spark.datasource.userDefinedDataSource."
+    val optionName = "optionA"
+    withSQLConf(prefix + optionName -> "true") {
+      val df = spark
+        .read
+        .option(optionName, false)
+        .format(classOf[DataSourceV2WithSessionConfig].getName).load()
+      val options = df.queryExecution.analyzed.collectFirst {
+        case d: DataSourceV2Relation => d.options
+      }.get
+      assert(options.get(optionName) === "false")
+    }
+  }
+
+  test("SPARK-25425: extra options should override sessions options during writing") {
+    withTempPath { path =>
+      val sessionPath = path.getCanonicalPath
+      withSQLConf("spark.datasource.simpleWritableDataSource.path" -> sessionPath) {
+        withTempPath { file =>
+          val optionPath = file.getCanonicalPath
+          val format = classOf[SimpleWritableDataSource].getName
+
+          val df = Seq((1L, 2L)).toDF("i", "j")
+          df.write.format(format).mode("append").option("path", optionPath).save()
+          assert(!new File(sessionPath).exists)
+          checkAnswer(spark.read.format(format).option("path", optionPath).load(), df)
+        }
+      }
+    }
+  }
+
+  test("SPARK-27411: DataSourceV2Strategy should not eliminate subquery") {
+    withTempView("t1") {
+      val t2 = spark.read.format(classOf[SimpleDataSourceV2].getName).load()
+      Seq(2, 3).toDF("a").createTempView("t1")
+      val df = t2.where("i < (select max(a) from t1)").select($"i")
+      val subqueries = stripAQEPlan(df.queryExecution.executedPlan).collect {
+        case p => p.subqueries
+      }.flatten
+      assert(subqueries.length == 1)
+      checkAnswer(df, (0 until 3).map(i => Row(i)))
+    }
+  }
+
+  test("SPARK-32609: DataSourceV2 with different pushedfilters should be different") {
+    def getScanExec(query: DataFrame): BatchScanExec = {
+      query.queryExecution.executedPlan.collect {
+        case d: BatchScanExec => d
+      }.head
+    }
+
+    Seq(classOf[AdvancedDataSourceV2], classOf[JavaAdvancedDataSourceV2]).foreach { cls =>
+      withClue(cls.getName) {
+        val df = spark.read.format(cls.getName).load()
+        val q1 = df.select($"i").filter($"i" > 6)
+        val q2 = df.select($"i").filter($"i" > 5)
+        val scan1 = getScanExec(q1)
+        val scan2 = getScanExec(q2)
+        assert(!scan1.equals(scan2))
+      }
+    }
+  }
+
+  test("SPARK-33267: push down with condition 'in (..., null)' should not throw NPE") {
+    Seq(classOf[AdvancedDataSourceV2], classOf[JavaAdvancedDataSourceV2]).foreach { cls =>
+      withClue(cls.getName) {
+        val df = spark.read.format(cls.getName).load()
+        // before SPARK-33267 below query just threw NPE
+        df.select($"i").where("i in (1, null)").collect()
+      }
+    }
+  }
+
+  test("SPARK-35803: Support datasorce V2 in CREATE VIEW USING") {
+    Seq(classOf[SimpleDataSourceV2], classOf[JavaSimpleDataSourceV2]).foreach { cls =>
+      withClue(cls.getName) {
+        sql(s"CREATE or REPLACE TEMPORARY VIEW s1 USING ${cls.getName}")
+        checkAnswer(sql("select * from s1"), (0 until 10).map(i => Row(i, -i)))
+        checkAnswer(sql("select j from s1"), (0 until 10).map(i => Row(-i)))
+        checkAnswer(sql("select * from s1 where i > 5"),
+          (6 until 10).map(i => Row(i, -i)))
+      }
+    }
+  }
+
+  test("SPARK-46043: create table in SQL using a DSv2 source") {
+    Seq(classOf[SimpleDataSourceV2], classOf[JavaSimpleDataSourceV2]).foreach { cls =>
+      withClue(cls.getName) {
+        // Create a table with empty schema.
+        withTable("test") {
+          sql(s"CREATE TABLE test USING ${cls.getName}")
+          checkAnswer(
+            sql(s"SELECT * FROM test WHERE i < 3"),
+            Seq(Row(0, 0), Row(1, -1), Row(2, -2)))
+        }
+        // Create a table with non-empty schema is not allowed.
+        checkError(
+          exception = intercept[SparkUnsupportedOperationException] {
+            sql(s"CREATE TABLE test(a INT, b INT) USING ${cls.getName}")
+          },
+          condition = "CANNOT_CREATE_DATA_SOURCE_TABLE.EXTERNAL_METADATA_UNSUPPORTED",
+          parameters = Map("tableName" -> "`default`.`test`", "provider" -> cls.getName)
+        )
+      }
+    }
+  }
+
+  test("SPARK-46043: create table in SQL with schema required data source") {
+    val cls = classOf[SchemaRequiredDataSource]
+    val e = intercept[IllegalArgumentException] {
+      sql(s"CREATE TABLE test USING ${cls.getName}")
+    }
+    assert(e.getMessage.contains("requires a user-supplied schema"))
+    withTable("test") {
+      sql(s"CREATE TABLE test(i INT, j INT) USING ${cls.getName}")
+      checkAnswer(sql(s"SELECT * FROM test"), Seq(Row(0, 0), Row(1, -1)))
+    }
+    withTable("test") {
+      sql(s"CREATE TABLE test(i INT) USING ${cls.getName}")
+      checkAnswer(sql(s"SELECT * FROM test"), Seq(Row(0), Row(1)))
+    }
+    withTable("test") {
+      // Test the behavior when there is a mismatch between the schema defined in the
+      // CREATE TABLE command and the actual schema produced by the data source. The
+      // resulting behavior is not guaranteed and may vary based on the data source's
+      // implementation.
+      sql(s"CREATE TABLE test(i INT, j INT, k INT) USING ${cls.getName}")
+      val e = intercept[Exception] {
+        sql("SELECT * FROM test").collect()
+      }
+      assert(e.getMessage.contains(
+        "java.lang.ArrayIndexOutOfBoundsException: Index 2 out of bounds for length 2"))
+    }
+  }
+
+  test("SPARK-46043: create table in SQL with partitioning required data source") {
+    val cls = classOf[PartitionsRequiredDataSource]
+    val e = intercept[IllegalArgumentException](
+      sql(s"CREATE TABLE test(a INT) USING ${cls.getName}"))
+    assert(e.getMessage.contains("user-supplied partitioning"))
+    withTable("test") {
+      sql(s"CREATE TABLE test(i INT, j INT) USING ${cls.getName} PARTITIONED BY (i)")
+      checkAnswer(sql(s"SELECT * FROM test"), Seq(Row(0, 0), Row(1, -1)))
+    }
+  }
+
+  test("SPARK-46043: create table in SQL with path option") {
+    val cls = classOf[WritableDataSourceSupportsExternalMetadata]
+    withTempDir { dir =>
+      val path = s"${dir.getCanonicalPath}/test"
+      Seq((0, 1), (1, 2)).toDF("x", "y").write.format("csv").save(path)
+      withTable("test") {
+        sql(
+          s"""
+             |CREATE TABLE test USING ${cls.getName}
+             |OPTIONS (PATH '$path')
+             |""".stripMargin)
+        checkAnswer(sql("SELECT * FROM test"), Seq(Row(0, 1), Row(1, 2)))
+        sql(
+          s"""
+             |CREATE OR REPLACE TABLE test USING ${cls.getName}
+             |OPTIONS (PATH '${dir.getCanonicalPath}/non-existing')
+             |""".stripMargin)
+        checkAnswer(sql("SELECT * FROM test"), Nil)
+        sql(
+          s"""
+             |CREATE OR REPLACE TABLE test USING ${cls.getName}
+             |LOCATION '$path'
+             |""".stripMargin)
+        checkAnswer(sql("SELECT * FROM test"), Seq(Row(0, 1), Row(1, 2)))
+      }
+    }
+  }
+
+  test("SPARK-46272: create table - schema mismatch") {
+    withTable("test") {
+      val cls = classOf[WritableDataSourceSupportsExternalMetadata]
+      checkError(
+        exception = intercept[AnalysisException] {
+          sql(s"CREATE TABLE test (x INT, y INT) USING ${cls.getName}")
+        },
+        condition = "DATA_SOURCE_TABLE_SCHEMA_MISMATCH",
+        parameters = Map(
+          "dsSchema" -> "\"STRUCT<i: INT, j: INT>\"",
+          "expectedSchema" -> "\"STRUCT<x: INT, y: INT>\""))
+    }
+  }
+
+  test("SPARK-46272: create table as select") {
+    val cls = classOf[WritableDataSourceSupportsExternalMetadata]
+    withTable("test") {
+      sql(
+        s"""
+           |CREATE TABLE test USING ${cls.getName}
+           |AS VALUES (0, 1), (1, 2) t(i, j)
+           |""".stripMargin)
+      checkAnswer(sql("SELECT * FROM test"), Seq((0, 1), (1, 2)).toDF("i", "j"))
+      sql(
+        s"""
+           |CREATE OR REPLACE TABLE test USING ${cls.getName}
+           |AS VALUES (2, 3), (4, 5) t(i, j)
+           |""".stripMargin)
+      checkAnswer(sql("SELECT * FROM test"), Seq((2, 3), (4, 5)).toDF("i", "j"))
+      sql(
+        s"""
+           |CREATE TABLE IF NOT EXISTS test USING ${cls.getName}
+           |AS VALUES (3, 4), (4, 5)
+           |""".stripMargin)
+      checkAnswer(sql("SELECT * FROM test"), Seq((2, 3), (4, 5)).toDF("i", "j"))
+    }
+  }
+
+  test("SPARK-46272: create table as select - schema name mismatch") {
+    val cls = classOf[WritableDataSourceSupportsExternalMetadata]
+    withTable("test") {
+      checkError(
+        exception = intercept[AnalysisException] {
+          sql(s"CREATE TABLE test USING ${cls.getName} AS VALUES (0, 1), (1, 2)")
+        },
+        condition = "DATA_SOURCE_TABLE_SCHEMA_MISMATCH",
+        parameters = Map(
+          "dsSchema" -> "\"STRUCT<i: INT, j: INT>\"",
+          "expectedSchema" -> "\"STRUCT<col1: INT, col2: INT>\""))
+    }
+  }
+
+  test("SPARK-46272: create table as select - column type mismatch") {
+    val cls = classOf[WritableDataSourceSupportsExternalMetadata]
+    withTable("test") {
+      checkError(
+        exception = intercept[AnalysisException] {
+          sql(
+            s"""
+               |CREATE TABLE test USING ${cls.getName}
+               |AS VALUES ('a', 'b'), ('c', 'd') t(i, j)
+               |""".stripMargin)
+        },
+        condition = "DATA_SOURCE_TABLE_SCHEMA_MISMATCH",
+        parameters = Map(
+          "dsSchema" -> "\"STRUCT<i: INT, j: INT>\"",
+          "expectedSchema" -> "\"STRUCT<i: STRING, j: STRING>\""))
+    }
+  }
+
+  test("SPARK-46272: create or replace table as select with path options") {
+    val cls = classOf[CustomSchemaAndPartitioningDataSource]
+    withTempDir { dir =>
+      val path = s"${dir.getCanonicalPath}/test"
+      Seq((0, 1), (1, 2)).toDF("x", "y").write.format("csv").save(path)
+      withTable("test") {
+        sql(
+          s"""
+             |CREATE TABLE test USING ${cls.getName}
+             |OPTIONS (PATH '$path')
+             |AS VALUES (0, 1)
+             |""".stripMargin)
+        checkAnswer(sql("SELECT * FROM test"), Seq(Row(0, 1), Row(0, 1), Row(1, 2)))
+        // Check the data currently in the path location.
+        checkAnswer(
+          spark.read.format("csv").load(path),
+          Seq(Row("0", "1"), Row("0", "1"), Row("1", "2")))
+        // Replace the table with new data.
+        sql(
+          s"""
+             |CREATE OR REPLACE TABLE test USING ${cls.getName}
+             |OPTIONS (PATH '$path')
+             |AS VALUES (2, 3)
+             |""".stripMargin)
+        checkAnswer(sql("SELECT * FROM test"), Seq(Row(2, 3)))
+        // Replace the table without the path options.
+        sql(
+          s"""
+             |CREATE OR REPLACE TABLE test USING ${cls.getName}
+             |AS VALUES (3, 4)
+             |""".stripMargin)
+        checkAnswer(sql("SELECT * FROM test"), Seq(Row(3, 4)))
+      }
+    }
+  }
+
+  test("SPARK-46272: create table as select with incompatible data sources") {
+    // CTAS with data sources that do not support external metadata.
+    withTable("test") {
+      val cls = classOf[SimpleDataSourceV2]
+      checkError(
+        exception = intercept[SparkUnsupportedOperationException] {
+          sql(s"CREATE TABLE test USING ${cls.getName} AS VALUES (0, 1)")
+        },
+        condition = "CANNOT_CREATE_DATA_SOURCE_TABLE.EXTERNAL_METADATA_UNSUPPORTED",
+        parameters = Map(
+          "tableName" -> "`default`.`test`",
+          "provider" -> "org.apache.spark.sql.connector.SimpleDataSourceV2"))
+    }
+    // CTAS with data sources that do not support batch write.
+    withTable("test") {
+      val cls = classOf[SchemaRequiredDataSource]
+      checkError(
+        exception = intercept[AnalysisException] {
+          sql(s"CREATE TABLE test USING ${cls.getName} AS SELECT * FROM VALUES (0, 1)")
+        },
+        condition = "UNSUPPORTED_FEATURE.TABLE_OPERATION",
+        parameters = Map(
+          "tableName" -> "`spark_catalog`.`default`.`test`",
+          "operation" -> "append in batch mode"))
+    }
+  }
+
+  test("SPARK-46273: insert into") {
+    val cls = classOf[CustomSchemaAndPartitioningDataSource]
+    withTable("test") {
+      sql(
+        s"""
+           |CREATE TABLE test (x INT, y INT) USING ${cls.getName}
+           |""".stripMargin)
+      sql("INSERT INTO test VALUES (1, 2)")
+      checkAnswer(sql("SELECT * FROM test"), Seq(Row(1, 2)))
+      // Insert by name
+      sql("INSERT INTO test(y, x) VALUES (3, 2)")
+      checkAnswer(sql("SELECT * FROM test"), Seq(Row(1, 2), Row(2, 3)))
+      // Can be casted automatically
+      sql("INSERT INTO test(y, x) VALUES (4L, 3L)")
+      checkAnswer(sql("SELECT * FROM test"), Seq(Row(1, 2), Row(2, 3), Row(3, 4)))
+      // Insert values by name
+      sql("INSERT INTO test BY NAME VALUES (5, 4) t(y, x)")
+      checkAnswer(sql("SELECT * FROM test"), Seq(Row(1, 2), Row(2, 3), Row(3, 4), Row(4, 5)))
+      // Missing columns
+      checkError(
+        exception = intercept[AnalysisException] {
+          sql(s"INSERT INTO test VALUES (4)")
+        },
+        condition = "INSERT_COLUMN_ARITY_MISMATCH.NOT_ENOUGH_DATA_COLUMNS",
+        parameters = Map(
+          "tableName" -> "`spark_catalog`.`default`.`test`",
+          "tableColumns" -> "`x`, `y`",
+          "dataColumns" -> "`col1`"
+        )
+      )
+      // Duplicate columns
+      checkError(
+        exception = intercept[AnalysisException] {
+          sql(s"INSERT INTO test(x, x) VALUES (4, 5)")
+        },
+        condition = "COLUMN_ALREADY_EXISTS",
+        parameters = Map("columnName" -> "`x`"))
+    }
+  }
+
+  test("SPARK-46273: insert overwrite") {
+    val cls = classOf[CustomSchemaAndPartitioningDataSource]
+    withTable("test") {
+      sql(
+        s"""
+           |CREATE TABLE test USING ${cls.getName}
+           |AS VALUES (0, 1), (1, 2) t(x, y)
+           |""".stripMargin)
+      sql(
+        s"""
+           |INSERT OVERWRITE test VALUES (2, 3), (3, 4)
+           |""".stripMargin)
+      checkAnswer(sql("SELECT * FROM test"), Seq(Row(2, 3), Row(3, 4)))
+      // Insert overwrite by name
+      sql("INSERT OVERWRITE test(y, x) VALUES (3, 2)")
+      checkAnswer(sql("SELECT * FROM test"), Seq(Row(2, 3)))
+      // Can be casted automatically
+      sql("INSERT OVERWRITE test(y, x) VALUES (4L, 3L)")
+      checkAnswer(sql("SELECT * FROM test"), Seq(Row(3, 4)))
+    }
+  }
+
+  test("SPARK-46273: insert into with partition") {
+    val cls = classOf[CustomSchemaAndPartitioningDataSource]
+    withTable("test") {
+      sql(s"CREATE TABLE test(x INT, y INT) USING ${cls.getName} PARTITIONED BY (x, y)")
+      sql("INSERT INTO test PARTITION(x = 1) VALUES (2)")
+      sql("INSERT INTO test PARTITION(x = 2, y) VALUES (3)")
+      checkAnswer(sql("SELECT * FROM test"), Seq(Row(1, 2), Row(2, 3)))
+      sql("INSERT INTO test PARTITION(y, x = 3) VALUES (4)")
+      checkAnswer(sql("SELECT * FROM test"), Seq(Row(1, 2), Row(2, 3), Row(3, 4)))
+      sql("INSERT INTO test PARTITION(x, y) VALUES (4, 5)")
+      checkAnswer(sql("SELECT * FROM test"), Seq(Row(1, 2), Row(2, 3), Row(3, 4), Row(4, 5)))
+      checkError(
+        exception = intercept[AnalysisException] {
+          sql("INSERT INTO test PARTITION(z = 1) VALUES (2)")
+        },
+        condition = "NON_PARTITION_COLUMN",
+        parameters = Map("columnName" -> "`z`"))
+      checkError(
+        exception = intercept[AnalysisException] {
+          sql("INSERT INTO test PARTITION(x, y = 1) VALUES (2, 3)")
+        },
+        condition = "INSERT_COLUMN_ARITY_MISMATCH.TOO_MANY_DATA_COLUMNS",
+        parameters = Map(
+          "tableName" -> "`spark_catalog`.`default`.`test`",
+          "tableColumns" -> "`x`, `y`",
+          "dataColumns" -> "`col1`, `y`, `col2`")
+      )
+    }
+  }
+
+  test("SPARK-46273: insert overwrite with partition") {
+    val cls = classOf[CustomSchemaAndPartitioningDataSource]
+    withTable("test") {
+      sql(s"CREATE TABLE test (x INT, y INT) USING ${cls.getName} PARTITIONED BY (x, y)")
+      sql("INSERT INTO test PARTITION(x = 1) VALUES (2)")
+      checkError(
+        exception = intercept[AnalysisException] {
+          sql("INSERT OVERWRITE test PARTITION(x = 1) VALUES (5)")
+        },
+        condition = "UNSUPPORTED_FEATURE.TABLE_OPERATION",
+        parameters = Map(
+          "tableName" -> "`spark_catalog`.`default`.`test`",
+          "operation" -> "overwrite by filter in batch mode")
+      )
+    }
+  }
+
+  test("SPARK-47463: Pushed down v2 filter with if expression") {
+    withTempView("t1") {
+      spark.read.format(classOf[AdvancedDataSourceV2WithV2Filter].getName).load()
+        .createTempView("t1")
+      val df = sql("SELECT * FROM  t1 WHERE if(i = 1, i, 0) > 0")
+      val result = df.collect()
+      assert(result.length == 1)
+    }
+  }
+
+  test("SPARK-53809: scan canonicalization") {
+    val table = new SimpleDataSourceV2().getTable(CaseInsensitiveStringMap.empty())
+
+    def createDsv2ScanRelation(): DataSourceV2ScanRelation = {
+      val relation = DataSourceV2Relation.create(
+        table, None, None, CaseInsensitiveStringMap.empty())
+      val scan = relation.table.asReadable.newScanBuilder(relation.options).build()
+      DataSourceV2ScanRelation(relation, scan, relation.output)
+    }
+
+    // Create two DataSourceV2ScanRelation instances, representing the scan of the same table
+    val scanRelation1 = createDsv2ScanRelation()
+    val scanRelation2 = createDsv2ScanRelation()
+
+    // the two instances should not be the same, as they should have different attribute IDs
+    assert(scanRelation1 != scanRelation2,
+      "Two created DataSourceV2ScanRelation instances should not be the same")
+    assert(scanRelation1.output.map(_.exprId).toSet != scanRelation2.output.map(_.exprId).toSet,
+      "Output attributes should have different expression IDs before canonicalization")
+    assert(scanRelation1.relation.output.map(_.exprId).toSet !=
+      scanRelation2.relation.output.map(_.exprId).toSet,
+      "Relation output attributes should have different expression IDs before canonicalization")
+
+    // After canonicalization, the two instances should be equal
+    assert(scanRelation1.canonicalized == scanRelation2.canonicalized,
+      "Canonicalized DataSourceV2ScanRelation instances should be equal")
+  }
+
+  test("SPARK-54163: scan canonicalization for partitioning and ordering aware data source") {
+    val options = new CaseInsensitiveStringMap(Map(
+      "partitionKeys" -> "i",
+      "orderKeys" -> "i,j"
+    ).asJava)
+    val table = new OrderAndPartitionAwareDataSource().getTable(options)
+
+    def createDsv2ScanRelation(): DataSourceV2ScanRelation = {
+      val relation = DataSourceV2Relation.create(table, None, None, options)
+      val scan = relation.table.asReadable.newScanBuilder(relation.options).build()
+      val scanRelation = DataSourceV2ScanRelation(relation, scan, relation.output)
+      // Attach partitioning and ordering information to DataSourceV2ScanRelation
+      V2ScanPartitioningAndOrdering.apply(scanRelation).asInstanceOf[DataSourceV2ScanRelation]
+    }
+
+    // Create two DataSourceV2ScanRelation instances, representing the scan of the same table
+    val scanRelation1 = createDsv2ScanRelation()
+    val scanRelation2 = createDsv2ScanRelation()
+
+    // assert scanRelations have partitioning and ordering
+    assert(scanRelation1.keyGroupedPartitioning.isDefined &&
+      scanRelation1.keyGroupedPartitioning.get.nonEmpty,
+      "DataSourceV2ScanRelation should have key grouped partitioning")
+    assert(scanRelation1.ordering.isDefined && scanRelation1.ordering.get.nonEmpty,
+      "DataSourceV2ScanRelation should have ordering")
+
+    // the two instances should not be the same, as they should have different attribute IDs
+    assert(scanRelation1 != scanRelation2,
+      "Two created DataSourceV2ScanRelation instances should not be the same")
+    assert(scanRelation1.output.map(_.exprId).toSet != scanRelation2.output.map(_.exprId).toSet,
+      "Output attributes should have different expression IDs before canonicalization")
+    assert(scanRelation1.relation.output.map(_.exprId).toSet !=
+      scanRelation2.relation.output.map(_.exprId).toSet,
+      "Relation output attributes should have different expression IDs before canonicalization")
+    assert(scanRelation1.keyGroupedPartitioning.get.flatMap(_.references.map(_.exprId)).toSet !=
+      scanRelation2.keyGroupedPartitioning.get.flatMap(_.references.map(_.exprId)).toSet,
+      "Partitioning columns should have different expression IDs before canonicalization")
+    assert(scanRelation1.ordering.get.flatMap(_.references.map(_.exprId)).toSet !=
+      scanRelation2.ordering.get.flatMap(_.references.map(_.exprId)).toSet,
+      "Ordering columns should have different expression IDs before canonicalization")
+
+    // After canonicalization, the two instances should be equal
+    assert(scanRelation1.canonicalized == scanRelation2.canonicalized,
+      "Canonicalized DataSourceV2ScanRelation instances should be equal")
+  }
+
+  test("SPARK-53809: check mergeScalarSubqueries is effective for DataSourceV2ScanRelation") {
+    val df = spark.read.format(classOf[SimpleDataSourceV2].getName).load()
+    df.createOrReplaceTempView("df")
+
+    val query = sql("select (select max(i) from df) as max_i, (select min(i) from df) as min_i")
+    val optimizedPlan = query.queryExecution.optimizedPlan
+
+    // check optimizedPlan merged scalar subqueries `select max(i), min(i) from df`
+    val sub1 = optimizedPlan.asInstanceOf[Project].projectList.head.collect {
+      case s: ScalarSubquery => s
+    }
+    val sub2 = optimizedPlan.asInstanceOf[Project].projectList(1).collect {
+      case s: ScalarSubquery => s
+    }
+
+    // Both subqueries should reference the same merged plan `select max(i), min(i) from df`
+    assert(sub1.nonEmpty && sub2.nonEmpty, "Both scalar subqueries should exist")
+    assert(sub1.head.plan == sub2.head.plan,
+      "Both subqueries should reference the same merged plan")
+
+    // Extract the aggregate from the merged plan sub1
+    val agg = sub1.head.plan.collect {
+      case a: Aggregate => a
+    }.head
+
+    // Check that the aggregate contains both max(i) and min(i)
+    val aggFunctionSet = agg.aggregateExpressions.flatMap { expr =>
+      expr.collect {
+        case ae: org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression =>
+          ae.aggregateFunction
+      }
+    }.toSet
+
+    assert(aggFunctionSet.size == 2, "Aggregate should contain exactly two aggregate functions")
+    assert(aggFunctionSet
+      .exists(_.isInstanceOf[org.apache.spark.sql.catalyst.expressions.aggregate.Max]),
+      "Aggregate should contain max(i)")
+    assert(aggFunctionSet
+      .exists(_.isInstanceOf[org.apache.spark.sql.catalyst.expressions.aggregate.Min]),
+      "Aggregate should contain min(i)")
+
+    // Verify the query produces correct results
+    checkAnswer(query, Row(9, 0))
+  }
+
+  test(
+    "SPARK-54163: check mergeScalarSubqueries is effective for OrderAndPartitionAwareDataSource"
+  ) {
+    withSQLConf(SQLConf.V2_BUCKETING_ENABLED.key -> "true") {
+      val options = Map(
+        "partitionKeys" -> "i",
+        "orderKeys" -> "i,j"
+      )
+
+      // Create the OrderAndPartitionAwareDataSource DataFrame
+      val df = spark.read
+        .format(classOf[OrderAndPartitionAwareDataSource].getName)
+        .options(options)
+        .load()
+      df.createOrReplaceTempView("df")
+
+      val query = sql("select (select max(i) from df) as max_i, (select min(i) from df) as min_i")
+      val optimizedPlan = query.queryExecution.optimizedPlan
+
+      // check optimizedPlan merged scalar subqueries `select max(i), min(i) from df`
+      val sub1 = optimizedPlan.asInstanceOf[Project].projectList.head.collect {
+        case s: ScalarSubquery => s
+      }
+      val sub2 = optimizedPlan.asInstanceOf[Project].projectList(1).collect {
+        case s: ScalarSubquery => s
+      }
+
+      // Both subqueries should reference the same merged plan `select max(i), min(i) from df`
+      assert(sub1.nonEmpty && sub2.nonEmpty, "Both scalar subqueries should exist")
+      assert(sub1.head.plan == sub2.head.plan,
+        "Both subqueries should reference the same merged plan")
+
+      // Extract the aggregate from the merged plan sub1
+      val agg = sub1.head.plan.collect {
+        case a: Aggregate => a
+      }.head
+
+      // Check that the aggregate contains both max(i) and min(i)
+      val aggFunctionSet = agg.aggregateExpressions.flatMap { expr =>
+        expr.collect {
+          case ae: org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression =>
+            ae.aggregateFunction
+        }
+      }.toSet
+
+      assert(aggFunctionSet.size == 2, "Aggregate should contain exactly two aggregate functions")
+      assert(aggFunctionSet
+        .exists(_.isInstanceOf[org.apache.spark.sql.catalyst.expressions.aggregate.Max]),
+        "Aggregate should contain max(i)")
+      assert(aggFunctionSet
+        .exists(_.isInstanceOf[org.apache.spark.sql.catalyst.expressions.aggregate.Min]),
+        "Aggregate should contain min(i)")
+
+      // Verify the query produces correct results
+      checkAnswer(query, Row(4, 1))
+    }
+  }
+
+  private def getScanRelation(query: DataFrame): DataSourceV2ScanRelation = {
+    query.queryExecution.optimizedPlan.collect {
+      case s: DataSourceV2ScanRelation => s
+    }.head
+  }
+
+  private def hasIGt3(condition: CatalystExpression): Boolean = {
+    condition.exists {
+      case CatalystGreaterThan(attr: AttributeReference, CatalystLiteral(value: Int, _)) =>
+        attr.name == "i" && value == 3
+      case _ => false
+    }
+  }
+
+  private def containsFilter(condition: CatalystExpression, filter: String): Boolean = {
+    val expected = CatalystSqlParser.parseExpression(filter).sql
+    condition.exists(_.sql == expected)
+  }
+
+  private def hasJLtNeg5(condition: CatalystExpression): Boolean = {
+    condition.exists {
+      case CatalystLessThan(attr: AttributeReference, CatalystLiteral(value: Int, _)) =>
+        attr.name == "j" && value == -5
+      case _ => false
+    }
+  }
+
+  test("Spark post-pushdown adjustments re-add fully pushed predicates") {
+    val df = spark.read.format(
+      classOf[AdvancedDataSourceV2WithSparkPostPushdownAdjustments].getName).load()
+    val q = df.filter($"i" > 3)
+    checkAnswer(q, (4 until 10).map(i => Row(i, -i)))
+
+    val plan = q.queryExecution.optimizedPlan
+    assert(plan.collect { case f: LogicalFilter => f }.exists(f => hasIGt3(f.condition)),
+      s"Expected i > 3 in a post-scan Filter when Spark owns post-pushdown adjustments:\n$plan")
+    val scan = getScanRelation(q)
+    assert(scan.pushedFilters.exists(hasIGt3),
+      "scan.pushedFilters should still record the pushed predicate")
+  }
+
+  test("Spark post-pushdown adjustments use delegated stats end-to-end") {
+    withSQLConf(SQLConf.CBO_ENABLED.key -> "true") {
+      val df = spark.read.format(
+        classOf[AdvancedDataSourceV2WithSparkPostPushdownAdjustments].getName).load()
+      val q = df.filter($"i" > 3)
+      checkAnswer(q, (4 until 10).map(i => Row(i, -i)))
+
+      val scan = getScanRelation(q)
+      val stats = scan.stats
+      val expectedSize = EstimationUtils.getOutputSize(
+        scan.output, BigInt(10), stats.attributeStats)
+      assert(stats.rowCount.contains(BigInt(10)),
+        "fake connector should delegate numRows through scan stats")
+      assert(stats.sizeInBytes === expectedSize,
+        "fake connector should use Spark's projection-aware scan-delegated stats size")
+      assert(q.queryExecution.optimizedPlan.stats.rowCount.contains(BigInt(7)),
+        "re-added pushed predicate should adjust plan row count from the scan's pre-filter stats")
+    }
+  }
+
+  test("scan stats alone do not imply Spark post-pushdown adjustments") {
+    withSQLConf(SQLConf.CBO_ENABLED.key -> "true") {
+      val df = spark.read.format(classOf[AdvancedDataSourceV2WithScanStats].getName).load()
+      val q = df.filter($"i" > 3)
+      checkAnswer(q, (4 until 10).map(i => Row(i, -i)))
+
+      val plan = q.queryExecution.optimizedPlan
+      assert(!plan.collect { case f: LogicalFilter => f }.exists(f => hasIGt3(f.condition)),
+        s"i > 3 should be stripped from the post-scan Filter by default:\n$plan")
+
+      val scan = getScanRelation(q)
+      val stats = scan.stats
+      assert(scan.scan.asInstanceOf[SupportsReportStatistics].reflectsFullyPushedDownFilters(),
+        "this fake connector reports scan stats as post-pushdown by default")
+      assert(stats.rowCount.contains(BigInt(2)),
+        "connector should use scan rowCount")
+      assert(stats.sizeInBytes === BigInt(32),
+        "connector should use scan sizeInBytes")
+    }
+  }
+
+  test("V1ScanWrapper delegates optional reported statistics") {
+    val v1Scan = new V1Scan with SupportsReportStatistics {
+      override def readSchema(): StructType = TestingV2Source.schema
+      override def toV1TableScan[T <: BaseRelation with TableScan](context: SQLContext): T =
+        throw new UnsupportedOperationException("not used")
+      override def estimateStatistics(): Statistics = new Statistics {
+        override def sizeInBytes(): OptionalLong = OptionalLong.of(128L)
+        override def numRows(): OptionalLong = OptionalLong.of(8L)
+      }
+      override def estimateSizeInBytes(): OptionalLong = OptionalLong.of(64L)
+      override def reflectsFullyPushedDownFilters(): Boolean = false
+      override def useInferredFilterEstimation(): Boolean = true
+    }
+
+    val wrapper = V1ScanWrapper(v1Scan, Nil,
+      PushedDownOperators(None, None, None, None, Nil, Nil, Nil, None))
+
+    val stats = wrapper.estimateStatistics()
+    assert(stats.sizeInBytes().getAsLong === 128L)
+    assert(stats.numRows().getAsLong === 8L)
+    assert(wrapper.estimateSizeInBytes().getAsLong === 64L)
+    assert(!wrapper.reflectsFullyPushedDownFilters())
+    assert(wrapper.useInferredFilterEstimation())
+  }
+
+  test("V1ScanWrapper uses empty/default statistics when V1 scan does not report them") {
+    val v1Scan = new V1Scan {
+      override def readSchema(): StructType = TestingV2Source.schema
+      override def toV1TableScan[T <: BaseRelation with TableScan](context: SQLContext): T =
+        throw new UnsupportedOperationException("not used")
+    }
+
+    val wrapper = V1ScanWrapper(v1Scan, Nil,
+      PushedDownOperators(None, None, None, None, Nil, Nil, Nil, None))
+
+    val stats = wrapper.estimateStatistics()
+    assert(!stats.sizeInBytes().isPresent)
+    assert(!stats.numRows().isPresent)
+    assert(!wrapper.estimateSizeInBytes().isPresent)
+    assert(wrapper.reflectsFullyPushedDownFilters())
+    assert(!wrapper.useInferredFilterEstimation())
+  }
+
+  test("Spark post-pushdown adjustments are not added for scans without reported stats") {
+    withSQLConf(SQLConf.CONSTRAINT_PROPAGATION_ENABLED.key -> "false") {
+      val df = spark.read.format(classOf[AdvancedDataSourceV2].getName).load()
+      val q = df.filter($"i" > 3)
+      checkAnswer(q, (4 until 10).map(i => Row(i, -i)))
+
+      val plan = q.queryExecution.optimizedPlan
+      assert(!plan.collect { case f: LogicalFilter => f }.exists(f => hasIGt3(f.condition)),
+        s"i > 3 should not be re-added without SupportsReportStatistics opt-in:\n$plan")
+
+      val scan = getScanRelation(q)
+      assert(scan.pushedFilters.exists(hasIGt3),
+        "scan.pushedFilters should still record the pushed predicate")
+    }
+  }
+
+  test("Spark post-pushdown adjustments merge pushed and unpushed predicates") {
+    val df = spark.read.format(
+      classOf[AdvancedDataSourceV2WithSparkPostPushdownAdjustments].getName).load()
+    val q = df.filter($"i" > 3 && $"j" < -5)
+    checkAnswer(q, (6 until 10).map(i => Row(i, -i)))
+
+    val optimizedPlan = q.queryExecution.optimizedPlan
+    val directScanFilters = optimizedPlan.collect {
+      case LogicalFilter(condition, _: DataSourceV2ScanRelation) => condition
+    }
+    assert(directScanFilters.length == 1,
+      s"pushed and unpushed predicates should be merged into one Filter above the scan:\n" +
+        optimizedPlan)
+    assert(hasIGt3(directScanFilters.head))
+    assert(hasJLtNeg5(directScanFilters.head))
+  }
+
+  test("Spark post-pushdown adjustments preserve projection when re-adding predicates") {
+    withSQLConf(SQLConf.CONSTRAINT_PROPAGATION_ENABLED.key -> "false") {
+      val df = spark.read.format(
+        classOf[AdvancedDataSourceV2WithSparkPostPushdownAdjustments].getName).load()
+      val q = df.filter($"i" > 3).select($"j")
+      checkAnswer(q, (4 until 10).map(i => Row(-i)))
+
+      val optimizedPlan = q.queryExecution.optimizedPlan
+      val directScanFilters = optimizedPlan.collect {
+        case LogicalFilter(condition, _: DataSourceV2ScanRelation) => condition
+      }
+      assert(directScanFilters.length == 1,
+        s"pushed predicate should be re-added directly above the scan before projection:\n" +
+          optimizedPlan)
+      assert(hasIGt3(directScanFilters.head))
+      assert(optimizedPlan.output.map(_.name) == Seq("j"))
+
+      val scan = getScanRelation(q)
+      assert(scan.output.exists(_.name == "i"),
+        "scan output should retain the pushed-filter column needed for the re-added predicate")
+      assert(scan.output.exists(_.name == "j"),
+        "scan output should retain the projected column")
+    }
+  }
+
+  test("Spark post-pushdown adjustments skip pushed predicates pruned from scan output") {
+    withSQLConf(SQLConf.CONSTRAINT_PROPAGATION_ENABLED.key -> "false") {
+      val df = spark.read.format(
+        classOf[AdvancedDataSourceV2WithBestEffortSparkPostPushdownAdjustments].getName).load()
+      val q = df.filter($"i" > 3).select($"j")
+      checkAnswer(q, (4 until 10).map(i => Row(-i)))
+
+      val scan = getScanRelation(q)
+      assert(!scan.output.exists(_.name == "i"),
+        "column i should be pruned from the scan output")
+      assert(!scan.scan.asInstanceOf[SupportsReportStatistics].reflectsFullyPushedDownFilters(),
+        "fake connector should request Spark post-pushdown adjustments")
+      // SPARK-40259 made pushedFilters the complete set: it keeps a fully-pushed filter even when
+      // the filter's column is pruned from the scan output (the adjustment below uses a separate,
+      // pruned-output-remapped set, so it still does not re-add i > 3).
+      assert(scan.pushedFilters.exists(hasIGt3),
+        "pushedFilters keeps i > 3 even though column i was pruned (complete-set semantics)")
+
+      val optimizedPlan = q.queryExecution.optimizedPlan
+      assert(!optimizedPlan.collect { case f: LogicalFilter => f }.exists(f =>
+        hasIGt3(f.condition)),
+        s"pruned pushed predicate should not be re-added above the scan:\n$optimizedPlan")
+    }
+  }
+
+  test("Spark post-pushdown adjustments re-add pushed predicates below stacked residual filters") {
+    withSQLConf(SQLConf.CONSTRAINT_PROPAGATION_ENABLED.key -> "false") {
+      // Non-deterministic, always-true residual filters: they cannot be pushed down and cannot be
+      // combined with each other, so two Filter nodes stay stacked above the scan. This forces
+      // addToScan to recurse through the outer Filter to re-add the fully pushed i > 3.
+      val alwaysTrue = udf((_: Int) => true).asNondeterministic()
+      val df = spark.read.format(
+        classOf[AdvancedDataSourceV2WithSparkPostPushdownAdjustments].getName).load()
+      val q = df.filter($"i" > 3).filter(alwaysTrue($"i")).filter(alwaysTrue($"j"))
+      checkAnswer(q, (4 until 10).map(i => Row(i, -i)))
+
+      val optimizedPlan = q.queryExecution.optimizedPlan
+      val filters = optimizedPlan.collect { case f: LogicalFilter => f }
+      assert(filters.length == 2,
+        s"the two non-deterministic residual filters should stay stacked above the scan:\n" +
+          optimizedPlan)
+      val directScanFilters = optimizedPlan.collect {
+        case LogicalFilter(condition, _: DataSourceV2ScanRelation) => condition
+      }
+      assert(directScanFilters.length == 1,
+        s"pushed predicate should be re-added into the filter directly above the scan:\n" +
+          optimizedPlan)
+      assert(hasIGt3(directScanFilters.head),
+        s"addToScan should recurse through the outer residual filter to re-add i > 3:\n" +
+          optimizedPlan)
+    }
+  }
+
+  test("pushedFilters are set for fully pushed filters") {
+    val df = spark.read.format(classOf[AdvancedDataSourceV2].getName).load()
+    // AdvancedDataSourceV2 only supports pushing GreaterThan on column "i".
+    // i > 3 matches, so it is fully pushed.
+    val q = df.filter($"i" > 3)
+    checkAnswer(q, (4 until 10).map(i => Row(i, -i)))
+
+    val scanRelation = getScanRelation(q)
+    assert(scanRelation.pushedFilters.nonEmpty,
+      "pushedFilters should be non-empty when filters are fully pushed")
+    // The pushed filter should reference column i
+    assert(scanRelation.pushedFilters.flatMap(_.references.map(_.name)).contains("i"))
+  }
+
+  test("pushedFilters are empty when no filters are pushed") {
+    val df = spark.read.format(classOf[AdvancedDataSourceV2].getName).load()
+    // AdvancedDataSourceV2 only supports pushing GreaterThan on column "i".
+    // j < -10 does not match, so it is not pushed.
+    val q = df.filter($"j" < -10)
+    checkAnswer(q, Nil)
+
+    val scanRelation = getScanRelation(q)
+    assert(scanRelation.pushedFilters.isEmpty,
+      "pushedFilters should be empty when no filters are pushed")
+  }
+
+  test("pushedFilters are empty when no filter is present") {
+    val df = spark.read.format(classOf[AdvancedDataSourceV2].getName).load()
+    val q = df.select($"i", $"j")
+    checkAnswer(q, (0 until 10).map(i => Row(i, -i)))
+
+    val scanRelation = getScanRelation(q)
+    assert(scanRelation.pushedFilters.isEmpty,
+      "pushedFilters should be empty when there is no filter")
+  }
+
+  test("pushedFilters contains only pushed filters in mixed case") {
+    val df = spark.read.format(classOf[AdvancedDataSourceV2].getName).load()
+    // AdvancedDataSourceV2 only supports pushing GreaterThan on column "i".
+    // i > 3 matches so it is pushed; j < 0 does not match so it is not pushed.
+    val q = df.filter($"i" > 3 && $"j" < 0)
+    checkAnswer(q, (4 until 10).map(i => Row(i, -i)))
+
+    val scanRelation = getScanRelation(q)
+    // Only i > 3 should be in pushedFilters, not j < 0
+    assert(scanRelation.pushedFilters.nonEmpty,
+      "pushedFilters should be non-empty for the pushed portion")
+    val referencedCols = scanRelation.pushedFilters.flatMap(_.references.map(_.name)).toSet
+    assert(referencedCols.contains("i"),
+      "pushedFilters should contain the pushed filter on column i")
+    assert(!referencedCols.contains("j"),
+      "pushedFilters should not contain the unsupported filter on column j")
+  }
+
+  test("pushedFilters does not include filters that remain as post-scan") {
+    val df = spark.read.format(classOf[OverlappingFilterDataSourceV2].getName).load()
+    // OverlappingFilterDataSourceV2 only evaluates GreaterThan on column "i".
+    // i > 3 is fully pushed; j < 0 overlaps (reported by pushedFilters() but also post-scan).
+    val q = df.filter($"i" > 3 && $"j" < 0)
+    checkAnswer(q, (4 until 10).map(i => Row(i, -i)))
+
+    val scanRelation = getScanRelation(q)
+    // Only i > 3 should be in pushedFilters (fully pushed, not in post-scan).
+    // j < 0 is in post-scan so it should be excluded from pushedFilters despite being
+    // reported by the scan's pushedFilters() API.
+    assert(scanRelation.pushedFilters.nonEmpty,
+      "pushedFilters should contain the fully-pushed filter")
+    val referencedCols = scanRelation.pushedFilters.flatMap(_.references.map(_.name)).toSet
+    assert(referencedCols.contains("i"),
+      "pushedFilters should contain the fully-pushed filter on column i")
+    assert(!referencedCols.contains("j"),
+      "pushedFilters should not contain the overlapping filter on column j")
+  }
+
+  test("pushedFilters with V2 filter API") {
+    val df = spark.read.format(classOf[AdvancedDataSourceV2WithV2Filter].getName).load()
+    // i > 3 is fully pushed via V2 filter API
+    val q = df.filter($"i" > 3)
+    checkAnswer(q, (4 until 10).map(i => Row(i, -i)))
+
+    val scanRelation = getScanRelation(q)
+    assert(scanRelation.pushedFilters.nonEmpty,
+      "pushedFilters should be non-empty with V2 filter API")
+    assert(scanRelation.pushedFilters.flatMap(_.references.map(_.name)).contains("i"))
+  }
+
+  test("pushedFilters with V2 filter API contains only pushed filters in mixed case") {
+    val df = spark.read.format(classOf[AdvancedDataSourceV2WithV2Filter].getName).load()
+    // AdvancedScanBuilderWithV2Filter only supports pushing ">" predicates.
+    // i > 3 has predicate name ">" so it is pushed; j < 0 has predicate name "<" so it is not.
+    val q = df.filter($"i" > 3 && $"j" < 0)
+    checkAnswer(q, (4 until 10).map(i => Row(i, -i)))
+
+    val scanRelation = getScanRelation(q)
+    assert(scanRelation.pushedFilters.nonEmpty,
+      "pushedFilters should be non-empty for the pushed portion")
+    val referencedCols = scanRelation.pushedFilters.flatMap(_.references.map(_.name)).toSet
+    assert(referencedCols.contains("i"),
+      "pushedFilters should contain the pushed filter on column i")
+    assert(!referencedCols.contains("j"),
+      "pushedFilters should not contain the unsupported filter on column j")
+  }
+
+  test("pushedFilters keep the relation-level struct type after nested schema pruning") {
+    val df = spark.read.format(classOf[NestedSchemaDataSourceV2].getName).load()
+    // NestedSchemaScanBuilder pushes GreaterThan on "s.a".
+    // Selecting only s.a triggers nested schema pruning: the scan output narrows s to struct<a>,
+    // but pushedFilters records the fully-pushed filter against the relation's pre-pruning schema,
+    // so its struct column keeps the full type struct<a, b>.
+    val q = df.select($"s.a").filter($"s.a" > 3)
+    checkAnswer(q, (4 until 10).map(i => Row(i)))
+
+    val scanRelation = getScanRelation(q)
+    assert(scanRelation.pushedFilters.nonEmpty,
+      "pushedFilters should be non-empty")
+    val structAttrs = scanRelation.pushedFilters
+      .flatMap(_.collect { case a: AttributeReference if a.name == "s" => a })
+    assert(structAttrs.nonEmpty, "pushed filter should reference struct column s")
+    val structType = structAttrs.head.dataType.asInstanceOf[StructType]
+    assert(structType.fieldNames.toSeq == Seq("a", "b"),
+      s"struct column in pushed filter should keep type struct<a, b> but was $structType")
+  }
+
+  test("pushedFilters keep filters referencing pruned nested struct fields") {
+    // Disable constraint propagation so IsNotNull(s.a) is not added as a post-scan
+    // filter (it would keep field a alive in the struct).
+    withSQLConf(SQLConf.CONSTRAINT_PROPAGATION_ENABLED.key -> "false") {
+      val df = spark.read.format(classOf[NestedSchemaDataSourceV2].getName).load()
+      // Filter on s.a but select only s.b. Column pruning narrows the scan output's s to struct<b>,
+      // but pushedFilters keeps the fully-pushed filter on s.a (against the relation schema) so a
+      // later scan merge can re-enforce it.
+      val q = df.filter($"s.a" > 3).select($"s.b")
+      checkAnswer(q, (4 until 10).map(i => Row(-i)))
+
+      val scanRelation = getScanRelation(q)
+      val referencedStructFields = scanRelation.pushedFilters.flatMap { filter =>
+        filter.collect { case a: AttributeReference if a.name == "s" => a }
+          .flatMap(_.dataType.asInstanceOf[StructType].fieldNames)
+      }
+      assert(referencedStructFields.contains("a"),
+        "pushedFilters should keep the filter referencing nested field a")
+    }
+  }
+
+  test("scan canonicalization with pushedFilters") {
+    // Use SimpleDataSourceV2 whose scan implements equals, so canonicalization comparison works
+    val table = new SimpleDataSourceV2().getTable(CaseInsensitiveStringMap.empty())
+
+    val relation1 = DataSourceV2Relation.create(
+      table, None, None, CaseInsensitiveStringMap.empty())
+    val relation2 = DataSourceV2Relation.create(
+      table, None, None, CaseInsensitiveStringMap.empty())
+    val scan1 = relation1.table.asReadable.newScanBuilder(relation1.options).build()
+    val scan2 = relation2.table.asReadable.newScanBuilder(relation2.options).build()
+
+    val filter1 = CatalystGreaterThan(relation1.output.head, CatalystLiteral(3))
+    val filter2 = CatalystGreaterThan(relation2.output.head, CatalystLiteral(3))
+
+    val scanRelation1 = DataSourceV2ScanRelation(relation1, scan1, relation1.output,
+      pushedFilters = Seq(filter1))
+    val scanRelation2 = DataSourceV2ScanRelation(relation2, scan2, relation2.output,
+      pushedFilters = Seq(filter2))
+
+    assert(scanRelation1 != scanRelation2,
+      "Two instances should not be equal before canonicalization")
+    assert(scanRelation1.canonicalized == scanRelation2.canonicalized,
+      "Canonicalized instances with equivalent pushedFilters should be equal")
+  }
+
+  test("scan canonicalization distinguishes different pushedFilters") {
+    // Negative counterpart to the test above: two scans of the same relation whose pushedFilters
+    // differ must NOT canonicalize equal. This inequality is what lets MergeSubplans tell the two
+    // scans apart; if they compared equal it could treat them as identical and apply one side's
+    // filter to both -- a wrong-answer bug.
+    val table = new SimpleDataSourceV2().getTable(CaseInsensitiveStringMap.empty())
+
+    val relation1 = DataSourceV2Relation.create(
+      table, None, None, CaseInsensitiveStringMap.empty())
+    val relation2 = DataSourceV2Relation.create(
+      table, None, None, CaseInsensitiveStringMap.empty())
+    val scan1 = relation1.table.asReadable.newScanBuilder(relation1.options).build()
+    val scan2 = relation2.table.asReadable.newScanBuilder(relation2.options).build()
+
+    val filter1 = CatalystGreaterThan(relation1.output.head, CatalystLiteral(3))
+    val filter2 = CatalystGreaterThan(relation2.output.head, CatalystLiteral(5))
+
+    val scanRelation1 = DataSourceV2ScanRelation(relation1, scan1, relation1.output,
+      pushedFilters = Seq(filter1))
+    val scanRelation2 = DataSourceV2ScanRelation(relation2, scan2, relation2.output,
+      pushedFilters = Seq(filter2))
+
+    assert(scanRelation1.canonicalized != scanRelation2.canonicalized,
+      "Canonicalized instances with different pushedFilters must not be equal")
+  }
+
+  test("pushedFilters excludes non-deterministic filters") {
+    val df = spark.read.format(classOf[AdvancedDataSourceV2].getName).load()
+    // i > 3 is pushable and deterministic; rand() > 0.5 is non-deterministic and not pushable.
+    // Before the fix, ExpressionSet.contains would miss the non-deterministic filter,
+    // causing it to incorrectly appear in pushedFilterExpressions.
+    val q = df.filter($"i" > 3 && rand() > 0.5)
+
+    val scanRelation = getScanRelation(q)
+    // pushedFilters should only contain the deterministic pushed filter (i > 3).
+    assert(scanRelation.pushedFilters.nonEmpty,
+      "pushedFilters should contain the deterministic pushed filter")
+    assert(scanRelation.pushedFilters.forall(_.deterministic),
+      "pushedFilters should not contain non-deterministic filters")
+    val referencedCols = scanRelation.pushedFilters.flatMap(_.references.map(_.name)).toSet
+    assert(referencedCols.contains("i"),
+      "pushedFilters should contain the pushed filter on column i")
+  }
+
+  test("catalyst filter pushdown skips non-deterministic filters") {
+    val df = spark.read.format(classOf[CatalystFilterDataSourceV2].getName).load()
+    val q = df.filter($"i" > 3 && rand() > 0.5)
+
+    val scanRelation = getScanRelation(q)
+    assert(scanRelation.pushedFilters.nonEmpty,
+      "pushedFilters should contain the deterministic pushed filter")
+    assert(scanRelation.pushedFilters.forall(_.deterministic),
+      "pushedFilters should not contain non-deterministic filters")
+    val referencedCols = scanRelation.pushedFilters.flatMap(_.references.map(_.name)).toSet
+    assert(referencedCols.contains("i"),
+      "pushedFilters should contain the pushed filter on column i")
+
+    // The non-deterministic filter is not pushed, so it must be retained as a post-scan
+    // Filter above the scan to still be evaluated.
+    val postScanConditions = q.queryExecution.optimizedPlan.collect {
+      case f: LogicalFilter => f.condition
+    }
+    assert(postScanConditions.exists(cond => cond.exists(!_.deterministic)),
+      "non-deterministic filter should be retained as a post-scan Filter")
+  }
+
+  test("inferred filters remain scan metadata") {
+    // Rows satisfy j = -i, so i > 2 implies the inferred predicate j < -2.
+    val query = spark.read
+      .format(classOf[CatalystFilterDataSourceV2].getName)
+      .option(CatalystFilterScanBuilder.INFERRED_DERIVATION,
+        CatalystFilterScanBuilder.NEGATE_I_TO_J)
+      .load()
+      .filter($"i" > 2)
+
+    checkAnswer(query, (3 until 10).map(i => Row(i, -i)))
+    val inferredFilter = "j < -2"
+    val filters = query.queryExecution.optimizedPlan.collect {
+      case filter: LogicalFilter => filter.condition
+    }
+    assert(!filters.exists(containsFilter(_, inferredFilter)),
+      s"inferred filter $inferredFilter should remain outside the logical Filter:\n" +
+        query.queryExecution.optimizedPlan)
+    assert(getScanRelation(query).inferredFilters.exists(containsFilter(_, inferredFilter)),
+      "inferred filter should be recorded on the scan relation")
+    val execFilters = query.queryExecution.executedPlan.collect {
+      case filter: FilterExec => filter.condition
+    }
+    assert(!execFilters.exists(containsFilter(_, inferredFilter)),
+      s"inferred filter $inferredFilter should not reach FilterExec:\n" +
+        query.queryExecution.executedPlan)
+  }
+
+  test("inferred filters respect scan statistics ownership") {
+    withSQLConf(SQLConf.CBO_ENABLED.key -> "true") {
+      val exactStatsQuery = spark.read
+        .format(classOf[CatalystFilterDataSourceV2].getName)
+        .option(CatalystFilterScanBuilder.INFERRED_DERIVATION,
+          CatalystFilterScanBuilder.NEGATE_I_TO_J)
+        // Exact statistics report the seven filtered rows, so Spark must not adjust them again.
+        .option(CatalystFilterScanBuilder.REFLECTS_FULLY_PUSHED_DOWN_FILTERS, "true")
+        .option(CatalystFilterScanBuilder.REPORTED_ROW_COUNT, "7")
+        .option(CatalystFilterScanBuilder.REPORT_COLUMN_STATS, "true")
+        .load()
+        .filter($"i" > 2)
+      checkAnswer(exactStatsQuery, (3 until 10).map(i => Row(i, -i)))
+      val exactStatsPlan = exactStatsQuery.queryExecution.optimizedPlan
+      val exactStatsScan = getScanRelation(exactStatsQuery)
+      assert(exactStatsScan.stats.rowCount.contains(BigInt(7)))
+      assert(exactStatsScan.inferredFilters.exists(containsFilter(_, "j < -2")),
+        "the valid inferred filter should remain scan metadata")
+      assert(exactStatsPlan.stats.rowCount.contains(BigInt(7)),
+        s"exact scan statistics must not be filtered again:\n$exactStatsPlan")
+      assert(!exactStatsPlan.exists {
+        case filter: LogicalFilter => containsFilter(filter.condition, "j < -2")
+        case _ => false
+      }, s"inferred filter must not adjust exact scan statistics:\n$exactStatsPlan")
+
+      val preFilterStatsQuery = spark.read
+        .format(classOf[CatalystFilterDataSourceV2].getName)
+        .option(CatalystFilterScanBuilder.INFERRED_DERIVATION,
+          CatalystFilterScanBuilder.NEGATE_I_TO_J)
+        // Pre-filter statistics report all ten input rows, so Spark should adjust them.
+        .option(CatalystFilterScanBuilder.REFLECTS_FULLY_PUSHED_DOWN_FILTERS, "false")
+        .option(CatalystFilterScanBuilder.REPORTED_ROW_COUNT, "10")
+        .option(CatalystFilterScanBuilder.REPORT_COLUMN_STATS, "true")
+        .load()
+        .filter($"i" > 2)
+      checkAnswer(preFilterStatsQuery, (3 until 10).map(i => Row(i, -i)))
+      val preFilterStatsPlan = preFilterStatsQuery.queryExecution.optimizedPlan
+      val preFilterStatsScan = getScanRelation(preFilterStatsQuery)
+      assert(preFilterStatsScan.stats.rowCount.contains(BigInt(8)))
+      assert(preFilterStatsPlan.stats.rowCount.contains(BigInt(8)))
+      assert(preFilterStatsScan.inferredFilters.nonEmpty)
+      assert(!preFilterStatsPlan.exists {
+        case filter: LogicalFilter => containsFilter(filter.condition, "j < -2")
+        case _ => false
+      }, s"inferred predicates should remain metadata when adjusting stats:\n$preFilterStatsPlan")
+    }
+  }
+
+  gridTest("inferred filters do not duplicate fully pushed filters")(
+      Seq(false, true)) { estimateInferred =>
+    val query = spark.read
+      .format(classOf[CatalystFilterDataSourceV2].getName)
+      .option(CatalystFilterScanBuilder.INFERRED_DERIVATION,
+        CatalystFilterScanBuilder.REPEAT_PUSHED_FILTERS)
+      .option(CatalystFilterScanBuilder.USE_INFERRED_FILTER_ESTIMATION,
+        estimateInferred.toString)
+      .load()
+      .filter($"i" > 2)
+
+    checkAnswer(query, (3 until 10).map(i => Row(i, -i)))
+    val scan = getScanRelation(query)
+    assert(scan.pushedFilters.exists(containsFilter(_, "i > 2")))
+    assert(scan.inferredFilters.isEmpty)
+    val filters = query.queryExecution.optimizedPlan.collect {
+      case filter: LogicalFilter => filter.condition
+    }
+    assert(filters.size == 1)
+    val pushed = CatalystGreaterThan(scan.output.find(_.name == "i").get, CatalystLiteral(2))
+    assert(filters.head.collect { case expr if expr.semanticEquals(pushed) => expr }.size == 1)
+    val execFilters = query.queryExecution.executedPlan.collect {
+      case filter: FilterExec => filter.condition
+    }
+    assert(execFilters.size == 1)
+    assert(execFilters.head.collect { case expr if expr.semanticEquals(pushed) => expr }.size == 1)
+  }
+
+  test("inferred filters use separate estimates only when the scan opts in") {
+    withSQLConf(SQLConf.CBO_ENABLED.key -> "true") {
+      Seq(false, true).foreach { keepResiduals =>
+        def load(infer: Boolean, estimateInferred: Boolean = true): DataFrame = {
+          spark.read
+            .format(classOf[CatalystFilterDataSourceV2].getName)
+            .option(CatalystFilterScanBuilder.INFERRED_DERIVATION,
+              if (infer) CatalystFilterScanBuilder.NEGATE_I_TO_J else "")
+            .option(CatalystFilterScanBuilder.USE_INFERRED_FILTER_ESTIMATION,
+              estimateInferred.toString)
+            .option(CatalystFilterScanBuilder.REPORTED_ROW_COUNT, "10")
+            .option(CatalystFilterScanBuilder.REPORT_COLUMN_STATS, "true")
+            .option(CatalystFilterScanBuilder.KEEP_RESIDUAL_FILTERS, keepResiduals.toString)
+            .load()
+            .filter($"i" > 7)
+        }
+
+        val baseline = load(infer = false).queryExecution.optimizedPlan.stats
+        Seq(false, true).foreach { estimateInferred =>
+          val query = load(infer = true, estimateInferred = estimateInferred)
+          checkAnswer(query, Seq(Row(8, -8), Row(9, -9)))
+          val plan = query.queryExecution.optimizedPlan
+          assert(plan.stats.rowCount.contains(BigInt(if (estimateInferred) 3 else 1)))
+          if (estimateInferred) {
+            assert(plan.stats.rowCount == baseline.rowCount)
+            assert(plan.stats.sizeInBytes == baseline.sizeInBytes)
+          }
+          val scan = getScanRelation(query)
+          assert(scan.inferredFilters.nonEmpty)
+          assert(scan.stats.rowCount.contains(BigInt(if (estimateInferred) 3 else 10)))
+          val filters = plan.collect { case filter: LogicalFilter => filter.condition }
+          assert(filters.nonEmpty == (keepResiduals || !estimateInferred))
+          assert(filters.exists(containsFilter(_, "j < -7")) == !estimateInferred)
+          val execFilters = query.queryExecution.executedPlan.collect {
+            case filter: FilterExec => filter.condition
+          }
+          assert(execFilters.exists(containsFilter(_, "j < -7")) == !estimateInferred)
+        }
+      }
+    }
+  }
+
+  test("inferred filters do not retain pruned columns during execution") {
+    withSQLConf(SQLConf.CONSTRAINT_PROPAGATION_ENABLED.key -> "false") {
+      val query = spark.read
+        .format(classOf[CatalystFilterDataSourceV2].getName)
+        .option(CatalystFilterScanBuilder.INFERRED_DERIVATION,
+          CatalystFilterScanBuilder.NEGATE_I_TO_J)
+        .load()
+        .filter($"i" > 2)
+        .select($"i")
+
+      checkAnswer(query, (3 until 10).map(Row(_)))
+      val scan = getScanRelation(query)
+      assert(scan.output.map(_.name) == Seq("i"),
+        s"the inferred-filter column j should be pruned:\n${query.queryExecution.optimizedPlan}")
+      assert(scan.inferredFilters.isEmpty,
+        s"the inferred filter on j should be dropped:\n${query.queryExecution.optimizedPlan}")
+      assert(!query.queryExecution.optimizedPlan.exists {
+        case filter: LogicalFilter => filter.condition.references.exists(_.name == "j")
+        case _ => false
+      }, s"the logical plan should not filter on pruned column j:\n" +
+        query.queryExecution.optimizedPlan)
+      assert(!query.queryExecution.executedPlan.exists {
+        case filter: FilterExec => filter.condition.references.exists(_.name == "j")
+        case _ => false
+      }, s"the physical plan should not filter on pruned column j:\n" +
+        query.queryExecution.executedPlan)
+    }
+  }
+
+  test("inferred filters do not retain pruned nested fields during execution") {
+    withSQLConf(SQLConf.CONSTRAINT_PROPAGATION_ENABLED.key -> "false") {
+      val query = spark.read
+        .format(classOf[NestedCatalystFilterDataSourceV2].getName)
+        .load()
+        .filter($"i" > 2)
+        .select($"s.b")
+
+      checkAnswer(query, (3 until 10).map(i => Row(-i)))
+      val scan = getScanRelation(query)
+      val structType = scan.output.head.dataType.asInstanceOf[StructType]
+      assert(structType.fieldNames.toSeq == Seq("b"),
+        s"the inferred-filter field s.a should be pruned:\n${query.queryExecution.optimizedPlan}")
+      assert(scan.inferredFilters.isEmpty,
+        s"the inferred filter on s.a should be dropped:\n${query.queryExecution.optimizedPlan}")
+      assert(!query.queryExecution.optimizedPlan.exists {
+        case filter: LogicalFilter => containsFilter(filter.condition, "s.a > 2")
+        case _ => false
+      }, s"the logical plan should not filter on pruned field s.a:\n" +
+        query.queryExecution.optimizedPlan)
+      assert(!query.queryExecution.executedPlan.exists {
+        case filter: FilterExec => containsFilter(filter.condition, "s.a > 2")
+        case _ => false
+      }, s"the physical plan should not filter on pruned field s.a:\n" +
+        query.queryExecution.executedPlan)
+    }
+  }
+
+  test("inferred filters remain metadata with a non-deterministic residual") {
+    val query = spark.read
+      .format(classOf[CatalystFilterDataSourceV2].getName)
+      .option(CatalystFilterScanBuilder.INFERRED_DERIVATION,
+        CatalystFilterScanBuilder.NEGATE_I_TO_J)
+      .load()
+      .filter($"i" > 2 && rand(0) > 0.5)
+
+    val inferredFilter = "j < -2"
+    assert(getScanRelation(query).inferredFilters.exists(containsFilter(_, inferredFilter)),
+      "inferred filter should be recorded on the scan relation")
+    val execFilters = query.queryExecution.executedPlan.collect {
+      case filter: FilterExec => filter.condition
+    }
+    assert(execFilters.exists(_.exists(!_.deterministic)),
+      s"expected a non-deterministic residual FilterExec:\n${query.queryExecution.executedPlan}")
+    assert(!execFilters.exists(containsFilter(_, inferredFilter)),
+      s"inferred filter $inferredFilter should not reach FilterExec:\n" +
+        query.queryExecution.executedPlan)
+    val logicalFilters = query.queryExecution.optimizedPlan.collect {
+      case filter: LogicalFilter => filter.condition
+    }
+    assert(!logicalFilters.exists(containsFilter(_, inferredFilter)),
+      s"inferred filter $inferredFilter should remain outside the logical Filter:\n" +
+        query.queryExecution.optimizedPlan)
+  }
+
+  test("compound inferred filters remain scan metadata") {
+    // i > 2 AND i < 8 implies j < -2 AND j > -8.
+    val query = spark.read
+      .format(classOf[CatalystFilterDataSourceV2].getName)
+      .option(CatalystFilterScanBuilder.INFERRED_DERIVATION,
+        CatalystFilterScanBuilder.NEGATE_I_TO_J)
+      .load()
+      .filter($"i" > 2 && $"i" < 8)
+
+    checkAnswer(query, (3 until 8).map(i => Row(i, -i)))
+    val inferredFilters = getScanRelation(query).inferredFilters
+    assert(inferredFilters.length == 2,
+      s"compound inferred filter should be stored as conjuncts: $inferredFilters")
+    val execFilters = query.queryExecution.executedPlan.collect {
+      case filter: FilterExec => filter.condition
+    }
+    assert(!execFilters.exists(containsFilter(_, "j < -2")))
+    assert(!execFilters.exists(containsFilter(_, "j > -8")))
+    val logicalFilters = query.queryExecution.optimizedPlan.collect {
+      case filter: LogicalFilter => filter.condition
+    }
+    assert(!logicalFilters.exists(containsFilter(_, "j < -2")))
+    assert(!logicalFilters.exists(containsFilter(_, "j > -8")))
+  }
+
+  test("inferred filters do not block join pushdown") {
+    val format = classOf[CatalystFilterJoinDataSourceV2].getName
+    def load(): DataFrame =
+      spark.read.format(format)
+        .option(CatalystFilterScanBuilder.INFERRED_DERIVATION,
+          CatalystFilterScanBuilder.NEGATE_I_TO_J)
+        .load()
+        .filter($"i" >= 0)
+    withSQLConf(SQLConf.DATA_SOURCE_V2_JOIN_PUSHDOWN.key -> "true") {
+      val df = load().join(load(), Seq("i"))
+      val joins = df.queryExecution.optimizedPlan.collect { case j: Join => j }
+      assert(joins.isEmpty,
+        s"join should be pushed:\n${df.queryExecution.optimizedPlan}")
+      assert(getScanRelation(df).inferredFilters.isEmpty,
+        s"inferred filters must not survive join pushdown:\n" +
+          df.queryExecution.optimizedPlan)
+      val filters = df.queryExecution.optimizedPlan.collect {
+        case filter: LogicalFilter => filter.condition
+      }
+      assert(!filters.exists(containsFilter(_, "j <= 0")),
+        s"inferred filter j <= 0 should not remain after join pushdown:\n" +
+          df.queryExecution.optimizedPlan)
+    }
+  }
+
+  test("inferred filters do not block limit pushdown") {
+    val df = spark.read
+      .format(classOf[CatalystFilterLimitDataSourceV2].getName)
+      .option(CatalystFilterScanBuilder.INFERRED_DERIVATION,
+        CatalystFilterScanBuilder.NEGATE_I_TO_J)
+      .load()
+      .filter($"i" > 2)
+      .limit(5)
+    val limits = df.queryExecution.optimizedPlan.collect {
+      case l: LocalLimit => l
+      case g: GlobalLimit => g
+    }
+    assert(limits.isEmpty, s"limit should be pushed:\n${df.queryExecution.optimizedPlan}")
+    checkAnswer(df, (3 until 8).map(i => Row(i, -i)))
+    val inferredFilter = "j < -2"
+    val filters = df.queryExecution.optimizedPlan.collect {
+      case filter: LogicalFilter => filter.condition
+    }
+    assert(!filters.exists(containsFilter(_, inferredFilter)),
+      s"inferred filter $inferredFilter should remain outside the logical Filter:\n" +
+        df.queryExecution.optimizedPlan)
+    assert(getScanRelation(df).inferredFilters.exists(containsFilter(_, inferredFilter)),
+      "inferred filter should be recorded on the scan relation")
+    val execFilters = df.queryExecution.executedPlan.collect {
+      case filter: FilterExec => filter.condition
+    }
+    assert(!execFilters.exists(containsFilter(_, inferredFilter)),
+      s"inferred filter $inferredFilter should not reach FilterExec:\n" +
+        df.queryExecution.executedPlan)
+  }
+
+  test("inferred filters are ignored when the Catalyst pushFilters callback did not run") {
+    // The builder mixes SupportsPushDownV2Filters and SupportsPushDownCatalystFilters.
+    // PushDownUtils prefers the V2 path, so the Catalyst pushFilters callback never runs and its
+    // Inferred filters must not be collected, even though the source reports a non-empty one.
+    val df = spark.read
+      .format(classOf[CatalystAndV2FilterDataSourceV2].getName)
+      .option(CatalystFilterScanBuilder.INFERRED_DERIVATION,
+        CatalystFilterScanBuilder.CONSTANT_J_LT_100)
+      .load()
+      .filter($"i" > 2)
+    assert(getScanRelation(df).inferredFilters.isEmpty,
+      s"inferred filters must be ignored when the Catalyst callback did not run:\n" +
+        df.queryExecution.optimizedPlan)
+  }
+
+  test("inferred filters are ignored when there is no eligible Catalyst filter") {
+    // A subquery-only filter leaves no eligible (non-subquery) Catalyst filter to push, so even a
+    // pure Catalyst source's inferred filters (j < 100) must not be collected. The subquery reads
+    // the same source so it is not constant-folded away before pushdown, and constraint propagation
+    // is disabled so no isnotnull predicate is inferred alongside the subquery.
+    withSQLConf(SQLConf.CONSTRAINT_PROPAGATION_ENABLED.key -> "false") {
+      withTempView("catalyst_inferred_src") {
+        val df = spark.read
+          .format(classOf[CatalystFilterDataSourceV2].getName)
+          .option(CatalystFilterScanBuilder.INFERRED_DERIVATION,
+            CatalystFilterScanBuilder.CONSTANT_J_LT_100)
+          .load()
+        df.createOrReplaceTempView("catalyst_inferred_src")
+        val query = sql(
+          "SELECT * FROM catalyst_inferred_src " +
+            "WHERE i > (SELECT max(i) FROM catalyst_inferred_src)")
+        assert(getScanRelation(query).inferredFilters.isEmpty,
+          s"inferred filters must be ignored for a subquery-only filter:\n" +
+            query.queryExecution.optimizedPlan)
+      }
+    }
+  }
+
+  test("inferred filters are ignored for a non-deterministic-only Catalyst filter") {
+    val query = spark.read
+      .format(classOf[CatalystFilterDataSourceV2].getName)
+      .option(CatalystFilterScanBuilder.INFERRED_DERIVATION,
+        CatalystFilterScanBuilder.CONSTANT_J_LT_100)
+      .load()
+      .filter(rand(0) > 0.5)
+    assert(getScanRelation(query).inferredFilters.isEmpty,
+      s"inferred filters must be ignored for a non-deterministic-only filter:\n" +
+        query.queryExecution.optimizedPlan)
+  }
+
+  test("SPARK-58207: V2 filter pushdown skips non-deterministic filters") {
+    val df = spark.read.format(classOf[AdvancedDataSourceV2WithV2Filter].getName).load()
+    // i > 3 is deterministic and pushable; rand() > 0.5 is non-deterministic. rand() translates
+    // to a V2 Predicate (V2ExpressionBuilder handles Rand), so without a guard it would be pushed
+    // to the source, which may evaluate it a different number of times than Spark (or use it for
+    // pruning while also returning it for post-scan re-check).
+    val q = df.filter($"i" > 3 && rand() > 0.5)
+
+    // Only the deterministic predicate should reach the source's pushPredicates.
+    val pushed = getBatchWithV2Filter(q).predicates.map(_.describe())
+    assert(pushed.exists(_.contains("i")),
+      s"the deterministic predicate on i should be pushed; got: ${pushed.mkString(", ")}")
+    assert(!pushed.exists(_.contains("RAND")),
+      s"a non-deterministic predicate must not be pushed; got: ${pushed.mkString(", ")}")
+
+    // The non-deterministic filter must be retained as a post-scan Filter.
+    val postScanConditions = q.queryExecution.optimizedPlan.collect {
+      case f: LogicalFilter => f.condition
+    }
+    assert(postScanConditions.exists(cond => cond.exists(!_.deterministic)),
+      "non-deterministic filter should be retained as a post-scan Filter")
+  }
+
+  test("pushedFilters keep filters referencing pruned columns") {
+    // Disable constraint propagation so IsNotNull(i) is not added (it would keep
+    // column i in the scan output). This simulates a connector that pushes IsNotNull.
+    withSQLConf(SQLConf.CONSTRAINT_PROPAGATION_ENABLED.key -> "false") {
+      val df = spark.read.format(classOf[AdvancedDataSourceV2].getName).load()
+      // i > 3 is fully pushed; selecting only j causes column pruning to drop i from the scan
+      // output, but pushedFilters keeps the fully-pushed filter on i (against the relation schema)
+      // so a later scan merge can re-enforce it.
+      val q = df.filter($"i" > 3).select($"j")
+      checkAnswer(q, (4 until 10).map(i => Row(-i)))
+
+      val scanRelation = getScanRelation(q)
+      assert(!scanRelation.output.exists(_.name == "i"),
+        "column i should be pruned from scan output")
+      val referencedCols = scanRelation.pushedFilters.flatMap(_.references.map(_.name)).toSet
+      assert(referencedCols.contains("i"),
+        "pushedFilters should keep the filter referencing the pruned column i")
+    }
+  }
+
+  test("SPARK-57225: DSv2 source without batch write capability throws clear error") {
+    val cls = classOf[ReadOnlyV2DataSource].getName
+    val df = spark.range(1).toDF("i")
+    checkError(
+      exception = intercept[AnalysisException] {
+        df.write.format(cls).mode("append").save()
+      },
+      condition = "UNSUPPORTED_FEATURE.TABLE_OPERATION",
+      parameters = Map(
+        "tableName" -> "`read_only_v2_test`",
+        "operation" -> "batch write"
+      )
+    )
+
+    checkError(
+      exception = intercept[AnalysisException] {
+        df.write.format(cls).save()
+      },
+      condition = "UNSUPPORTED_FEATURE.TABLE_OPERATION",
+      parameters = Map(
+        "tableName" -> "`read_only_v2_test`",
+        "operation" -> "batch write"
+      )
+    )
+  }
+
+  test("SPARK-57225: DSv2 source with V1_BATCH_WRITE still falls back to V1 path") {
+    val cls = classOf[V1BatchWriteV2DataSource].getName
+    val df = spark.range(1).toDF("i")
+    // V1_BATCH_WRITE sources should fall through to saveToV1SourceCommand, which calls
+    // DataSource.planForWriting. Since our test source doesn't implement
+    // CreatableRelationProvider or FileFormat, planForWriting hits the case _ branch
+    // and throws INTERNAL_ERROR with "does not allow create table as select".
+    // This proves V1_BATCH_WRITE reached the V1 write path.
+    val ex = intercept[SparkException] {
+      df.write.format(cls).mode("append").save()
+    }
+    assert(ex.getCondition == "INTERNAL_ERROR",
+      "V1_BATCH_WRITE source should reach DataSource.planForWriting (V1 path)")
+    assert(ex.getMessage.contains("does not allow create table as select"))
+  }
+
+}
+
+case class RangeInputPartition(start: Int, end: Int) extends InputPartition
+
+case class ValuesInputPartition(values: Seq[Int]) extends InputPartition
+
+class ValuesReaderFactory(requiredSchema: StructType) extends PartitionReaderFactory {
+  override def createReader(partition: InputPartition): PartitionReader[InternalRow] = {
+    val ValuesInputPartition(values) = partition
+    new PartitionReader[InternalRow] {
+      private var index = -1
+
+      override def next(): Boolean = {
+        index += 1
+        index < values.length
+      }
+
+      override def get(): InternalRow = {
+        val i = values(index)
+        InternalRow.fromSeq(requiredSchema.map(_.name).map {
+          case "i" => i
+          case "j" => -i
+        })
+      }
+
+      override def close(): Unit = {}
+    }
+  }
+}
+
+class SimpleReaderFactory(requiredSchema: StructType) extends PartitionReaderFactory {
+  override def createReader(partition: InputPartition): PartitionReader[InternalRow] = {
+    val RangeInputPartition(start, end) = partition
+    new PartitionReader[InternalRow] {
+      private var current = start - 1
+
+      override def next(): Boolean = {
+        current += 1
+        current < end
+      }
+
+      override def get(): InternalRow = InternalRow.fromSeq(requiredSchema.map(_.name).map {
+        case "i" => current
+        case "j" => -current
+      })
+
+      override def close(): Unit = {}
+    }
+  }
+}
+
+object SimpleReaderFactory extends SimpleReaderFactory(TestingV2Source.schema)
+
+abstract class SimpleBatchTable extends Table with SupportsRead  {
+
+  override def schema(): StructType = TestingV2Source.schema
+
+  override def name(): String = this.getClass.toString
+
+  override def capabilities(): java.util.Set[TableCapability] = java.util.EnumSet.of(BATCH_READ)
+}
+
+abstract class SimpleScanBuilder extends ScanBuilder
+  with Batch with Scan {
+
+  override def build(): Scan = this
+
+  override def toBatch: Batch = this
+
+  override def readSchema(): StructType = TestingV2Source.schema
+
+  override def createReaderFactory(): PartitionReaderFactory = SimpleReaderFactory
+
+  override def equals(obj: Any): Boolean = {
+    obj match {
+      case s: Scan =>
+        this.readSchema() == s.readSchema()
+      case _ => false
+    }
+  }
+
+  override def hashCode(): Int = {
+    this.readSchema().hashCode()
+  }
+}
+
+trait TestingV2Source extends TableProvider {
+  override def inferSchema(options: CaseInsensitiveStringMap): StructType = {
+    TestingV2Source.schema
+  }
+
+  override def getTable(
+      schema: StructType,
+      partitioning: Array[Transform],
+      properties: java.util.Map[String, String]): Table = {
+    getTable(new CaseInsensitiveStringMap(properties))
+  }
+
+  def getTable(options: CaseInsensitiveStringMap): Table
+}
+
+object TestingV2Source {
+  val schema = new StructType().add("i", "int").add("j", "int")
+}
+
+class SimpleSinglePartitionSource extends TestingV2Source {
+
+  class MyScanBuilder extends SimpleScanBuilder {
+    override def planInputPartitions(): Array[InputPartition] = {
+      Array(RangeInputPartition(0, 5))
+    }
+  }
+
+  override def getTable(options: CaseInsensitiveStringMap): Table = new SimpleBatchTable {
+    override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
+      new MyScanBuilder()
+    }
+  }
+}
+
+class ScanDefinedColumnarSupport extends TestingV2Source {
+
+  class MyScanBuilder(st: ColumnarSupportMode) extends SimpleScanBuilder {
+    override def planInputPartitions(): Array[InputPartition] = {
+      throw new IllegalArgumentException("planInputPartitions must not be called")
+    }
+
+    override def columnarSupportMode() : ColumnarSupportMode = st
+
+  }
+
+  override def getTable(options: CaseInsensitiveStringMap): Table = new SimpleBatchTable {
+    override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
+      new MyScanBuilder(Scan.ColumnarSupportMode.valueOf(options.get("columnar")))
+    }
+  }
+
+}
+
+
+// This class is used by pyspark tests. If this class is modified/moved, make sure pyspark
+// tests still pass.
+class SimpleDataSourceV2 extends TestingV2Source {
+
+  class MyScanBuilder extends SimpleScanBuilder {
+    override def planInputPartitions(): Array[InputPartition] = {
+      Array(RangeInputPartition(0, 5), RangeInputPartition(5, 10))
+    }
+  }
+
+  override def getTable(options: CaseInsensitiveStringMap): Table = new SimpleBatchTable {
+    override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
+      new MyScanBuilder()
+    }
+  }
+}
+
+class AdvancedDataSourceV2 extends TestingV2Source {
+
+  override def getTable(options: CaseInsensitiveStringMap): Table = new SimpleBatchTable {
+    override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
+      new AdvancedScanBuilder()
+    }
+  }
+}
+
+class CatalystFilterDataSourceV2 extends TestingV2Source {
+
+  override def getTable(options: CaseInsensitiveStringMap): Table = new SimpleBatchTable {
+    override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
+      new CatalystFilterScanBuilder(options)
+    }
+  }
+}
+
+class CatalystFilterJoinDataSourceV2 extends TestingV2Source {
+
+  override def getTable(options: CaseInsensitiveStringMap): Table = new SimpleBatchTable {
+    override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
+      new CatalystFilterJoinScanBuilder(options)
+    }
+  }
+}
+
+class CatalystAndV2FilterDataSourceV2 extends TestingV2Source {
+
+  override def getTable(options: CaseInsensitiveStringMap): Table = new SimpleBatchTable {
+    override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
+      new CatalystAndV2FilterScanBuilder(options)
+    }
+  }
+}
+
+// Implements both the Catalyst and V2 filter traits. `PushDownUtils.pushFilters` prefers the V2
+// path, so the Catalyst `pushFilters` callback never runs and the inferred filters it would report
+// must be ignored.
+class CatalystAndV2FilterScanBuilder(options: CaseInsensitiveStringMap)
+  extends CatalystFilterScanBuilder(options) with SupportsPushDownV2Filters {
+
+  private var pushedV2Predicates = Array.empty[Predicate]
+
+  override def pushPredicates(predicates: Array[Predicate]): Array[Predicate] = {
+    pushedV2Predicates = predicates
+    // Return all as post-scan filters: the source does not guarantee them.
+    predicates
+  }
+
+  override def pushedPredicates(): Array[Predicate] = Array.empty
+}
+
+class CatalystFilterJoinScanBuilder(options: CaseInsensitiveStringMap)
+  extends CatalystFilterScanBuilder(options) with SupportsPushDownJoin {
+
+  private var joinedSchema: Option[StructType] = None
+
+  override def isOtherSideCompatibleForJoin(other: SupportsPushDownJoin): Boolean =
+    other.isInstanceOf[CatalystFilterJoinScanBuilder]
+
+  override def pushDownJoin(
+      other: SupportsPushDownJoin,
+      joinType: V2JoinType,
+      leftColumns: Array[ColumnWithAlias],
+      rightColumns: Array[ColumnWithAlias],
+      condition: Predicate): Boolean = {
+    def fields(columns: Array[ColumnWithAlias]): Array[StructField] = columns.map { col =>
+      val name = if (col.alias() != null) col.alias() else col.colName()
+      TestingV2Source.schema(col.colName()).copy(name = name)
+    }
+    joinedSchema = Some(StructType(fields(leftColumns) ++ fields(rightColumns)))
+    true
+  }
+
+  override def readSchema(): StructType = joinedSchema.getOrElse(super.readSchema())
+}
+
+class CatalystFilterLimitDataSourceV2 extends TestingV2Source {
+
+  override def getTable(options: CaseInsensitiveStringMap): Table = new SimpleBatchTable {
+    override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
+      new CatalystFilterLimitScanBuilder(options)
+    }
+  }
+}
+
+class CatalystFilterLimitScanBuilder(options: CaseInsensitiveStringMap)
+  extends CatalystFilterScanBuilder(options) with SupportsPushDownLimit {
+
+  private var pushedLimit: Option[Int] = None
+
+  override def pushLimit(limit: Int): Boolean = {
+    pushedLimit = Some(limit)
+    true
+  }
+
+  override def isPartiallyPushed: Boolean = false
+
+  override def planInputPartitions(): Array[InputPartition] = {
+    val partitions = super.planInputPartitions()
+    pushedLimit match {
+      case Some(n) =>
+        val values = partitions.flatMap {
+          case ValuesInputPartition(vs) => vs
+          case RangeInputPartition(start, end) => start until end
+          case other =>
+            throw new IllegalArgumentException(s"Unexpected partition: $other")
+        }.take(n)
+        Array(ValuesInputPartition(values.toSeq))
+      case None =>
+        partitions
+    }
+  }
+
+  override def createReaderFactory(): PartitionReaderFactory = {
+    if (pushedLimit.isDefined) {
+      new ValuesReaderFactory(readSchema())
+    } else {
+      super.createReaderFactory()
+    }
+  }
+}
+
+class CatalystFilterScanBuilder(options: CaseInsensitiveStringMap) extends SimpleScanBuilder
+  with SupportsPushDownCatalystFilters
+  with SupportsPushDownRequiredColumns
+  with SupportsReportStatistics {
+
+  private var pushedCatalystFilters = Seq.empty[CatalystExpression]
+  private val deriveInferred = CatalystFilterScanBuilder.derivation(options)
+  private val statsReflectFullyPushedDownFilters =
+    Option(options.get(CatalystFilterScanBuilder.REFLECTS_FULLY_PUSHED_DOWN_FILTERS))
+      .exists(_.toBoolean)
+  private val reportedRowCount =
+    Option(options.get(CatalystFilterScanBuilder.REPORTED_ROW_COUNT)).map(_.toLong)
+  private val reportColumnStats =
+    options.getBoolean(CatalystFilterScanBuilder.REPORT_COLUMN_STATS, false)
+  private val keepResidualFilters =
+    options.getBoolean(CatalystFilterScanBuilder.KEEP_RESIDUAL_FILTERS, false)
+  private var requiredSchema = TestingV2Source.schema
+
+  override def readSchema(): StructType = requiredSchema
+
+  override def pruneColumns(schema: StructType): Unit = {
+    requiredSchema = schema
+  }
+
+  override def pushFilters(filters: Seq[CatalystExpression]): Seq[CatalystExpression] = {
+    if (filters.exists(!_.deterministic)) {
+      throw new IllegalArgumentException(
+        s"Non-deterministic filters should not be pushed: ${filters.mkString(", ")}")
+    }
+    pushedCatalystFilters = filters
+    if (keepResidualFilters) filters else Nil
+  }
+
+  override def inferredFilters: Seq[CatalystExpression] = deriveInferred(pushedCatalystFilters)
+
+  override def pushedFilters: Array[Predicate] = Array.empty
+
+  override def estimateStatistics(): Statistics = new Statistics {
+    override def sizeInBytes(): OptionalLong = OptionalLong.empty()
+    override def numRows(): OptionalLong = reportedRowCount
+      .map(rowCount => OptionalLong.of(rowCount))
+      .getOrElse(OptionalLong.empty())
+
+    override def columnStats(): util.Map[NamedReference, ColumnStatistics] = {
+      val stats = new util.HashMap[NamedReference, ColumnStatistics]()
+      if (reportColumnStats) {
+        Seq(("i", 0, 9), ("j", -9, 0)).foreach { case (name, lower, upper) =>
+          stats.put(FieldReference.column(name), new ColumnStatistics {
+            override def distinctCount(): OptionalLong = OptionalLong.of(10L)
+            override def min(): Optional[AnyRef] = Optional.of(Int.box(lower))
+            override def max(): Optional[AnyRef] = Optional.of(Int.box(upper))
+            override def nullCount(): OptionalLong = OptionalLong.of(0L)
+          })
+        }
+      }
+      stats
+    }
+  }
+
+  override def reflectsFullyPushedDownFilters(): Boolean = statsReflectFullyPushedDownFilters
+
+  override def useInferredFilterEstimation(): Boolean =
+    options.getBoolean(CatalystFilterScanBuilder.USE_INFERRED_FILTER_ESTIMATION, true)
+
+  override def planInputPartitions(): Array[InputPartition] = {
+    // This source enforces inferred filters and asks Spark to use them for stats adjustment.
+    val enforcedFilters = pushedCatalystFilters ++ inferredFilters
+    enforcedFilters.reduceLeftOption(CatalystAnd) match {
+      case Some(filter) =>
+        val attrs = DataTypeUtils.toAttributes(TestingV2Source.schema)
+        val bound = filter.transformUp {
+          case attr: AttributeReference =>
+            attrs.find(_.name == attr.name).getOrElse(
+              throw new IllegalArgumentException(s"Unknown column: ${attr.name}"))
+        }
+        val predicate = CatalystPredicate.createInterpreted(
+          BindReferences.bindReference(bound, attrs))
+        Array(ValuesInputPartition((0 until 10).filter { i =>
+          predicate.eval(InternalRow(i, -i))
+        }))
+      case None =>
+        Array(RangeInputPartition(0, 5), RangeInputPartition(5, 10))
+    }
+  }
+
+  override def createReaderFactory(): PartitionReaderFactory = {
+    if (pushedCatalystFilters.nonEmpty) {
+      new ValuesReaderFactory(readSchema())
+    } else {
+      new SimpleReaderFactory(readSchema())
+    }
+  }
+}
+
+object CatalystFilterScanBuilder {
+  val INFERRED_DERIVATION: String = "inferredDerivation"
+  val REFLECTS_FULLY_PUSHED_DOWN_FILTERS: String = "reflectsFullyPushedDownFilters"
+  val USE_INFERRED_FILTER_ESTIMATION: String = "useInferredFilterEstimation"
+  val REPORTED_ROW_COUNT: String = "reportedRowCount"
+  val REPORT_COLUMN_STATS: String = "reportColumnStats"
+  val KEEP_RESIDUAL_FILTERS: String = "keepResidualFilters"
+  val NEGATE_I_TO_J: String = "negate-i-to-j"
+  val CONSTANT_J_LT_100: String = "constant-j-lt-100"
+  val REPEAT_PUSHED_FILTERS: String = "repeat-pushed-filters"
+
+  // Always reports the same inferred filter (j < 100), regardless of the pushed filters. Rows are
+  // (i, j) with j = -i in [0, 9], so it drops nothing. Used to prove that inferred-filter
+  // collection is gated on the Catalyst pushFilters dispatch and eligibility, not on the
+  // reported inferred filter.
+  val constantJLt100: Seq[CatalystExpression] => Seq[CatalystExpression] = { _ =>
+    Seq(CatalystLessThan(AttributeReference("j", IntegerType)(), CatalystLiteral(100)))
+  }
+
+  // Common derivation used by inferred-filter tests. Rows are (i, j) with j = -i, so a
+  // pushed predicate on i implies the corresponding predicate on j after negating both sides.
+  val negateIToJ: Seq[CatalystExpression] => Seq[CatalystExpression] = { filters =>
+    val jAttr = AttributeReference("j", IntegerType)()
+    filters.flatMap {
+      case CatalystGreaterThan(a: AttributeReference, CatalystLiteral(n: Int, _))
+          if a.name == "i" =>
+        Some(CatalystLessThan(jAttr, CatalystLiteral(-n)))
+      case CatalystGreaterThanOrEqual(a: AttributeReference, CatalystLiteral(n: Int, _))
+          if a.name == "i" =>
+        Some(CatalystLessThanOrEqual(jAttr, CatalystLiteral(-n)))
+      case CatalystLessThan(a: AttributeReference, CatalystLiteral(n: Int, _))
+          if a.name == "i" =>
+        Some(CatalystGreaterThan(jAttr, CatalystLiteral(-n)))
+      case CatalystLessThanOrEqual(a: AttributeReference, CatalystLiteral(n: Int, _))
+          if a.name == "i" =>
+        Some(CatalystGreaterThanOrEqual(jAttr, CatalystLiteral(-n)))
+      case CatalystEqualTo(a: AttributeReference, CatalystLiteral(n: Int, _))
+          if a.name == "i" =>
+        Some(CatalystEqualTo(jAttr, CatalystLiteral(-n)))
+      case _ =>
+        None
+    }
+  }
+
+  private val derivations
+      : Map[String, Seq[CatalystExpression] => Seq[CatalystExpression]] =
+    Map(
+      NEGATE_I_TO_J -> negateIToJ,
+      CONSTANT_J_LT_100 -> constantJLt100,
+      REPEAT_PUSHED_FILTERS -> ((filters: Seq[CatalystExpression]) => filters))
+
+  private[connector] def derivation(
+      options: CaseInsensitiveStringMap): Seq[CatalystExpression] => Seq[CatalystExpression] = {
+    Option(options.get(INFERRED_DERIVATION)).flatMap(derivations.get).getOrElse(_ => Nil)
+  }
+}
+
+class AdvancedScanBuilder extends ScanBuilder
+  with Scan with SupportsPushDownFilters with SupportsPushDownRequiredColumns {
+
+  var requiredSchema = TestingV2Source.schema
+  var filters = Array.empty[Filter]
+
+  override def pruneColumns(requiredSchema: StructType): Unit = {
+    this.requiredSchema = requiredSchema
+  }
+
+  override def readSchema(): StructType = requiredSchema
+
+  override def pushFilters(filters: Array[Filter]): Array[Filter] = {
+    val (supported, unsupported) = filters.partition {
+      case GreaterThan("i", _: Int) => true
+      case _ => false
+    }
+    this.filters = supported
+    unsupported
+  }
+
+  override def pushedFilters(): Array[Filter] = filters
+
+  override def build(): Scan = this
+
+  override def toBatch: Batch = new AdvancedBatch(filters, requiredSchema)
+}
+
+class AdvancedBatch(val filters: Array[Filter], val requiredSchema: StructType) extends Batch {
+
+  override def planInputPartitions(): Array[InputPartition] = {
+    val lowerBound = filters.collectFirst {
+      case GreaterThan("i", v: Int) => v
+    }
+
+    val res = scala.collection.mutable.ArrayBuffer.empty[InputPartition]
+
+    if (lowerBound.isEmpty) {
+      res.append(RangeInputPartition(0, 5))
+      res.append(RangeInputPartition(5, 10))
+    } else if (lowerBound.get < 4) {
+      res.append(RangeInputPartition(lowerBound.get + 1, 5))
+      res.append(RangeInputPartition(5, 10))
+    } else if (lowerBound.get < 9) {
+      res.append(RangeInputPartition(lowerBound.get + 1, 10))
+    }
+
+    res.toArray
+  }
+
+  override def createReaderFactory(): PartitionReaderFactory = {
+    new AdvancedReaderFactory(requiredSchema)
+  }
+}
+
+class AdvancedDataSourceV2WithSparkPostPushdownAdjustments extends TestingV2Source {
+
+  override def getTable(options: CaseInsensitiveStringMap): Table = new SimpleBatchTable {
+    override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
+      new AdvancedScanBuilderWithSparkPostPushdownAdjustments()
+    }
+  }
+}
+
+class AdvancedScanBuilderWithSparkPostPushdownAdjustments
+  extends AdvancedScanBuilder with SupportsReportStatistics {
+
+  override def reflectsFullyPushedDownFilters(): Boolean = false
+
+  override def pruneColumns(requiredSchema: StructType): Unit = {
+    this.requiredSchema = schemaWithPushedFilterColumns(requiredSchema)
+  }
+
+  override def estimateStatistics(): Statistics = new Statistics {
+    override def sizeInBytes(): OptionalLong = OptionalLong.empty()
+    override def numRows(): OptionalLong = OptionalLong.of(10L)
+    override def columnStats(): java.util.Map[NamedReference, ColumnStatistics] = {
+      val stats = new java.util.HashMap[NamedReference, ColumnStatistics]()
+      stats.put(FieldReference.column("i"), new ColumnStatistics {
+        override def distinctCount(): OptionalLong = OptionalLong.of(10L)
+        override def min(): Optional[AnyRef] = Optional.of(Int.box(0))
+        override def max(): Optional[AnyRef] = Optional.of(Int.box(9))
+      })
+      stats
+    }
+  }
+
+  private def schemaWithPushedFilterColumns(prunedSchema: StructType): StructType = {
+    val existingFields = prunedSchema.fieldNames.toSet
+    val pushedFilterFields = filters.collect {
+      case GreaterThan(columnName: String, _) => columnName
+    }.distinct
+      .filterNot(existingFields.contains)
+      .flatMap { columnName =>
+        TestingV2Source.schema.fields.find(_.name == columnName)
+      }
+    StructType(prunedSchema.fields ++ pushedFilterFields)
+  }
+}
+
+class AdvancedDataSourceV2WithBestEffortSparkPostPushdownAdjustments extends TestingV2Source {
+
+  override def getTable(options: CaseInsensitiveStringMap): Table = new SimpleBatchTable {
+    override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
+      new AdvancedScanBuilderWithBestEffortSparkPostPushdownAdjustments()
+    }
+  }
+}
+
+class AdvancedScanBuilderWithBestEffortSparkPostPushdownAdjustments
+  extends AdvancedScanBuilder with SupportsReportStatistics {
+
+  override def reflectsFullyPushedDownFilters(): Boolean = false
+
+  override def estimateStatistics(): Statistics = new Statistics {
+    override def sizeInBytes(): OptionalLong = OptionalLong.empty()
+    override def numRows(): OptionalLong = OptionalLong.of(10L)
+  }
+}
+
+class AdvancedDataSourceV2WithScanStats extends TestingV2Source {
+
+  override def getTable(options: CaseInsensitiveStringMap): Table = new SimpleBatchTable {
+    override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
+      new AdvancedScanBuilderWithReportedStatistics()
+    }
+  }
+}
+
+class AdvancedScanBuilderWithReportedStatistics
+  extends AdvancedScanBuilder with SupportsReportStatistics {
+
+  override def estimateStatistics(): Statistics = new Statistics {
+    override def sizeInBytes(): OptionalLong = OptionalLong.of(32L)
+    override def numRows(): OptionalLong = OptionalLong.of(2L)
+  }
+}
+
+class AdvancedDataSourceV2WithV2Filter extends TestingV2Source {
+
+  override def getTable(options: CaseInsensitiveStringMap): Table = new SimpleBatchTable {
+    override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
+      new AdvancedScanBuilderWithV2Filter()
+    }
+  }
+}
+
+class AdvancedScanBuilderWithV2Filter extends ScanBuilder
+  with Scan with SupportsPushDownV2Filters with SupportsPushDownRequiredColumns {
+
+  var requiredSchema = TestingV2Source.schema
+  var predicates = Array.empty[Predicate]
+
+  override def pruneColumns(requiredSchema: StructType): Unit = {
+    this.requiredSchema = requiredSchema
+  }
+
+  override def readSchema(): StructType = requiredSchema
+
+  override def pushPredicates(predicates: Array[Predicate]): Array[Predicate] = {
+    val (supported, unsupported) = predicates.partition {
+      case p: Predicate if p.name() == ">" => true
+      case _ => false
+    }
+    this.predicates = supported
+    unsupported
+  }
+
+  override def pushedPredicates(): Array[Predicate] = predicates
+
+  override def build(): Scan = this
+
+  override def toBatch: Batch = new AdvancedBatchWithV2Filter(predicates, requiredSchema)
+}
+
+class AdvancedBatchWithV2Filter(
+    val predicates: Array[Predicate],
+    val requiredSchema: StructType) extends Batch {
+
+  override def planInputPartitions(): Array[InputPartition] = {
+    val lowerBound = predicates.collectFirst {
+      case p: Predicate if p.name().equals(">") =>
+        val value = p.children()(1)
+        assert(value.isInstanceOf[Literal[_]])
+        value.asInstanceOf[Literal[_]]
+    }
+
+    val res = scala.collection.mutable.ArrayBuffer.empty[InputPartition]
+
+    if (lowerBound.isEmpty) {
+      res.append(RangeInputPartition(0, 5))
+      res.append(RangeInputPartition(5, 10))
+    } else if (lowerBound.get.value.asInstanceOf[Integer] < 4) {
+      res.append(RangeInputPartition(lowerBound.get.value.asInstanceOf[Integer] + 1, 5))
+      res.append(RangeInputPartition(5, 10))
+    } else if (lowerBound.get.value.asInstanceOf[Integer] < 9) {
+      res.append(RangeInputPartition(lowerBound.get.value.asInstanceOf[Integer] + 1, 10))
+    }
+
+    res.toArray
+  }
+
+  override def createReaderFactory(): PartitionReaderFactory = {
+    new AdvancedReaderFactory(requiredSchema)
+  }
+}
+
+class AdvancedReaderFactory(requiredSchema: StructType) extends PartitionReaderFactory {
+
+  override def createReader(partition: InputPartition): PartitionReader[InternalRow] = {
+    val RangeInputPartition(start, end) = partition
+    new PartitionReader[InternalRow] {
+      private var current = start - 1
+
+      override def next(): Boolean = {
+        current += 1
+        current < end
+      }
+
+      override def get(): InternalRow = {
+        val values = requiredSchema.map(_.name).map {
+          case "i" => current
+          case "j" => -current
+        }
+        InternalRow.fromSeq(values)
+      }
+
+      override def close(): Unit = {}
+    }
+  }
+}
+
+
+// Data source where pushed filters overlap with post-scan filters.
+// pushFilters returns unsupported filters, but pushedFilters() returns ALL filters
+// (including the unsupported ones). This mimics the Parquet row-group filter pattern
+// where a filter is pushed for best-effort evaluation but must also be re-evaluated.
+class OverlappingFilterDataSourceV2 extends TestingV2Source {
+  override def getTable(options: CaseInsensitiveStringMap): Table = new SimpleBatchTable {
+    override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
+      new OverlappingScanBuilder()
+    }
+  }
+}
+
+class OverlappingScanBuilder extends ScanBuilder
+  with Scan with SupportsPushDownFilters with SupportsPushDownRequiredColumns {
+
+  var requiredSchema = TestingV2Source.schema
+  private var allFilters = Array.empty[Filter]
+  private var evaluableFilters = Array.empty[Filter]
+
+  override def pruneColumns(requiredSchema: StructType): Unit = {
+    this.requiredSchema = requiredSchema
+  }
+
+  override def readSchema(): StructType = requiredSchema
+
+  override def pushFilters(filters: Array[Filter]): Array[Filter] = {
+    val (supported, unsupported) = filters.partition {
+      case GreaterThan("i", _: Int) => true
+      case _ => false
+    }
+    this.evaluableFilters = supported
+    this.allFilters = filters
+    // Return unsupported filters as post-scan, but report ALL filters as pushed
+    unsupported
+  }
+
+  // Reports all filters as pushed (including unsupported ones that overlap with post-scan)
+  override def pushedFilters(): Array[Filter] = allFilters
+
+  override def build(): Scan = this
+
+  override def toBatch: Batch = new AdvancedBatch(evaluableFilters, requiredSchema)
+}
+
+// Data source with a nested (struct) column to test ProjectionOverSchema remapping.
+// Schema: s: struct<a: int, b: int>, i: int
+// Pushes GreaterThan on nested field "s.a".
+class NestedSchemaDataSourceV2 extends TableProvider {
+
+  override def inferSchema(options: CaseInsensitiveStringMap): StructType =
+    NestedSchemaDataSourceV2.schema
+
+  override def getTable(
+      schema: StructType,
+      partitioning: Array[Transform],
+      properties: util.Map[String, String]): Table = {
+    new Table with SupportsRead {
+      override def name(): String = "nested-schema-test"
+      override def schema(): StructType = NestedSchemaDataSourceV2.schema
+      override def capabilities(): util.Set[TableCapability] =
+        util.EnumSet.of(TableCapability.BATCH_READ)
+      override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder =
+        new NestedSchemaScanBuilder()
+    }
+  }
+}
+
+class NestedCatalystFilterDataSourceV2 extends NestedSchemaDataSourceV2 {
+
+  override def getTable(
+      schema: StructType,
+      partitioning: Array[Transform],
+      properties: util.Map[String, String]): Table = {
+    new Table with SupportsRead {
+      override def name(): String = "nested-catalyst-filter-test"
+      override def schema(): StructType = NestedSchemaDataSourceV2.schema
+      override def capabilities(): util.Set[TableCapability] =
+        util.EnumSet.of(TableCapability.BATCH_READ)
+      override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder =
+        new NestedCatalystFilterScanBuilder()
+    }
+  }
+}
+
+object NestedSchemaDataSourceV2 {
+  val schema: StructType = StructType(Seq(
+    StructField("s", StructType(Seq(
+      StructField("a", IntegerType),
+      StructField("b", IntegerType)
+    ))),
+    StructField("i", IntegerType)
+  ))
+}
+
+class NestedSchemaScanBuilder extends ScanBuilder
+  with Scan with SupportsPushDownFilters with SupportsPushDownRequiredColumns {
+
+  var requiredSchema: StructType = NestedSchemaDataSourceV2.schema
+  var filters = Array.empty[Filter]
+
+  override def pruneColumns(requiredSchema: StructType): Unit = {
+    this.requiredSchema = requiredSchema
+  }
+
+  override def readSchema(): StructType = requiredSchema
+
+  override def pushFilters(filters: Array[Filter]): Array[Filter] = {
+    // Push GreaterThan on nested field "s.a"
+    val (supported, unsupported) = filters.partition {
+      case GreaterThan("s.a", _: Int) => true
+      case _ => false
+    }
+    this.filters = supported
+    unsupported
+  }
+
+  override def pushedFilters(): Array[Filter] = filters
+
+  override def build(): Scan = this
+
+  override def toBatch: Batch = new NestedSchemaBatch(filters, requiredSchema)
+}
+
+class NestedCatalystFilterScanBuilder extends ScanBuilder
+  with Scan
+  with Batch
+  with SupportsPushDownCatalystFilters
+  with SupportsPushDownRequiredColumns
+  with SupportsReportStatistics {
+
+  private var requiredSchema = NestedSchemaDataSourceV2.schema
+  private var pushedCatalystFilters = Seq.empty[CatalystExpression]
+
+  override def pruneColumns(requiredSchema: StructType): Unit = {
+    this.requiredSchema = requiredSchema
+  }
+
+  override def readSchema(): StructType = requiredSchema
+
+  override def pushFilters(filters: Seq[CatalystExpression]): Seq[CatalystExpression] = {
+    pushedCatalystFilters = filters
+    Nil
+  }
+
+  override def pushedFilters: Array[Predicate] = Array.empty
+
+  override def inferredFilters: Seq[CatalystExpression] = pushedCatalystFilters.collect {
+    case CatalystGreaterThan(a: AttributeReference, CatalystLiteral(n: Int, _))
+        if a.name == "i" =>
+      CatalystGreaterThan(AttributeReference("s.a", IntegerType)(), CatalystLiteral(n))
+  }
+
+  override def build(): Scan = this
+
+  override def toBatch: Batch = this
+
+  override def estimateStatistics(): Statistics = new Statistics {
+    override def sizeInBytes(): OptionalLong = OptionalLong.empty()
+    override def numRows(): OptionalLong = OptionalLong.of(10L)
+  }
+
+  override def reflectsFullyPushedDownFilters(): Boolean = false
+
+  override def useInferredFilterEstimation(): Boolean = true
+
+  override def planInputPartitions(): Array[InputPartition] = {
+    val lowerBound = pushedCatalystFilters.collectFirst {
+      case CatalystGreaterThan(a: AttributeReference, CatalystLiteral(n: Int, _))
+          if a.name == "i" => n
+    }
+    lowerBound match {
+      case Some(n) => Array(RangeInputPartition(n + 1, 10))
+      case None => Array(RangeInputPartition(0, 10))
+    }
+  }
+
+  override def createReaderFactory(): PartitionReaderFactory =
+    new NestedSchemaReaderFactory(requiredSchema)
+}
+
+class NestedSchemaBatch(
+    val filters: Array[Filter],
+    val requiredSchema: StructType) extends Batch {
+
+  override def planInputPartitions(): Array[InputPartition] = {
+    val lowerBound = filters.collectFirst {
+      case GreaterThan("s.a", v: Int) => v
+    }
+    val res = scala.collection.mutable.ArrayBuffer.empty[InputPartition]
+    if (lowerBound.isEmpty) {
+      res.append(RangeInputPartition(0, 5))
+      res.append(RangeInputPartition(5, 10))
+    } else if (lowerBound.get < 4) {
+      res.append(RangeInputPartition(lowerBound.get + 1, 5))
+      res.append(RangeInputPartition(5, 10))
+    } else if (lowerBound.get < 9) {
+      res.append(RangeInputPartition(lowerBound.get + 1, 10))
+    }
+    res.toArray
+  }
+
+  override def createReaderFactory(): PartitionReaderFactory =
+    new NestedSchemaReaderFactory(requiredSchema)
+}
+
+class NestedSchemaReaderFactory(
+    requiredSchema: StructType) extends PartitionReaderFactory {
+
+  override def createReader(partition: InputPartition): PartitionReader[InternalRow] = {
+    val RangeInputPartition(start, end) = partition
+    new PartitionReader[InternalRow] {
+      private var current = start - 1
+
+      override def next(): Boolean = {
+        current += 1
+        current < end
+      }
+
+      override def get(): InternalRow = {
+        val values = requiredSchema.map { field =>
+          field.name match {
+            case "s" =>
+              val structType = field.dataType.asInstanceOf[StructType]
+              val structValues = structType.map(_.name).map {
+                case "a" => current
+                case "b" => -current
+              }
+              InternalRow.fromSeq(structValues)
+            case "i" => current
+          }
+        }
+        InternalRow.fromSeq(values)
+      }
+
+      override def close(): Unit = {}
+    }
+  }
+}
+
+class SchemaRequiredDataSource extends TableProvider {
+
+  class MyScanBuilder(schema: StructType) extends SimpleScanBuilder {
+    override def planInputPartitions(): Array[InputPartition] = {
+      Array(RangeInputPartition(0, 2))
+    }
+
+    override def readSchema(): StructType = schema
+  }
+
+  override def supportsExternalMetadata(): Boolean = true
+
+  override def inferSchema(options: CaseInsensitiveStringMap): StructType = {
+    throw new IllegalArgumentException("requires a user-supplied schema")
+  }
+
+  override def getTable(
+      schema: StructType,
+      partitioning: Array[Transform],
+      properties: java.util.Map[String, String]): Table = {
+    val userGivenSchema = schema
+    new SimpleBatchTable {
+      override def schema(): StructType = userGivenSchema
+
+      override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
+        new MyScanBuilder(userGivenSchema)
+      }
+    }
+  }
+}
+
+class PartitionsRequiredDataSource extends SchemaRequiredDataSource {
+  override def inferPartitioning(options: CaseInsensitiveStringMap): Array[Transform] = {
+    throw new IllegalArgumentException("requires user-supplied partitioning")
+  }
+}
+
+class ColumnarDataSourceV2 extends TestingV2Source {
+
+  class MyScanBuilder extends SimpleScanBuilder {
+
+    override def planInputPartitions(): Array[InputPartition] = {
+      Array(RangeInputPartition(0, 50), RangeInputPartition(50, 90))
+    }
+
+    override def createReaderFactory(): PartitionReaderFactory = {
+      ColumnarReaderFactory
+    }
+  }
+
+  override def getTable(options: CaseInsensitiveStringMap): Table = new SimpleBatchTable {
+    override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
+      new MyScanBuilder()
+    }
+  }
+}
+
+object ColumnarReaderFactory extends PartitionReaderFactory {
+  private final val BATCH_SIZE = 20
+
+  override def supportColumnarReads(partition: InputPartition): Boolean = true
+
+  override def createReader(partition: InputPartition): PartitionReader[InternalRow] = {
+    throw SparkUnsupportedOperationException()
+  }
+
+  override def createColumnarReader(partition: InputPartition): PartitionReader[ColumnarBatch] = {
+    val RangeInputPartition(start, end) = partition
+    new PartitionReader[ColumnarBatch] {
+      private lazy val i = new OnHeapColumnVector(BATCH_SIZE, IntegerType)
+      private lazy val j = new OnHeapColumnVector(BATCH_SIZE, IntegerType)
+      private lazy val batch = new ColumnarBatch(Array(i, j))
+
+      private var current = start
+
+      override def next(): Boolean = {
+        i.reset()
+        j.reset()
+
+        var count = 0
+        while (current < end && count < BATCH_SIZE) {
+          i.putInt(count, current)
+          j.putInt(count, -current)
+          current += 1
+          count += 1
+        }
+
+        if (count == 0) {
+          false
+        } else {
+          batch.setNumRows(count)
+          true
+        }
+      }
+
+      override def get(): ColumnarBatch = batch
+
+      override def close(): Unit = batch.close()
+    }
+  }
+}
+
+class PartitionAwareDataSource extends TestingV2Source {
+
+  class MyScanBuilder extends SimpleScanBuilder
+    with SupportsReportPartitioning {
+
+    override def planInputPartitions(): Array[InputPartition] = {
+      // Note that we don't have same value of column `i` across partitions.
+      Array(
+        SpecificInputPartition(Array(1, 1, 3), Array(4, 4, 6)),
+        SpecificInputPartition(Array(2, 4, 4), Array(6, 2, 2)))
+    }
+
+    override def createReaderFactory(): PartitionReaderFactory = {
+      SpecificReaderFactory
+    }
+
+    override def outputPartitioning(): Partitioning =
+      new KeyGroupedPartitioning(Array(FieldReference("i")), 2)
+  }
+
+  override def getTable(options: CaseInsensitiveStringMap): Table = new SimpleBatchTable {
+    override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
+      new MyScanBuilder()
+    }
+  }
+}
+
+class OrderAndPartitionAwareDataSource extends PartitionAwareDataSource {
+
+  class OrderAwareScanBuilder(
+      val partitionKeys: Option[Seq[String]],
+      val orderKeys: Seq[String])
+    extends SimpleScanBuilder
+    with SupportsReportPartitioning with SupportsReportOrdering {
+
+    override def planInputPartitions(): Array[InputPartition] = {
+      // data are partitioned by column `i` or `j`, so we can report any partitioning
+      // column `i` is not ordered globally, but within partitions, together with`j`
+      // this allows us to report ordering by [i] and [i, j]
+      Array(
+        SpecificInputPartition(Array(1, 1, 3), Array(4, 5, 5)),
+        SpecificInputPartition(Array(2, 4, 4), Array(6, 1, 2)))
+    }
+
+    override def createReaderFactory(): PartitionReaderFactory = {
+      SpecificReaderFactory
+    }
+
+    override def outputPartitioning(): Partitioning = {
+      partitionKeys.map(keys =>
+        new KeyGroupedPartitioning(keys.map(FieldReference(_)).toArray, 2)
+      ).getOrElse(
+        new UnknownPartitioning(2)
+      )
+    }
+
+    override def outputOrdering(): Array[SortOrder] = orderKeys.map(
+      new MySortOrder(_)
+    ).toArray
+  }
+
+  override def getTable(options: CaseInsensitiveStringMap): Table = new SimpleBatchTable {
+    override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
+      new OrderAwareScanBuilder(
+        Option(options.get("partitionKeys")).map(_.split(",").toImmutableArraySeq),
+        Option(options.get("orderKeys")).map(_.split(",").toSeq).getOrElse(Seq.empty)
+      )
+    }
+  }
+
+  class MySortOrder(columnName: String) extends SortOrder {
+    override def expression(): Expression = new MyIdentityTransform(
+      new MyNamedReference(columnName)
+    )
+    override def direction(): SortDirection = SortDirection.ASCENDING
+    override def nullOrdering(): NullOrdering = NullOrdering.NULLS_FIRST
+  }
+
+  class MyNamedReference(parts: String*) extends NamedReference {
+    override def fieldNames(): Array[String] = parts.toArray
+  }
+
+  class MyIdentityTransform(namedReference: NamedReference) extends Transform {
+    override def name(): String = "identity"
+    override def references(): Array[NamedReference] = Array.empty
+    override def arguments(): Array[Expression] = Seq(namedReference).toArray
+  }
+}
+
+case class SpecificInputPartition(
+    i: Array[Int],
+    j: Array[Int]) extends InputPartition with HasPartitionKey {
+  override def partitionKey(): InternalRow = PartitionInternalRow(Seq(i(0)).toArray)
+}
+
+object SpecificReaderFactory extends PartitionReaderFactory {
+  override def createReader(partition: InputPartition): PartitionReader[InternalRow] = {
+    val p = partition.asInstanceOf[SpecificInputPartition]
+    new PartitionReader[InternalRow] {
+      private var current = -1
+
+      override def next(): Boolean = {
+        current += 1
+        current < p.i.length
+      }
+
+      override def get(): InternalRow = InternalRow(p.i(current), p.j(current))
+
+      override def close(): Unit = {}
+    }
+  }
+}
+
+class SchemaReadAttemptException(m: String) extends RuntimeException(m)
+
+/**
+ * A writable data source whose batch write both fails to commit and then fails to abort. This
+ * drives the exact branch in `WriteToDataSourceV2Exec` that raises `WRITING_JOB_FAILED`: the
+ * write's `commit` throws, and the follow-up `abort` also throws, so the original failure is
+ * wrapped rather than re-thrown. The per-task `DataWriter` succeeds so the failure is driver-side
+ * and deterministic (no dependence on task scheduling).
+ */
+class CommitAndAbortFailingDataSource extends TestingV2Source {
+
+  override def getTable(options: CaseInsensitiveStringMap): Table = new SimpleBatchTable
+    with SupportsWrite {
+
+    override def capabilities(): java.util.Set[TableCapability] =
+      java.util.EnumSet.of(TableCapability.BATCH_READ, TableCapability.BATCH_WRITE,
+        TableCapability.TRUNCATE)
+
+    override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder =
+      new SimpleScanBuilder {
+        override def planInputPartitions(): Array[InputPartition] = Array.empty
+      }
+
+    override def newWriteBuilder(info: LogicalWriteInfo): WriteBuilder = new WriteBuilder {
+      override def build(): Write = new Write {
+        override def toBatch: BatchWrite = new BatchWrite {
+          override def createBatchWriterFactory(info: PhysicalWriteInfo): DataWriterFactory =
+            CommitAndAbortFailingDataSource.WriterFactory
+
+          override def commit(messages: Array[WriterCommitMessage]): Unit =
+            throw new RuntimeException("commit failed")
+
+          override def abort(messages: Array[WriterCommitMessage]): Unit =
+            throw new RuntimeException("abort failed")
+        }
+      }
+    }
+  }
+}
+
+object CommitAndAbortFailingDataSource {
+  object WriterFactory extends DataWriterFactory {
+    override def createWriter(partitionId: Int, taskId: Long): DataWriter[InternalRow] =
+      new DataWriter[InternalRow] {
+        override def write(record: InternalRow): Unit = {}
+        override def commit(): WriterCommitMessage = null
+        override def abort(): Unit = {}
+        override def close(): Unit = {}
+      }
+  }
+}
+
+class SimpleWriteOnlyDataSource extends SimpleWritableDataSource {
+
+  override def getTable(options: CaseInsensitiveStringMap): Table = {
+    new MyTable(options) {
+      override def schema(): StructType = {
+        throw new SchemaReadAttemptException("schema should not be read.")
+      }
+    }
+  }
+}
+
+/**
+ * A writable data source that supports external metadata with a fixed schema (i int, j int).
+ */
+class WritableDataSourceSupportsExternalMetadata extends SimpleWritableDataSource {
+  override def supportsExternalMetadata(): Boolean = true
+}
+
+/**
+ * A writable data source that supports external metadata with
+ * user-specified schema and partitioning.
+ */
+class CustomSchemaAndPartitioningDataSource extends WritableDataSourceSupportsExternalMetadata {
+  class TestTable(
+      schema: StructType,
+      partitioning: Array[Transform],
+      options: CaseInsensitiveStringMap) extends MyTable(options) {
+    override def schema(): StructType = schema
+
+    override def partitioning(): Array[Transform] = partitioning
+  }
+
+  override def getTable(
+      schema: StructType,
+      partitioning: Array[Transform],
+      properties: util.Map[String, String]): Table = {
+    new TestTable(schema, partitioning, new CaseInsensitiveStringMap(properties))
+  }
+}
+
+class SupportsExternalMetadataWritableDataSource extends SimpleWritableDataSource {
+  override def supportsExternalMetadata(): Boolean = true
+
+  override def inferSchema(options: CaseInsensitiveStringMap): StructType = {
+    throw new IllegalArgumentException(
+      "Dataframe writer should not require inferring table schema the data source supports" +
+        " external metadata.")
+  }
+}
+
+class ReportStatisticsDataSource extends SimpleWritableDataSource {
+
+  class ReportStatisticsScanBuilder extends SimpleScanBuilder
+    with SupportsReportStatistics {
+    override def estimateStatistics(): Statistics = {
+      new Statistics {
+        override def sizeInBytes(): OptionalLong = OptionalLong.of(80)
+
+        override def numRows(): OptionalLong = OptionalLong.of(10)
+      }
+    }
+
+    override def planInputPartitions(): Array[InputPartition] = {
+      Array(RangeInputPartition(0, 5), RangeInputPartition(5, 10))
+    }
+  }
+
+  override def getTable(options: CaseInsensitiveStringMap): Table = {
+    new SimpleBatchTable {
+      override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
+        new ReportStatisticsScanBuilder
+      }
+    }
+  }
+}
+
+class InvalidDataSource extends TestingV2Source {
+  throw new IllegalArgumentException("test error")
+
+  override def getTable(options: CaseInsensitiveStringMap): Table = null
+}
+
+/**
+ * A read-only DSv2 data source that only declares BATCH_READ capability.
+ * Used to test that write attempts produce a clear error instead of falling through to V1.
+ */
+class ReadOnlyV2DataSource extends SimpleTableProvider {
+  override def getTable(options: CaseInsensitiveStringMap): Table = {
+    new ReadOnlyV2Table
+  }
+}
+
+class ReadOnlyV2Table extends Table with SupportsRead {
+  override def name(): String = "read_only_v2_test"
+  override def schema(): StructType = new StructType().add("i", "long")
+  override def capabilities(): java.util.Set[TableCapability] =
+    java.util.EnumSet.of(TableCapability.BATCH_READ)
+  override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder =
+    throw new UnsupportedOperationException("scan not needed for write tests")
+}
+
+/**
+ * A DSv2 data source that declares V1_BATCH_WRITE, simulating the JDBC pattern.
+ * Used to verify that V1 fallback is preserved for sources that opt into it.
+ */
+class V1BatchWriteV2DataSource extends SimpleTableProvider {
+  override def getTable(options: CaseInsensitiveStringMap): Table = {
+    new V1BatchWriteV2Table
+  }
+}
+
+class V1BatchWriteV2Table extends Table with SupportsRead {
+  override def name(): String = "v1_batch_write_test"
+  override def schema(): StructType = new StructType().add("i", "long")
+  override def capabilities(): java.util.Set[TableCapability] =
+    java.util.EnumSet.of(TableCapability.BATCH_READ, TableCapability.V1_BATCH_WRITE)
+  override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder =
+    throw new UnsupportedOperationException("scan not needed for write tests")
+}

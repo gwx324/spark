@@ -1,0 +1,1333 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.connector
+
+import org.apache.spark.internal.config
+import org.apache.spark.sql.{AnalysisException, Row}
+import org.apache.spark.sql.QueryTest.withQueryExecutionsCaptured
+import org.apache.spark.sql.catalyst.expressions.CheckInvariant
+import org.apache.spark.sql.catalyst.plans.logical.Filter
+import org.apache.spark.sql.catalyst.trees.TreePattern.WITH_EXPRESSION
+import org.apache.spark.sql.connector.catalog.{Aborted, Committed, InMemoryRowLevelOperationTable, InMemoryTable, InMemoryTruncatableOnlyTable, InMemoryTruncatableOnlyTableCatalog, TableWritePrivilege}
+import org.apache.spark.sql.connector.write.DeleteSummary
+import org.apache.spark.sql.execution.datasources.v2.{DeleteFromTableExec, ReplaceDataExec, TruncateTableExec, WriteDeltaExec}
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.sources
+
+abstract class DeleteFromTableSuiteBase extends RowLevelOperationSuiteBase {
+
+  import testImplicits._
+
+  protected def enforceCheckConstraintOnDelete: Boolean = true
+
+  protected def deltaDelete: Boolean = false
+
+  protected def getDeleteSummary(): DeleteSummary = {
+    val t = catalog.loadTable(ident).asInstanceOf[InMemoryTable]
+    t.commits.last.writeSummary.get.asInstanceOf[DeleteSummary]
+  }
+
+  protected def checkDeleteMetrics(
+      numDeletedRows: Long,
+      numCopiedRows: Long): Unit = {
+    val summary = getDeleteSummary()
+    assert(summary.numDeletedRows() === numDeletedRows,
+      s"Expected numDeletedRows=$numDeletedRows, got ${summary.numDeletedRows()}")
+    val expectedCopied = if (deltaDelete) 0L else numCopiedRows
+    assert(summary.numCopiedRows() === expectedCopied,
+      s"Expected numCopiedRows=$expectedCopied, got ${summary.numCopiedRows()}")
+  }
+
+  test("delete from table containing added column with default value") {
+    createAndInitTable("pk INT NOT NULL, dep STRING", """{ "pk": 1, "dep": "hr" }""")
+
+    sql(s"ALTER TABLE $tableNameAsString ADD COLUMN txt STRING DEFAULT 'initial-text'")
+
+    append("pk INT, dep STRING",
+      """{ "pk": 2, "dep": "hr" }
+        |{ "pk": 3, "dep": "software" }
+        |{ "pk": 4, "dep": "hr" }
+        |""".stripMargin)
+
+    sql(s"ALTER TABLE $tableNameAsString ALTER COLUMN txt SET DEFAULT 'new-text'")
+
+    append("pk INT, dep STRING",
+      """{ "pk": 5, "dep": "hr" }
+        |{ "pk": 6, "dep": "hr" }
+        |""".stripMargin)
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Seq(
+        Row(1, "hr", "initial-text"),
+        Row(2, "hr", "initial-text"),
+        Row(3, "software", "initial-text"),
+        Row(4, "hr", "initial-text"),
+        Row(5, "hr", "new-text"),
+        Row(6, "hr", "new-text")))
+
+    sql(s"DELETE FROM $tableNameAsString WHERE pk IN (2, 5)")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Seq(
+        Row(1, "hr", "initial-text"),
+        Row(3, "software", "initial-text"),
+        Row(4, "hr", "initial-text"),
+        Row(6, "hr", "new-text")))
+    checkDeleteMetrics(numDeletedRows = 2, numCopiedRows = 3)
+  }
+
+  test("delete from table with table constraints") {
+    createAndInitTable(
+      "pk INT NOT NULL, id INT, dep STRING",
+      """{ "pk": 1, "id": 2, "dep": "hr" }
+        |{ "pk": 2, "id": 4, "dep": "eng" }
+        |{ "pk": 3, "id": 6, "dep": "eng" }
+        |""".stripMargin)
+    sql(s"ALTER TABLE $tableNameAsString ADD CONSTRAINT positive_pk CHECK (pk > 0)")
+    val df = sql(s"DELETE FROM $tableNameAsString WHERE pk < 2")
+    val checkInvariant = df.queryExecution.analyzed.collectFirst {
+      case f: Filter =>
+        f.condition.collectFirst {
+          case c: CheckInvariant => c
+        }
+    }.flatten
+    if (enforceCheckConstraintOnDelete) {
+      assert(checkInvariant.isDefined, "Check invariant should be present in the delete plan")
+    } else {
+      assert(checkInvariant.isEmpty, "Check invariant should not be present in the delete plan")
+    }
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Seq(Row(2, 4, "eng"), Row(3, 6, "eng")))
+    checkDeleteMetrics(numDeletedRows = 1, numCopiedRows = 0)
+
+    sql(s"DELETE FROM $tableNameAsString WHERE pk >=3")
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Seq(Row(2, 4, "eng")))
+    checkDeleteMetrics(numDeletedRows = 1, numCopiedRows = 1)
+  }
+
+  test("delete from table containing struct column with default value") {
+    sql(
+      s"""CREATE TABLE $tableNameAsString (
+         | pk INT NOT NULL,
+         | complex STRUCT<c1:INT,c2:STRING> DEFAULT struct(-1, 'unknown'),
+         | dep STRING)
+         |PARTITIONED BY (dep)
+         |""".stripMargin)
+
+    append("pk INT NOT NULL, dep STRING",
+      """{ "pk": 1, "dep": "hr" }
+        |{ "pk": 2, "dep": "hr" }
+        |{ "pk": 3, "dep": "hr" }
+        |""".stripMargin)
+
+    append("pk INT NOT NULL, complex STRUCT<c1:INT,c2:STRING>, dep STRING",
+      """{ "pk": 4, "dep": "hr" }
+        |{ "pk": 5, "complex": { "c1": 5, "c2": "v5" }, "dep": "hr" }
+        |""".stripMargin)
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Seq(
+        Row(1, Row(-1, "unknown"), "hr"),
+        Row(2, Row(-1, "unknown"), "hr"),
+        Row(3, Row(-1, "unknown"), "hr"),
+        Row(4, null, "hr"),
+        Row(5, Row(5, "v5"), "hr")))
+
+    sql(s"DELETE FROM $tableNameAsString WHERE pk < 3")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Seq(
+        Row(3, Row(-1, "unknown"), "hr"),
+        Row(4, null, "hr"),
+        Row(5, Row(5, "v5"), "hr")))
+  }
+
+  test("EXPLAIN only delete") {
+    createAndInitTable("id INT, dep STRING", """{ "id": 1, "dep": "hr" }""")
+
+    sql(s"EXPLAIN DELETE FROM $tableNameAsString WHERE id <= 10")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(1, "hr") :: Nil)
+  }
+
+  test("delete from empty tables") {
+    createTable("pk INT NOT NULL, id INT, dep STRING")
+
+    sql(s"DELETE FROM $tableNameAsString WHERE id <= 1")
+
+    checkAnswer(sql(s"SELECT * FROM $tableNameAsString"), Nil)
+
+    checkDeleteMetrics(numDeletedRows = 0, numCopiedRows = 0)
+  }
+
+  test("delete with literal false condition") {
+    createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
+      """{ "pk": 1, "id": 1, "dep": "hr" }
+        |{ "pk": 2, "id": 2, "dep": "software" }
+        |{ "pk": 3, "id": 3, "dep": "hr" }
+        |""".stripMargin)
+
+    sql(s"DELETE FROM $tableNameAsString WHERE false")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(1, 1, "hr") :: Row(2, 2, "software") :: Row(3, 3, "hr") :: Nil)
+
+    checkDeleteMetrics(numDeletedRows = 0, numCopiedRows = 0)
+  }
+
+  test("delete with literal true condition") {
+    createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
+      """{ "pk": 1, "id": 1, "dep": "hr" }
+        |{ "pk": 2, "id": 2, "dep": "software" }
+        |{ "pk": 3, "id": 3, "dep": "hr" }
+        |""".stripMargin)
+
+    sql(s"DELETE FROM $tableNameAsString WHERE true")
+
+    checkAnswer(sql(s"SELECT * FROM $tableNameAsString"), Nil)
+  }
+
+  test("delete with NULL equality on VOID column") {
+    createAndInitTable("pk INT NOT NULL, v VOID, dep STRING",
+      """{ "pk": 1, "v": null, "dep": "hr" }
+        |{ "pk": 2, "v": null, "dep": "software" }
+        |{ "pk": 3, "v": null, "dep": "hr" }
+        |""".stripMargin)
+
+    sql(s"DELETE FROM $tableNameAsString WHERE v = NULL")
+
+    checkAnswer(
+      sql(s"SELECT pk, dep FROM $tableNameAsString"),
+      Row(1, "hr") :: Row(2, "software") :: Row(3, "hr") :: Nil)
+
+    checkDeleteMetrics(numDeletedRows = 0, numCopiedRows = 0)
+  }
+
+  test("delete with NULL condition on non-null column") {
+    createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
+      """{ "pk": 1, "id": 1, "dep": "hr" }
+        |{ "pk": 2, "id": 2, "dep": "software" }
+        |{ "pk": 3, "id": 3, "dep": "hr" }
+        |""".stripMargin)
+
+    sql(s"DELETE FROM $tableNameAsString WHERE pk = NULL")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(1, 1, "hr") :: Row(2, 2, "software") :: Row(3, 3, "hr") :: Nil)
+
+    checkDeleteMetrics(numDeletedRows = 0, numCopiedRows = 0)
+  }
+
+  test("delete with basic filters") {
+    createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
+      """{ "pk": 1, "id": 1, "dep": "hr" }
+        |{ "pk": 2, "id": 2, "dep": "software" }
+        |{ "pk": 3, "id": 3, "dep": "hr" }
+        |""".stripMargin)
+
+    sql(s"DELETE FROM $tableNameAsString WHERE id <= 1")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(2, 2, "software") :: Row(3, 3, "hr") :: Nil)
+
+    checkDeleteMetrics(numDeletedRows = 1, numCopiedRows = 1)
+  }
+
+  test("SPARK-59962: delete with a condition reading a computed value twice") {
+    // BETWEEN reads `id + pk` twice. A group-based delete pushes the condition down to the scan
+    // and reuses it for runtime group filtering, where a column pre-evaluated under the write is
+    // not found. The untouched `finance` group is copied only if that filter is missing.
+    createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
+      """{ "pk": 1, "id": 1, "dep": "hr" }
+        |{ "pk": 2, "id": 2, "dep": "software" }
+        |{ "pk": 3, "id": 3, "dep": "hr" }
+        |{ "pk": 4, "id": 10, "dep": "finance" }
+        |""".stripMargin)
+
+    val (cond, groupFilterCond) = executeAndKeepConditions {
+      sql(s"DELETE FROM $tableNameAsString WHERE (id + pk) BETWEEN 2 AND 4")
+    }
+    // The condition reaches the source inlined. A group-based write also has a group filter
+    // condition, only evaluated in the runtime group filter, which keeps the `With` for that
+    // filter to memoize.
+    assert(!cond.containsPattern(WITH_EXPRESSION), s"condition: $cond")
+    assert(groupFilterCond.isDefined == !deltaDelete, s"group filter condition: $groupFilterCond")
+    assert(groupFilterCond.forall(_.containsPattern(WITH_EXPRESSION)),
+      s"group filter condition: $groupFilterCond")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(3, 3, "hr") :: Row(4, 10, "finance") :: Nil)
+
+    checkDeleteMetrics(numDeletedRows = 2, numCopiedRows = 1)
+  }
+
+  test("delete with aliases") {
+    createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
+      """{ "pk": 1, "id": 1, "dep": "hr" }
+        |{ "pk": 2, "id": 2, "dep": "software" }
+        |{ "pk": 3, "id": 3, "dep": "hr" }
+        |""".stripMargin)
+
+    sql(s"DELETE FROM $tableNameAsString AS t WHERE t.id <= 1 OR t.dep = 'hr'")
+
+    checkAnswer(sql(s"SELECT * FROM $tableNameAsString"), Row(2, 2, "software") :: Nil)
+
+    checkDeleteMetrics(numDeletedRows = 2, numCopiedRows = 0)
+  }
+
+  test("SPARK-60978: delete keeps columns whose names differ only by case") {
+    // such a table can only be created and read in a case-sensitive session
+    withSQLConf(SQLConf.CASE_SENSITIVE.key -> "true") {
+      createAndInitTable("pk INT NOT NULL, salary INT, SALARY INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "SALARY": 200, "dep": "hr" }
+          |{ "pk": 2, "salary": 300, "SALARY": 400, "dep": "hr" }
+          |""".stripMargin)
+    }
+
+    // the statement does not name the colliding columns so it is not ambiguous
+    sql(s"DELETE FROM $tableNameAsString WHERE pk <= 1")
+
+    withSQLConf(SQLConf.CASE_SENSITIVE.key -> "true") {
+      checkAnswer(sql(s"SELECT * FROM $tableNameAsString"), Row(2, 300, 400, "hr") :: Nil)
+    }
+  }
+
+  test("delete with IN predicates") {
+    createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
+      """{ "pk": 1, "id": 1, "dep": "hr" }
+        |{ "pk": 2, "id": 2, "dep": "software" }
+        |{ "pk": 3, "id": null, "dep": "hr" }
+        |""".stripMargin)
+
+    sql(s"DELETE FROM $tableNameAsString WHERE id IN (1, null)")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(2, 2, "software") :: Row(3, null, "hr") :: Nil)
+
+    checkDeleteMetrics(numDeletedRows = 1, numCopiedRows = 1)
+  }
+
+  test("delete with NOT IN predicates") {
+    createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
+      """{ "pk": 1, "id": 1, "dep": "hr" }
+        |{ "pk": 2, "id": 2, "dep": "software" }
+        |{ "pk": 3, "id": null, "dep": "hr" }
+        |""".stripMargin)
+
+    sql(s"DELETE FROM $tableNameAsString WHERE id NOT IN (null, 1)")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(1, 1, "hr") :: Row(2, 2, "software") :: Row(3, null, "hr") :: Nil)
+    checkDeleteMetrics(numDeletedRows = 0, numCopiedRows = 0)
+
+    sql(s"DELETE FROM $tableNameAsString WHERE id NOT IN (1, 10)")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(1, 1, "hr") :: Row(3, null, "hr") :: Nil)
+    checkDeleteMetrics(numDeletedRows = 1, numCopiedRows = 0)
+  }
+
+  test("delete with conditions on nested columns") {
+    createAndInitTable("pk INT NOT NULL, id INT, complex STRUCT<c1:INT,c2:STRING>, dep STRING",
+      """{ "pk": 1, "id": 1, "complex": { "c1": 3, "c2": "v1" }, "dep": "hr" }
+        |{ "pk": 2, "id": 2, "complex": { "c1": 2, "c2": "v2" }, "dep": "software" }
+        |""".stripMargin)
+
+    sql(s"DELETE FROM $tableNameAsString WHERE complex.c1 = id + 2")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(2, 2, Row(2, "v2"), "software") :: Nil)
+    checkDeleteMetrics(numDeletedRows = 1, numCopiedRows = 0)
+
+    sql(s"DELETE FROM $tableNameAsString t WHERE t.complex.c1 = id")
+
+    checkAnswer(sql(s"SELECT * FROM $tableNameAsString"), Nil)
+    checkDeleteMetrics(numDeletedRows = 1, numCopiedRows = 0)
+  }
+
+  test("SPARK-61462: delete with a condition on a CHAR column stored with and without padding") {
+    createTable("pk INT NOT NULL, id INT, dep CHAR(8)")
+    withSQLConf(SQLConf.LEGACY_CHAR_VARCHAR_AS_STRING.key -> "true") {
+      append("pk INT NOT NULL, id INT, dep STRING",
+        """{ "pk": 1, "id": 1, "dep": "hr" }
+          |{ "pk": 2, "id": 2, "dep": "software" }
+          |""".stripMargin)
+    }
+    append("pk INT NOT NULL, id INT, dep STRING", """{ "pk": 3, "id": 3, "dep": "hr" }""")
+
+    // the data source cannot delete these rows with filters that compare the padded literal with
+    // the stored values, so this delete must be executed as a row-level operation
+    sql(s"DELETE FROM $tableNameAsString WHERE dep = 'hr'")
+
+    checkAnswer(sql(s"SELECT * FROM $tableNameAsString"), Row(2, 2, "software") :: Nil)
+    checkDeleteMetrics(numDeletedRows = 2, numCopiedRows = 0)
+  }
+
+  test("SPARK-61462: delete with a CHAR condition in an OR with a partition condition") {
+    createTable("pk INT NOT NULL, c CHAR(3), dep STRING")
+    append("pk INT NOT NULL, c STRING, dep STRING",
+      """{ "pk": 1, "c": "a", "dep": "hr" }
+        |{ "pk": 2, "c": "b", "dep": "software" }
+        |{ "pk": 3, "c": "x", "dep": "hr" }
+        |{ "pk": 4, "c": "a", "dep": "finance" }
+        |{ "pk": 5, "c": "y", "dep": "finance" }
+        |""".stripMargin)
+
+    // the padded comparison has no V1 filter, so it must not be dropped from the OR
+    sql(s"DELETE FROM $tableNameAsString WHERE c = 'a' OR dep = 'software'")
+
+    checkAnswer(
+      sql(s"SELECT pk FROM $tableNameAsString"),
+      Row(3) :: Row(5) :: Nil)
+  }
+
+  test("SPARK-61462: delete with a correlated subquery on a CHAR column") {
+    withTempView("deleted") {
+      createTable("pk INT NOT NULL, c CHAR(3), dep STRING")
+      append("pk INT NOT NULL, c STRING, dep STRING",
+        """{ "pk": 1, "c": "a", "dep": "hr" }
+          |{ "pk": 2, "c": "b", "dep": "software" }
+          |{ "pk": 3, "c": "x", "dep": "hr" }
+          |""".stripMargin)
+
+      Seq("a  ", "z  ").toDF("v").createOrReplaceTempView("deleted")
+
+      sql(s"DELETE FROM $tableNameAsString t WHERE EXISTS (SELECT 1 FROM deleted WHERE v = t.c)")
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(2, "b  ", "software") :: Row(3, "x  ", "hr") :: Nil)
+      checkDeleteMetrics(numDeletedRows = 1, numCopiedRows = 1)
+    }
+  }
+
+  test("SPARK-60673: delete with metadata columns in the condition") {
+    // the metadata columns must be read even if the operation does not require them
+    createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
+      """{ "pk": 1, "id": 1, "dep": "hr" }
+        |{ "pk": 2, "id": 2, "dep": "hr" }
+        |{ "pk": 3, "id": 1, "dep": "software" }
+        |""".stripMargin)
+
+    sql(s"DELETE FROM $tableNameAsString WHERE _partition = 'hr' AND id < 2")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(2, 2, "hr") :: Row(3, 1, "software") :: Nil)
+    checkDeleteMetrics(numDeletedRows = 1, numCopiedRows = 1)
+
+    sql(s"DELETE FROM $tableNameAsString t WHERE t.index = 0 AND t.id > 1")
+
+    checkAnswer(sql(s"SELECT * FROM $tableNameAsString"), Row(3, 1, "software") :: Nil)
+    checkDeleteMetrics(numDeletedRows = 1, numCopiedRows = 0)
+  }
+
+  test("delete with IN subqueries") {
+    withTempView("deleted_id", "deleted_dep") {
+      createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
+        """{ "pk": 1, "id": 1, "dep": "hr" }
+          |{ "pk": 2, "id": 2, "dep": "hardware" }
+          |{ "pk": 3, "id": null, "dep": "hr" }
+          |""".stripMargin)
+
+      val deletedIdDF = Seq(Some(0), Some(1), None).toDF()
+      deletedIdDF.createOrReplaceTempView("deleted_id")
+
+      val deletedDepDF = Seq("software", "hr").toDF()
+      deletedDepDF.createOrReplaceTempView("deleted_dep")
+
+      sql(
+        s"""DELETE FROM $tableNameAsString
+           |WHERE
+           | id IN (SELECT * FROM deleted_id)
+           | AND
+           | dep IN (SELECT * FROM deleted_dep)
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(2, 2, "hardware") :: Row(3, null, "hr") :: Nil)
+      checkDeleteMetrics(numDeletedRows = 1, numCopiedRows = 1)
+
+      append("pk INT NOT NULL, id INT, dep STRING",
+        """{ "pk": 4, "id": 1, "dep": "hr" }
+          |{ "pk": 5, "id": -1, "dep": "hr" }
+          |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(5, -1, "hr") :: Row(4, 1, "hr") :: Row(2, 2, "hardware") :: Row(3, null, "hr") :: Nil)
+
+      sql(
+        s"""DELETE FROM $tableNameAsString
+           |WHERE
+           | id IS NULL
+           | OR
+           | id IN (SELECT value + 2 FROM deleted_id)
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(5, -1, "hr") :: Row(4, 1, "hr") :: Nil)
+      checkDeleteMetrics(numDeletedRows = 2, numCopiedRows = 2)
+
+      append("pk INT NOT NULL, id INT, dep STRING",
+        """{ "pk": 6, "id": null, "dep": "hr" }
+          |{ "pk": 7, "id": 2, "dep": "hr" }
+          |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(5, -1, "hr") :: Row(4, 1, "hr") :: Row(7, 2, "hr") :: Row(6, null, "hr") :: Nil)
+
+      sql(
+        s"""DELETE FROM $tableNameAsString
+           |WHERE
+           | id IN (SELECT value + 2 FROM deleted_id)
+           | AND
+           | dep = 'hr'
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(5, -1, "hr") :: Row(4, 1, "hr") :: Row(6, null, "hr") :: Nil)
+      checkDeleteMetrics(numDeletedRows = 1, numCopiedRows = 3)
+    }
+  }
+
+  test("delete with multi-column IN subqueries") {
+    withTempView("deleted_employee") {
+      createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
+        """{ "pk": 1, "id": 1, "dep": "hr" }
+          |{ "pk": 2, "id": 2, "dep": "hardware" }
+          |{ "pk": 3, "id": null, "dep": "hr" }
+          |""".stripMargin)
+
+      val deletedEmployeeDF = Seq((None, "hr"), (Some(1), "hr")).toDF()
+      deletedEmployeeDF.createOrReplaceTempView("deleted_employee")
+
+      sql(
+        s"""DELETE FROM $tableNameAsString
+           |WHERE
+           | (id, dep) IN (SELECT * FROM deleted_employee)
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(2, 2, "hardware") :: Row(3, null, "hr") :: Nil)
+      checkDeleteMetrics(numDeletedRows = 1, numCopiedRows = 1)
+    }
+  }
+
+  test("metric values are stable across stage retries") {
+    // Force a shuffle in the DELETE plan via an IN-subquery (with broadcast disabled), then
+    // have the DAGScheduler corrupt the first attempt of every upstream shuffle map stage.
+    // The scan-side numOutputRows doubles up across attempts, and the driver-side derivation
+    // numDeletedRows = numScannedRows - numCopiedRows in `ReplaceDataExec.getWriteSummary`
+    // propagates that doubling into `DeleteSummary`. With SQLLastAttemptMetric on the scan,
+    // the surfaced numDeletedRows stays correct. (The current fetch-failure injection does
+    // not retry the writer stage, so writer-side numCopiedRows isn't actually exercised
+    // here; follow-up #55738 will fill that gap.)
+    withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1") {
+      withTempView("source") {
+        createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+          """{ "pk": 1, "salary": 100, "dep": "hr" }
+            |{ "pk": 2, "salary": 200, "dep": "software" }
+            |{ "pk": 3, "salary": 300, "dep": "hr" }
+            |{ "pk": 4, "salary": 400, "dep": "software" }
+            |""".stripMargin)
+
+        val sourceDF = Seq(1, 2).toDF("pk")
+        sourceDF.createOrReplaceTempView("source")
+
+        withSparkContextConf(
+            config.Tests.INJECT_SHUFFLE_FETCH_FAILURES.key -> "true") {
+          sql(
+            s"""DELETE FROM $tableNameAsString
+               |WHERE pk IN (SELECT pk FROM source)
+               |""".stripMargin)
+        }
+
+        checkDeleteMetrics(numDeletedRows = 2, numCopiedRows = 2)
+
+        checkAnswer(
+          sql(s"SELECT * FROM $tableNameAsString"),
+          Seq(
+            Row(3, 300, "hr"),
+            Row(4, 400, "software")))
+      }
+    }
+  }
+
+  test("delete with NOT IN subqueries") {
+    withTempView("deleted_id", "deleted_dep") {
+      createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
+        """{ "pk": 1, "id": 1, "dep": "hr" }
+          |{ "pk": 2, "id": 2, "dep": "hardware" }
+          |{ "pk": 3, "id": null, "dep": "hr" }
+          |""".stripMargin)
+
+      val deletedIdDF = Seq(Some(-1), Some(-2), None).toDF()
+      deletedIdDF.createOrReplaceTempView("deleted_id")
+
+      val deletedDepDF = Seq("software", "hr").toDF()
+      deletedDepDF.createOrReplaceTempView("deleted_dep")
+
+      sql(
+        s"""DELETE FROM $tableNameAsString
+           |WHERE
+           | id NOT IN (SELECT * FROM deleted_id)
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(1, 1, "hr") :: Row(2, 2, "hardware") :: Row(3, null, "hr") :: Nil)
+      checkDeleteMetrics(numDeletedRows = 0, numCopiedRows = 0)
+
+      sql(
+        s"""DELETE FROM $tableNameAsString
+           |WHERE
+           | id NOT IN (SELECT * FROM deleted_id WHERE value IS NOT NULL)
+           |""".stripMargin)
+
+      checkAnswer(sql(s"SELECT * FROM $tableNameAsString"), Row(3, null, "hr") :: Nil)
+      checkDeleteMetrics(numDeletedRows = 2, numCopiedRows = 1)
+
+      append("pk INT NOT NULL, id INT, dep STRING",
+        """{ "pk": 4, "id": 1, "dep": "hr" }
+          |{ "pk": 5, "id": 2, "dep": "hardware" }
+          |{ "pk": 6, "id": null, "dep": "hr" }
+          |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(4, 1, "hr") :: Row(5, 2, "hardware") :: Row(3, null, "hr") :: Row(6, null, "hr") :: Nil)
+
+      sql(
+        s"""DELETE FROM $tableNameAsString
+           |WHERE
+           | id NOT IN (SELECT * FROM deleted_id)
+           | OR
+           | dep IN ('software', 'hr')
+           |""".stripMargin)
+
+      checkAnswer(sql(s"SELECT * FROM $tableNameAsString"), Row(5, 2, "hardware") :: Nil)
+      checkDeleteMetrics(numDeletedRows = 3, numCopiedRows = 0)
+
+      sql(
+        s"""DELETE FROM $tableNameAsString
+           |WHERE
+           | id NOT IN (SELECT * FROM deleted_id WHERE value IS NOT NULL)
+           | AND
+           | EXISTS (SELECT 1 FROM FROM deleted_dep WHERE dep = deleted_dep.value)
+           |""".stripMargin)
+
+      checkAnswer(sql(s"SELECT * FROM $tableNameAsString"), Row(5, 2, "hardware") :: Nil)
+
+      sql(
+        s"""DELETE FROM $tableNameAsString t
+           |WHERE
+           | t.id NOT IN (SELECT * FROM deleted_id WHERE value IS NOT NULL)
+           | OR
+           | EXISTS (SELECT 1 FROM FROM deleted_dep WHERE t.dep = deleted_dep.value)
+           |""".stripMargin)
+
+      checkAnswer(sql(s"SELECT * FROM $tableNameAsString"), Nil)
+    }
+  }
+
+  test("delete with EXISTS subquery") {
+    withTempView("deleted_id", "deleted_dep") {
+      createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
+        """{ "pk": 1, "id": 1, "dep": "hr" }
+          |{ "pk": 2, "id": 2, "dep": "hardware" }
+          |{ "pk": 3, "id": null, "dep": "hr" }
+          |""".stripMargin)
+
+      val deletedIdDF = Seq(Some(-1), Some(-2), None).toDF()
+      deletedIdDF.createOrReplaceTempView("deleted_id")
+
+      val deletedDepDF = Seq("software", "hr").toDF()
+      deletedDepDF.createOrReplaceTempView("deleted_dep")
+
+      sql(
+        s"""DELETE FROM $tableNameAsString t
+           |WHERE
+           | EXISTS (SELECT 1 FROM deleted_id d WHERE t.id = d.value)
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(1, 1, "hr") :: Row(2, 2, "hardware") :: Row(3, null, "hr") :: Nil)
+      checkDeleteMetrics(numDeletedRows = 0, numCopiedRows = 0)
+
+      sql(
+        s"""DELETE FROM $tableNameAsString t
+           |WHERE
+           | EXISTS (SELECT 1 FROM deleted_id d WHERE t.id = d.value + 2)
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(2, 2, "hardware") :: Row(3, null, "hr") :: Nil)
+      checkDeleteMetrics(numDeletedRows = 1, numCopiedRows = 1)
+
+      sql(
+        s"""DELETE FROM $tableNameAsString t
+           |WHERE
+           | EXISTS (SELECT 1 FROM deleted_id d WHERE t.id = d.value) OR t.id IS NULL
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(2, 2, "hardware") :: Nil)
+      checkDeleteMetrics(numDeletedRows = 1, numCopiedRows = 0)
+
+      sql(
+        s"""DELETE FROM $tableNameAsString t
+           |WHERE
+           | EXISTS (SELECT 1 FROM deleted_id di WHERE t.id = di.value)
+           | AND
+           | EXISTS (SELECT 1 FROM deleted_dep dd WHERE t.dep = dd.value)
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(2, 2, "hardware") :: Nil)
+      checkDeleteMetrics(numDeletedRows = 0, numCopiedRows = 0)
+    }
+  }
+
+  test("delete with NOT EXISTS subquery") {
+    withTempView("deleted_id", "deleted_dep") {
+      createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
+        """{ "pk": 1, "id": 1, "dep": "hr" }
+          |{ "pk": 2, "id": 2, "dep": "hardware" }
+          |{ "pk": 3, "id": null, "dep": "hr" }
+          |""".stripMargin)
+
+      val deletedIdDF = Seq(Some(-1), Some(-2), None).toDF()
+      deletedIdDF.createOrReplaceTempView("deleted_id")
+
+      val deletedDepDF = Seq("software", "hr").toDF()
+      deletedDepDF.createOrReplaceTempView("deleted_dep")
+
+      sql(
+        s"""DELETE FROM $tableNameAsString t
+           |WHERE
+           | NOT EXISTS (SELECT 1 FROM deleted_id di WHERE t.id = di.value + 2)
+           | AND
+           | NOT EXISTS (SELECT 1 FROM deleted_dep dd WHERE t.dep = dd.value)
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(1, 1, "hr") :: Row(3, null, "hr") :: Nil)
+      checkDeleteMetrics(numDeletedRows = 1, numCopiedRows = 0)
+
+      sql(
+        s"""DELETE FROM $tableNameAsString t
+           |WHERE
+           | NOT EXISTS (SELECT 1 FROM deleted_id d WHERE t.id = d.value + 2)
+           |""".stripMargin)
+
+      checkAnswer(sql(s"SELECT * FROM $tableNameAsString"), Row(1, 1, "hr") :: Nil)
+      checkDeleteMetrics(numDeletedRows = 1, numCopiedRows = 1)
+
+      sql(
+        s"""DELETE FROM $tableNameAsString t
+           |WHERE
+           | NOT EXISTS (SELECT 1 FROM deleted_id d WHERE t.id = d.value + 2)
+           | OR
+           | t.id = 1
+           |""".stripMargin)
+
+      checkAnswer(sql(s"SELECT * FROM $tableNameAsString"), Nil)
+      checkDeleteMetrics(numDeletedRows = 1, numCopiedRows = 0)
+    }
+  }
+
+  test("delete with a scalar subquery") {
+    withTempView("deleted_id") {
+      createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
+        """{ "pk": 1, "id": 1, "dep": "hr" }
+          |{ "pk": 2, "id": 2, "dep": "hardware" }
+          |{ "pk": 3, "id": null, "dep": "hr" }
+          |""".stripMargin)
+
+      val deletedIdDF = Seq(Some(1), Some(100), None).toDF()
+      deletedIdDF.createOrReplaceTempView("deleted_id")
+
+      sql(
+        s"""DELETE FROM $tableNameAsString t
+           |WHERE
+           | id <= (SELECT min(value) FROM deleted_id)
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(2, 2, "hardware") :: Row(3, null, "hr") :: Nil)
+      checkDeleteMetrics(numDeletedRows = 1, numCopiedRows = 1)
+    }
+  }
+
+  test("delete refreshes relation cache") {
+    withTempView("temp") {
+      withCache("temp") {
+        createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
+          """{ "pk": 1, "id": 1, "dep": "hr" }
+            |{ "pk": 2, "id": 1, "dep": "hardware" }
+            |{ "pk": 3, "id": 2, "dep": "hardware" }
+            |{ "pk": 4, "id": 3, "dep": "hr" }
+            |""".stripMargin)
+
+        // define a view on top of the table
+        val query = sql(s"SELECT * FROM $tableNameAsString WHERE id = 1")
+        query.createOrReplaceTempView("temp")
+
+        // cache the view
+        sql("CACHE TABLE temp")
+
+        // verify the view returns expected results
+        checkAnswer(
+          sql("SELECT * FROM temp"),
+          Row(1, 1, "hr") :: Row(2, 1, "hardware") :: Nil)
+
+        // delete some records from the table
+        sql(s"DELETE FROM $tableNameAsString WHERE id <= 1")
+
+        // verify the delete was successful
+        checkAnswer(
+          sql(s"SELECT * FROM $tableNameAsString"),
+          Row(3, 2, "hardware") :: Row(4, 3, "hr") :: Nil)
+        checkDeleteMetrics(numDeletedRows = 2, numCopiedRows = 2)
+
+        // verify the view reflects the changes in the table
+        checkAnswer(sql("SELECT * FROM temp"), Nil)
+      }
+    }
+  }
+
+  test("delete without condition executed as delete with filters") {
+    createAndInitTable("pk INT NOT NULL, id INT, dep INT",
+      """{ "pk": 1, "id": 1, "dep": 100 }
+        |{ "pk": 2, "id": 2, "dep": 200 }
+        |{ "pk": 3, "id": 3, "dep": 100 }
+        |""".stripMargin)
+
+    executeDeleteWithFilters(s"DELETE FROM $tableNameAsString")
+
+    checkAnswer(sql(s"SELECT * FROM $tableNameAsString"), Nil)
+  }
+
+  test("delete with supported predicates gets converted into delete with filters") {
+    createAndInitTable("pk INT NOT NULL, id INT, dep INT",
+      """{ "pk": 1, "id": 1, "dep": 100 }
+        |{ "pk": 2, "id": 2, "dep": 200 }
+        |{ "pk": 3, "id": 3, "dep": 100 }
+        |""".stripMargin)
+
+    executeDeleteWithFilters(s"DELETE FROM $tableNameAsString WHERE dep = 100")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(2, 2, 200) :: Nil)
+  }
+
+  test("delete with unsupported predicates cannot be converted into delete with filters") {
+    createAndInitTable("pk INT NOT NULL, id INT, dep INT",
+      """{ "pk": 1, "id": 1, "dep": 100 }
+        |{ "pk": 2, "id": 2, "dep": 200 }
+        |{ "pk": 3, "id": 3, "dep": 100 }
+        |""".stripMargin)
+
+    executeDeleteWithRewrite(s"DELETE FROM $tableNameAsString WHERE dep = 100 OR dep < 200")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(2, 2, 200) :: Nil)
+    checkDeleteMetrics(numDeletedRows = 2, numCopiedRows = 0)
+  }
+
+  test("delete with subquery cannot be converted into delete with filters") {
+    withTempView("deleted_id") {
+      createAndInitTable("pk INT NOT NULL, id INT, dep INT",
+        """{ "pk": 1, "id": 1, "dep": 100 }
+          |{ "pk": 2, "id": 2, "dep": 200 }
+          |{ "pk": 3, "id": 3, "dep": 100 }
+          |""".stripMargin)
+
+      val deletedIdDF = Seq(Some(1), Some(100), None).toDF()
+      deletedIdDF.createOrReplaceTempView("deleted_id")
+
+      val q = s"DELETE FROM $tableNameAsString WHERE dep = 100 AND id IN (SELECT * FROM deleted_id)"
+      executeDeleteWithRewrite(q)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(2, 2, 200) :: Row(3, 3, 100) :: Nil)
+      checkDeleteMetrics(numDeletedRows = 1, numCopiedRows = 1)
+    }
+  }
+
+
+  test("delete from table with recursive CTE") {
+    withTempView("source") {
+      sql(
+        s"""CREATE TABLE $tableNameAsString (
+           | val INT)
+           |""".stripMargin)
+
+      append("val INT",
+        """{ "val": 1 }
+          |{ "val": 9 }
+          |{ "val": 8 }
+          |{ "val": 4 }
+          |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1),
+          Row(9),
+          Row(8),
+          Row(4)))
+
+      sql(
+        s"""WITH RECURSIVE s(val) AS (
+           |  SELECT 1
+           |  UNION ALL
+           |  SELECT val + 1 FROM s WHERE val < 5
+           |) DELETE FROM $tableNameAsString WHERE val IN (SELECT val FROM s)
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(9),
+          Row(8)))
+    }
+  }
+
+  test("delete with analysis failure and transactional checks") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |""".stripMargin)
+
+    val exception = intercept[AnalysisException] {
+      sql(s"DELETE FROM $tableNameAsString WHERE invalid_column = 1")
+    }
+
+    assert(exception.getMessage.contains("invalid_column"))
+    assert(catalog.lastTransaction.currentState == Aborted)
+    assert(catalog.lastTransaction.isClosed)
+  }
+
+  test("delete with transactional checks") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |{ "pk": 3, "salary": 300, "dep": "hr" }
+        |""".stripMargin)
+
+    // simple predicate delete: goes through SupportsDelete.deleteWhere (no Spark-side scan)
+    val (txn, _) = executeTransaction {
+      sql(s"DELETE FROM $tableNameAsString WHERE dep = 'hr'")
+    }
+
+    assert(txn.currentState == Committed)
+    assert(txn.isClosed)
+    assert(table.version() == "2")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Seq(Row(2, 200, "software")))
+  }
+
+  test("delete with subquery on source table and transactional checks") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |{ "pk": 3, "salary": 300, "dep": "hr" }
+        |""".stripMargin)
+
+    sql(s"CREATE TABLE $sourceNameAsString (pk INT NOT NULL, salary INT, dep STRING)")
+    sql(s"INSERT INTO $sourceNameAsString VALUES (1, 150, 'hr'), (4, 400, 'finance')")
+
+    val (txn, txnTables) = executeTransaction {
+      sql(
+        s"""DELETE FROM $tableNameAsString
+           |WHERE pk IN (SELECT pk FROM $sourceNameAsString WHERE dep = 'hr')
+           |""".stripMargin)
+    }
+
+    assert(txn.currentState == Committed)
+    assert(txn.isClosed)
+    assert(txnTables.size == 2)
+    assert(table.version() == "2")
+
+    val sourceTxnTable = txnTables(sourceNameAsString)
+    val expectedNumSourceScans = if (deltaDelete) 1 else 2
+    assert(sourceTxnTable.scanEvents.size == expectedNumSourceScans)
+
+    val numSubquerySourceScans = sourceTxnTable.scanEvents.flatten.count {
+      case sources.EqualTo("dep", "hr") => true
+      case _ => false
+    }
+    assert(numSubquerySourceScans == expectedNumSourceScans)
+
+    val targetTxnTable = txnTables(tableNameAsString)
+    val expectedNumTargetScans = if (deltaDelete) 1 else 2
+    assert(targetTxnTable.scanEvents.size == expectedNumTargetScans)
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Seq(
+        Row(2, 200, "software"), // unchanged
+        Row(3, 300, "hr")))      // unchanged (pk 3 not in subquery result)
+  }
+
+  test("delete with CTE and transactional checks") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |{ "pk": 3, "salary": 300, "dep": "hr" }
+        |""".stripMargin)
+
+    sql(s"CREATE TABLE $sourceNameAsString (pk INT NOT NULL, salary INT, dep STRING)")
+    sql(s"INSERT INTO $sourceNameAsString VALUES (1, 150, 'hr'), (4, 400, 'finance')")
+
+    val (txn, txnTables) = executeTransaction {
+      sql(
+        s"""WITH cte AS (
+           |  SELECT pk FROM $sourceNameAsString WHERE dep = 'hr'
+           |)
+           |DELETE FROM $tableNameAsString
+           |WHERE pk IN (SELECT pk FROM cte)
+           |""".stripMargin)
+    }
+
+    assert(txn.currentState == Committed)
+    assert(txn.isClosed)
+    assert(txnTables.size == 2)
+    assert(table.version() == "2")
+
+    val targetTxnTable = txnTables(tableNameAsString)
+    val expectedNumTargetScans = if (deltaDelete) 1 else 2
+    assert(targetTxnTable.scanEvents.size == expectedNumTargetScans)
+
+    val sourceTxnTable = txnTables(sourceNameAsString)
+    val expectedNumSourceScans = if (deltaDelete) 1 else 2
+    assert(sourceTxnTable.scanEvents.size == expectedNumSourceScans)
+
+    val numCteSourceScans = sourceTxnTable.scanEvents.flatten.count {
+      case sources.EqualTo("dep", "hr") => true
+      case _ => false
+    }
+    assert(numCteSourceScans == expectedNumSourceScans)
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Seq(
+        Row(2, 200, "software"), // unchanged
+        Row(3, 300, "hr")))      // unchanged (pk 3 not in source)
+  }
+
+  test("delete using view with transactional checks") {
+    withView("temp_view") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |{ "pk": 3, "salary": 300, "dep": "hr" }
+          |""".stripMargin)
+
+      sql(s"CREATE TABLE $sourceNameAsString (pk INT NOT NULL, salary INT, dep STRING)")
+      sql(s"INSERT INTO $sourceNameAsString VALUES (1, 150, 'hr'), (4, 400, 'finance')")
+
+      sql(
+        s"""CREATE VIEW temp_view AS
+           |SELECT pk FROM $sourceNameAsString WHERE dep = 'hr'
+           |""".stripMargin)
+
+      val (txn, txnTables) = executeTransaction {
+        sql(s"DELETE FROM $tableNameAsString WHERE pk IN (SELECT pk FROM temp_view)")
+      }
+
+      assert(txn.currentState == Committed)
+      assert(txn.isClosed)
+      assert(txnTables.size == 2)
+      assert(table.version() == "2")
+
+      val targetTxnTable = txnTables(tableNameAsString)
+      val expectedNumTargetScans = if (deltaDelete) 1 else 2
+      assert(targetTxnTable.scanEvents.size == expectedNumTargetScans)
+
+      val sourceTxnTable = txnTables(sourceNameAsString)
+      val expectedNumSourceScans = if (deltaDelete) 1 else 2
+      assert(sourceTxnTable.scanEvents.size == expectedNumSourceScans)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(2, 200, "software"), // unchanged
+          Row(3, 300, "hr")))      // unchanged (pk 3 not in source)
+    }
+  }
+
+  test("EXPLAIN DELETE SQL with transactional checks") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |""".stripMargin)
+
+    sql(s"EXPLAIN DELETE FROM $tableNameAsString WHERE dep = 'hr'")
+
+    // EXPLAIN should not start a new transaction
+    assert(catalog.transaction === null)
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Seq(
+        Row(1, 100, "hr"),
+        Row(2, 200, "software")))
+  }
+
+  test("delete with NOT IN over empty subquery") {
+    withTempView("empty_subq") {
+      createAndInitTable("pk INT NOT NULL, id INT NOT NULL, dep STRING",
+        """{ "pk": 1, "id": 1, "dep": "hr" }
+          |{ "pk": 2, "id": 2, "dep": "hr" }
+          |{ "pk": 3, "id": 3, "dep": "hr" }
+          |""".stripMargin)
+
+      Seq.empty[Int].toDF("v").createOrReplaceTempView("empty_subq")
+
+      sql(
+        s"""DELETE FROM $tableNameAsString
+           |WHERE id NOT IN (SELECT v FROM empty_subq)
+           |""".stripMargin)
+
+      checkAnswer(sql(s"SELECT * FROM $tableNameAsString"), Nil)
+      // The filter gets replaced by an EmptyRelation in the ReplaceData executed plan, which hides
+      // the executed BatchScan and prevents computing numDeletedRows using numOutputRows of the
+      // scan node.
+      checkDeleteMetrics(numDeletedRows = if (deltaDelete) 3 else -1, numCopiedRows = 0)
+    }
+  }
+
+  private def executeDeleteWithFilters(query: String): Unit = {
+    val executedPlan = executeAndKeepPlan {
+      sql(query)
+    }
+
+    executedPlan match {
+      case _: DeleteFromTableExec =>
+        // OK
+      case other =>
+        fail("unexpected executed plan: " + other)
+    }
+  }
+
+  test("SPARK-58008: delete with dynamic options") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |""".stripMargin)
+
+    // Use salary < 200 (LessThan) rather than pk = 1 (EqualTo) so the optimizer does not
+    // replace the row-level plan with a filter-only deleteWhere call via
+    // OptimizeMetadataOnlyDeleteFromTable (canDeleteWhere returns false for LessThan).
+    checkRowLevelOperationOptions(
+      sql(s"DELETE FROM $tableNameAsString WITH " +
+        s"(`load-option` = 'load-value', `write-option` = 'write-value') WHERE salary < 200"),
+      "load-option" -> "load-value",
+      "write-option" -> "write-value")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(2, 200, "software") :: Nil)
+  }
+
+  test("SPARK-58008: delete with dynamic options and a subquery on the same table") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |{ "pk": 3, "salary": 300, "dep": "hr" }
+        |""".stripMargin)
+
+    checkRowLevelOperationOptions(
+      sql(s"DELETE FROM $tableNameAsString WITH (`write.split-size` = 10) " +
+        s"WHERE pk IN (SELECT pk FROM $tableNameAsString WHERE dep = 'hr')"),
+      "write.split-size" -> "10")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(2, 200, "software") :: Nil)
+  }
+
+  test("SPARK-58008: delete with dynamic options and a CTE") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |{ "pk": 3, "salary": 300, "dep": "hr" }
+        |""".stripMargin)
+
+    checkRowLevelOperationOptions(
+      sql(s"""WITH cte AS (
+             |  SELECT pk FROM $tableNameAsString WHERE dep = 'hr'
+             |)
+             |DELETE FROM $tableNameAsString WITH (`write.split-size` = 10)
+             |WHERE pk IN (SELECT pk FROM cte)""".stripMargin),
+      "write.split-size" -> "10")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(2, 200, "software") :: Nil)
+  }
+
+  test("SPARK-58008: delete with dynamic options on the deleteWhere path") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |""".stripMargin)
+
+    // dep = 'hr' is an EqualTo on the partition column. OptimizeMetadataOnlyDeleteFromTable
+    // converts the row-level plan to a deleteWhere call. Verify options flow into the exec.
+    val Seq(qe) = withQueryExecutionsCaptured(spark) {
+      sql(s"DELETE FROM $tableNameAsString WITH " +
+        s"(`load-option` = 'load-value', `write-option` = 'write-value') WHERE dep = 'hr'")
+    }
+    val exec = qe.executedPlan.collectFirst {
+      case e: DeleteFromTableExec => e
+    }.getOrElse(fail("expected DeleteFromTableExec for the metadata-only deleteWhere path"))
+    assert(exec.options.get("load-option") === "load-value")
+    assert(exec.options.get("write-option") === "write-value")
+    val v2Table = exec.table.asInstanceOf[InMemoryRowLevelOperationTable]
+    assert(v2Table.lastDeleteOptions.get("load-option") === "load-value")
+    assert(v2Table.lastDeleteOptions.get("write-option") === "write-value")
+    assertLastTransactionWriteLoadOptions(
+      "load-option" -> "load-value",
+      "write-option" -> "write-value")
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(2, 200, "software") :: Nil)
+  }
+
+  test("SPARK-58008: delete all rows with dynamic options") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |""".stripMargin)
+
+    // DELETE with no WHERE: RewriteDeleteFromTable leaves the plan unrewritten (TruncatableTable
+    // short-circuit). DataSourceV2Strategy then matches SupportsDeleteV2.canDeleteWhere(AlwaysTrue)
+    // and produces DeleteFromTableExec, carrying the WITH-clause options through r.options.
+    val Seq(qe) = withQueryExecutionsCaptured(spark) {
+      sql(s"DELETE FROM $tableNameAsString WITH (`write.split-size` = 10)")
+    }
+    val exec = qe.executedPlan.collectFirst {
+      case e: DeleteFromTableExec => e
+    }.getOrElse(fail("expected DeleteFromTableExec for the delete-all path"))
+    assert(exec.options.get("write.split-size") === "10",
+      "options must reach DeleteFromTableExec on the delete-all path")
+    assert(exec.table.asInstanceOf[InMemoryRowLevelOperationTable].lastDeleteOptions
+      .get("write.split-size") === "10",
+      "options must be forwarded to SupportsDeleteV2.deleteWhere(predicates, options)")
+
+    checkAnswer(sql(s"SELECT * FROM $tableNameAsString"), Nil)
+  }
+
+  test("SPARK-58008: delete all rows with dynamic options on the truncate path") {
+    // Use a TruncatableTable-only fixture (no SupportsDeleteV2) so that DELETE with no WHERE
+    // is planned as TruncateTableExec (not DeleteFromTableExec).
+    withSQLConf(
+        "spark.sql.catalog.trunccat" ->
+          classOf[InMemoryTruncatableOnlyTableCatalog].getName,
+        "spark.sql.catalog.trunccat.tableStateOptionKeys" -> "load-option") {
+      withTable("trunccat.ns.tbl") {
+        sql("CREATE TABLE trunccat.ns.tbl (pk INT NOT NULL, dep STRING) USING foo")
+        sql("INSERT INTO trunccat.ns.tbl VALUES (1, 'hr'), (2, 'software')")
+        val truncCatalog = spark.sessionState.catalogManager
+          .catalog("trunccat").asInstanceOf[InMemoryTruncatableOnlyTableCatalog]
+        truncCatalog.resetLoadTableCalls()
+
+        val Seq(qe) = withQueryExecutionsCaptured(spark) {
+          sql("DELETE FROM trunccat.ns.tbl WITH " +
+            "(`load-option` = 'load-value', `write-option` = 'write-value')")
+        }
+        val exec = qe.executedPlan.collectFirst {
+          case e: TruncateTableExec => e
+        }.getOrElse(fail("expected TruncateTableExec for the truncate path"))
+        assert(exec.options.get("load-option") === "load-value")
+        assert(exec.options.get("write-option") === "write-value")
+
+        val targetLoads = truncCatalog.loadTableCalls.filter {
+          case (context, options) =>
+            context.writePrivileges() === java.util.Set.of(TableWritePrivilege.DELETE) &&
+              options.get("load-option") == "load-value" &&
+              options.get("write-option") == null &&
+              options.size() == 1
+        }
+        assert(targetLoads.nonEmpty, "target loadTable did not receive truncate state options")
+
+        val truncTable = truncCatalog
+          .loadTable(org.apache.spark.sql.connector.catalog.Identifier.of(
+            Array("ns"), "tbl"))
+          .asInstanceOf[InMemoryTruncatableOnlyTable]
+        assert(truncTable.lastTruncateOptions.get("load-option") === "load-value")
+        assert(truncTable.lastTruncateOptions.get("write-option") === "write-value")
+
+        checkAnswer(spark.table("trunccat.ns.tbl"), Nil)
+      }
+    }
+  }
+
+  private def executeDeleteWithRewrite(query: String): Unit = {
+    val executedPlan = executeAndKeepPlan {
+      sql(query)
+    }
+
+    executedPlan match {
+      case _: ReplaceDataExec =>
+        // OK
+      case _: WriteDeltaExec =>
+        // OK
+      case other =>
+        fail("unexpected executed plan: " + other)
+    }
+  }
+}

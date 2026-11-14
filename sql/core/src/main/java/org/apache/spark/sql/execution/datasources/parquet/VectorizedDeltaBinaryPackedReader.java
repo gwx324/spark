@@ -1,0 +1,525 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.spark.sql.execution.datasources.parquet;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.Arrays;
+
+import org.apache.parquet.bytes.ByteBufferInputStream;
+import org.apache.parquet.bytes.BytesUtils;
+import org.apache.parquet.column.values.bitpacking.BytePackerForLong;
+import org.apache.parquet.column.values.bitpacking.Packer;
+import org.apache.parquet.io.ParquetDecodingException;
+
+import org.apache.spark.sql.catalyst.util.RebaseDateTime;
+import org.apache.spark.sql.execution.datasources.DataSourceUtils;
+import org.apache.spark.sql.execution.vectorized.WritableColumnVector;
+
+/**
+ * An implementation of the Parquet DELTA_BINARY_PACKED decoder that supports the vectorized
+ * interface. DELTA_BINARY_PACKED is a delta encoding for integer and long types that stores values
+ * as a delta between consecutive values. Delta values are themselves bit packed. Similar to RLE but
+ * is more effective in the case of large variation of values in the encoded column.
+ * <p>
+ * DELTA_BINARY_PACKED is the default encoding for integer and long columns in Parquet V2.
+ * <p>
+ * Supported Types: INT32, INT64
+ * <p>
+ *
+ * @see <a href="https://github.com/apache/parquet-format/blob/master/Encodings.md#delta-encoding-delta_binary_packed--5">
+ * Parquet format encodings: DELTA_BINARY_PACKED</a>
+ */
+public class VectorizedDeltaBinaryPackedReader extends VectorizedReaderBase {
+
+  // Upper bound accepted for the block size declared in the page header. Parquet writers use
+  // small blocks (parquet-java defaults to 128 values per block), so this generous ceiling only
+  // exists to keep a corrupt header from blowing up the scratch-buffer allocations in
+  // initFromPage: 2^20 values caps those buffers at ~12 MiB.
+  private static final int MAX_BLOCK_SIZE_IN_VALUES = 1 << 20;
+
+  // header data
+  private int blockSizeInValues;
+  private int miniBlockNumInABlock;
+  private int totalValueCount;
+  private long firstValue;
+
+  private int miniBlockSizeInValues;
+
+  // values read by the caller
+  private int valuesRead = 0;
+
+  // variables to keep state of the current block and miniblock
+  private long lastValueRead;  // needed to compute the next value
+  private long minDeltaInCurrentBlock; // needed to compute the next value
+  // currentMiniBlock keeps track of the mini block within the current block that
+  // we read and decoded most recently. Only used as an index into
+  // bitWidths array
+  private int currentMiniBlock = 0;
+  private int[] bitWidths; // bit widths for each miniBlock in the current block
+  private int remainingInBlock = 0; // values in current block still to be read
+  private int remainingInMiniBlock = 0; // values in current mini block still to be read
+  private long[] unpackedValuesBuffer;
+  // Scratch buffer for narrowing long -> int during bulk readIntegers.
+  // Allocated eagerly in initFromPage, sized to miniBlockSizeInValues.
+  private int[] intScratchBuffer;
+
+  private ByteBufferInputStream in;
+
+  // temporary buffers used by readByte, readShort, readInteger, and readLong
+  private byte byteVal;
+  private short shortVal;
+  private int intVal;
+  private long longVal;
+
+  @Override
+  public void initFromPage(int valueCount, ByteBufferInputStream in) throws IOException {
+    if (valueCount < 1) {
+      throw new ParquetDecodingException("Invalid DELTA_BINARY_PACKED page: it must have at "
+          + "least one value, but it has " + valueCount);
+    }
+    this.in = in;
+    // Read the header
+    this.blockSizeInValues = BytesUtils.readUnsignedVarInt(in);
+    this.miniBlockNumInABlock = BytesUtils.readUnsignedVarInt(in);
+    // Validate the block layout from the page header before sizing any buffers from it.
+    if (blockSizeInValues <= 0 || blockSizeInValues > MAX_BLOCK_SIZE_IN_VALUES) {
+      throw new ParquetDecodingException("Invalid DELTA_BINARY_PACKED block size in values: "
+          + blockSizeInValues + " (must be in [1, " + MAX_BLOCK_SIZE_IN_VALUES + "])");
+    }
+    if (miniBlockNumInABlock <= 0) {
+      throw new ParquetDecodingException("Invalid DELTA_BINARY_PACKED mini block count: "
+          + miniBlockNumInABlock + " (block size in values: " + blockSizeInValues + ")");
+    }
+    if (blockSizeInValues % miniBlockNumInABlock != 0 ||
+        (blockSizeInValues / miniBlockNumInABlock) % 8 != 0) {
+      throw new ParquetDecodingException("Invalid DELTA_BINARY_PACKED mini block count: "
+          + miniBlockNumInABlock + " (block size in values: " + blockSizeInValues
+          + ", the mini block size must be a multiple of 8)");
+    }
+    this.miniBlockSizeInValues = blockSizeInValues / miniBlockNumInABlock;
+    // True value count. May be less than valueCount because of nulls
+    this.totalValueCount = BytesUtils.readUnsignedVarInt(in);
+    if (totalValueCount < 0) {
+      throw new ParquetDecodingException(
+          "Invalid DELTA_BINARY_PACKED total value count: " + totalValueCount);
+    }
+    this.bitWidths = new int[miniBlockNumInABlock];
+    this.unpackedValuesBuffer = new long[miniBlockSizeInValues];
+    this.intScratchBuffer = new int[miniBlockSizeInValues];
+    // read the first value
+    firstValue = BytesUtils.readZigZagVarLong(in);
+  }
+
+  // True value count. May be less than valueCount because of nulls
+  int getTotalValueCount() {
+    return totalValueCount;
+  }
+
+  @Override
+  public byte readByte() {
+    readValues(1, null, 0, (w, r, v) -> byteVal = (byte) v);
+    return byteVal;
+  }
+
+  @Override
+  public short readShort() {
+    readValues(1, null, 0, (w, r, v) -> shortVal = (short) v);
+    return shortVal;
+  }
+
+  @Override
+  public int readInteger() {
+    readValues(1, null, 0, (w, r, v) -> intVal = (int) v);
+    return intVal;
+  }
+
+  @Override
+  public long readLong() {
+    readValues(1, null, 0, (w, r, v) -> longVal = v);
+    return longVal;
+  }
+
+  @Override
+  public void readBytes(int total, WritableColumnVector c, int rowId) {
+    readValues(total, c, rowId, (w, r, v) -> w.putByte(r, (byte) v));
+  }
+
+  @Override
+  public void readShorts(int total, WritableColumnVector c, int rowId) {
+    readValues(total, c, rowId, (w, r, v) -> w.putShort(r, (short) v));
+  }
+
+  @Override
+  public void readIntegers(int total, WritableColumnVector c, int rowId) {
+    readBulkIntegers(total, c, rowId);
+  }
+
+  @Override
+  public void readIntegersAsLongs(int total, WritableColumnVector c, int rowId) {
+    // The INT32 delta encoder uses int arithmetic (with modular overflow) for deltas and
+    // stores minDelta as a zigzag VarInt. The prefix sum in loadMiniBlockBulk operates in
+    // long space, so we must truncate each result to int (matching the encoder's 32-bit
+    // modular semantics) then sign-extend back to long for the output.
+    checkReadBounds(total);
+    int remaining = total;
+    if (valuesRead == 0) {
+      c.putLong(rowId, (int) firstValue);
+      lastValueRead = firstValue;
+      rowId++;
+      remaining--;
+    }
+    readBulkLoop(remaining, c, rowId, this::bulkWriteIntsAsLongs);
+    valuesRead += total;
+  }
+
+  @Override
+  public void readIntegersAsDoubles(int total, WritableColumnVector c, int rowId) {
+    // Same as readIntegersAsLongs: truncate the long prefix-sum result to int (matching the
+    // INT32 encoder's modular arithmetic) then widen to double.
+    checkReadBounds(total);
+    int remaining = total;
+    if (valuesRead == 0) {
+      c.putDouble(rowId, (double) (int) firstValue);
+      lastValueRead = firstValue;
+      rowId++;
+      remaining--;
+    }
+    readBulkLoop(remaining, c, rowId, this::bulkWriteIntsAsDoubles);
+    valuesRead += total;
+  }
+
+  // Based on VectorizedPlainValuesReader.readIntegersWithRebase
+  @Override
+  public final void readIntegersWithRebase(
+      int total, WritableColumnVector c, int rowId, boolean failIfRebase) {
+    readValues(total, c, rowId, (w, r, v) -> {
+      if (v < RebaseDateTime.lastSwitchJulianDay()) {
+        if (failIfRebase) {
+          throw DataSourceUtils.newRebaseExceptionInRead("Parquet");
+        } else {
+          w.putInt(r, RebaseDateTime.rebaseJulianToGregorianDays((int) v));
+        }
+      } else {
+        w.putInt(r, (int) v);
+      }
+    });
+  }
+
+  @Override
+  public void readUnsignedIntegers(int total, WritableColumnVector c, int rowId) {
+    readValues(total, c, rowId, (w, r, v) -> {
+      w.putLong(r, Integer.toUnsignedLong((int) v));
+    });
+  }
+
+  @Override
+  public void readUnsignedLongs(int total, WritableColumnVector c, int rowId) {
+    readValues(total, c, rowId, (w, r, v) -> {
+      putUnsignedLongAsBigInteger(w, r, v);
+    });
+  }
+
+  @Override
+  public void readLongs(int total, WritableColumnVector c, int rowId) {
+    readBulkLongs(total, c, rowId);
+  }
+
+  @Override
+  public final void readLongsWithRebase(
+      int total, WritableColumnVector c, int rowId, boolean failIfRebase, String timeZone) {
+    readValues(total, c, rowId, (w, r, v) -> {
+      if (v < RebaseDateTime.lastSwitchJulianTs()) {
+        if (failIfRebase) {
+          throw DataSourceUtils.newRebaseExceptionInRead("Parquet");
+        } else {
+          w.putLong(r, RebaseDateTime.rebaseJulianToGregorianMicros(timeZone, v));
+        }
+      } else {
+        w.putLong(r, v);
+      }
+    });
+  }
+
+  @Override
+  public void skipBytes(int total) {
+    skipValues(total);
+  }
+
+  @Override
+  public void skipShorts(int total) {
+    skipValues(total);
+  }
+
+  @Override
+  public void skipIntegers(int total) {
+    skipValues(total);
+  }
+
+  @Override
+  public void skipLongs(int total) {
+    skipValues(total);
+  }
+
+  // ---- Bulk read helpers for readIntegers / readLongs ----------------------------
+  //
+  // The generic readValues() path dispatches a lambda per value.  For the two most
+  // common callers (readIntegers, readLongs) we can do much better: compute a prefix
+  // sum over the unpacked deltas in-place, then bulk-copy the result into the column
+  // vector with putInts / putLongs (backed by System.arraycopy on-heap).
+
+  /**
+   * Callback for writing a chunk of prefix-summed absolute values from
+   * {@code unpackedValuesBuffer} into a column vector.  Called once per mini-block
+   * (not per value), so lambda overhead is negligible.
+   */
+  @FunctionalInterface
+  private interface BulkWriter {
+    void write(WritableColumnVector c, int rowId, long[] values, int start, int count);
+  }
+
+  /** Narrows long[] -> int[] scratch and bulk-writes via putInts. */
+  private void bulkWriteInts(WritableColumnVector c, int rowId,
+      long[] buf, int start, int count) {
+    for (int i = start; i < start + count; i++) {
+      intScratchBuffer[i] = (int) buf[i];
+    }
+    c.putInts(rowId, count, intScratchBuffer, start);
+  }
+
+  private void bulkWriteIntsAsLongs(WritableColumnVector c, int rowId,
+      long[] buf, int start, int count) {
+    for (int i = start; i < start + count; i++) {
+      buf[i] = (int) buf[i];
+    }
+    c.putLongs(rowId, count, buf, start);
+  }
+
+  private void bulkWriteIntsAsDoubles(WritableColumnVector c, int rowId,
+      long[] buf, int start, int count) {
+    for (int i = start; i < start + count; i++) {
+      c.putDouble(rowId + i - start, (double) (int) buf[i]);
+    }
+  }
+
+  private void readBulkIntegers(int total, WritableColumnVector c, int rowId) {
+    checkReadBounds(total);
+    int remaining = total;
+    if (valuesRead == 0) {
+      c.putInt(rowId, (int) firstValue);
+      lastValueRead = firstValue;
+      rowId++;
+      remaining--;
+    }
+    readBulkLoop(remaining, c, rowId, this::bulkWriteInts);
+    valuesRead += total;
+  }
+
+  private void readBulkLongs(int total, WritableColumnVector c, int rowId) {
+    checkReadBounds(total);
+    int remaining = total;
+    if (valuesRead == 0) {
+      c.putLong(rowId, firstValue);
+      lastValueRead = firstValue;
+      rowId++;
+      remaining--;
+    }
+    readBulkLoop(remaining, c, rowId,
+        (col, r, buf, s, n) -> col.putLongs(r, n, buf, s));
+    valuesRead += total;
+  }
+
+  private void checkReadBounds(int total) {
+    if (valuesRead + total > totalValueCount) {
+      throw new ParquetDecodingException(
+          "No more values to read. Total values read:  " + valuesRead + ", total count: "
+              + totalValueCount + ", trying to read " + total + " more.");
+    }
+  }
+
+  /** Mini-block iteration loop shared by readBulkIntegers and readBulkLongs. */
+  private void readBulkLoop(int remaining, WritableColumnVector c, int rowId,
+      BulkWriter writer) {
+    while (remaining > 0) {
+      int n;
+      try {
+        n = loadMiniBlockBulk(remaining, c, rowId, writer);
+      } catch (IOException e) {
+        throw new ParquetDecodingException("Error reading mini block.", e);
+      }
+      rowId += n;
+      remaining -= n;
+    }
+  }
+
+  /**
+   * Loads the next mini-block (if needed), prefix-sums the deltas in-place, and
+   * delegates the type-specific column write to {@code writer}.
+   */
+  private int loadMiniBlockBulk(int remaining, WritableColumnVector c, int rowId,
+      BulkWriter writer) throws IOException {
+    if (remainingInBlock == 0) readBlockHeader();
+    if (remainingInMiniBlock == 0) unpackMiniBlock();
+
+    int start = miniBlockSizeInValues - remainingInMiniBlock;
+    int count = Math.min(remaining, remainingInMiniBlock);
+
+    // Prefix-sum: convert raw deltas -> absolute values in-place.
+    long running = lastValueRead;
+    long minDelta = minDeltaInCurrentBlock;
+    long[] buf = unpackedValuesBuffer;
+    for (int i = start; i < start + count; i++) {
+      running += minDelta + buf[i];
+      buf[i] = running;
+    }
+    lastValueRead = running;
+
+    writer.write(c, rowId, buf, start, count);
+
+    remainingInBlock -= count;
+    remainingInMiniBlock -= count;
+    return count;
+  }
+
+  private void readValues(int total, WritableColumnVector c, int rowId,
+      IntegerOutputWriter outputWriter) {
+    if (valuesRead + total > totalValueCount) {
+      throw new ParquetDecodingException(
+          "No more values to read. Total values read:  " + valuesRead + ", total count: "
+              + totalValueCount + ", trying to read " + total + " more.");
+    }
+    int remaining = total;
+    // First value
+    if (valuesRead == 0) {
+      outputWriter.write(c, rowId, firstValue);
+      lastValueRead = firstValue;
+      rowId++;
+      remaining--;
+    }
+    while (remaining > 0) {
+      int n;
+      try {
+        n = loadMiniBlockToOutput(remaining, c, rowId, outputWriter);
+      } catch (IOException e) {
+        throw new ParquetDecodingException("Error reading mini block.", e);
+      }
+      rowId += n;
+      remaining -= n;
+    }
+    valuesRead += total;
+  }
+
+
+  /**
+   * Read from a mini block.  Read at most 'remaining' values into output.
+   *
+   * @return the number of values read into output
+   */
+  private int loadMiniBlockToOutput(int remaining, WritableColumnVector c, int rowId,
+      IntegerOutputWriter outputWriter) throws IOException {
+
+    // new block; read the block header
+    if (remainingInBlock == 0) {
+      readBlockHeader();
+    }
+
+    // new miniblock, unpack the miniblock
+    if (remainingInMiniBlock == 0) {
+      unpackMiniBlock();
+    }
+
+    // read values from miniblock
+    int valuesRead = 0;
+    for (int i = miniBlockSizeInValues - remainingInMiniBlock;
+        i < miniBlockSizeInValues && valuesRead < remaining; i++) {
+      // calculate values from deltas unpacked for current block
+      long outValue = lastValueRead + minDeltaInCurrentBlock + unpackedValuesBuffer[i];
+      lastValueRead = outValue;
+      outputWriter.write(c, rowId + valuesRead, outValue);
+      remainingInBlock--;
+      remainingInMiniBlock--;
+      valuesRead++;
+    }
+
+    return valuesRead;
+  }
+
+  private void readBlockHeader() {
+    try {
+      minDeltaInCurrentBlock = BytesUtils.readZigZagVarLong(in);
+    } catch (IOException e) {
+      throw new ParquetDecodingException("Can not read min delta in current block", e);
+    }
+    readBitWidthsForMiniBlocks();
+    remainingInBlock = blockSizeInValues;
+    currentMiniBlock = 0;
+    remainingInMiniBlock = 0;
+  }
+
+  /**
+   * mini block has a size of 8*n, unpack 32 value each time
+   *
+   * see org.apache.parquet.column.values.delta.DeltaBinaryPackingValuesReader#unpackMiniBlock
+   */
+  private void unpackMiniBlock() throws IOException {
+    int bitWidth = bitWidths[currentMiniBlock];
+    // The bit widths of the unused mini blocks of the last block can be anything, so a width is
+    // checked only when its mini block is unpacked.
+    if (bitWidth > 64) {
+      throw new ParquetDecodingException("Invalid DELTA_BINARY_PACKED mini block bit width: "
+          + bitWidth + " (must be at most 64)");
+    }
+    Arrays.fill(this.unpackedValuesBuffer, 0);
+    BytePackerForLong packer = Packer.LITTLE_ENDIAN.newBytePackerForLong(bitWidth);
+    for (int j = 0; j < miniBlockSizeInValues; j += 8) {
+      ByteBuffer buffer = in.slice(packer.getBitWidth());
+      if (buffer.hasArray()) {
+        packer.unpack8Values(buffer.array(),
+          buffer.arrayOffset() + buffer.position(), unpackedValuesBuffer, j);
+      } else {
+        packer.unpack8Values(buffer, buffer.position(), unpackedValuesBuffer, j);
+      }
+    }
+    remainingInMiniBlock = miniBlockSizeInValues;
+    currentMiniBlock++;
+  }
+
+  // From org.apache.parquet.column.values.delta.DeltaBinaryPackingValuesReader
+  private void readBitWidthsForMiniBlocks() {
+    for (int i = 0; i < miniBlockNumInABlock; i++) {
+      try {
+        bitWidths[i] = BytesUtils.readIntLittleEndianOnOneByte(in);
+      } catch (IOException e) {
+        throw new ParquetDecodingException("Can not decode bitwidth in block header", e);
+      }
+    }
+  }
+
+  private void skipValues(int total) {
+    // Read the values but don't write them out (the writer output method is a no-op)
+    readValues(total, null, -1, (w, r, v) -> {});
+  }
+
+  // Reusable buffer for unsigned long -> BigInteger encoding (9 bytes: sign + 8 value bytes).
+  private final byte[] unsignedLongScratch = new byte[9];
+
+  private void putUnsignedLongAsBigInteger(WritableColumnVector c, int rowId, long v) {
+    int start = encodeUnsignedLongBigEndian(v, unsignedLongScratch);
+    c.putByteArray(rowId, unsignedLongScratch, start, 9 - start);
+  }
+
+}

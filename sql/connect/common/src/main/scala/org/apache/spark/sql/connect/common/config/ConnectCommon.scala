@@ -1,0 +1,35 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.spark.sql.connect.common.config
+
+private[sql] object ConnectCommon {
+  val CONNECT_GRPC_BINDING_PORT: Int = 15002
+  val CONNECT_GRPC_PORT_MAX_RETRIES: Int = 0
+  val CONNECT_GRPC_MAX_MESSAGE_SIZE: Int = 128 * 1024 * 1024
+  val CONNECT_GRPC_MARSHALLER_RECURSION_LIMIT: Int = 1024
+  val CONNECT_SERVER_SIDE_MAVEN_RESOLUTION_ENABLED: String =
+    "spark.connect.session.serverSideMavenResolution.enabled"
+  // Detects a silently-dead connection (e.g. a NAT gateway/load balancer dropping an idle
+  // connection mapping without sending a TCP RST/FIN) via gRPC/HTTP2 keepalive PINGs, so a
+  // blocked RPC surfaces as UNAVAILABLE instead of hanging forever. Guarded by
+  // CONNECT_GRPC_KEEPALIVE_ENABLED so it can be turned off entirely as an escape hatch (e.g. if
+  // it interacts badly with a particular network path, or with long GC pauses).
+  val CONNECT_GRPC_KEEPALIVE_ENABLED: Boolean = true
+  val CONNECT_GRPC_KEEPALIVE_TIME_SECONDS: Long = 60
+  val CONNECT_GRPC_KEEPALIVE_TIMEOUT_SECONDS: Long = 20
+  val CONNECT_GRPC_KEEPALIVE_WITHOUT_CALLS: Boolean = true
+}

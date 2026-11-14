@@ -17,34 +17,59 @@
 
 package org.apache.spark.ml.source.libsvm
 
-import java.io.File
+import java.io.{File, FileOutputStream, IOException}
 import java.nio.charset.StandardCharsets
+import java.nio.file.Files
+import java.util.zip.GZIPOutputStream
 
-import com.google.common.io.Files
-
-import org.apache.spark.{SparkException, SparkFunSuite}
+import org.apache.spark.SparkFunSuite
+import org.apache.spark.ml.attribute.AttributeGroup
 import org.apache.spark.ml.linalg.{DenseVector, SparseVector, Vector, Vectors}
+import org.apache.spark.ml.linalg.SQLDataTypes.VectorType
 import org.apache.spark.mllib.util.MLlibTestSparkContext
 import org.apache.spark.sql.{Row, SaveMode}
+import org.apache.spark.sql.execution.datasources.CommonFileDataSourceSuite
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.types.{DoubleType, StructField, StructType}
 import org.apache.spark.util.Utils
 
+class LibSVMRelationSuite
+  extends SparkFunSuite
+  with MLlibTestSparkContext
+  with CommonFileDataSourceSuite {
 
-class LibSVMRelationSuite extends SparkFunSuite with MLlibTestSparkContext {
+  override protected def dataSourceFormat = "libsvm"
+  override protected def inputDataset = {
+    val rawData = new java.util.ArrayList[Row]()
+    rawData.add(Row(1.0, Vectors.sparse(1, Seq((0, 1.0)))))
+    val struct = new StructType()
+      .add("labelFoo", DoubleType, false)
+      .add("featuresBar", VectorType, false)
+    spark.createDataFrame(rawData, struct)
+  }
+
   // Path for dataset
   var path: String = _
 
   override def beforeAll(): Unit = {
     super.beforeAll()
-    val lines =
+    val lines0 =
       """
         |1 1:1.0 3:2.0 5:3.0
         |0
+      """.stripMargin
+    val lines1 =
+      """
         |0 2:4.0 4:5.0 6:6.0
       """.stripMargin
-    val dir = Utils.createDirectory(tempDir.getCanonicalPath, "data")
-    val file = new File(dir, "part-00000")
-    Files.write(lines, file, StandardCharsets.UTF_8)
-    path = dir.toURI.toString
+    val dir = Utils.createTempDir()
+    val succ = new File(dir, "_SUCCESS")
+    val file0 = new File(dir, "part-00000")
+    val file1 = new File(dir, "part-00001")
+    Files.writeString(succ.toPath, "")
+    Files.writeString(file0.toPath, lines0)
+    Files.writeString(file1.toPath, lines1)
+    path = dir.getPath
   }
 
   override def afterAll(): Unit = {
@@ -63,6 +88,7 @@ class LibSVMRelationSuite extends SparkFunSuite with MLlibTestSparkContext {
     assert(row1.getDouble(0) == 1.0)
     val v = row1.getAs[SparseVector](1)
     assert(v == Vectors.sparse(6, Seq((0, 1.0), (2, 2.0), (4, 3.0))))
+    assert(AttributeGroup.fromStructField(df.schema("features")).size === v.size)
   }
 
   test("select as dense vector") {
@@ -75,6 +101,15 @@ class LibSVMRelationSuite extends SparkFunSuite with MLlibTestSparkContext {
     assert(row1.getDouble(0) == 1.0)
     val v = row1.getAs[DenseVector](1)
     assert(v == Vectors.dense(1.0, 0.0, 2.0, 0.0, 3.0, 0.0))
+    assert(AttributeGroup.fromStructField(df.schema("features")).size === v.size)
+  }
+
+  test("illegal vector types") {
+    val e = intercept[IllegalArgumentException] {
+      spark.read.format("libsvm").options(Map("VectorType" -> "sparser")).load(path)
+    }.getMessage
+    assert(e.contains("Invalid value `sparser` for parameter `vectorType`. Expected " +
+      "types are `sparse` and `dense`."))
   }
 
   test("select a vector with specifying the longer dimension") {
@@ -83,31 +118,144 @@ class LibSVMRelationSuite extends SparkFunSuite with MLlibTestSparkContext {
     val row1 = df.first()
     val v = row1.getAs[SparseVector](1)
     assert(v == Vectors.sparse(100, Seq((0, 1.0), (2, 2.0), (4, 3.0))))
+    assert(AttributeGroup.fromStructField(df.schema("features")).size === v.size)
+  }
+
+  test("case insensitive option") {
+    val df = spark.read.option("NuMfEaTuReS", "100").format("libsvm").load(path)
+    assert(df.first().getAs[SparseVector](1) ==
+      Vectors.sparse(100, Seq((0, 1.0), (2, 2.0), (4, 3.0))))
+    assert(AttributeGroup.fromStructField(df.schema("features")).size === 100)
   }
 
   test("write libsvm data and read it again") {
     val df = spark.read.format("libsvm").load(path)
-    val tempDir2 = new File(tempDir, "read_write_test")
-    val writepath = tempDir2.toURI.toString
-    // TODO: Remove requirement to coalesce by supporting multiple reads.
-    df.coalesce(1).write.format("libsvm").mode(SaveMode.Overwrite).save(writepath)
+    val writePath = Utils.createTempDir().getPath
 
-    val df2 = spark.read.format("libsvm").load(writepath)
+    // TODO: Remove requirement to coalesce by supporting multiple reads.
+    df.coalesce(1).write.format("libsvm").mode(SaveMode.Overwrite).save(writePath)
+
+    val df2 = spark.read.format("libsvm").load(writePath)
     val row1 = df2.first()
     val v = row1.getAs[SparseVector](1)
     assert(v == Vectors.sparse(6, Seq((0, 1.0), (2, 2.0), (4, 3.0))))
+    assert(AttributeGroup.fromStructField(df.schema("features")).size === v.size)
+    assert(AttributeGroup.fromStructField(df2.schema("features")).size === v.size)
   }
 
   test("write libsvm data failed due to invalid schema") {
     val df = spark.read.format("text").load(path)
-    intercept[SparkException] {
+    intercept[IOException] {
       df.write.format("libsvm").save(path + "_2")
     }
   }
 
+  test("write libsvm data from scratch and read it again") {
+    val rawData = new java.util.ArrayList[Row]()
+    rawData.add(Row(1.0, Vectors.sparse(3, Seq((0, 2.0), (1, 3.0)))))
+    rawData.add(Row(4.0, Vectors.sparse(3, Seq((0, 5.0), (2, 6.0)))))
+
+    val struct = StructType(Array(
+      StructField("labelFoo", DoubleType, false),
+      StructField("featuresBar", VectorType, false))
+    )
+    val df = spark.createDataFrame(rawData, struct)
+
+    val writePath = Utils.createTempDir().getPath
+
+    df.coalesce(1).write.format("libsvm").mode(SaveMode.Overwrite).save(writePath)
+
+    val df2 = spark.read.format("libsvm").load(writePath)
+    val row1 = df2.first()
+    val v = row1.getAs[SparseVector](1)
+    assert(v == Vectors.sparse(3, Seq((0, 2.0), (1, 3.0))))
+    assert(AttributeGroup.fromStructField(df2.schema("features")).size === v.size)
+  }
+
   test("select features from libsvm relation") {
     val df = spark.read.format("libsvm").load(path)
-    df.select("features").rdd.map { case Row(d: Vector) => d }.first
-    df.select("features").collect
+    df.select("features").rdd.map { case Row(d: Vector) => d }.first()
+    df.select("features").collect()
+  }
+
+  test("create libsvmTable table without schema") {
+    try {
+      spark.sql(
+        s"""
+           |CREATE TABLE libsvmTable
+           |USING libsvm
+           |OPTIONS (
+           |  path '$path'
+           |)
+         """.stripMargin)
+      val df = spark.table("libsvmTable")
+      assert(df.columns(0) == "label")
+      assert(df.columns(1) == "features")
+    } finally {
+      spark.sql("DROP TABLE IF EXISTS libsvmTable")
+    }
+  }
+
+  test("create libsvmTable table without schema and path") {
+    try {
+      val e = intercept[IllegalArgumentException] {
+        spark.sql("CREATE TABLE libsvmTable USING libsvm")
+      }
+      assert(e.getMessage.contains("No input path specified for libsvm data"))
+    } finally {
+      spark.sql("DROP TABLE IF EXISTS libsvmTable")
+    }
+  }
+
+  test("SPARK-32815: Test LibSVM data source on file paths with glob metacharacters") {
+    withTempDir { dir =>
+      val basePath = dir.getCanonicalPath
+      // test libsvm writer / reader without specifying schema
+      val svmFileName = "[abc]"
+      val escapedSvmFileName = "\\[abc\\]"
+      val rawData = new java.util.ArrayList[Row]()
+      rawData.add(Row(1.0, Vectors.sparse(2, Seq((0, 2.0), (1, 3.0)))))
+      val struct = new StructType()
+        .add("labelFoo", DoubleType, false)
+        .add("featuresBar", VectorType, false)
+      val df = spark.createDataFrame(rawData, struct)
+      df.write.format("libsvm").save(s"$basePath/$svmFileName")
+      val df2 = spark.read.format("libsvm").load(s"$basePath/$escapedSvmFileName")
+      val row1 = df2.first()
+      val v = row1.getAs[SparseVector](1)
+      assert(v == Vectors.sparse(2, Seq((0, 2.0), (1, 3.0))))
+    }
+  }
+
+  test("SPARK-60217 decompression option decides whether a libsvm file is split") {
+    withTempDir { dir =>
+      // A gzip-compressed file whose `.libsvm` name says nothing about its compression.
+      val file = new File(dir, "data.libsvm")
+      val out = new GZIPOutputStream(new FileOutputStream(file))
+      try {
+        out.write((1 to 2000).map(i => s"${i % 2} 1:$i.0").mkString("\n")
+          .getBytes(StandardCharsets.UTF_8))
+      } finally {
+        out.close()
+      }
+      val maxPartitionBytes = SQLConf.FILES_MAX_PARTITION_BYTES.key
+      val previous = spark.conf.getOption(maxPartitionBytes)
+      spark.conf.set(maxPartitionBytes, "256")
+      try {
+        // gzip is not splittable, so the file must be read as a single split, whether or not
+        // numFeatures has to be inferred first.
+        Seq(Map.empty[String, String], Map("numFeatures" -> "1")).foreach { options =>
+          val df = spark.read.format("libsvm").options(options)
+            .option("decompression", "gzip").load(file.getCanonicalPath)
+          assert(df.rdd.getNumPartitions == 1, s"options=$options")
+          assert(df.count() == 2000, s"options=$options")
+        }
+      } finally {
+        previous match {
+          case Some(v) => spark.conf.set(maxPartitionBytes, v)
+          case None => spark.conf.unset(maxPartitionBytes)
+        }
+      }
+    }
   }
 }

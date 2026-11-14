@@ -16,12 +16,11 @@
 #
 
 # $example on$
-from pyspark.mllib.classification import LogisticRegressionWithLBFGS
-from pyspark.mllib.util import MLUtils
-from pyspark.mllib.evaluation import MulticlassMetrics
 # $example off$
-
 from pyspark import SparkContext
+from pyspark.mllib.classification import LogisticRegressionWithLBFGS
+from pyspark.mllib.evaluation import MulticlassMetrics
+from pyspark.mllib.util import MLUtils
 
 if __name__ == "__main__":
     sc = SparkContext(appName="MultiClassMetricsExample")
@@ -32,7 +31,7 @@ if __name__ == "__main__":
     data = MLUtils.loadLibSVMFile(sc, "data/mllib/sample_multiclass_classification_data.txt")
 
     # Split data into training (60%) and test (40%)
-    training, test = data.randomSplit([0.6, 0.4], seed=11L)
+    training, test = data.randomSplit([0.6, 0.4], seed=11)
     training.cache()
 
     # Run training algorithm to build the model
@@ -45,9 +44,9 @@ if __name__ == "__main__":
     metrics = MulticlassMetrics(predictionAndLabels)
 
     # Overall statistics
-    precision = metrics.precision()
-    recall = metrics.recall()
-    f1Score = metrics.fMeasure()
+    precision = metrics.precision(1.0)
+    recall = metrics.recall(1.0)
+    f1Score = metrics.fMeasure(1.0)
     print("Summary Stats")
     print("Precision = %s" % precision)
     print("Recall = %s" % recall)

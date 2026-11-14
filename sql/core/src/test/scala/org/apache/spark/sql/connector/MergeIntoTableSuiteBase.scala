@@ -1,0 +1,3633 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.connector
+
+import org.apache.spark.SparkRuntimeException
+import org.apache.spark.internal.config
+import org.apache.spark.sql.{AnalysisException, Row}
+import org.apache.spark.sql.QueryTest.withQueryExecutionsCaptured
+import org.apache.spark.sql.catalyst.expressions.{AttributeReference, EqualTo, In, Not}
+import org.apache.spark.sql.catalyst.optimizer.BuildLeft
+import org.apache.spark.sql.catalyst.plans.logical.{ReplaceData, WriteDelta}
+import org.apache.spark.sql.connector.catalog.{Aborted, Column, ColumnDefaultValue, Committed, InMemoryBaseTable, InMemoryTable, TableInfo}
+import org.apache.spark.sql.connector.expressions.{GeneralScalarExpression, LiteralValue}
+import org.apache.spark.sql.connector.write.MergeSummary
+import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
+import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2Relation, DataSourceV2ScanRelation, InsertOnlyMergeExec, MergeRowsExec}
+import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, BroadcastNestedLoopJoinExec, CartesianProductExec}
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.sources
+import org.apache.spark.sql.types.{IntegerType, StringType}
+
+abstract class MergeIntoTableSuiteBase extends RowLevelOperationSuiteBase
+  with AdaptiveSparkPlanHelper {
+
+  import testImplicits._
+
+  protected def deltaMerge: Boolean = false
+
+  test("self merge with transactional checks") {
+    // create table
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |{ "pk": 3, "salary": 300, "dep": "hr" }
+        |""".stripMargin)
+
+    // merge into table using a subquery on top of itself
+    val (txn, txnTables) = executeTransaction {
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING (SELECT * FROM $tableNameAsString WHERE salary = 100) s
+           |ON t.pk = s.pk AND t.dep = 'hr'
+           |WHEN MATCHED THEN
+           | UPDATE SET salary = t.salary + 1
+           |WHEN NOT MATCHED THEN
+           | INSERT *
+           |""".stripMargin)
+    }
+
+    // check txn was properly committed and closed
+    assert(txn.currentState == Committed)
+    assert(txn.isClosed)
+    assert(txnTables.size == 1)
+    assert(table.version() == "2")
+
+    // check all table scans
+    val targetTxnTable = txnTables(tableNameAsString)
+    assert(targetTxnTable.scanEvents.size == 4)
+
+    // check table scans as MERGE target
+    val numTargetScans = targetTxnTable.scanEvents.flatten.count {
+      case sources.EqualTo("dep", "hr") => true
+      case _ => false
+    }
+    assert(numTargetScans == 2)
+
+    // check table scans as MERGE source
+    val numSourceScans = targetTxnTable.scanEvents.flatten.count {
+      case sources.EqualTo("salary", 100) => true
+      case _ => false
+    }
+    assert(numSourceScans == 2)
+
+    // check txn state was propagated correctly
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Seq(
+        Row(1, 101, "hr"), // update
+        Row(2, 200, "software"), // unchanged
+        Row(3, 300, "hr"))) // unchanged
+  }
+
+  test("merge into table with analysis failure and transactional checks") {
+    createAndInitTable(
+      "pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |{ "pk": 3, "salary": 300, "dep": "hr" }
+        |""".stripMargin)
+
+    sql(s"CREATE TABLE $sourceNameAsString (pk INT NOT NULL, salary INT, dep STRING)")
+    sql(s"INSERT INTO $sourceNameAsString VALUES (1, 150, 'support'), (4, 400, 'finance')")
+
+    val exception = intercept[AnalysisException] {
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING $sourceNameAsString s
+           |ON t.pk = s.pk
+           |WHEN MATCHED THEN
+           | UPDATE SET salary = s.invalid_column
+           |WHEN NOT MATCHED THEN
+           | INSERT (pk, salary, dep) VALUES (s.pk, s.salary, 'pending')
+           |""".stripMargin)
+    }
+
+    assert(exception.getMessage.contains("invalid_column"))
+    assert(catalog.lastTransaction.currentState == Aborted)
+    assert(catalog.lastTransaction.isClosed)
+  }
+
+  test("merge into table using view with transactional checks") {
+    withView("temp_view") {
+      // create target table
+      createAndInitTable(
+        "pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |{ "pk": 3, "salary": 300, "dep": "hr" }
+          |""".stripMargin)
+
+      // create source table
+      sql(s"CREATE TABLE $sourceNameAsString (pk INT NOT NULL, salary INT)")
+      sql(s"INSERT INTO $sourceNameAsString (pk, salary) VALUES (1, 150), (4, 400)")
+
+      // create view on top of source and target tables
+      sql(
+        s"""CREATE VIEW temp_view AS
+           |SELECT s.pk, s.salary, t.dep
+           |FROM $sourceNameAsString s
+           |LEFT JOIN (
+           | SELECT * FROM $tableNameAsString WHERE pk < 10
+           |) t ON s.pk = t.pk
+           |""".stripMargin)
+
+      // merge into target table using view
+      val (txn, txnTables) = executeTransaction {
+        sql(s"""MERGE INTO $tableNameAsString t
+           |USING temp_view s
+           |ON t.pk = s.pk AND t.dep = 'hr'
+           |WHEN MATCHED THEN
+           | UPDATE SET salary = s.salary, dep = s.dep
+           |WHEN NOT MATCHED THEN
+           | INSERT (pk, salary, dep) VALUES (s.pk, s.salary, 'pending')
+           |""".stripMargin)
+      }
+
+      // check txn covers both tables and was properly committed and closed
+      assert(txn.currentState == Committed)
+      assert(txn.isClosed)
+      assert(txnTables.size == 2)
+      assert(table.version() == "2")
+
+      // check target table was scanned correctly
+      val targetTxnTable = txnTables(tableNameAsString)
+      assert(targetTxnTable.scanEvents.size == 4)
+
+      // check target table scans as MERGE target (dep = 'hr')
+      val numMergeTargetScans = targetTxnTable.scanEvents.flatten.count {
+        case sources.EqualTo("dep", "hr") => true
+        case _ => false
+      }
+      assert(numMergeTargetScans == 2)
+
+      // check target table scans in view as MERGE source (pk < 10)
+      val numViewTargetScans = targetTxnTable.scanEvents.flatten.count {
+        case sources.LessThan("pk", 10L) => true
+        case _ => false
+      }
+      assert(numViewTargetScans == 2)
+
+      // check source table scans in view as MERGE source (no predicate)
+      val sourceTxnTable = txnTables(sourceNameAsString)
+      assert(sourceTxnTable.scanEvents.size == 2)
+
+      // check txn state was propagated correctly
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 150, "hr"), // update
+          Row(2, 200, "software"), // unchanged
+          Row(3, 300, "hr"), // unchanged
+          Row(4, 400, "pending"))) // new
+    }
+  }
+
+  test("merge into table using nested view with transactional checks") {
+    withView("base_view", "nested_view") {
+      withTable(sourceNameAsString) {
+        // create target table
+        createAndInitTable(
+          "pk INT NOT NULL, salary INT, dep STRING",
+          """{ "pk": 1, "salary": 100, "dep": "hr" }
+            |{ "pk": 2, "salary": 200, "dep": "software" }
+            |{ "pk": 3, "salary": 300, "dep": "hr" }
+            |""".stripMargin)
+
+        // create source table
+        sql(s"CREATE TABLE $sourceNameAsString (pk INT NOT NULL, salary INT)")
+        sql(s"INSERT INTO $sourceNameAsString (pk, salary) VALUES (1, 150), (4, 400)")
+
+        // create base view
+        sql(
+          s"""CREATE VIEW base_view AS
+             |SELECT s.pk, s.salary, t.dep
+             |FROM $sourceNameAsString s
+             |LEFT JOIN (
+             | SELECT * FROM $tableNameAsString WHERE pk < 10
+             |) t ON s.pk = t.pk
+             |""".stripMargin)
+
+        // create nested view on top of base view
+        sql(
+          s"""CREATE VIEW nested_view AS
+             |SELECT * FROM base_view
+             |""".stripMargin)
+
+        // merge into target table using nested view
+        val (txn, txnTables) = executeTransaction {
+          sql(
+            s"""MERGE INTO $tableNameAsString t
+               |USING nested_view s
+               |ON t.pk = s.pk AND t.dep = 'hr'
+               |WHEN MATCHED THEN
+               | UPDATE SET salary = s.salary, dep = s.dep
+               |WHEN NOT MATCHED THEN
+               | INSERT (pk, salary, dep) VALUES (s.pk, s.salary, 'pending')
+               |""".stripMargin)
+        }
+
+        // check txn covers both tables and was properly committed and closed
+        assert(txn.currentState == Committed)
+        assert(txn.isClosed)
+        assert(txnTables.size == 2)
+        assert(table.version() == "2")
+
+        // check target table was scanned correctly
+        val targetTxnTable = txnTables(tableNameAsString)
+        assert(targetTxnTable.scanEvents.size == 4)
+
+        // check target table scans as MERGE target (dep = 'hr')
+        val numMergeTargetScans = targetTxnTable.scanEvents.flatten.count {
+          case sources.EqualTo("dep", "hr") => true
+          case _ => false
+        }
+        assert(numMergeTargetScans == 2)
+
+        // check target table scans in view as MERGE source (pk < 10)
+        val numViewTargetScans = targetTxnTable.scanEvents.flatten.count {
+          case sources.LessThan("pk", 10L) => true
+          case _ => false
+        }
+        assert(numViewTargetScans == 2)
+
+        // check source table scans in view as MERGE source (no predicate)
+        val sourceTxnTable = txnTables(sourceNameAsString)
+        assert(sourceTxnTable.scanEvents.size == 2)
+
+        // check txn state was propagated correctly
+        checkAnswer(
+          sql(s"SELECT * FROM $tableNameAsString"),
+          Seq(
+            Row(1, 150, "hr"), // update
+            Row(2, 200, "software"), // unchanged
+            Row(3, 300, "hr"), // unchanged
+            Row(4, 400, "pending"))) // new
+      }
+    }
+  }
+
+  test("merge into table rewritten as INSERT with transactional checks") {
+    withTable(sourceNameAsString) {
+      // create target table
+      createAndInitTable(
+        "pk INT, value STRING, dep STRING",
+        """{ "pk": 1, "value": "a", "dep": "hr" }
+          |{ "pk": 2, "value": "b", "dep": "finance" }
+          |""".stripMargin)
+
+      // create source table
+      sql(s"CREATE TABLE $sourceNameAsString (pk INT, value STRING, dep STRING)")
+      sql(s"INSERT INTO $sourceNameAsString VALUES (3, 'c', 'hr'), (4, 'd', 'software')")
+
+      // merge into target with only WHEN NOT MATCHED clauses (rewritten as insert)
+      val (txn, txnTables) = executeTransaction {
+        sql(
+          s"""MERGE INTO $tableNameAsString t
+             |USING $sourceNameAsString s
+             |ON t.pk = s.pk
+             |WHEN NOT MATCHED AND s.pk < 4 THEN
+             |  INSERT (pk, value, dep) VALUES (s.pk, concat(s.value, '_low'), s.dep)
+             |WHEN NOT MATCHED AND s.pk >= 4 THEN
+             |  INSERT (pk, value, dep) VALUES (s.pk, concat(s.value, '_high'), s.dep)
+             |""".stripMargin)
+      }
+
+      // check txn covers both tables and was properly committed and closed
+      assert(txn.currentState == Committed)
+      assert(txn.isClosed)
+      assert(txnTables.size == 2)
+      assert(table.version() == "2")
+
+      // check target table was scanned correctly
+      val targetTxnTable = txnTables(tableNameAsString)
+      assert(targetTxnTable.scanEvents.size == 1)
+
+      // check source table was scanned correctly
+      val sourceTxnTable = txnTables(sourceNameAsString)
+      assert(sourceTxnTable.scanEvents.size == 1)
+
+      // check txn state was propagated correctly
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, "a", "hr"), // unchanged
+          Row(2, "b", "finance"), // unchanged
+          Row(3, "c_low", "hr"), // inserted via first NOT MATCHED clause
+          Row(4, "d_high", "software"))) // inserted via second NOT MATCHED clause
+    }
+  }
+
+  test("merge into table with expression-based default values") {
+    val columns = Array(
+      Column.create("pk", IntegerType),
+      Column.create("salary", IntegerType),
+      Column.create("dep", StringType),
+      Column.create(
+        "value",
+        IntegerType,
+        false, /* not nullable */
+        null, /* no comment */
+        new ColumnDefaultValue(
+          new GeneralScalarExpression(
+            "+",
+            Array(LiteralValue(100, IntegerType), LiteralValue(23, IntegerType))),
+          LiteralValue(123, IntegerType)),
+        "{}"))
+    val tableInfo = new TableInfo.Builder().withColumns(columns).build()
+    catalog.createTable(ident, tableInfo)
+
+    withTempView("source") {
+      val sourceRows = Seq(
+        (1, 500, "eng"),
+        (2, 600, "hr"))
+      sourceRows.toDF("pk", "salary", "dep").createOrReplaceTempView("source")
+
+      sql(s"INSERT INTO $tableNameAsString (pk, salary, dep, value) VALUES (1, 200, 'eng', 999)")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN MATCHED THEN
+           | UPDATE SET value = DEFAULT
+           |WHEN NOT MATCHED THEN
+           | INSERT (pk, salary, dep) VALUES (s.pk, s.salary, s.dep)
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 200, "eng", 123), // update
+          Row(2, 600, "hr", 123))) // insert
+    }
+  }
+
+  test("merge into table containing added column with default value") {
+    withTempView("source") {
+      sql(
+        s"""CREATE TABLE $tableNameAsString (
+           | pk INT NOT NULL,
+           | salary INT NOT NULL DEFAULT -1,
+           | dep STRING)
+           |PARTITIONED BY (dep)
+           |""".stripMargin)
+
+      append("pk INT NOT NULL, dep STRING",
+        """{ "pk": 1, "dep": "hr" }
+          |{ "pk": 2, "dep": "hr" }
+          |{ "pk": 3, "dep": "hr" }
+          |""".stripMargin)
+
+      sql(s"ALTER TABLE $tableNameAsString ADD COLUMN txt STRING DEFAULT 'initial-text'")
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, -1, "hr", "initial-text"),
+          Row(2, -1, "hr", "initial-text"),
+          Row(3, -1, "hr", "initial-text")))
+
+      val sourceRows = Seq(
+        (1, 100, "hr"),
+        (4, 400, "hr"))
+      sourceRows.toDF("pk", "salary", "dep").createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN MATCHED THEN
+           | UPDATE SET t.salary = s.salary, t.txt = DEFAULT
+           |WHEN NOT MATCHED THEN
+           | INSERT (pk, salary, dep) VALUES (s.pk, DEFAULT, s.dep)
+           |WHEN NOT MATCHED BY SOURCE THEN
+           | UPDATE SET salary = DEFAULT
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 100, "hr", "initial-text"),
+          Row(2, -1, "hr", "initial-text"),
+          Row(3, -1, "hr", "initial-text"),
+          Row(4, -1, "hr", "initial-text")))
+    }
+  }
+
+  test("SPARK-45974: merge into non filter attributes table") {
+    val tableName: String = "cat.ns1.non_partitioned_table"
+    withTable(tableName) {
+      withTempView("source") {
+        val sourceRows = Seq(
+          (1, 100, "hr"),
+          (2, 200, "finance"),
+          (3, 300, "hr"))
+        sourceRows.toDF("pk", "salary", "dep").createOrReplaceTempView("source")
+
+        sql(s"CREATE TABLE $tableName (pk INT NOT NULL, salary INT, dep STRING)".stripMargin)
+
+        val df = sql(
+          s"""MERGE INTO $tableName t
+             |USING (select * from source) s
+             |ON t.pk = s.pk
+             |WHEN MATCHED THEN
+             | UPDATE SET t.salary = s.salary
+             |WHEN NOT MATCHED THEN
+             | INSERT *
+             |""".stripMargin)
+
+        checkAnswer(
+          sql(s"SELECT * FROM $tableName"),
+          Seq(
+            Row(1, 100, "hr"), // insert
+            Row(2, 200, "finance"), // insert
+            Row(3, 300, "hr"))) // insert
+      }
+    }
+  }
+
+  test("merge into empty table with NOT MATCHED clause") {
+    withTempView("source") {
+      createTable("pk INT NOT NULL, salary INT, dep STRING")
+
+      val sourceRows = Seq(
+        (1, 100, "hr"),
+        (2, 200, "finance"),
+        (3, 300, "hr"))
+      sourceRows.toDF("pk", "salary", "dep").createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN NOT MATCHED THEN
+           | INSERT *
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 100, "hr"), // insert
+          Row(2, 200, "finance"), // insert
+          Row(3, 300, "hr"))) // insert
+
+      val mergeSummary = getMergeSummary()
+      assert(mergeSummary.numTargetRowsInserted === 3L)
+      assert(mergeSummary.numTargetRowsCopied === 0L)
+      assert(mergeSummary.numTargetRowsUpdated === 0L)
+      assert(mergeSummary.numTargetRowsDeleted === 0L)
+      assert(mergeSummary.numTargetRowsMatchedUpdated === 0L)
+      assert(mergeSummary.numTargetRowsMatchedDeleted === 0L)
+      assert(mergeSummary.numTargetRowsNotMatchedBySourceUpdated === 0L)
+      assert(mergeSummary.numTargetRowsNotMatchedBySourceDeleted === 0L)
+    }
+  }
+
+  test("merge into empty table with conditional NOT MATCHED clause") {
+    withTempView("source") {
+      createTable("pk INT NOT NULL, salary INT, dep STRING")
+
+      val sourceRows = Seq(
+        (1, 100, "hr"),
+        (2, 200, "finance"),
+        (3, 300, "hr"))
+      sourceRows.toDF("pk", "salary", "dep").createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN NOT MATCHED AND s.pk >= 2 THEN
+           | INSERT *
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(2, 200, "finance"), // insert
+          Row(3, 300, "hr"))) // insert
+
+      val mergeSummary = getMergeSummary()
+      assert(mergeSummary.numTargetRowsInserted === 2L)
+      assert(mergeSummary.numTargetRowsCopied === 0L)
+      assert(mergeSummary.numTargetRowsUpdated === 0L)
+      assert(mergeSummary.numTargetRowsDeleted === 0L)
+      assert(mergeSummary.numTargetRowsMatchedUpdated === 0L)
+      assert(mergeSummary.numTargetRowsMatchedDeleted === 0L)
+      assert(mergeSummary.numTargetRowsNotMatchedBySourceUpdated === 0L)
+      assert(mergeSummary.numTargetRowsNotMatchedBySourceDeleted === 0L)
+    }
+  }
+
+  test("merge into empty table with multiple NOT MATCHED clause") {
+    withTempView("source") {
+      createTable("pk INT NOT NULL, salary INT, dep STRING")
+
+      val sourceRows = Seq(
+        (1, 100, "hr"),
+        (2, 200, "finance"),
+        (3, 300, "hr"))
+      sourceRows.toDF("pk", "salary", "dep").createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN NOT MATCHED AND s.pk >= 2 THEN
+           | INSERT *
+           |WHEN NOT MATCHED THEN
+           | INSERT *
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 100, "hr"), // insert
+          Row(2, 200, "finance"), // insert
+          Row(3, 300, "hr"))) // insert
+
+      val mergeSummary = getMergeSummary()
+      assert(mergeSummary.numTargetRowsInserted === 3L)
+      assert(mergeSummary.numTargetRowsCopied === 0L)
+      assert(mergeSummary.numTargetRowsUpdated === 0L)
+      assert(mergeSummary.numTargetRowsDeleted === 0L)
+      assert(mergeSummary.numTargetRowsMatchedUpdated === 0L)
+      assert(mergeSummary.numTargetRowsMatchedDeleted === 0L)
+      assert(mergeSummary.numTargetRowsNotMatchedBySourceUpdated === 0L)
+      assert(mergeSummary.numTargetRowsNotMatchedBySourceDeleted === 0L)
+    }
+  }
+
+  test("merge with literal false ON condition") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "hardware" }
+          |""".stripMargin)
+
+      Seq((1, 100, "hr"), (3, 300, "finance"))
+        .toDF("pk", "salary", "dep").createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON false
+           |WHEN MATCHED THEN UPDATE SET t.salary = -1
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(Row(1, 100, "hr"), Row(2, 200, "hardware")))
+
+      val summary = getMergeSummary()
+      assert(summary.numTargetRowsUpdated === 0L)
+      assert(summary.numTargetRowsDeleted === 0L)
+      assert(summary.numTargetRowsInserted === 0L)
+      assert(summary.numTargetRowsMatchedUpdated === 0L)
+      assert(summary.numTargetRowsMatchedDeleted === 0L)
+      assert(summary.numTargetRowsNotMatchedBySourceUpdated === 0L)
+      assert(summary.numTargetRowsNotMatchedBySourceDeleted === 0L)
+      assert(summary.numTargetRowsCopied === 0L)
+    }
+  }
+
+  test("merge with literal true ON condition") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "hardware" }
+          |""".stripMargin)
+
+      Seq((99, 999, "finance"))
+        .toDF("pk", "salary", "dep").createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON true
+           |WHEN MATCHED THEN UPDATE SET t.salary = -1
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(Row(1, -1, "hr"), Row(2, -1, "hardware")))
+
+      val summary = getMergeSummary()
+      assert(summary.numTargetRowsUpdated === 2L)
+      assert(summary.numTargetRowsDeleted === 0L)
+      assert(summary.numTargetRowsInserted === 0L)
+      assert(summary.numTargetRowsMatchedUpdated === 2L)
+      assert(summary.numTargetRowsMatchedDeleted === 0L)
+      assert(summary.numTargetRowsNotMatchedBySourceUpdated === 0L)
+      assert(summary.numTargetRowsNotMatchedBySourceDeleted === 0L)
+      assert(summary.numTargetRowsCopied === 0L)
+    }
+  }
+
+  test("merge with statically empty source and only MATCHED clauses") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "hardware" }
+          |""".stripMargin)
+
+      Seq.empty[(Int, Int, String)].toDF("pk", "salary", "dep")
+        .createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN MATCHED THEN UPDATE SET t.salary = -1
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(Row(1, 100, "hr"), Row(2, 200, "hardware")))
+
+      val summary = getMergeSummary()
+      assert(summary.numTargetRowsUpdated === 0L)
+      assert(summary.numTargetRowsDeleted === 0L)
+      assert(summary.numTargetRowsInserted === 0L)
+      assert(summary.numTargetRowsMatchedUpdated === 0L)
+      assert(summary.numTargetRowsMatchedDeleted === 0L)
+      assert(summary.numTargetRowsNotMatchedBySourceUpdated === 0L)
+      assert(summary.numTargetRowsNotMatchedBySourceDeleted === 0L)
+      assert(summary.numTargetRowsCopied === 0L)
+    }
+  }
+
+  test("merge into with conditional WHEN MATCHED clause (update)") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "corrupted" }
+          |""".stripMargin)
+
+      val sourceRows = Seq(
+        (1, 100, "software"),
+        (2, 200, "finance"),
+        (3, 300, "software"))
+      sourceRows.toDF("pk", "salary", "dep").createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN MATCHED AND s.pk = 2 THEN
+           | UPDATE SET *
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 100, "hr"), // unchanged
+          Row(2, 200, "finance"))) // update
+    }
+  }
+
+  test("merge into with conditional WHEN MATCHED clause (delete)") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "corrupted" }
+          |""".stripMargin)
+
+      Seq(1, 2, 3).toDF("pk").createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN MATCHED AND t.salary = 200 THEN
+           | DELETE
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(Row(1, 100, "hr"))) // unchanged
+    }
+  }
+
+  test("merge into with assignments to primary key in NOT MATCHED BY SOURCE") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "finance" }
+          |""".stripMargin)
+
+      val sourceRows = Seq(
+        (1, 100, "software"),
+        (5, 500, "finance"))
+      sourceRows.toDF("pk", "salary", "dep").createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN MATCHED THEN
+           | UPDATE SET t.salary = -1
+           |WHEN NOT MATCHED BY SOURCE THEN
+           | UPDATE SET t.pk = -1
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, -1, "hr"), // update (matched)
+          Row(-1, 200, "finance"))) // update (not matched by source)
+    }
+  }
+
+  test("merge into with assignments to primary key in MATCHED") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "finance" }
+          |""".stripMargin)
+
+      val sourceRows = Seq(
+        (1, 100, "software"),
+        (5, 500, "finance"))
+      sourceRows.toDF("pk", "salary", "dep").createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN MATCHED THEN
+           | UPDATE SET t.pk = -1
+           |WHEN NOT MATCHED BY SOURCE THEN
+           | UPDATE SET t.salary = -1
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(-1, 100, "hr"), // update (matched)
+          Row(2, -1, "finance"))) // update (not matched by source)
+    }
+  }
+
+  test("merge with all types of clauses") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |{ "pk": 3, "salary": 300, "dep": "hr" }
+          |{ "pk": 4, "salary": 400, "dep": "hr" }
+          |{ "pk": 5, "salary": 500, "dep": "hr" }
+          |""".stripMargin)
+
+      val sourceDF = Seq(3, 4, 5, 6).toDF("pk")
+      sourceDF.createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN MATCHED THEN
+           | UPDATE SET t.salary = t.salary + 1
+           |WHEN NOT MATCHED THEN
+           | INSERT (pk, salary, dep) VALUES (s.pk, 0, 'new')
+           |WHEN NOT MATCHED BY SOURCE THEN
+           | DELETE
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(3, 301, "hr"), // update
+          Row(4, 401, "hr"), // update
+          Row(5, 501, "hr"), // update
+          Row(6, 0, "new"))) // insert
+    }
+  }
+
+  test("merge with all types of clauses (update and insert star)") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |{ "pk": 3, "salary": 300, "dep": "software" }
+          |""".stripMargin)
+
+      val sourceRows = Seq(
+        (1, 101, "support"),
+        (2, 201, "support"),
+        (4, 401, "support"),
+        (5, 501, "support"))
+      sourceRows.toDF("pk", "salary", "dep").createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN MATCHED AND t.pk = 1 THEN
+           | UPDATE SET *
+           |WHEN NOT MATCHED AND s.pk = 4 THEN
+           | INSERT *
+           |WHEN NOT MATCHED BY SOURCE AND t.pk = t.salary / 100 THEN
+           | DELETE
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 101, "support"), // update
+          Row(2, 200, "software"), // unchanged
+          Row(4, 401, "support"))) // insert
+    }
+  }
+
+  test("merge with all types of conditional clauses") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |{ "pk": 3, "salary": 300, "dep": "hr" }
+          |{ "pk": 4, "salary": 400, "dep": "hr" }
+          |{ "pk": 5, "salary": 500, "dep": "hr" }
+          |""".stripMargin)
+
+      val sourceDF = Seq(3, 4, 5, 6, 7).toDF("pk")
+      sourceDF.createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN MATCHED AND t.pk = 4 THEN
+           | UPDATE SET t.salary = t.salary + 1
+           |WHEN NOT MATCHED AND pk = 6 THEN
+           | INSERT (pk, salary, dep) VALUES (s.pk, 0, 'new')
+           |WHEN NOT MATCHED BY SOURCE AND salary = 100 THEN
+           | DELETE
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(2, 200, "software"), // unchanged
+          Row(3, 300, "hr"), // unchanged
+          Row(4, 401, "hr"), // update
+          Row(5, 500, "hr"), // unchanged
+          Row(6, 0, "new"))) // insert
+    }
+  }
+
+  test("SPARK-60673: merge with metadata columns in conditions and assignments") {
+    // the metadata columns must be read even if the operation does not require them
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |{ "pk": 3, "salary": 300, "dep": "hr" }
+          |{ "pk": 4, "salary": 400, "dep": "software" }
+          |""".stripMargin)
+
+      val sourceDF = Seq((1, "hr"), (2, "hr"), (5, "hr")).toDF("pk", "dep")
+      sourceDF.createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk AND t._partition = s.dep
+           |WHEN MATCHED AND t.index = 0 THEN
+           | UPDATE SET t.salary = t.index + 10
+           |WHEN NOT MATCHED THEN
+           | INSERT (pk, salary, dep) VALUES (s.pk, 0, s.dep)
+           |WHEN NOT MATCHED BY SOURCE AND t._partition = 'software' THEN
+           | DELETE
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 10, "hr"), // update
+          Row(2, 0, "hr"), // insert
+          Row(3, 300, "hr"), // unchanged
+          Row(5, 0, "hr"))) // insert
+    }
+  }
+
+  test("SPARK-60721: merge with assignments to metadata columns") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |""".stripMargin)
+
+      Seq((1, "hr"), (3, "hr")).toDF("pk", "dep").createOrReplaceTempView("source")
+
+      Seq(
+        "WHEN MATCHED THEN UPDATE SET t.salary = -1, t.index = 5" -> "index",
+        "WHEN NOT MATCHED BY SOURCE THEN UPDATE SET t._partition = 'x'" -> "_partition",
+        """WHEN MATCHED THEN UPDATE SET salary = -1
+          |WHEN NOT MATCHED THEN INSERT (pk, salary, dep, _partition)
+          | VALUES (s.pk, 0, s.dep, 'x')""".stripMargin -> "_partition",
+        // insert-only MERGE
+        "WHEN NOT MATCHED THEN INSERT (pk, salary, dep, index) VALUES (s.pk, 0, s.dep, 7)" ->
+          "index",
+        // the implicit cast in the condition resolves the command in a later analyzer iteration
+        "WHEN MATCHED AND t.salary < 150.5 THEN UPDATE SET index = 5" -> "index"
+      ).foreach { case (clauses, metadataCol) =>
+        val e = intercept[AnalysisException] {
+          sql(
+            s"""MERGE INTO $tableNameAsString t
+               |USING source s
+               |ON t.pk = s.pk
+               |$clauses
+               |""".stripMargin)
+        }
+        assert(e.getCondition == "DATATYPE_MISMATCH.INVALID_ROW_LEVEL_OPERATION_ASSIGNMENTS")
+        assert(e.getMessage.contains(s"Cannot assign to metadata column '$metadataCol'"))
+      }
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 100, "hr"), // unchanged
+          Row(2, 200, "software"))) // unchanged
+    }
+  }
+
+  test("SPARK-60721: merge ignores assignments to metadata columns in legacy mode") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |""".stripMargin)
+
+      Seq((1, "hr"), (3, "hr")).toDF("pk", "dep").createOrReplaceTempView("source")
+
+      withSQLConf(SQLConf.LEGACY_IGNORE_METADATA_COLUMN_ASSIGNMENTS.key -> "true") {
+        sql(
+          s"""MERGE INTO $tableNameAsString t
+             |USING source s
+             |ON t.pk = s.pk
+             |WHEN MATCHED THEN
+             | UPDATE SET t.salary = -1, t.index = 5
+             |WHEN NOT MATCHED THEN
+             | INSERT (pk, salary, dep, _partition) VALUES (s.pk, 0, s.dep, 'x')
+             |""".stripMargin)
+      }
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, -1, "hr"), // updated
+          Row(2, 200, "software"), // unchanged
+          Row(3, 0, "hr"))) // new
+    }
+  }
+
+  test("SPARK-60721: merge with schema evolution rejects assignments to metadata columns" +
+      " before evolving the schema") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |""".stripMargin)
+
+      // `bonus` is missing from the target, so schema evolution would add it
+      Seq((1, 150, "hr", 10, 1000), (3, 350, "hr", 30, 3000))
+        .toDF("pk", "salary", "dep", "index", "bonus")
+        .createOrReplaceTempView("source")
+
+      Seq(
+        "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *" -> "index",
+        "WHEN MATCHED THEN UPDATE SET bonus = s.bonus, _partition = s.dep" -> "_partition"
+      ).foreach { case (clauses, metadataCol) =>
+        val e = intercept[AnalysisException] {
+          sql(
+            s"""MERGE WITH SCHEMA EVOLUTION INTO $tableNameAsString t
+               |USING source s
+               |ON t.pk = s.pk
+               |$clauses
+               |""".stripMargin)
+        }
+        assert(e.getCondition == "DATATYPE_MISMATCH.INVALID_ROW_LEVEL_OPERATION_ASSIGNMENTS")
+        assert(e.getMessage.contains(s"Cannot assign to metadata column '$metadataCol'"))
+        // the schema is not evolved, not even in the aborted transaction
+        assert(catalog.lastTransaction.currentState == Aborted)
+        val txnTable = catalog.lastTransaction.catalog.txnTables(ident)
+        assert(txnTable.columns().map(_.name).toSeq == Seq("pk", "salary", "dep"))
+      }
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 100, "hr"), // unchanged
+          Row(2, 200, "software"))) // unchanged
+    }
+  }
+
+  test("merge with one NOT MATCHED BY SOURCE clause") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |{ "pk": 3, "salary": 300, "dep": "hr" }
+          |""".stripMargin)
+
+      val sourceDF = Seq(1, 2).toDF("pk")
+      sourceDF.createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN NOT MATCHED BY SOURCE THEN
+           | DELETE
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 100, "hr"), // unchanged
+          Row(2, 200, "software"))) // unchanged
+    }
+  }
+
+  test("merge with one conditional NOT MATCHED BY SOURCE clause") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |{ "pk": 3, "salary": 300, "dep": "hr" }
+          |""".stripMargin)
+
+      val sourceDF = Seq(2).toDF("pk")
+      sourceDF.createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN NOT MATCHED BY SOURCE AND salary = 100 THEN
+           | UPDATE SET salary = -1
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, -1, "hr"), // updated
+          Row(2, 200, "software"), // unchanged
+          Row(3, 300, "hr"))) // unchanged
+    }
+  }
+
+  test("merge with MATCHED and NOT MATCHED BY SOURCE clauses") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |{ "pk": 3, "salary": 300, "dep": "hr" }
+          |""".stripMargin)
+
+      val sourceDF = Seq(2).toDF("pk")
+      sourceDF.createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN MATCHED THEN
+           | DELETE
+           |WHEN NOT MATCHED BY SOURCE AND salary = 100 THEN
+           | UPDATE SET salary = -1
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, -1, "hr"), // updated
+          Row(3, 300, "hr"))) // unchanged
+    }
+  }
+
+  test("merge with NOT MATCHED and NOT MATCHED BY SOURCE clauses") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |{ "pk": 3, "salary": 300, "dep": "hr" }
+          |""".stripMargin)
+
+      val sourceDF = Seq(2, 3, 4).toDF("pk")
+      sourceDF.createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN NOT MATCHED THEN
+           | INSERT (pk, salary, dep) VALUES (pk, -1, 'new')
+           |WHEN NOT MATCHED BY SOURCE THEN
+           | DELETE
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(2, 200, "software"), // unchanged
+          Row(3, 300, "hr"), // unchanged
+          Row(4, -1, "new"))) // insert
+    }
+  }
+
+  test("merge with multiple NOT MATCHED BY SOURCE clauses") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |{ "pk": 3, "salary": 300, "dep": "hr" }
+          |""".stripMargin)
+
+      val sourceDF = Seq(5, 6, 7).toDF("pk")
+      sourceDF.createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN NOT MATCHED BY SOURCE AND salary = 100 THEN
+           | UPDATE SET salary = salary + 1
+           |WHEN NOT MATCHED BY SOURCE AND salary = 300 THEN
+           | DELETE
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 101, "hr"), // update
+          Row(2, 200, "software"))) // unchanged
+    }
+  }
+
+  test("merge with MATCHED BY SOURCE clause and NULL values") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, id INT, salary INT, dep STRING",
+        """{ "pk": 1, "id": null, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "id": 2, "salary": 200, "dep": "software" }
+          |{ "pk": 3, "id": 3, "salary": 300, "dep": "hr" }
+          |""".stripMargin)
+
+      val sourceRows = Seq(
+        (2, 2, 201, "support"),
+        (1, 1, 101, "support"),
+        (3, 3, 301, "support"))
+      sourceRows.toDF("pk", "id", "salary", "dep").createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.id = s.id AND t.id < 3
+           |WHEN MATCHED THEN
+           | UPDATE SET *
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, null, 100, "hr"), // unchanged
+          Row(2, 2, 201, "support"), // update
+          Row(3, 3, 300, "hr"))) // unchanged
+    }
+  }
+
+  test("merge with CTE") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |""".stripMargin)
+
+      val sourceRows = Seq(
+        (0, 101, "support"),
+        (2, 301, "support"))
+      sourceRows.toDF("pk", "salary", "dep").createOrReplaceTempView("source")
+
+      sql(
+        s"""WITH cte1 AS (SELECT pk + 1 as pk, salary, dep FROM source)
+           |MERGE INTO $tableNameAsString AS t
+           |USING cte1 AS s
+           |ON t.pk = s.pk
+           |WHEN MATCHED THEN
+           | UPDATE SET *
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 101, "support"), // unchanged
+          Row(2, 200, "software"))) // unchanged
+    }
+  }
+
+  test("merge with CTE with transactional checks") {
+    withTable(sourceNameAsString) {
+      // create target table
+      createAndInitTable(
+        "pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |{ "pk": 3, "salary": 300, "dep": "hr" }
+          |""".stripMargin)
+
+      // create source table
+      sql(s"CREATE TABLE $sourceNameAsString (pk INT NOT NULL, salary INT, dep STRING)")
+      sql(s"INSERT INTO $sourceNameAsString VALUES (1, 150, 'hr'), (4, 400, 'finance')")
+
+      // merge into target table using CTE
+      val (txn, txnTables) = executeTransaction {
+        sql(
+          s"""WITH cte AS (
+             |  SELECT pk, salary + 50 AS salary, dep
+             |  FROM $sourceNameAsString
+             |  WHERE salary > 100
+             |)
+             |MERGE INTO $tableNameAsString t
+             |USING cte s
+             |ON t.pk = s.pk AND t.dep = 'hr'
+             |WHEN MATCHED THEN
+             | UPDATE SET salary = s.salary
+             |WHEN NOT MATCHED THEN
+             | INSERT (pk, salary, dep) VALUES (s.pk, s.salary, 'pending')
+             |""".stripMargin)
+      }
+
+      // check txn covers both tables and was properly committed and closed
+      assert(txn.currentState == Committed)
+      assert(txn.isClosed)
+      assert(txnTables.size == 2)
+      assert(table.version() == "2")
+
+      // check target table was scanned correctly
+      val targetTxnTable = txnTables(tableNameAsString)
+      assert(targetTxnTable.scanEvents.size == 2)
+
+      // check target table scans as MERGE target (dep = 'hr')
+      val numMergeTargetScans = targetTxnTable.scanEvents.flatten.count {
+        case sources.EqualTo("dep", "hr") => true
+        case _ => false
+      }
+      assert(numMergeTargetScans == 2)
+
+      // check source table was scanned correctly
+      val sourceTxnTable = txnTables(sourceNameAsString)
+      assert(sourceTxnTable.scanEvents.size == 2)
+
+      // check source table scans in CTE (salary > 100)
+      val numCteSourceScans = sourceTxnTable.scanEvents.flatten.count {
+        case sources.GreaterThan("salary", 100) => true
+        case _ => false
+      }
+      assert(numCteSourceScans == 2)
+
+      // check txn state was propagated correctly
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 200, "hr"), // updated (150 + 50)
+          Row(2, 200, "software"), // unchanged
+          Row(3, 300, "hr"), // unchanged
+          Row(4, 450, "pending"))) // inserted (400 + 50)
+    }
+  }
+
+  test("merge with cached source and transactional checks") {
+    withTable(sourceNameAsString) {
+      // create target table
+      createAndInitTable(
+        "pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |{ "pk": 3, "salary": 300, "dep": "hr" }
+          |""".stripMargin)
+
+      // create and populate source table
+      sql(s"CREATE TABLE $sourceNameAsString (pk INT NOT NULL, salary INT, dep STRING)")
+      sql(s"INSERT INTO $sourceNameAsString VALUES (1, 150, 'support'), (4, 400, 'finance')")
+
+      // Cache source table before the transaction. Make sure when the transation is active the
+      // catalog still creates a transaction table.
+      spark.table(sourceNameAsString).cache()
+
+      try {
+        val (txn, txnTables) = executeTransaction {
+          sql(
+            s"""MERGE INTO $tableNameAsString t
+               |USING $sourceNameAsString s
+               |ON t.pk = s.pk AND t.dep = 'hr'
+               |WHEN MATCHED THEN
+               | UPDATE SET salary = s.salary, dep = s.dep
+               |WHEN NOT MATCHED THEN
+               | INSERT (pk, salary, dep) VALUES (s.pk, s.salary, 'pending')
+               |""".stripMargin)
+        }
+
+        assert(txn.currentState == Committed)
+        assert(txn.isClosed)
+        // The source TxnTable is still created during analysis (the txn catalog routes the
+        // load), but cache substitution reuses the cached scan instead of issuing a fresh
+        // BatchScanExec for the source, so only the target appears in the executed plan.
+        assert(txn.catalog.txnTables.size == 2)
+        assert(txnTables.size == 1)
+        assert(txnTables.contains(tableNameAsString))
+        assert(table.version() == "2")
+        // The connector accepted the cached source scan via registerScans, which also
+        // records the scan as a read event against the source's TxnTable.
+        assert(txn.registeredScans.nonEmpty)
+        val sourceTxnTable = txn.catalog.txnTables.values.find(_.name == sourceNameAsString).get
+        assert(sourceTxnTable.scanEvents.nonEmpty)
+        assert(txnTables(tableNameAsString).scanEvents.nonEmpty)
+
+        checkAnswer(
+          sql(s"SELECT * FROM $tableNameAsString"),
+          Seq(
+            Row(1, 150, "support"), // matched and updated
+            Row(2, 200, "software"), // unchanged
+            Row(3, 300, "hr"), // unchanged (no match in source)
+            Row(4, 400, "pending"))) // not matched, inserted
+      } finally {
+        spark.catalog.uncacheTable(sourceNameAsString)
+      }
+    }
+  }
+
+  test("merge with subquery as source") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 6, "salary": 600, "dep": "software" }
+          |""".stripMargin)
+
+      val sourceRows = Seq(
+        (2, 201, "support"),
+        (1, 101, "support"),
+        (3, 301, "support"),
+        (6, 601, "support"))
+      sourceRows.toDF("pk", "salary", "dep").createOrReplaceTempView("source")
+
+      val subquery =
+        s"""
+           |SELECT * FROM source WHERE pk = 2
+           |UNION ALL
+           |SELECT * FROM source WHERE pk = 1 OR pk = 6
+           |""".stripMargin
+
+      sql(
+        s"""MERGE INTO $tableNameAsString AS t
+           |USING ($subquery) AS s
+           |ON t.pk = s.pk
+           |WHEN MATCHED THEN
+           | UPDATE SET *
+           |WHEN NOT MATCHED THEN
+           | INSERT *
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 101, "support"), // update
+          Row(2, 201, "support"), // insert
+          Row(6, 601, "support"))) // update
+    }
+  }
+
+  test("merge cardinality check with conditional MATCHED clause (delete)") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 6, "salary": 600, "dep": "software" }
+          |""".stripMargin)
+
+      val sourceRows = Seq(
+        (1, 101, "support"),
+        (1, 102, "support"),
+        (2, 201, "support"))
+      sourceRows.toDF("pk", "salary", "dep").createOrReplaceTempView("source")
+
+      assertCardinalityError(
+        s"""MERGE INTO $tableNameAsString AS t
+           |USING source AS s
+           |ON t.pk = s.pk
+           |WHEN MATCHED AND s.salary = 101 THEN
+           | DELETE
+           |""".stripMargin)
+    }
+  }
+
+  test("merge cardinality check with unconditional MATCHED clause (delete)") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 6, "salary": 600, "dep": "software" }
+          |""".stripMargin)
+
+      val sourceRows = Seq(
+        (1, 101, "support"),
+        (1, 102, "support"),
+        (2, 201, "support"))
+      sourceRows.toDF("pk", "salary", "dep").createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString AS t
+           |USING source AS s
+           |ON t.pk = s.pk
+           |WHEN MATCHED THEN
+           | DELETE
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(Row(6, 600, "software"))) // unchanged
+    }
+  }
+
+  test("merge cardinality check with only NOT MATCHED clauses") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 6, "salary": 600, "dep": "software" }
+          |""".stripMargin)
+
+      val sourceRows = Seq(
+        (1, 101, "support"),
+        (1, 102, "support"),
+        (2, 201, "support"))
+      sourceRows.toDF("pk", "salary", "dep").createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString AS t
+           |USING source AS s
+           |ON t.pk = s.pk
+           |WHEN NOT MATCHED THEN
+           | INSERT *
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 100, "hr"), // unchanged
+          Row(2, 201, "support"), // insert
+          Row(6, 600, "software"))) // unchanged
+    }
+  }
+
+  test("merge cardinality check with small target and large source (broadcast enabled)") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |""".stripMargin)
+
+      val sourceRows = (1 to 1000).map(pk => (pk, pk * 100, "support"))
+      sourceRows.toDF("pk", "salary", "dep").createOrReplaceTempView("source")
+
+      withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> Long.MaxValue.toString) {
+        assertCardinalityError(
+          s"""MERGE INTO $tableNameAsString AS t
+             |USING (SELECT * FROM source UNION ALL SELECT * FROM source) AS s
+             |ON t.pk = s.pk
+             |WHEN MATCHED THEN
+             | UPDATE SET *
+             |""".stripMargin)
+
+        assertNoLeftBroadcastOrReplication(
+          s"""MERGE INTO $tableNameAsString AS t
+             |USING source AS s
+             |ON t.pk = s.pk
+             |WHEN MATCHED THEN
+             | UPDATE SET *
+             |""".stripMargin)
+
+        assert(sql(s"SELECT * FROM $tableNameAsString").count() == 2)
+      }
+    }
+  }
+
+  test("merge cardinality check with small target and large source (broadcast disabled)") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |""".stripMargin)
+
+      val sourceRows = (1 to 1000).map(pk => (pk, pk * 100, "support"))
+      sourceRows.toDF("pk", "salary", "dep").createOrReplaceTempView("source")
+
+      withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1") {
+        assertCardinalityError(
+          s"""MERGE INTO $tableNameAsString AS t
+             |USING (SELECT * FROM source UNION ALL SELECT * FROM source) AS s
+             |ON t.pk = s.pk
+             |WHEN MATCHED THEN
+             | UPDATE SET *
+             |""".stripMargin)
+
+        assertNoLeftBroadcastOrReplication(
+          s"""MERGE INTO $tableNameAsString AS t
+             |USING source AS s
+             |ON t.pk = s.pk
+             |WHEN MATCHED THEN
+             | UPDATE SET *
+             |""".stripMargin)
+
+        assert(sql(s"SELECT * FROM $tableNameAsString").count() == 2)
+      }
+    }
+  }
+
+  test("merge cardinality check with small target and large source (shuffle hash enabled)") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |""".stripMargin)
+
+      val sourceRows = (1 to 1000).map(pk => (pk, pk * 100, "support"))
+      sourceRows.toDF("pk", "salary", "dep").createOrReplaceTempView("source")
+
+      withSQLConf(
+          SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+          SQLConf.PREFER_SORTMERGEJOIN.key -> "false") {
+
+        assertCardinalityError(
+          s"""MERGE INTO $tableNameAsString AS t
+             |USING (SELECT * FROM source UNION ALL SELECT * FROM source) AS s
+             |ON t.pk = s.pk
+             |WHEN MATCHED THEN
+             | UPDATE SET *
+             |""".stripMargin)
+
+        assertNoLeftBroadcastOrReplication(
+          s"""MERGE INTO $tableNameAsString AS t
+             |USING source AS s
+             |ON t.pk = s.pk
+             |WHEN MATCHED THEN
+             | UPDATE SET *
+             |""".stripMargin)
+
+        assert(sql(s"SELECT * FROM $tableNameAsString").count() == 2)
+      }
+    }
+  }
+
+  test("merge cardinality check without equality condition and only MATCHED clauses") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |""".stripMargin)
+
+      val sourceRows = (1 to 1000).map(pk => (pk, pk * 100, "support"))
+      sourceRows.toDF("pk", "salary", "dep").createOrReplaceTempView("source")
+
+      withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1") {
+        assertCardinalityError(
+          s"""MERGE INTO $tableNameAsString AS t
+             |USING (SELECT * FROM source UNION ALL SELECT * FROM source) AS s
+             |ON t.pk > s.pk
+             |WHEN MATCHED THEN
+             | UPDATE SET *
+             |""".stripMargin)
+
+        assert(sql(s"SELECT * FROM $tableNameAsString").count() == 2)
+      }
+    }
+  }
+
+  test("merge cardinality check without equality condition") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |""".stripMargin)
+
+      val sourceRows = (1 to 1000).map(pk => (pk, pk * 100, "support"))
+      sourceRows.toDF("pk", "salary", "dep").createOrReplaceTempView("source")
+
+      withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1") {
+        assertCardinalityError(
+          s"""MERGE INTO $tableNameAsString AS t
+             |USING (SELECT * FROM source UNION ALL SELECT * FROM source) AS s
+             |ON t.pk > s.pk
+             |WHEN MATCHED THEN
+             | UPDATE SET *
+             |WHEN NOT MATCHED THEN
+             | INSERT *
+             |""".stripMargin)
+
+        assert(sql(s"SELECT * FROM $tableNameAsString").count() == 2)
+      }
+    }
+  }
+
+  test("self merge") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |{ "pk": 3, "salary": 300, "dep": "hr" }
+        |""".stripMargin)
+
+    sql(
+      s"""MERGE INTO $tableNameAsString t
+         |USING $tableNameAsString s
+         |ON t.pk = s.pk
+         |WHEN MATCHED AND t.salary = 100 THEN
+         | UPDATE SET salary = t.salary + 1
+         |WHEN NOT MATCHED THEN
+         | INSERT *
+         |""".stripMargin)
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Seq(
+        Row(1, 101, "hr"), // update
+        Row(2, 200, "software"), // unchanged
+        Row(3, 300, "hr"))) // unchanged
+  }
+
+  test("merge with self subquery") {
+    withTempView("ids") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |{ "pk": 3, "salary": 300, "dep": "hr" }
+          |""".stripMargin)
+
+      Seq(1, 2).toDF("value").createOrReplaceTempView("ids")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING (SELECT pk FROM $tableNameAsString r JOIN ids ON r.pk = ids.value) s
+           |ON t.pk = s.pk
+           |WHEN MATCHED AND t.salary = 100 THEN
+           | UPDATE SET salary = t.salary + 1
+           |WHEN NOT MATCHED THEN
+           | INSERT (dep, salary, pk) VALUES ('new', 300, 1)
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 101, "hr"), // update
+          Row(2, 200, "software"), // unchanged
+          Row(3, 300, "hr"))) // unchanged
+    }
+  }
+
+  test("merge with extra columns in source") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |{ "pk": 3, "salary": 300, "dep": "hr" }
+          |""".stripMargin)
+
+      val sourceRows = Seq(
+        (1, "smth", 101, "support"),
+        (2, "smth", 201, "support"),
+        (4, "smth", 401, "support"))
+      sourceRows.toDF("pk", "extra", "salary", "dep").createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN MATCHED THEN
+           | UPDATE SET salary = s.salary + 1
+           |WHEN NOT MATCHED THEN
+           | INSERT (pk, salary, dep) VALUES (s.pk, s.salary, s.dep)
+           |WHEN NOT MATCHED BY SOURCE THEN
+           | DELETE
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 102, "hr"), // update
+          Row(2, 202, "software"), // update
+          Row(4, 401, "support"))) // insert
+    }
+  }
+
+  test("merge with NULL values in target and source") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, id INT, salary INT, dep STRING",
+        """{ "pk": 1, "id": null, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "id": 2, "salary": 200, "dep": "software" }
+          |""".stripMargin)
+
+      val sourceRows = Seq(
+        (5, None, 501, "support"),
+        (6, Some(6), 601, "support"))
+      sourceRows.toDF("pk", "id", "salary", "dep").createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.id = s.id
+           |WHEN MATCHED THEN
+           | UPDATE SET *
+           |WHEN NOT MATCHED THEN
+           | INSERT *
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, null, 100, "hr"), // unchanged
+          Row(2, 2, 200, "software"), // unchanged
+          Row(5, null, 501, "support"), // insert
+          Row(6, 6, 601, "support"))) // insert
+    }
+  }
+
+  test("merge with <=>") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, id INT, salary INT, dep STRING",
+        """{ "pk": 1, "id": null, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "id": 2, "salary": 200, "dep": "software" }
+          |""".stripMargin)
+
+      val sourceRows = Seq(
+        (5, None, 501, "support"),
+        (6, Some(6), 601, "support"))
+      sourceRows.toDF("pk", "id", "salary", "dep").createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.id <=> s.id
+           |WHEN MATCHED THEN
+           | UPDATE SET *
+           |WHEN NOT MATCHED THEN
+           | INSERT *
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(2, 2, 200, "software"), // unchanged
+          Row(5, null, 501, "support"), // updated
+          Row(6, 6, 601, "support"))) // insert
+    }
+  }
+
+  test("merge with NULL ON condition") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, id INT, salary INT, dep STRING",
+        """{ "pk": 1, "id": null, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "id": 2, "salary": 200, "dep": "software" }
+          |""".stripMargin)
+
+      val sourceRows = Seq(
+        (5, None, 501, "support"),
+        (6, Some(2), 201, "support"))
+      sourceRows.toDF("pk", "id", "salary", "dep").createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.id = s.id AND NULL
+           |WHEN MATCHED THEN
+           | UPDATE SET salary = s.salary
+           |WHEN NOT MATCHED THEN
+           | INSERT *
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, null, 100, "hr"), // unchanged
+          Row(2, 2, 200, "software"), // unchanged
+          Row(5, null, 501, "support"), // new
+          Row(6, 2, 201, "support"))) // new
+    }
+  }
+
+  test("merge with NULL clause conditions") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |""".stripMargin)
+
+      val sourceRows = Seq(
+        (1, 101, "support"),
+        (3, 301, "support"))
+      sourceRows.toDF("pk", "salary", "dep").createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN MATCHED AND NULL THEN
+           | UPDATE SET salary = s.salary
+           |WHEN NOT MATCHED AND NULL THEN
+           | INSERT *
+           |WHEN NOT MATCHED BY SOURCE AND NULL THEN
+           | DELETE
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 100, "hr"), // unchanged
+          Row(2, 200, "software"))) // unchanged
+    }
+  }
+
+  test("merge with multiple matching clauses") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |""".stripMargin)
+
+      val sourceRows = Seq(
+        (1, 101, "support"),
+        (3, 301, "support"))
+      sourceRows.toDF("pk", "salary", "dep").createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN MATCHED AND t.pk = 1 THEN
+           | UPDATE SET salary = t.salary + 5
+           |WHEN MATCHED AND t.salary = 100 THEN
+           | UPDATE SET salary = t.salary + 2
+           |WHEN NOT MATCHED BY SOURCE AND t.pk = 2 THEN
+           | UPDATE SET salary = salary - 1
+           |WHEN NOT MATCHED BY SOURCE AND t.salary = 200 THEN
+           | DELETE
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 105, "hr"), // updated (matched)
+          Row(2, 199, "software"))) // updated (not matched by source)
+    }
+  }
+
+  test("merge resolves and aligns columns by name") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |""".stripMargin)
+
+      val sourceRows = Seq(
+        ("support", 1, 101),
+        ("support", 3, 301))
+      sourceRows.toDF("dep", "pk", "salary").createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN MATCHED THEN
+           | UPDATE SET *
+           |WHEN NOT MATCHED THEN
+           | INSERT *
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 101, "support"), // update
+          Row(2, 200, "software"), // unchanged
+          Row(3, 301, "support"))) // insert
+    }
+  }
+
+  test("SPARK-60978: merge keeps columns whose names differ only by case") {
+    withTempView("source") {
+      // such a table can only be created and read in a case-sensitive session
+      withSQLConf(SQLConf.CASE_SENSITIVE.key -> "true") {
+        createAndInitTable("pk INT NOT NULL, salary INT, SALARY INT, dep STRING",
+          """{ "pk": 1, "salary": 100, "SALARY": 200, "dep": "hr" }
+            |{ "pk": 2, "salary": 300, "SALARY": 400, "dep": "hr" }
+            |""".stripMargin)
+      }
+
+      Seq(1).toDF("pk").createOrReplaceTempView("source")
+
+      // the statement does not name the colliding columns so it is not ambiguous
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN MATCHED THEN
+           | UPDATE SET t.dep = 'support'
+           |""".stripMargin)
+
+      withSQLConf(SQLConf.CASE_SENSITIVE.key -> "true") {
+        checkAnswer(
+          sql(s"SELECT * FROM $tableNameAsString"),
+          Seq(
+            Row(1, 100, 200, "support"), // update
+            Row(2, 300, 400, "hr"))) // unchanged
+      }
+    }
+  }
+
+  test("merge refreshed relation cache") {
+    withTempView("temp", "source") {
+      withCache("temp") {
+        createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+          """{ "pk": 1, "salary": 100, "dep": "hr" }
+            |{ "pk": 2, "salary": 100, "dep": "software" }
+            |{ "pk": 3, "salary": 300, "dep": "hr" }
+            |""".stripMargin)
+
+        // define a view on top of the table
+        val query = sql(s"SELECT * FROM $tableNameAsString WHERE salary = 100")
+        query.createOrReplaceTempView("temp")
+
+        // cache the view
+        sql("CACHE TABLE temp")
+
+        // verify the view returns expected results
+        checkAnswer(
+          sql("SELECT * FROM temp"),
+          Row(1, 100, "hr") :: Row(2, 100, "software") :: Nil)
+
+        val sourceRows = Seq(
+          ("support", 1, 101),
+          ("support", 3, 301))
+        sourceRows.toDF("dep", "pk", "salary").createOrReplaceTempView("source")
+
+        // merge changes into the table
+        sql(
+          s"""MERGE INTO $tableNameAsString t
+             |USING source s
+             |ON t.pk = s.pk
+             |WHEN MATCHED THEN
+             | UPDATE SET *
+             |WHEN NOT MATCHED THEN
+             | INSERT *
+             |""".stripMargin)
+
+        // verify the merge was successful
+        checkAnswer(
+          sql(s"SELECT * FROM $tableNameAsString"),
+          Seq(
+            Row(1, 101, "support"), // update
+            Row(2, 100, "software"), // unchanged
+            Row(3, 301, "support"))) // insert
+
+        // verify the view reflects the changes in the table
+        checkAnswer(sql("SELECT * FROM temp"), Row(2, 100, "software") :: Nil)
+      }
+    }
+  }
+
+  test("merge with updates to nested struct fields in MATCHED clauses") {
+    withTempView("source") {
+      createAndInitTable(
+        s"""pk INT NOT NULL,
+           |s STRUCT<c1: INT, c2: STRUCT<a: ARRAY<INT>, m: MAP<STRING, STRING>>>,
+           |dep STRING""".stripMargin,
+        """{ "pk": 1, "s": { "c1": 2, "c2": { "a": [1,2], "m": { "a": "b" } } }, "dep": "hr" }""")
+
+      Seq(1, 3).toDF("pk").createOrReplaceTempView("source")
+
+      // update primitive, array, map columns inside a struct
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source src
+           |ON t.pk = src.pk
+           |WHEN MATCHED THEN
+           | UPDATE SET s.c1 = -1, s.c2.m = map('k', 'v'), s.c2.a = array(-1)
+           |""".stripMargin)
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(Row(1, Row(-1, Row(Seq(-1), Map("k" -> "v"))), "hr")))
+
+      // set primitive, array, map columns to NULL (proper casts should be in inserted)
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source src
+           |ON t.pk = src.pk
+           |WHEN MATCHED THEN
+           | UPDATE SET s.c1 = NULL, s.c2 = NULL
+           |""".stripMargin)
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(1, Row(null, null), "hr") :: Nil)
+
+      // assign an entire struct
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source src
+           |ON t.pk = src.pk
+           |WHEN MATCHED THEN
+           | UPDATE SET s = named_struct('c1', 1, 'c2', named_struct('a', array(1), 'm', null))
+           |""".stripMargin)
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(1, Row(1, Row(Seq(1), null)), "hr") :: Nil)
+    }
+  }
+
+  test("merge with updates to nested struct fields in NOT MATCHED BY SOURCE clauses") {
+    withTempView("source") {
+      createAndInitTable(
+        s"""pk INT NOT NULL,
+           |s STRUCT<c1: INT, c2: STRUCT<a: ARRAY<INT>, m: MAP<STRING, STRING>>>,
+           |dep STRING""".stripMargin,
+        """{ "pk": 1, "s": { "c1": 2, "c2": { "a": [1,2], "m": { "a": "b" } } }, "dep": "hr" }""")
+
+      Seq(2, 4).toDF("pk").createOrReplaceTempView("source")
+
+      // update primitive, array, map columns inside a struct
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source src
+           |ON t.pk = src.pk
+           |WHEN NOT MATCHED BY SOURCE THEN
+           | UPDATE SET s.c1 = -1, s.c2.m = map('k', 'v'), s.c2.a = array(-1)
+           |""".stripMargin)
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(Row(1, Row(-1, Row(Seq(-1), Map("k" -> "v"))), "hr")))
+
+      // set primitive, array, map columns to NULL (proper casts should be in inserted)
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source src
+           |ON t.pk = src.pk
+           |WHEN NOT MATCHED BY SOURCE THEN
+           | UPDATE SET s.c1 = NULL, s.c2 = NULL
+           |""".stripMargin)
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(1, Row(null, null), "hr") :: Nil)
+
+      // assign an entire struct
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source src
+           |ON t.pk = src.pk
+           |WHEN NOT MATCHED BY SOURCE THEN
+           | UPDATE SET s = named_struct('c1', 1, 'c2', named_struct('a', array(1), 'm', null))
+           |""".stripMargin)
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(1, Row(1, Row(Seq(1), null)), "hr") :: Nil)
+    }
+  }
+
+  test("merge with default values") {
+    withTempView("source") {
+      val idDefault = new ColumnDefaultValue("42", LiteralValue(42, IntegerType))
+      val columns = Array(
+        Column.create("pk", IntegerType, false, null, null),
+        Column.create("id", IntegerType, true, null, idDefault, null),
+        Column.create("dep", StringType, true, null, null))
+
+      createTable(columns)
+
+      append("pk INT NOT NULL, id INT, dep STRING",
+        """{ "pk": 1, "id": 1, "dep": "hr" }
+          |{ "pk": 2, "id": 2, "dep": "software" }
+          |{ "pk": 3, "id": 3, "dep": "hr" }
+          |""".stripMargin)
+
+      Seq(1, 2, 4).toDF("pk").createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN MATCHED THEN
+           | UPDATE SET id = DEFAULT
+           |WHEN NOT MATCHED THEN
+           | INSERT (pk, id, dep) VALUES (s.pk, DEFAULT, 'new')
+           |WHEN NOT MATCHED BY SOURCE THEN
+           | UPDATE SET id = DEFAULT
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 42, "hr"), // update (matched)
+          Row(2, 42, "software"), // update (matched)
+          Row(3, 42, "hr"), // update (not matched by source)
+          Row(4, 42, "new"))) // insert
+    }
+  }
+
+  test("merge with char/varchar columns") {
+    withTempView("source") {
+      createTable("pk INT NOT NULL, s STRUCT<n_c: CHAR(3), n_vc: VARCHAR(5)>, dep STRING")
+
+      append("pk INT NOT NULL, s STRUCT<n_c: STRING, n_vc: STRING>, dep STRING",
+        """{ "pk": 1, "s": { "n_c": "aaa", "n_vc": "aaa" }, "dep": "hr" }
+          |{ "pk": 2, "s": { "n_c": "bbb", "n_vc": "bbb" }, "dep": "software" }
+          |{ "pk": 3, "s": { "n_c": "ccc", "n_vc": "ccc" }, "dep": "hr" }
+          |""".stripMargin)
+
+      Seq(1, 2, 4).toDF("pk").createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN MATCHED THEN
+           | UPDATE SET s.n_c = 'x1', s.n_vc = 'x2'
+           |WHEN NOT MATCHED BY SOURCE THEN
+           | UPDATE SET s.n_c = 'y1', s.n_vc = 'y2'
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, Row("x1 ", "x2"), "hr"), // update (matched)
+          Row(2, Row("x1 ", "x2"), "software"), // update (matched)
+          Row(3, Row("y1 ", "y2"), "hr"))) // update (not matched by source)
+    }
+  }
+
+  test("SPARK-61462: delete-only merge comparing CHAR columns stored with and without padding") {
+    createTable("pk INT NOT NULL, c CHAR(3), dep STRING")
+    sql(s"CREATE TABLE $sourceNameAsString (c CHAR(3), dep STRING)")
+
+    withSQLConf(SQLConf.LEGACY_CHAR_VARCHAR_AS_STRING.key -> "true") {
+      append("pk INT NOT NULL, c STRING, dep STRING",
+        """{ "pk": 1, "c": "a", "dep": "hr" }
+          |{ "pk": 3, "c": "x", "dep": "hr" }
+          |""".stripMargin)
+      sql(s"INSERT INTO $sourceNameAsString VALUES ('b', 'software')")
+    }
+    append("pk INT NOT NULL, c STRING, dep STRING",
+      """{ "pk": 2, "c": "b", "dep": "software" }
+        |{ "pk": 4, "c": "y", "dep": "finance" }
+        |""".stripMargin)
+    sql(s"INSERT INTO $sourceNameAsString VALUES ('a', 'hr')")
+
+    sql(
+      s"""MERGE INTO $tableNameAsString t
+         |USING $sourceNameAsString s
+         |ON t.c = s.c AND t.dep = s.dep
+         |WHEN MATCHED THEN
+         | DELETE
+         |""".stripMargin)
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(3, "x  ", "hr") :: Row(4, "y  ", "finance") :: Nil)
+  }
+
+  Seq("true", "false").foreach { groupFilterEnabled =>
+    test("SPARK-61462: delete-only merge with a condition on a CHAR column stored without " +
+      s"padding (group filter enabled: $groupFilterEnabled)") {
+      withSQLConf(
+          SQLConf.RUNTIME_ROW_LEVEL_OPERATION_GROUP_FILTER_ENABLED.key -> groupFilterEnabled) {
+        withTempView("source") {
+          createTable("pk INT NOT NULL, id INT, dep CHAR(8)")
+          withSQLConf(SQLConf.LEGACY_CHAR_VARCHAR_AS_STRING.key -> "true") {
+            append("pk INT NOT NULL, id INT, dep STRING",
+              """{ "pk": 1, "id": 1, "dep": "hr" }
+                |{ "pk": 2, "id": 2, "dep": "it" }
+                |{ "pk": 3, "id": 3, "dep": "software" }
+                |""".stripMargin)
+          }
+
+          Seq(1, 2, 3).toDF("pk").createOrReplaceTempView("source")
+
+          sql(
+            s"""MERGE INTO $tableNameAsString t
+               |USING source s
+               |ON t.pk = s.pk AND t.dep IN ('hr', 'it')
+               |WHEN MATCHED THEN
+               | DELETE
+               |""".stripMargin)
+
+          checkAnswer(sql(s"SELECT * FROM $tableNameAsString"), Row(3, 3, "software") :: Nil)
+        }
+      }
+    }
+  }
+
+  test("SPARK-60708: merge into char/varchar table with metadata columns") {
+    withTempView("source") {
+      createTable("pk INT NOT NULL, id INT, dep STRING, name VARCHAR(10)")
+
+      append("pk INT NOT NULL, id INT, dep STRING, name STRING",
+        """{ "pk": 1, "id": 1, "dep": "hr", "name": "a" }
+          |{ "pk": 2, "id": 2, "dep": "software", "name": "b" }
+          |{ "pk": 3, "id": 3, "dep": "hr", "name": "c" }
+          |{ "pk": 4, "id": 4, "dep": "software", "name": "d" }
+          |""".stripMargin)
+
+      Seq(1, 2, 5).toDF("pk").createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN MATCHED AND t._partition = 'hr' THEN
+           | UPDATE SET t.id = t.index + 10
+           |WHEN NOT MATCHED THEN
+           | INSERT (pk, id, dep, name) VALUES (s.pk, 0, 'hr', 'e')
+           |WHEN NOT MATCHED BY SOURCE AND t._partition = 'software' THEN
+           | DELETE
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 10, "hr", "a"), // update (matched)
+          Row(2, 2, "software", "b"), // unchanged
+          Row(3, 3, "hr", "c"), // unchanged
+          Row(5, 0, "hr", "e"))) // insert
+    }
+  }
+
+  test("SPARK-60708: insert-only merge into char/varchar table with metadata column in ON") {
+    withTempView("source") {
+      createTable("pk INT NOT NULL, id INT, dep STRING, name VARCHAR(10)")
+
+      append("pk INT NOT NULL, id INT, dep STRING, name STRING",
+        """{ "pk": 1, "id": 1, "dep": "hr", "name": "a" }
+          |{ "pk": 2, "id": 2, "dep": "software", "name": "b" }
+          |""".stripMargin)
+
+      Seq(1, 2, 3).toDF("pk").createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk AND t._partition = 'hr'
+           |WHEN NOT MATCHED THEN
+           | INSERT (pk, id, dep, name) VALUES (s.pk, 0, 'hr', 'new')
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 1, "hr", "a"), // unchanged (matched)
+          Row(2, 2, "software", "b"), // unchanged
+          Row(2, 0, "hr", "new"), // insert (not matched in hr)
+          Row(3, 0, "hr", "new"))) // insert
+    }
+  }
+
+  test("SPARK-61479: merge with CHAR columns stored without padding") {
+    createTable("pk INT NOT NULL, c CHAR(3), id INT, v STRING, dep STRING")
+    sql(s"CREATE TABLE $sourceNameAsString (pk INT NOT NULL, c CHAR(3))")
+    sql(s"INSERT INTO $sourceNameAsString VALUES (1, 'a'), (2, 'q'), (3, 'x')")
+    // read-side padding also covers values that are not padded in the storage, so the rows to
+    // update must be found by comparing the padded values of the target
+    withSQLConf(SQLConf.LEGACY_CHAR_VARCHAR_AS_STRING.key -> "true") {
+      append("pk INT NOT NULL, c STRING, id INT, v STRING, dep STRING",
+        """{ "pk": 1, "c": "a", "id": 1, "dep": "hr" }
+          |{ "pk": 2, "c": "b", "id": 2, "dep": "software" }
+          |{ "pk": 3, "c": "x", "id": 3, "dep": "hr" }
+          |{ "pk": 4, "c": "y", "id": 4, "dep": "finance" }
+          |""".stripMargin)
+    }
+
+    sql(
+      s"""MERGE INTO $tableNameAsString t
+         |USING $sourceNameAsString s
+         |ON t.pk = s.pk AND t.c IN ('a', 'b', 'c')
+         |WHEN MATCHED THEN
+         | UPDATE SET id = -1
+         |""".stripMargin)
+
+    checkAnswer(
+      sql(s"SELECT pk, id FROM $tableNameAsString"),
+      Row(1, -1) :: Row(2, -1) :: Row(3, 3) :: Row(4, 4) :: Nil)
+
+    sql(
+      s"""MERGE INTO $tableNameAsString t
+         |USING $sourceNameAsString s
+         |ON t.c = s.c
+         |WHEN MATCHED THEN
+         | UPDATE SET id = -2
+         |""".stripMargin)
+
+    checkAnswer(
+      sql(s"SELECT pk, id FROM $tableNameAsString"),
+      Row(1, -2) :: Row(2, -1) :: Row(3, -2) :: Row(4, 4) :: Nil)
+
+    sql(
+      s"""MERGE INTO $tableNameAsString t
+         |USING $sourceNameAsString s
+         |ON t.pk = s.pk
+         |WHEN MATCHED AND t.c = 'x' THEN
+         | UPDATE SET v = t.c
+         |WHEN NOT MATCHED BY SOURCE AND t.c = 'y' THEN
+         | UPDATE SET v = t.c
+         |""".stripMargin)
+
+    checkAnswer(
+      sql(s"SELECT pk, v FROM $tableNameAsString"),
+      Row(1, null) :: Row(2, null) :: Row(3, "x  ") :: Row(4, "y  ") :: Nil)
+
+    // only the conditions and the assigned values read the padded values
+    withSQLConf(SQLConf.LEGACY_CHAR_VARCHAR_AS_STRING.key -> "true") {
+      checkAnswer(
+        sql(s"SELECT c FROM $tableNameAsString"),
+        Row("a") :: Row("b") :: Row("x") :: Row("y") :: Nil)
+    }
+  }
+
+  test("SPARK-61479: insert-only merge with CHAR columns stored without padding") {
+    withTempView("source") {
+      createTable("pk INT NOT NULL, c CHAR(3), dep STRING")
+      withSQLConf(SQLConf.LEGACY_CHAR_VARCHAR_AS_STRING.key -> "true") {
+        append("pk INT NOT NULL, c STRING, dep STRING",
+          """{ "pk": 1, "c": "a", "dep": "hr" }
+            |""".stripMargin)
+      }
+
+      Seq((1, "a  "), (2, "b  ")).toDF("pk", "c").createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.c = s.c
+           |WHEN NOT MATCHED THEN
+           | INSERT (pk, c, dep) VALUES (s.pk, s.c, 'new')
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(1, "a  ", "hr") :: Row(2, "b  ", "new") :: Nil)
+    }
+  }
+
+  test("SPARK-60667: insert-only merge with type coercion handles metadata columns correctly") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |{ "pk": 3, "salary": 700, "dep": "hr" }
+          |""".stripMargin)
+
+      Seq(1, 2, 3, 4).toDF("pk").createOrReplaceTempView("source")
+
+      // the ON condition references a metadata column and needs type coercion
+      // (`t.salary < 600.5`), so the MERGE is resolved only in a later iteration of the analyzer
+      val executedPlan = executeAndKeepPlan {
+        sql(
+          s"""MERGE INTO $tableNameAsString t
+             |USING source s
+             |ON t.pk = s.pk AND t._partition = 'hr' AND t.salary < 600.5
+             |WHEN NOT MATCHED THEN
+             | INSERT (pk, salary, dep) VALUES (s.pk, 0, 'new')
+             |""".stripMargin)
+      }
+
+      // the MERGE is rewritten into InsertOnlyMerge (an append) that writes only data columns
+      val write = executedPlan.collectFirst {
+        case e: InsertOnlyMergeExec => e.write
+      }.getOrElse(fail("expected an InsertOnlyMergeExec in the executed plan"))
+      val append = write.toBatch.asInstanceOf[InMemoryBaseTable#Append]
+      assert(append.info.schema.fieldNames === table.schema.fieldNames)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 100, "hr"), // unchanged (matched)
+          Row(2, 200, "software"), // unchanged
+          Row(3, 700, "hr"), // unchanged
+          Row(2, 0, "new"), // insert (not matched in hr)
+          Row(3, 0, "new"), // insert (not matched by salary)
+          Row(4, 0, "new"))) // insert
+    }
+  }
+
+  test("merge with NOT NULL checks") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, s STRUCT<n_i: INT NOT NULL, n_l: LONG>, dep STRING",
+        """{ "pk": 1, "s": { "n_i": 1, "n_l": 11 }, "dep": "hr" }
+          |{ "pk": 2, "s": { "n_i": 2, "n_l": 22 }, "dep": "software" }
+          |{ "pk": 3, "s": { "n_i": 3, "n_l": 33 }, "dep": "hr" }
+          |""".stripMargin)
+
+      Seq(1, 4).toDF("pk").createOrReplaceTempView("source")
+
+      val e1 = intercept[SparkRuntimeException] {
+        sql(
+          s"""MERGE INTO $tableNameAsString t
+             |USING source s
+             |ON t.pk = s.pk
+             |WHEN MATCHED THEN
+             | UPDATE SET s = named_struct('n_i', null, 'n_l', -1L)
+             |""".stripMargin)
+      }
+      assert(e1.getCondition == "NOT_NULL_ASSERT_VIOLATION")
+
+      val e2 = intercept[SparkRuntimeException] {
+        sql(
+          s"""MERGE INTO $tableNameAsString t
+             |USING source s
+             |ON t.pk = s.pk
+             |WHEN NOT MATCHED BY SOURCE THEN
+             | UPDATE SET s = named_struct('n_i', null, 'n_l', -1L)
+             |""".stripMargin)
+      }
+      assert(e2.getCondition == "NOT_NULL_ASSERT_VIOLATION")
+
+      val e3 = intercept[SparkRuntimeException] {
+        sql(
+          s"""MERGE INTO $tableNameAsString t
+             |USING source s
+             |ON t.pk = s.pk
+             |WHEN NOT MATCHED THEN
+             | INSERT (pk, s, dep) VALUES (s.pk, named_struct('n_i', null, 'n_l', -1L), 'invalid')
+             |""".stripMargin)
+      }
+      assert(e3.getCondition == "NOT_NULL_ASSERT_VIOLATION")
+    }
+  }
+
+  test("unsupported merge into conditions") {
+    withTempView("source") {
+      createTable("pk INT NOT NULL, salary INT, dep STRING")
+
+      val sourceRows = Seq(
+        (1, 100, "hr"),
+        (2, 200, "finance"),
+        (3, 300, "hr"))
+      sourceRows.toDF("pk", "salary", "dep").createOrReplaceTempView("source")
+
+      val unsupportedSourceExprs = Map(
+        "s.pk < rand()" -> "Non-deterministic expressions are not allowed",
+        "max(s.pk) < 10" -> "Aggregates are not allowed",
+        s"s.pk IN (SELECT pk FROM $tableNameAsString)" -> "Subqueries are not allowed")
+
+      unsupportedSourceExprs.map { case (expr, errMsg) =>
+        val e1 = intercept[AnalysisException] {
+          sql(
+            s"""MERGE INTO $tableNameAsString t
+               |USING source s
+               |ON t.pk = s.pk AND $expr
+               |WHEN MATCHED THEN
+               | UPDATE SET *
+               |""".stripMargin)
+        }
+        assert(e1.message.contains("unsupported SEARCH condition") && e1.message.contains(errMsg))
+
+        val e2 = intercept[AnalysisException] {
+          sql(
+            s"""MERGE INTO $tableNameAsString t
+               |USING source s
+               |ON t.pk = s.pk
+               |WHEN MATCHED AND $expr THEN
+               | UPDATE SET *
+               |""".stripMargin)
+        }
+        assert(e2.message.contains("unsupported UPDATE condition") && e2.message.contains(errMsg))
+
+        val e3 = intercept[AnalysisException] {
+          sql(
+            s"""MERGE INTO $tableNameAsString t
+               |USING source s
+               |ON t.pk = s.pk
+               |WHEN MATCHED AND $expr THEN
+               | DELETE
+               |""".stripMargin)
+        }
+        assert(e3.message.contains("unsupported DELETE condition") && e3.message.contains(errMsg))
+
+        val e4 = intercept[AnalysisException] {
+          sql(
+            s"""MERGE INTO $tableNameAsString t
+               |USING source s
+               |ON t.pk = s.pk
+               |WHEN NOT MATCHED AND $expr THEN
+               | INSERT *
+               |""".stripMargin)
+        }
+        assert(e4.message.contains("unsupported INSERT condition") && e4.message.contains(errMsg))
+      }
+
+      val unsupportedTargetExprs = Map(
+        "t.pk < rand()" -> "Non-deterministic expressions are not allowed",
+        "max(t.pk) < 10" -> "Aggregates are not allowed",
+        s"t.pk IN (SELECT pk FROM $tableNameAsString)" -> "Subqueries are not allowed")
+
+      unsupportedTargetExprs.map { case (expr, errMsg) =>
+        val e1 = intercept[AnalysisException] {
+          sql(
+            s"""MERGE INTO $tableNameAsString t
+               |USING source s
+               |ON t.pk = s.pk AND $expr
+               |WHEN MATCHED THEN
+               | UPDATE SET *
+               |""".stripMargin)
+        }
+        assert(e1.message.contains("unsupported SEARCH condition") && e1.message.contains(errMsg))
+
+        val e2 = intercept[AnalysisException] {
+          sql(
+            s"""MERGE INTO $tableNameAsString t
+               |USING source s
+               |ON t.pk = s.pk
+               |WHEN NOT MATCHED BY SOURCE AND $expr THEN
+               | UPDATE SET t.pk = -1
+               |""".stripMargin)
+        }
+        assert(e2.message.contains("unsupported UPDATE condition") && e2.message.contains(errMsg))
+
+        val e3 = intercept[AnalysisException] {
+          sql(
+            s"""MERGE INTO $tableNameAsString t
+               |USING source s
+               |ON t.pk = s.pk
+               |WHEN NOT MATCHED BY SOURCE AND $expr THEN
+               | DELETE
+               |""".stripMargin)
+        }
+        assert(e3.message.contains("unsupported DELETE condition") && e3.message.contains(errMsg))
+      }
+    }
+  }
+
+  test("all target filters are evaluated on data source side") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "hr" }
+          |{ "pk": 3, "salary": 300, "dep": "hr" }
+          |{ "pk": 4, "salary": 400, "dep": "software" }
+          |{ "pk": 5, "salary": 500, "dep": "software" }
+          |""".stripMargin)
+
+      val sourceDF = Seq(1, 2, 3, 6).toDF("pk")
+      sourceDF.createOrReplaceTempView("source")
+
+      val executedPlan = executeAndKeepPlan {
+        sql(
+          s"""MERGE INTO $tableNameAsString t
+             |USING source s
+             |ON t.pk = s.pk AND t.DeP IN ('hr', 'software')
+             |WHEN MATCHED THEN
+             | UPDATE SET t.salary = t.salary + 1
+             |WHEN NOT MATCHED THEN
+             | INSERT (pk, salary, dep) VALUES (s.pk, 0, 'hr')
+             |""".stripMargin)
+      }
+
+      val expressions = flatMap(executedPlan)(_.expressions.flatMap(splitConjunctivePredicates))
+      val inFilterPushed = expressions.forall {
+        case In(attr: AttributeReference, _) if attr.name == "DeP" => false
+        case _ => true
+      }
+      assert(inFilterPushed, "IN filter must be evaluated on data source side")
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 101, "hr"), // update
+          Row(2, 201, "hr"), // update
+          Row(3, 301, "hr"), // update
+          Row(4, 400, "software"), // unchanged
+          Row(5, 500, "software"), // unchanged
+          Row(6, 0, "hr"))) // insert
+    }
+  }
+
+  test("some target filters are evaluated on data source side") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "hr" }
+          |{ "pk": 3, "salary": 300, "dep": "hr" }
+          |{ "pk": 4, "salary": 400, "dep": "software" }
+          |{ "pk": 5, "salary": 500, "dep": "software" }
+          |""".stripMargin)
+
+      val sourceDF = Seq(1, 2, 3, 6).toDF("pk")
+      sourceDF.createOrReplaceTempView("source")
+
+      val executedPlan = executeAndKeepPlan {
+        sql(
+          s"""MERGE INTO $tableNameAsString t
+             |USING source s
+             |ON t.pk = s.pk AND t.dep IN ('hr', 'software') AND t.salary != -1
+             |WHEN MATCHED THEN
+             | UPDATE SET t.salary = t.salary + 1
+             |WHEN NOT MATCHED THEN
+             | INSERT (pk, salary, dep) VALUES (s.pk, 0, 'hr')
+             |""".stripMargin)
+      }
+
+      val expressions = flatMap(executedPlan)(_.expressions.flatMap(splitConjunctivePredicates))
+
+      val inFilterPushed = expressions.forall {
+        case In(attr: AttributeReference, _) if attr.name == "dep" => false
+        case _ => true
+      }
+      assert(inFilterPushed, "IN filter must be evaluated on data source side")
+
+      val notEqualFilterPreserved = expressions.exists {
+        case Not(EqualTo(attr: AttributeReference, _)) if attr.name == "salary" => true
+        case _ => false
+      }
+      assert(notEqualFilterPreserved, "NOT filter must be evaluated on Spark side")
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 101, "hr"), // update
+          Row(2, 201, "hr"), // update
+          Row(3, 301, "hr"), // update
+          Row(4, 400, "software"), // unchanged
+          Row(5, 500, "software"), // unchanged
+          Row(6, 0, "hr"))) // insert
+    }
+  }
+
+  test("pushable target filters are preserved with NOT MATCHED BY SOURCE clause") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "hr" }
+          |{ "pk": 3, "salary": 300, "dep": "hr" }
+          |{ "pk": 4, "salary": 400, "dep": "software" }
+          |{ "pk": 5, "salary": 500, "dep": "software" }
+          |""".stripMargin)
+
+      val sourceDF = Seq(1, 2, 3, 6).toDF("pk")
+      sourceDF.createOrReplaceTempView("source")
+
+      val executedPlan = executeAndKeepPlan {
+        sql(
+          s"""MERGE INTO $tableNameAsString t
+             |USING source s
+             |ON t.pk = s.pk AND DeP IN ('hr', 'software')
+             |WHEN MATCHED THEN
+             | UPDATE SET t.salary = t.salary + 1
+             |WHEN NOT MATCHED THEN
+             | INSERT (pk, salary, dep) VALUES (s.pk, 0, 'hr')
+             |WHEN NOT MATCHED BY SOURCE THEN
+             | DELETE
+             |""".stripMargin)
+      }
+
+      val expressions = flatMap(executedPlan)(_.expressions.flatMap(splitConjunctivePredicates))
+      val inFilterPreserved = expressions.exists {
+        case In(attr: AttributeReference, _) if attr.name == "DeP" => true
+        case _ => false
+      }
+      assert(inFilterPreserved, "IN filter must be preserved")
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 101, "hr"), // update
+          Row(2, 201, "hr"), // update
+          Row(3, 301, "hr"), // update
+          Row(6, 0, "hr"))) // insert
+    }
+  }
+
+  test("merge into table with recursive CTE") {
+    withTempView("source") {
+      sql(
+        s"""CREATE TABLE $tableNameAsString (
+           | val INT)
+           |""".stripMargin)
+
+      append("val INT",
+        """{ "val": 1 }
+          |{ "val": 9 }
+          |{ "val": 8 }
+          |{ "val": 4 }
+          |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1),
+          Row(9),
+          Row(8),
+          Row(4)))
+
+      sql(
+        s"""WITH RECURSIVE s(val) AS (
+           |  SELECT 1
+           |  UNION ALL
+           |  SELECT val + 1 FROM s WHERE val < 5
+           |) MERGE INTO $tableNameAsString t
+           |USING s
+           |ON t.val = s.val
+           |WHEN MATCHED THEN
+           | UPDATE SET t.val = t.val - 1
+           |WHEN NOT MATCHED THEN
+           | INSERT (val) VALUES (-s.val)
+           |WHEN NOT MATCHED BY SOURCE THEN
+           | UPDATE SET t.val = t.val + 1
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(0),
+          Row(10),
+          Row(9),
+          Row(3),
+          Row(-2),
+          Row(-3),
+          Row(-5)))
+    }
+  }
+
+  test("Merge metrics with matched clause") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |{ "pk": 3, "salary": 300, "dep": "hr" }
+          |""".stripMargin)
+
+      val sourceDF = Seq(1, 2, 10).toDF("pk")
+      sourceDF.createOrReplaceTempView("source")
+
+      val mergeExec = findMergeExec {
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN MATCHED AND salary < 200 THEN
+           | UPDATE SET salary = 1000
+           |""".stripMargin
+      }
+
+      assertMetric(mergeExec, "numTargetRowsCopied", if (deltaMerge) 0 else 2)
+      assertMetric(mergeExec, "numTargetRowsInserted", 0)
+      assertMetric(mergeExec, "numTargetRowsUpdated", 1)
+      assertMetric(mergeExec, "numTargetRowsDeleted", 0)
+      assertMetric(mergeExec, "numTargetRowsMatchedUpdated", 1)
+      assertMetric(mergeExec, "numTargetRowsMatchedDeleted", 0)
+      assertMetric(mergeExec, "numTargetRowsNotMatchedBySourceUpdated", 0)
+      assertMetric(mergeExec, "numTargetRowsNotMatchedBySourceDeleted", 0)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 1000, "hr"), // updated
+          Row(2, 200, "software"),
+          Row(3, 300, "hr")))
+
+      val mergeSummary = getMergeSummary()
+      assert(mergeSummary.numTargetRowsCopied === (if (deltaMerge) 0L else 2L))
+      assert(mergeSummary.numTargetRowsInserted === 0L)
+      assert(mergeSummary.numTargetRowsUpdated === 1L)
+      assert(mergeSummary.numTargetRowsDeleted === 0L)
+      assert(mergeSummary.numTargetRowsMatchedUpdated === 1L)
+      assert(mergeSummary.numTargetRowsMatchedDeleted === 0L)
+      assert(mergeSummary.numTargetRowsNotMatchedBySourceUpdated === 0L)
+      assert(mergeSummary.numTargetRowsNotMatchedBySourceDeleted === 0L)
+    }
+  }
+
+  test("Merge metrics with matched and not matched clause") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |{ "pk": 3, "salary": 300, "dep": "hr" }
+          |""".stripMargin)
+
+      val sourceDF = Seq(
+        (4, 100, "marketing"),
+        (5, 400, "executive"),
+        (6, 100, "hr")
+      ).toDF("pk", "salary", "dep")
+      sourceDF.createOrReplaceTempView("source")
+
+      val mergeExec = findMergeExec {
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN MATCHED THEN
+           | UPDATE SET salary = 9999
+           |WHEN NOT MATCHED AND salary > 200 THEN
+           | INSERT *
+           |""".stripMargin
+      }
+
+      assertMetric(mergeExec, "numTargetRowsCopied", 0)
+      assertMetric(mergeExec, "numTargetRowsInserted", 1)
+      assertMetric(mergeExec, "numTargetRowsUpdated", 0)
+      assertMetric(mergeExec, "numTargetRowsDeleted", 0)
+      assertMetric(mergeExec, "numTargetRowsMatchedUpdated", 0)
+      assertMetric(mergeExec, "numTargetRowsMatchedDeleted", 0)
+      assertMetric(mergeExec, "numTargetRowsNotMatchedBySourceUpdated", 0)
+      assertMetric(mergeExec, "numTargetRowsNotMatchedBySourceDeleted", 0)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 100, "hr"),
+          Row(2, 200, "software"),
+          Row(3, 300, "hr"),
+          Row(5, 400, "executive"))) // inserted
+
+      val mergeSummary = getMergeSummary()
+      assert(mergeSummary.numTargetRowsCopied === 0L)
+      assert(mergeSummary.numTargetRowsInserted === 1L)
+      assert(mergeSummary.numTargetRowsUpdated === 0L)
+      assert(mergeSummary.numTargetRowsDeleted === 0L)
+      assert(mergeSummary.numTargetRowsMatchedUpdated === 0L)
+      assert(mergeSummary.numTargetRowsMatchedDeleted === 0L)
+      assert(mergeSummary.numTargetRowsNotMatchedBySourceUpdated === 0L)
+      assert(mergeSummary.numTargetRowsNotMatchedBySourceDeleted === 0L)
+    }
+  }
+
+  test("Merge metrics with matched and not matched by source clauses: update") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |{ "pk": 3, "salary": 300, "dep": "hr" }
+          |{ "pk": 4, "salary": 400, "dep": "marketing" }
+          |{ "pk": 5, "salary": 500, "dep": "executive" }
+          |""".stripMargin)
+
+      val sourceDF = Seq(1, 2, 10).toDF("pk")
+      sourceDF.createOrReplaceTempView("source")
+
+      val mergeExec = findMergeExec {
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN MATCHED AND salary < 200 THEN
+           | UPDATE SET salary = 1000
+           |WHEN NOT MATCHED BY SOURCE AND salary > 400 THEN
+           | UPDATE SET salary = -1
+           |""".stripMargin
+      }
+
+      assertMetric(mergeExec, "numTargetRowsCopied", if (deltaMerge) 0 else 3)
+      assertMetric(mergeExec, "numTargetRowsInserted", 0)
+      assertMetric(mergeExec, "numTargetRowsUpdated", 2)
+      assertMetric(mergeExec, "numTargetRowsDeleted", 0)
+      assertMetric(mergeExec, "numTargetRowsMatchedUpdated", 1)
+      assertMetric(mergeExec, "numTargetRowsMatchedDeleted", 0)
+      assertMetric(mergeExec, "numTargetRowsNotMatchedBySourceUpdated", 1)
+      assertMetric(mergeExec, "numTargetRowsNotMatchedBySourceDeleted", 0)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 1000, "hr"), // updated
+          Row(2, 200, "software"),
+          Row(3, 300, "hr"),
+          Row(4, 400, "marketing"),
+          Row(5, -1, "executive"))) // updated
+
+      val mergeSummary = getMergeSummary()
+      assert(mergeSummary.numTargetRowsCopied === (if (deltaMerge) 0L else 3L))
+      assert(mergeSummary.numTargetRowsInserted === 0L)
+      assert(mergeSummary.numTargetRowsUpdated === 2L)
+      assert(mergeSummary.numTargetRowsDeleted === 0L)
+      assert(mergeSummary.numTargetRowsMatchedUpdated === 1L)
+      assert(mergeSummary.numTargetRowsMatchedDeleted === 0L)
+      assert(mergeSummary.numTargetRowsNotMatchedBySourceUpdated === 1L)
+      assert(mergeSummary.numTargetRowsNotMatchedBySourceDeleted === 0L)
+    }
+  }
+
+  test("Merge metrics with matched and not matched by source clauses: delete") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |{ "pk": 3, "salary": 300, "dep": "hr" }
+          |{ "pk": 4, "salary": 400, "dep": "marketing" }
+          |{ "pk": 5, "salary": 500, "dep": "executive" }
+          |""".stripMargin)
+
+      val sourceDF = Seq(1, 2, 10).toDF("pk")
+      sourceDF.createOrReplaceTempView("source")
+
+      val mergeExec = findMergeExec {
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN MATCHED AND salary < 200 THEN
+           | DELETE
+           |WHEN NOT MATCHED BY SOURCE AND salary > 400 THEN
+           | DELETE
+           |""".stripMargin
+      }
+
+
+      assertMetric(mergeExec, "numTargetRowsCopied", if (deltaMerge) 0 else 3)
+      assertMetric(mergeExec, "numTargetRowsInserted", 0)
+      assertMetric(mergeExec, "numTargetRowsUpdated", 0)
+      assertMetric(mergeExec, "numTargetRowsDeleted", 2)
+      assertMetric(mergeExec, "numTargetRowsMatchedUpdated", 0)
+      assertMetric(mergeExec, "numTargetRowsMatchedDeleted", 1)
+      assertMetric(mergeExec, "numTargetRowsNotMatchedBySourceUpdated", 0)
+      assertMetric(mergeExec, "numTargetRowsNotMatchedBySourceDeleted", 1)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          // Row(1, 100, "hr") deleted
+          Row(2, 200, "software"),
+          Row(3, 300, "hr"),
+          Row(4, 400, "marketing"))
+          // Row(5, 500, "executive") deleted
+      )
+
+      val mergeSummary = getMergeSummary()
+      assert(mergeSummary.numTargetRowsCopied === (if (deltaMerge) 0L else 3L))
+      assert(mergeSummary.numTargetRowsInserted === 0L)
+      assert(mergeSummary.numTargetRowsUpdated === 0L)
+      assert(mergeSummary.numTargetRowsDeleted === 2L)
+      assert(mergeSummary.numTargetRowsMatchedUpdated === 0L)
+      assert(mergeSummary.numTargetRowsMatchedDeleted === 1L)
+      assert(mergeSummary.numTargetRowsNotMatchedBySourceUpdated === 0L)
+      assert(mergeSummary.numTargetRowsNotMatchedBySourceDeleted === 1L)
+    }
+  }
+
+  test("Merge metrics with matched, not matched, and not matched by source clauses: update") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |{ "pk": 3, "salary": 300, "dep": "hr" }
+          |{ "pk": 4, "salary": 400, "dep": "marketing" }
+          |{ "pk": 5, "salary": 500, "dep": "executive" }
+          |""".stripMargin)
+
+      val sourceDF = Seq(1, 2, 6, 10).toDF("pk")
+      sourceDF.createOrReplaceTempView("source")
+
+      val mergeExec = findMergeExec {
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN MATCHED AND salary < 200 THEN
+           | UPDATE SET salary = 1000
+           |WHEN NOT MATCHED AND s.pk < 10 THEN
+           | INSERT (pk, salary, dep) VALUES (s.pk, -1, "dummy")
+           |WHEN NOT MATCHED BY SOURCE AND salary > 400 THEN
+           | UPDATE SET salary = -1
+           |""".stripMargin
+      }
+
+      assertMetric(mergeExec, "numTargetRowsCopied", if (deltaMerge) 0 else 3)
+      assertMetric(mergeExec, "numTargetRowsInserted", 1)
+      assertMetric(mergeExec, "numTargetRowsUpdated", 2)
+      assertMetric(mergeExec, "numTargetRowsDeleted", 0)
+      assertMetric(mergeExec, "numTargetRowsMatchedUpdated", 1)
+      assertMetric(mergeExec, "numTargetRowsMatchedDeleted", 0)
+      assertMetric(mergeExec, "numTargetRowsNotMatchedBySourceUpdated", 1)
+      assertMetric(mergeExec, "numTargetRowsNotMatchedBySourceDeleted", 0)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, 1000, "hr"), // updated
+          Row(2, 200, "software"),
+          Row(3, 300, "hr"),
+          Row(4, 400, "marketing"),
+          Row(5, -1, "executive"), // updated
+          Row(6, -1, "dummy"))) // inserted
+
+      val mergeSummary = getMergeSummary()
+      assert(mergeSummary.numTargetRowsCopied === (if (deltaMerge) 0L else 3L))
+      assert(mergeSummary.numTargetRowsInserted === 1L)
+      assert(mergeSummary.numTargetRowsUpdated === 2L)
+      assert(mergeSummary.numTargetRowsDeleted === 0L)
+      assert(mergeSummary.numTargetRowsMatchedUpdated === 1L)
+      assert(mergeSummary.numTargetRowsMatchedDeleted === 0L)
+      assert(mergeSummary.numTargetRowsNotMatchedBySourceUpdated === 1L)
+      assert(mergeSummary.numTargetRowsNotMatchedBySourceDeleted === 0L)
+    }
+  }
+
+  test("Merge metrics with matched, not matched, and not matched by source clauses: delete") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |{ "pk": 3, "salary": 300, "dep": "hr" }
+          |{ "pk": 4, "salary": 400, "dep": "marketing" }
+          |{ "pk": 5, "salary": 500, "dep": "executive" }
+          |""".stripMargin)
+
+      val sourceDF = Seq(1, 2, 6, 10).toDF("pk")
+      sourceDF.createOrReplaceTempView("source")
+
+      val mergeExec = findMergeExec {
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN MATCHED AND salary < 200 THEN
+           | DELETE
+           |WHEN NOT MATCHED AND s.pk < 10 THEN
+           | INSERT (pk, salary, dep) VALUES (s.pk, -1, "dummy")
+           |WHEN NOT MATCHED BY SOURCE AND salary > 400 THEN
+           | DELETE
+           |""".stripMargin
+      }
+
+      assertMetric(mergeExec, "numTargetRowsCopied", if (deltaMerge) 0 else 3)
+      assertMetric(mergeExec, "numTargetRowsInserted", 1)
+      assertMetric(mergeExec, "numTargetRowsUpdated", 0)
+      assertMetric(mergeExec, "numTargetRowsDeleted", 2)
+      assertMetric(mergeExec, "numTargetRowsMatchedUpdated", 0)
+      assertMetric(mergeExec, "numTargetRowsMatchedDeleted", 1)
+      assertMetric(mergeExec, "numTargetRowsNotMatchedBySourceUpdated", 0)
+      assertMetric(mergeExec, "numTargetRowsNotMatchedBySourceDeleted", 1)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          // Row(1, 100, "hr") deleted
+          Row(2, 200, "software"),
+          Row(3, 300, "hr"),
+          Row(4, 400, "marketing"),
+          // Row(5, 500, "executive") deleted
+          Row(6, -1, "dummy"))) // inserted
+
+      val mergeSummary = getMergeSummary()
+      assert(mergeSummary.numTargetRowsCopied === (if (deltaMerge) 0L else 3L))
+      assert(mergeSummary.numTargetRowsInserted === 1L)
+      assert(mergeSummary.numTargetRowsUpdated === 0L)
+      assert(mergeSummary.numTargetRowsDeleted === 2L)
+      assert(mergeSummary.numTargetRowsMatchedUpdated === 0L)
+      assert(mergeSummary.numTargetRowsMatchedDeleted === 1L)
+      assert(mergeSummary.numTargetRowsNotMatchedBySourceUpdated === 0L)
+      assert(mergeSummary.numTargetRowsNotMatchedBySourceDeleted === 1L)
+    }
+  }
+
+  test("SPARK-52689: V2 write metrics for merge") {
+    Seq("true", "false").foreach { aqeEnabled: String =>
+      withTempView("source") {
+        withSQLConf(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> aqeEnabled) {
+          createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+            """{ "pk": 1, "salary": 100, "dep": "hr" }
+              |{ "pk": 2, "salary": 200, "dep": "software" }
+              |{ "pk": 3, "salary": 300, "dep": "hr" }
+              |{ "pk": 4, "salary": 400, "dep": "marketing" }
+              |{ "pk": 5, "salary": 500, "dep": "executive" }
+              |""".stripMargin)
+
+          val sourceDF = Seq(1, 2, 6, 10).toDF("pk")
+          sourceDF.createOrReplaceTempView("source")
+
+          sql(
+            s"""MERGE INTO $tableNameAsString t
+               |USING source s
+               |ON t.pk = s.pk
+               |WHEN MATCHED AND salary < 200 THEN
+               | DELETE
+               |WHEN NOT MATCHED AND s.pk < 10 THEN
+               | INSERT (pk, salary, dep) VALUES (s.pk, -1, "dummy")
+               |WHEN NOT MATCHED BY SOURCE AND salary > 400 THEN
+               | DELETE
+               |""".stripMargin
+          )
+
+          val mergeMetrics = getMergeSummary()
+          assert(mergeMetrics.numTargetRowsCopied === (if (deltaMerge) 0L else 3L))
+          assert(mergeMetrics.numTargetRowsInserted === 1L)
+          assert(mergeMetrics.numTargetRowsUpdated === 0L)
+          assert(mergeMetrics.numTargetRowsDeleted === 2L)
+          assert(mergeMetrics.numTargetRowsMatchedUpdated === 0L)
+          assert(mergeMetrics.numTargetRowsMatchedDeleted === 1L)
+          assert(mergeMetrics.numTargetRowsNotMatchedBySourceUpdated === 0L)
+          assert(mergeMetrics.numTargetRowsNotMatchedBySourceDeleted === 1L)
+
+          sql(s"DROP TABLE $tableNameAsString")
+        }
+      }
+    }
+  }
+
+  test("metric values are stable across stage retries") {
+    // INJECT_SHUFFLE_FETCH_FAILURES corrupts the partition-0 task of the first successful
+    // attempt of every shuffle map stage, so a downstream stage FetchFails and the producer
+    // re-runs. For the metadata variants of MERGE - where the writer's
+    // `RequiresDistributionAndOrdering` forces a re-shuffle between MergeRowsExec and the
+    // writer - MergeRowsExec sits in a non-leaf shuffle map stage and therefore re-runs with
+    // the same metric instances, double-counting the per-row increments. SQLLastAttemptMetric
+    // reports only the last attempt, so `MergeSummary` is still correct.
+    withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1") {
+      withTempView("source") {
+        createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+          """{ "pk": 1, "salary": 100, "dep": "hr" }
+            |{ "pk": 2, "salary": 200, "dep": "software" }
+            |{ "pk": 3, "salary": 300, "dep": "hr" }
+            |""".stripMargin)
+
+        val sourceDF = Seq(1, 2, 10).toDF("pk")
+        sourceDF.createOrReplaceTempView("source")
+
+        val mergeExec = withSparkContextConf(
+            config.Tests.INJECT_SHUFFLE_FETCH_FAILURES.key -> "true") {
+          findMergeExec {
+            s"""MERGE INTO $tableNameAsString t
+               |USING source s
+               |ON t.pk = s.pk
+               |WHEN MATCHED THEN
+               | UPDATE SET salary = salary + 100
+               |WHEN NOT MATCHED THEN
+               | INSERT (pk, salary, dep) VALUES (s.pk, 999, 'unknown')
+               |""".stripMargin
+          }
+        }
+
+        val mergeSummary = getMergeSummary()
+        assert(mergeSummary.numTargetRowsUpdated === 2L)
+        assert(mergeSummary.numTargetRowsMatchedUpdated === 2L)
+        assert(mergeSummary.numTargetRowsInserted === 1L)
+        assert(mergeSummary.numTargetRowsCopied === (if (deltaMerge) 0L else 1L))
+        assert(mergeSummary.numTargetRowsDeleted === 0L)
+        assert(mergeSummary.numTargetRowsMatchedDeleted === 0L)
+        assert(mergeSummary.numTargetRowsNotMatchedBySourceUpdated === 0L)
+        assert(mergeSummary.numTargetRowsNotMatchedBySourceDeleted === 0L)
+
+        // For metadata variants, MergeRowsExec lives in a non-leaf shuffle map stage that the
+        // fetch-failure injection forces to re-run, so the raw per-MergeRowsExec accumulator
+        // (`metric.value`) overcounts. This doubles as a direct check that a retry actually
+        // fired. SLAM-aware `MergeSummary` (asserted above) is correct.
+        // For noMetadata variants, MergeRowsExec is in the result stage and is not re-run by an
+        // upstream injection, so there is no overcounting metric to assert.
+        if (!noMetadata) {
+          val rawUpdated = mergeExec.metrics("numTargetRowsUpdated").value
+          assert(rawUpdated > 2L,
+            s"Expected MergeRowsExec.numTargetRowsUpdated to overcount under fetch-failure " +
+              s"injection (got $rawUpdated)")
+          val rawMatchedUpdated = mergeExec.metrics("numTargetRowsMatchedUpdated").value
+          assert(rawMatchedUpdated > 2L,
+            s"Expected numTargetRowsMatchedUpdated to overcount (got $rawMatchedUpdated)")
+        }
+
+        checkAnswer(
+          sql(s"SELECT pk, salary FROM $tableNameAsString ORDER BY pk"),
+          Seq(
+            Row(1, 200),
+            Row(2, 300),
+            Row(3, 300),
+            Row(10, 999)))
+      }
+    }
+  }
+
+  test("SPARK-55074: imerge with type coercion from INT to STRING") {
+    // INT -> STRING is allowed in ANSI mode, merge should succeed via type coercion
+    // without requiring schema evolution
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, value STRING, dep STRING",
+        """{ "pk": 1, "value": "100", "dep": "hr" }
+          |{ "pk": 2, "value": "200", "dep": "finance" }
+          |{ "pk": 3, "value": "300", "dep": "engineering" }
+          |""".stripMargin)
+
+      // Source has INT type for 'value' column
+      Seq((2, 999, "finance"), (4, 400, "marketing"))
+        .toDF("pk", "value", "dep")
+        .createOrReplaceTempView("source")
+
+      sql(
+        s"""MERGE INTO $tableNameAsString t
+           |USING source s
+           |ON t.pk = s.pk
+           |WHEN MATCHED THEN
+           | UPDATE SET value = s.value, dep = s.dep
+           |WHEN NOT MATCHED THEN
+           | INSERT (pk, value, dep) VALUES (s.pk, s.value, s.dep)
+           |""".stripMargin)
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Seq(
+          Row(1, "100", "hr"),
+          Row(2, "999", "finance"), // updated, INT 999 coerced to STRING "999"
+          Row(3, "300", "engineering"),
+          Row(4, "400", "marketing"))) // inserted, INT 400 coerced to STRING "400"
+    }
+  }
+
+  private def findMergeExec(query: String): MergeRowsExec = {
+    val plan = executeAndKeepPlan {
+      sql(query)
+    }
+    collectFirst(plan) {
+      case m: MergeRowsExec => m
+    } match {
+      case Some(m) => m
+      case None =>
+        fail("MergeRowsExec not found in the plan")
+    }
+  }
+
+  private def getMergeSummary(): MergeSummary = {
+    val table = catalog.loadTable(ident)
+    table.asInstanceOf[InMemoryTable].commits.last.writeSummary.get
+      .asInstanceOf[MergeSummary]
+  }
+
+  private def assertNoLeftBroadcastOrReplication(query: String): Unit = {
+    val plan = executeAndKeepPlan {
+      sql(query)
+    }
+    assertNoLeftBroadcastOrReplication(plan)
+  }
+
+  private def assertNoLeftBroadcastOrReplication(plan: SparkPlan): Unit = {
+    val joins = plan.collect {
+      case j: BroadcastHashJoinExec if j.buildSide == BuildLeft => j
+      case j: BroadcastNestedLoopJoinExec if j.buildSide == BuildLeft => j
+      case j: CartesianProductExec => j
+    }
+    assert(joins.isEmpty, "left side must not be broadcasted or replicated")
+  }
+
+  private def assertCardinalityError(query: String): Unit = {
+    val e = intercept[SparkRuntimeException] {
+      sql(query)
+    }
+    assert(e.getMessage.contains("ON search condition of the MERGE statement"))
+    assert(catalog.lastTransaction.currentState == Aborted)
+    assert(catalog.lastTransaction.isClosed)
+  }
+
+  test("SPARK-58007: merge with dynamic options on the target") {
+    withTable(sourceNameAsString) {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |""".stripMargin)
+      sql(s"CREATE TABLE $sourceNameAsString (pk INT NOT NULL, salary INT, dep STRING)")
+      sql(s"INSERT INTO $sourceNameAsString VALUES (1, 150, 'hr'), (3, 300, 'hr')")
+
+      // the target options become the row-level operation options: they reach the rewritten
+      // DataSourceV2Relation, the RowLevelOperationInfo, and the write builder's LogicalWriteInfo
+      checkRowLevelOperationOptions(
+        sql(
+          s"""MERGE INTO $tableNameAsString t WITH
+             |  (`load-option` = 'load-value', `write-option` = 'write-value')
+             |USING $sourceNameAsString s
+             |ON t.pk = s.pk
+             |WHEN MATCHED THEN UPDATE SET t.salary = s.salary
+             |WHEN NOT MATCHED THEN INSERT *
+             |""".stripMargin),
+        "load-option" -> "load-value",
+        "write-option" -> "write-value")
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(1, 150, "hr") :: Row(2, 200, "software") :: Row(3, 300, "hr") :: Nil)
+    }
+  }
+
+  test("SPARK-58007: merge with dynamic options on the source") {
+    withTable(sourceNameAsString) {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |""".stripMargin)
+      sql(s"CREATE TABLE $sourceNameAsString (pk INT NOT NULL, salary INT, dep STRING)")
+      sql(s"INSERT INTO $sourceNameAsString VALUES (1, 150, 'hr'), (3, 300, 'hr')")
+
+      // the source is read-only; its options must reach the source scan the same way a
+      // SELECT ... WITH (...) does
+      val Seq(qe) = withQueryExecutionsCaptured(spark) {
+        sql(
+          s"""MERGE INTO $tableNameAsString t
+             |USING $sourceNameAsString WITH (`split-size` = 5) s
+             |ON t.pk = s.pk
+             |WHEN MATCHED THEN UPDATE SET t.salary = s.salary
+             |WHEN NOT MATCHED THEN INSERT *
+             |""".stripMargin)
+      }
+      val sourceOptions = qe.optimizedPlan.collect {
+        case r: DataSourceV2Relation => r.options
+        case s: DataSourceV2ScanRelation => s.relation.options
+      }.filter(_.containsKey("split-size"))
+      assert(sourceOptions.nonEmpty, "source relation carrying the option was not found")
+      sourceOptions.foreach(opts => assert(opts.get("split-size") === "5"))
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(1, 150, "hr") :: Row(2, 200, "software") :: Row(3, 300, "hr") :: Nil)
+    }
+  }
+
+  test("SPARK-58007: merge with dynamic options on both the target and the source") {
+    withTable(sourceNameAsString) {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |""".stripMargin)
+      sql(s"CREATE TABLE $sourceNameAsString (pk INT NOT NULL, salary INT, dep STRING)")
+      sql(s"INSERT INTO $sourceNameAsString VALUES (1, 150, 'hr'), (3, 300, 'hr')")
+
+      // the target and source each carry their own options bag; the two must not cross-contaminate
+      // (the single-option cases above already verify each bag reaches its destination)
+      val Seq(qe) = withQueryExecutionsCaptured(spark) {
+        sql(
+          s"""MERGE INTO $tableNameAsString t WITH (`write.split-size` = 10)
+             |USING $sourceNameAsString WITH (`split-size` = 5) s
+             |ON t.pk = s.pk
+             |WHEN MATCHED THEN UPDATE SET t.salary = s.salary
+             |WHEN NOT MATCHED THEN INSERT *
+             |""".stripMargin)
+      }
+
+      // target write relation carries only its own option, not the source's
+      val writeRelation = qe.optimizedPlan.collectFirst {
+        case rd: ReplaceData => rd.table
+        case wd: WriteDelta => wd.table
+      }.getOrElse(fail("couldn't find row-level operation in optimized plan"))
+        .asInstanceOf[DataSourceV2Relation]
+      assert(writeRelation.options.get("write.split-size") === "10", "target relation option")
+      assert(!writeRelation.options.containsKey("split-size"), "target must not see source option")
+
+      // source scan carries only its own option, not the target's
+      val sourceOptions = qe.optimizedPlan.collect {
+        case r: DataSourceV2Relation => r.options
+        case s: DataSourceV2ScanRelation => s.relation.options
+      }.filter(_.containsKey("split-size"))
+      assert(sourceOptions.nonEmpty, "source relation carrying the option was not found")
+      sourceOptions.foreach { opts =>
+        assert(opts.get("split-size") === "5", "source relation option")
+        assert(!opts.containsKey("write.split-size"), "source must not see target option")
+      }
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(1, 150, "hr") :: Row(2, 200, "software") :: Row(3, 300, "hr") :: Nil)
+    }
+  }
+
+  test("SPARK-58330: self-merge keeps each reference's own dynamic options") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |""".stripMargin)
+
+    // Target and source are the same table, so they share one per-query relation-cache entry.
+    // Each reference must keep its own options: the target keeps its write options and the source
+    // keeps its read options; neither is dropped or inherited from the other.
+    val Seq(qe) = withQueryExecutionsCaptured(spark) {
+      sql(
+        s"""MERGE INTO $tableNameAsString t WITH (`write.split-size` = 10)
+           |USING $tableNameAsString WITH (`split-size` = 5) s
+           |ON t.pk = s.pk
+           |WHEN MATCHED THEN UPDATE SET t.salary = s.salary
+           |""".stripMargin)
+    }
+
+    // target write relation carries only its own option, not the source's
+    val writeRelation = qe.optimizedPlan.collectFirst {
+      case rd: ReplaceData => rd.table
+      case wd: WriteDelta => wd.table
+    }.getOrElse(fail("couldn't find row-level operation in optimized plan"))
+      .asInstanceOf[DataSourceV2Relation]
+    assert(writeRelation.options.get("write.split-size") === "10", "target relation option")
+    assert(!writeRelation.options.containsKey("split-size"), "target must not see source option")
+
+    // source scan carries only its own option, not the target's
+    val sourceOptions = qe.optimizedPlan.collect {
+      case r: DataSourceV2Relation => r.options
+      case s: DataSourceV2ScanRelation => s.relation.options
+    }.filter(_.containsKey("split-size"))
+    assert(sourceOptions.nonEmpty, "source relation carrying the option was not found")
+    sourceOptions.foreach { opts =>
+      assert(opts.get("split-size") === "5", "source relation option")
+      assert(!opts.containsKey("write.split-size"), "source must not see target option")
+    }
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(1, 100, "hr") :: Row(2, 200, "software") :: Nil)
+  }
+
+  test("SPARK-58007: merge with dynamic options on the target, insert-only fast path") {
+    withTable(sourceNameAsString) {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |""".stripMargin)
+      sql(s"CREATE TABLE $sourceNameAsString (pk INT NOT NULL, salary INT, dep STRING)")
+      sql(s"INSERT INTO $sourceNameAsString VALUES (1, 150, 'hr'), (3, 300, 'hr')")
+
+      // a MATCHED-free merge is rewritten to InsertOnlyMerge (a plain append), which builds
+      // write from the target's options at a different site than the row-level rewrite path.
+      val executedPlan = executeAndKeepPlan {
+        sql(
+          s"""MERGE INTO $tableNameAsString t WITH
+             |  (`load-option` = 'load-value', `write-option` = 'write-value')
+             |USING $sourceNameAsString s
+             |ON t.pk = s.pk
+             |WHEN NOT MATCHED THEN INSERT *
+             |""".stripMargin)
+      }
+      val write = executedPlan.collectFirst {
+        case e: InsertOnlyMergeExec => e.write
+      }.getOrElse(fail("expected an InsertOnlyMergeExec in the executed plan"))
+      val append = write.toBatch.asInstanceOf[InMemoryBaseTable#Append]
+      assert(append.info.options.get("load-option") === "load-value")
+      assert(append.info.options.get("write-option") === "write-value")
+      assertLastTransactionWriteLoadOptions(
+        "load-option" -> "load-value",
+        "write-option" -> "write-value")
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(1, 100, "hr") :: Row(2, 200, "software") :: Row(3, 300, "hr") :: Nil)
+    }
+  }
+
+  private def assertMetric(
+      mergeExec: MergeRowsExec,
+      metricName: String,
+      expected: Long): Unit = {
+    mergeExec.metrics.get(metricName) match {
+      case Some(metric) =>
+        assert(metric.value == expected,
+          s"Expected $metricName to be $expected, but got ${metric.value}")
+      case None => fail(s"$metricName metric not found")
+    }
+  }
+
+  test("merge with a SQL variable in the merge condition") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |""".stripMargin)
+      Seq(1, 2).toDF("pk").createOrReplaceTempView("source")
+
+      withSessionVariable("target_dep") {
+        sql("DECLARE VARIABLE target_dep STRING DEFAULT 'hr'")
+        sql(
+          s"""MERGE INTO $tableNameAsString t
+             |USING source s
+             |ON t.pk = s.pk AND t.dep = target_dep
+             |WHEN MATCHED THEN UPDATE SET t.salary = 999
+             |""".stripMargin)
+
+        checkAnswer(
+          sql(s"SELECT * FROM $tableNameAsString"),
+          Row(1, 999, "hr") :: Row(2, 200, "software") :: Nil)
+      }
+    }
+  }
+
+  test("merge with a SQL variable in matched and not-matched-by-source conditions") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |""".stripMargin)
+      Seq(1).toDF("pk").createOrReplaceTempView("source")
+
+      withSessionVariable("salary_threshold") {
+        sql("DECLARE VARIABLE salary_threshold INT DEFAULT 150")
+        sql(
+          s"""MERGE INTO $tableNameAsString t
+             |USING source s
+             |ON t.pk = s.pk
+             |WHEN MATCHED AND t.salary < salary_threshold THEN UPDATE SET t.salary = 999
+             |WHEN NOT MATCHED BY SOURCE AND t.salary > salary_threshold THEN DELETE
+             |""".stripMargin)
+
+        checkAnswer(
+          sql(s"SELECT * FROM $tableNameAsString"),
+          Row(1, 999, "hr") :: Nil)
+      }
+    }
+  }
+
+  test("merge with a SQL variable in matched delete condition") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |""".stripMargin)
+      Seq(1, 2).toDF("pk").createOrReplaceTempView("source")
+
+      withSessionVariable("salary_threshold") {
+        sql("DECLARE VARIABLE salary_threshold INT DEFAULT 150")
+        sql(
+          s"""MERGE INTO $tableNameAsString t
+             |USING source s
+             |ON t.pk = s.pk
+             |WHEN MATCHED AND t.salary < salary_threshold THEN DELETE
+             |""".stripMargin)
+
+        checkAnswer(
+          sql(s"SELECT * FROM $tableNameAsString"),
+          Row(2, 200, "software") :: Nil)
+      }
+    }
+  }
+
+  test("merge with a SQL variable in matched update-star condition") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |{ "pk": 2, "salary": 200, "dep": "software" }
+          |""".stripMargin)
+      Seq((1, 999, "finance"), (2, 888, "sales"))
+        .toDF("pk", "salary", "dep").createOrReplaceTempView("source")
+
+      withSessionVariable("pk_threshold") {
+        sql("DECLARE VARIABLE pk_threshold INT DEFAULT 2")
+        sql(
+          s"""MERGE INTO $tableNameAsString t
+             |USING source s
+             |ON t.pk = s.pk
+             |WHEN MATCHED AND s.pk < pk_threshold THEN UPDATE SET *
+             |""".stripMargin)
+
+        checkAnswer(
+          sql(s"SELECT * FROM $tableNameAsString"),
+          Row(1, 999, "finance") :: Row(2, 200, "software") :: Nil)
+      }
+    }
+  }
+
+  test("merge with a SQL variable in the not-matched insert condition") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |""".stripMargin)
+      Seq((2, 200, "software"), (3, 300, "hr"))
+        .toDF("pk", "salary", "dep").createOrReplaceTempView("source")
+
+      withSessionVariable("pk_threshold") {
+        sql("DECLARE VARIABLE pk_threshold INT DEFAULT 3")
+        sql(
+          s"""MERGE INTO $tableNameAsString t
+             |USING source s
+             |ON t.pk = s.pk
+             |WHEN NOT MATCHED AND s.pk < pk_threshold THEN
+             |  INSERT (pk, salary, dep) VALUES (s.pk, s.salary, s.dep)
+             |""".stripMargin)
+
+        checkAnswer(
+          sql(s"SELECT * FROM $tableNameAsString"),
+          Row(1, 100, "hr") :: Row(2, 200, "software") :: Nil)
+      }
+    }
+  }
+
+  test("merge with a SQL variable in the not-matched insert-star condition") {
+    withTempView("source") {
+      createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+        """{ "pk": 1, "salary": 100, "dep": "hr" }
+          |""".stripMargin)
+      Seq((2, 200, "software"), (3, 300, "hr"))
+        .toDF("pk", "salary", "dep").createOrReplaceTempView("source")
+
+      withSessionVariable("pk_threshold") {
+        sql("DECLARE VARIABLE pk_threshold INT DEFAULT 3")
+        sql(
+          s"""MERGE INTO $tableNameAsString t
+             |USING source s
+             |ON t.pk = s.pk
+             |WHEN NOT MATCHED AND s.pk < pk_threshold THEN INSERT *
+             |""".stripMargin)
+
+        checkAnswer(
+          sql(s"SELECT * FROM $tableNameAsString"),
+          Row(1, 100, "hr") :: Row(2, 200, "software") :: Nil)
+      }
+    }
+  }
+
+}

@@ -1,0 +1,592 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.catalyst.expressions;
+
+import com.ibm.icu.text.Normalizer2;
+
+import java.nio.ByteBuffer;
+import java.security.GeneralSecurityException;
+import java.security.SecureRandom;
+import java.security.spec.AlgorithmParameterSpec;
+import java.text.BreakIterator;
+import java.text.DecimalFormat;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
+import java.util.zip.CRC32;
+import javax.crypto.Cipher;
+import javax.crypto.Mac;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+
+import org.apache.spark.SparkBuildInfo;
+import org.apache.spark.sql.catalyst.util.ArrayData;
+import org.apache.spark.sql.catalyst.util.GenericArrayData;
+import org.apache.spark.sql.errors.QueryExecutionErrors;
+import org.apache.spark.unsafe.types.UTF8String;
+import org.apache.spark.util.VersionUtils;
+import org.apache.spark.util.random.XORShiftRandom;
+
+/**
+ * A utility class for constructing expressions.
+ */
+public class ExpressionImplUtils {
+  private static final SecureRandom secureRandom = new SecureRandom();
+
+  private static final int GCM_IV_LEN = 12;
+  private static final int GCM_TAG_LEN = 128;
+  private static final int CBC_IV_LEN = 16;
+
+  enum CipherMode {
+    ECB("ECB", 0, 0, "AES/ECB/PKCS5Padding", false, false),
+    CBC("CBC", CBC_IV_LEN, 0, "AES/CBC/PKCS5Padding", true, false),
+    GCM("GCM", GCM_IV_LEN, GCM_TAG_LEN, "AES/GCM/NoPadding", true, true);
+
+    private final String name;
+    final int ivLength;
+    final int tagLength;
+    final String transformation;
+    final boolean usesSpec;
+    final boolean supportsAad;
+
+    CipherMode(String name,
+               int ivLen,
+               int tagLen,
+               String transformation,
+               boolean usesSpec,
+               boolean supportsAad) {
+      this.name = name;
+      this.ivLength = ivLen;
+      this.tagLength = tagLen;
+      this.transformation = transformation;
+      this.usesSpec = usesSpec;
+      this.supportsAad = supportsAad;
+    }
+
+    static CipherMode fromString(String modeName, String padding) {
+      boolean isNone = padding.equalsIgnoreCase("NONE");
+      boolean isPkcs = padding.equalsIgnoreCase("PKCS");
+      boolean isDefault = padding.equalsIgnoreCase("DEFAULT");
+      if (modeName.equalsIgnoreCase(ECB.name) && (isPkcs || isDefault)) {
+        return ECB;
+      } else if (modeName.equalsIgnoreCase(CBC.name) && (isPkcs || isDefault)) {
+        return CBC;
+      } else if (modeName.equalsIgnoreCase(GCM.name) && (isNone || isDefault)) {
+        return GCM;
+      }
+      throw QueryExecutionErrors.aesModeUnsupportedError(modeName, padding);
+    }
+  }
+
+  /**
+   * Function to check if a given number string is a valid Luhn number
+   * @param numberString
+   *  the number string to check
+   * @return
+   *  true if the number string is a valid Luhn number, false otherwise.
+   */
+  public static boolean isLuhnNumber(UTF8String numberString) {
+    String digits = numberString.toString();
+    // Empty string is not a valid Luhn number.
+    if (digits.isEmpty()) return false;
+    int checkSum = 0;
+    boolean isSecond = false;
+    for (int i = digits.length() - 1; i >= 0; i--) {
+      char ch = digits.charAt(i);
+      if (!Character.isDigit(ch)) return false;
+
+      int digit = Character.getNumericValue(ch);
+      // Double the digit if it's the second digit in the sequence.
+      int doubled = isSecond ? digit * 2 : digit;
+      // Add the two digits of the doubled number to the sum.
+      checkSum += doubled % 10 + doubled / 10;
+      // Toggle the isSecond flag for the next iteration.
+      isSecond = !isSecond;
+    }
+    // Check if the final sum is divisible by 10.
+    return checkSum % 10 == 0;
+  }
+
+  /**
+   * Function to validate a given UTF8 string according to Unicode rules.
+   *
+   * @param utf8String
+   *  the input string to validate against possible invalid byte sequences
+   * @return
+   *  the original string if the input string is a valid UTF8String, throw exception otherwise.
+   */
+  public static UTF8String validateUTF8String(UTF8String utf8String) {
+    if (utf8String.isValid()) return utf8String;
+    else throw QueryExecutionErrors.invalidUTF8StringError(utf8String);
+  }
+
+  /**
+   * Function to try to validate a given UTF8 string according to Unicode rules.
+   *
+   * @param utf8String
+   *  the input string to validate against possible invalid byte sequences
+   * @return
+   *  the original string if the input string is a valid UTF8String, null otherwise.
+   */
+  public static UTF8String tryValidateUTF8String(UTF8String utf8String) {
+    if (utf8String.isValid()) return utf8String;
+    else return null;
+  }
+
+  /**
+   * Normalizes the given string using the given Unicode normalization form, per the
+   * decomposition/composition algorithm in Unicode Standard Annex #15. Uses ICU4J, the same
+   * library backing Spark's collation support, instead of the JDK's {@code java.text.Normalizer}
+   * so the result is pinned to Spark's bundled ICU4J/Unicode data (see {@code icu4j.version} in
+   * pom.xml) and does not vary across JVM vendors or versions.
+   *
+   * @param input the input string to normalize.
+   * @param form the normalization form, one of NFC, NFD, NFKC, NFKD (case-insensitive).
+   * @return the normalized string.
+   */
+  public static UTF8String normalize(UTF8String input, UTF8String form) {
+    Normalizer2 normalizer = switch (form.toString().toUpperCase(Locale.ROOT)) {
+      case "NFC" -> Normalizer2.getNFCInstance();
+      case "NFD" -> Normalizer2.getNFDInstance();
+      case "NFKC" -> Normalizer2.getNFKCInstance();
+      case "NFKD" -> Normalizer2.getNFKDInstance();
+      default -> throw QueryExecutionErrors.invalidNormalizeFormError(form.toString());
+    };
+    return UTF8String.fromString(normalizer.normalize(input.toString()));
+  }
+
+  public static byte[] aesEncrypt(byte[] input,
+                                  byte[] key,
+                                  UTF8String mode,
+                                  UTF8String padding,
+                                  byte[] iv,
+                                  byte[] aad) {
+    return aesInternal(
+            input,
+            key,
+            mode.toString(),
+            padding.toString(),
+            Cipher.ENCRYPT_MODE,
+            iv,
+            aad
+    );
+  }
+
+  public static byte[] aesDecrypt(byte[] input,
+                                  byte[] key,
+                                  UTF8String mode,
+                                  UTF8String padding,
+                                  byte[] aad) {
+    return aesInternal(
+            input,
+            key,
+            mode.toString(),
+            padding.toString(),
+            Cipher.DECRYPT_MODE,
+            null,
+            aad
+    );
+  }
+
+  /**
+   * Computes a keyed-hash message authentication code (HMAC) of the given message using the
+   * given key and hash algorithm.
+   * @param key The secret key.
+   * @param message The message to authenticate.
+   * @param algorithm The hash algorithm. Supported values (case-insensitive):
+   *                  SHA-224, SHA-256, SHA-384, SHA-512, SHA-1, MD5.
+   * @return The raw HMAC bytes.
+   */
+  public static byte[] hmac(byte[] key, byte[] message, UTF8String algorithm) {
+    String macName = hmacName(algorithm.toString());
+    try {
+      Mac mac = Mac.getInstance(macName);
+      mac.init(new SecretKeySpec(key, macName));
+      return mac.doFinal(message);
+    } catch (GeneralSecurityException | IllegalArgumentException e) {
+      throw QueryExecutionErrors.hmacCryptoError(e.getMessage());
+    }
+  }
+
+  /**
+   * Maps a user-facing hash algorithm name to its JCA {@link Mac} algorithm name. Supported
+   * algorithms are SHA-224, SHA-256, SHA-384, SHA-512, SHA-1 and MD5 (case-insensitive).
+   */
+  private static String hmacName(String algorithm) {
+    return switch (algorithm.toUpperCase(Locale.ROOT)) {
+      case "SHA-224", "SHA224" -> "HmacSHA224";
+      case "SHA-256", "SHA256" -> "HmacSHA256";
+      case "SHA-384", "SHA384" -> "HmacSHA384";
+      case "SHA-512", "SHA512" -> "HmacSHA512";
+      case "SHA-1", "SHA1" -> "HmacSHA1";
+      case "MD5" -> "HmacMD5";
+      default -> throw QueryExecutionErrors.hmacUnsupportedAlgorithmError(algorithm);
+    };
+  }
+
+  /**
+   * Function to return the Spark version.
+   * @return
+   *  Space separated version and revision.
+   */
+  public static UTF8String getSparkVersion() {
+    String shortVersion = VersionUtils.shortVersion(SparkBuildInfo.spark_version());
+    String revision = SparkBuildInfo.spark_revision();
+    return UTF8String.fromString(shortVersion + " " + revision);
+  }
+
+  private static SecretKeySpec getSecretKeySpec(byte[] key) {
+    return switch (key.length) {
+      case 16, 24, 32 -> new SecretKeySpec(key, 0, key.length, "AES");
+      default -> throw QueryExecutionErrors.invalidAesKeyLengthError(key.length);
+    };
+  }
+
+  private static byte[] generateIv(CipherMode mode) {
+    byte[] iv = new byte[mode.ivLength];
+    secureRandom.nextBytes(iv);
+    return iv;
+  }
+
+  private static AlgorithmParameterSpec getParamSpec(CipherMode mode, byte[] input) {
+    return switch (mode) {
+      case CBC -> new IvParameterSpec(input, 0, mode.ivLength);
+      case GCM -> new GCMParameterSpec(mode.tagLength, input, 0, mode.ivLength);
+      default -> null;
+    };
+  }
+
+  private static byte[] aesInternal(
+      byte[] input,
+      byte[] key,
+      String mode,
+      String padding,
+      int opmode,
+      byte[] iv,
+      byte[] aad) {
+    try {
+      SecretKeySpec secretKey = getSecretKeySpec(key);
+      CipherMode cipherMode = CipherMode.fromString(mode, padding);
+      Cipher cipher = Cipher.getInstance(cipherMode.transformation);
+      if (opmode == Cipher.ENCRYPT_MODE) {
+        // This may be 0-length for ECB
+        if (iv == null || iv.length == 0) {
+          iv = generateIv(cipherMode);
+        } else if (!cipherMode.usesSpec) {
+          // If the caller passes an IV, ensure the mode actually uses it.
+          throw QueryExecutionErrors.aesUnsupportedIv(mode);
+        }
+        if (iv.length != cipherMode.ivLength) {
+          throw QueryExecutionErrors.invalidAesIvLengthError(mode, iv.length);
+        }
+
+        if (cipherMode.usesSpec) {
+          AlgorithmParameterSpec algSpec = getParamSpec(cipherMode, iv);
+          cipher.init(opmode, secretKey, algSpec);
+        } else {
+          cipher.init(opmode, secretKey);
+        }
+
+        // If the cipher mode supports additional authenticated data and it is provided, update it
+        if (aad != null && aad.length != 0) {
+          if (cipherMode.supportsAad != true) {
+            throw QueryExecutionErrors.aesUnsupportedAad(mode);
+          }
+          cipher.updateAAD(aad);
+        }
+
+        byte[] encrypted = cipher.doFinal(input, 0, input.length);
+        if (iv.length > 0) {
+          ByteBuffer byteBuffer = ByteBuffer.allocate(iv.length + encrypted.length);
+          byteBuffer.put(iv);
+          byteBuffer.put(encrypted);
+          return byteBuffer.array();
+        } else {
+          return encrypted;
+        }
+      } else {
+        assert(opmode == Cipher.DECRYPT_MODE);
+        if (cipherMode.usesSpec) {
+          AlgorithmParameterSpec algSpec = getParamSpec(cipherMode, input);
+          cipher.init(opmode, secretKey, algSpec);
+          if (aad != null && aad.length != 0) {
+            if (cipherMode.supportsAad != true) {
+              throw QueryExecutionErrors.aesUnsupportedAad(mode);
+            }
+            cipher.updateAAD(aad);
+          }
+          return cipher.doFinal(input, cipherMode.ivLength, input.length - cipherMode.ivLength);
+        } else {
+          cipher.init(opmode, secretKey);
+          return cipher.doFinal(input, 0, input.length);
+        }
+      }
+    } catch (GeneralSecurityException | IllegalArgumentException e) {
+      throw QueryExecutionErrors.aesCryptoError(e.getMessage());
+    }
+  }
+
+  public static ArrayData getSentences(
+      UTF8String str,
+      UTF8String language,
+      UTF8String country) {
+    if (str == null) return null;
+    Locale locale;
+    if (language != null && country != null) {
+      locale = Locale.of(language.toString(), country.toString());
+    } else if (language != null) {
+      locale = Locale.of(language.toString());
+    } else {
+      locale = Locale.US;
+    }
+    String sentences = str.toString();
+    BreakIterator sentenceInstance = BreakIterator.getSentenceInstance(locale);
+    sentenceInstance.setText(sentences);
+
+    int sentenceIndex = 0;
+    List<GenericArrayData> res = new ArrayList<>();
+    while (sentenceInstance.next() != BreakIterator.DONE) {
+      String sentence = sentences.substring(sentenceIndex, sentenceInstance.current());
+      sentenceIndex = sentenceInstance.current();
+      BreakIterator wordInstance = BreakIterator.getWordInstance(locale);
+      wordInstance.setText(sentence);
+      int wordIndex = 0;
+      List<UTF8String> words = new ArrayList<>();
+      while (wordInstance.next() != BreakIterator.DONE) {
+        String word = sentence.substring(wordIndex, wordInstance.current());
+        wordIndex = wordInstance.current();
+        if (Character.isLetterOrDigit(word.charAt(0))) {
+          words.add(UTF8String.fromString(word));
+        }
+      }
+      res.add(new GenericArrayData(words.toArray(new UTF8String[0])));
+    }
+    return new GenericArrayData(res.toArray(new GenericArrayData[0]));
+  }
+
+  public static UTF8String randStr(XORShiftRandom rng, int length) {
+    byte[] bytes = new byte[length];
+    for (int i = 0; i < bytes.length; i++) {
+      // We generate a random number between 0 and 61, inclusive. Between the 62 different choices
+      // we choose 0-9, a-z, or A-Z, where each category comprises 10 choices, 26 choices, or 26
+      // choices, respectively (10 + 26 + 26 = 62).
+      int v = Math.abs(rng.nextInt() % 62);
+      if (v < 10) {
+        bytes[i] = (byte)('0' + v);
+      } else if (v < 36) {
+        bytes[i] = (byte)('a' + (v - 10));
+      } else {
+        bytes[i] = (byte)('A' + (v - 36));
+      }
+    }
+    return UTF8String.fromBytes(bytes);
+  }
+
+  public static UTF8String quote(UTF8String str) {
+    final String qtChar = "'";
+    final String qtCharRep = "\\\\'";
+
+    String sp = str.toString().replaceAll(qtChar, qtCharRep);
+    return UTF8String.fromString(qtChar + sp + qtChar);
+  }
+
+  /**
+   * Inverse hyperbolic sine for the {@code asinh} expression, using the fdlibm
+   * {@code s_asinh.c} algorithm (odd function, so the sign of {@code x} is
+   * preserved). Shared by the eval and codegen paths so the generated Java is a
+   * single call rather than an inline five-branch if/else.
+   */
+  public static double asinh(double x) {
+    double ax = Math.abs(x);
+    double w;
+    if (Double.isInfinite(ax) || Double.isNaN(ax)) {
+      w = ax;
+    } else if (ax < 1.0 / (1 << 28)) {
+      w = ax;
+    } else if (ax > (1 << 28)) {
+      w = StrictMath.log(ax) + StrictMath.log(2.0);
+    } else if (ax > 2.0) {
+      w = StrictMath.log(2.0 * ax + 1.0 / (Math.sqrt(x * x + 1.0) + ax));
+    } else {
+      double t = x * x;
+      w = StrictMath.log1p(ax + t / (1.0 + Math.sqrt(1.0 + t)));
+    }
+    return Math.copySign(w, x);
+  }
+
+  /**
+   * Inverse hyperbolic cosine for the {@code acosh} expression, using the
+   * fdlibm {@code e_acosh.c} algorithm (returns {@code NaN} for {@code x < 1}).
+   * Shared by the eval and codegen paths so the generated Java is a single call
+   * rather than an inline five-branch if/else.
+   */
+  public static double acosh(double x) {
+    if (x < 1.0) {
+      return Double.NaN;
+    } else if (x >= (1 << 28)) {
+      return StrictMath.log(x) + StrictMath.log(2.0);
+    } else if (x == 1.0) {
+      return 0.0;
+    } else if (x > 2.0) {
+      return StrictMath.log(2.0 * x - 1.0 / (x + Math.sqrt(x * x - 1.0)));
+    } else {
+      double t = x - 1.0;
+      return StrictMath.log1p(t + Math.sqrt(2.0 * t + t * t));
+    }
+  }
+
+  /**
+   * Returns the single-character string for the {@code chr} expression: the
+   * ASCII/Latin-1 character for {@code longVal & 0xFF}. A negative argument
+   * yields the empty string. Shared by the eval and codegen paths so the
+   * generated Java is a single call rather than an inline if/else chain.
+   */
+  public static UTF8String chr(long longVal) {
+    if (longVal < 0) {
+      return UTF8String.EMPTY_UTF8;
+    } else if ((longVal & 0xFF) == 0) {
+      return UTF8String.fromString(String.valueOf(Character.MIN_VALUE));
+    } else {
+      char c = (char) (longVal & 0xFF);
+      return UTF8String.fromString(String.valueOf(c));
+    }
+  }
+
+  /**
+   * Compiles {@code regex} with the given {@code flags} for the regexp expression
+   * family, translating a {@link PatternSyntaxException} into the user-facing
+   * INVALID_PARAMETER_VALUE.PATTERN error. Shared by the regexp eval and codegen
+   * paths so the generated Java is a single call instead of an inline try/catch
+   * around {@code Pattern.compile}.
+   */
+  public static Pattern compileRegexPattern(String regex, int flags, String funcName) {
+    try {
+      return Pattern.compile(regex, flags);
+    } catch (PatternSyntaxException e) {
+      throw QueryExecutionErrors.invalidPatternError(funcName, e.getPattern(), e);
+    }
+  }
+
+  /**
+   * Computes the CRC32 checksum of {@code bytes} for the {@code crc32} expression.
+   * Shared by the eval and codegen paths so the per-stage generated Java is a
+   * single call rather than an inline allocate / update / getValue sequence.
+   */
+  public static long crc32(byte[] bytes) {
+    CRC32 checksum = new CRC32();
+    checksum.update(bytes, 0, bytes.length);
+    return checksum.getValue();
+  }
+
+  /**
+   * Returns the numeric value of the first character of the input string, or 0 if it is empty.
+   * Shared by the Ascii expression's eval and codegen paths so the generated Java is a single
+   * call rather than an inline substring/if-else block.
+   */
+  public static int ascii(UTF8String str) {
+    // only pick the first character to reduce the `toString` cost
+    UTF8String firstCharStr = str.substring(0, 1);
+    if (firstCharStr.numChars() > 0) {
+      return firstCharStr.toString().codePointAt(0);
+    } else {
+      return 0;
+    }
+  }
+
+  /**
+   * Builds the number pattern for the given scale (the default grouping pattern followed by
+   * {@code scale} decimal places) and applies it to the given {@link DecimalFormat}. Shared by the
+   * FormatNumber expression's eval and codegen paths so the generated Java is a single call and
+   * the pattern buffer does not need to be threaded through mutable state.
+   */
+  public static void applyNumberFormatScale(
+      DecimalFormat numberFormat, String defaultFormat, int scale) {
+    StringBuilder pattern = new StringBuilder(defaultFormat);
+    if (scale > 0) {
+      pattern.append('.');
+      for (int i = 0; i < scale; i++) {
+        pattern.append('0');
+      }
+    }
+    numberFormat.applyLocalizedPattern(pattern.toString());
+  }
+
+  /**
+   * Returns the Jaro-Winkler similarity between two strings.
+   * The result is a double between 0 and 1, where 1 means identical.
+   *
+   * Note: This implementation uses String.charAt() which operates on UTF-16 code units.
+   * Strings containing supplementary characters (surrogate pairs) may produce
+   * inaccurate results.
+   */
+  public static double jaroWinklerSimilarity(UTF8String left, UTF8String right) {
+    String s1 = left.toString();
+    String s2 = right.toString();
+
+    int len1 = s1.length();
+    int len2 = s2.length();
+
+    if (len1 == 0 && len2 == 0) return 1.0;
+    if (len1 == 0 || len2 == 0) return 0.0;
+
+    int matchWindow = Math.max(0, Math.max(len1, len2) / 2 - 1);
+
+    boolean[] s1Matched = new boolean[len1];
+    boolean[] s2Matched = new boolean[len2];
+
+    int matches = 0;
+    int transpositions = 0;
+
+    for (int i = 0; i < len1; i++) {
+      int start = Math.max(0, i - matchWindow);
+      int end = Math.min(i + matchWindow + 1, len2);
+      for (int j = start; j < end; j++) {
+        if (s2Matched[j] || s1.charAt(i) != s2.charAt(j)) continue;
+        s1Matched[i] = true;
+        s2Matched[j] = true;
+        matches++;
+        break;
+      }
+    }
+
+    if (matches == 0) return 0.0;
+
+    int k = 0;
+    for (int i = 0; i < len1; i++) {
+      if (!s1Matched[i]) continue;
+      while (!s2Matched[k]) k++;
+      if (s1.charAt(i) != s2.charAt(k)) transpositions++;
+      k++;
+    }
+
+    double jaro = ((double) matches / len1
+        + (double) matches / len2
+        + (double) (matches - transpositions / 2.0) / matches) / 3.0;
+
+    int prefix = 0;
+    for (int i = 0; i < Math.min(4, Math.min(len1, len2)); i++) {
+      if (s1.charAt(i) == s2.charAt(i)) prefix++;
+      else break;
+    }
+
+    return jaro + prefix * 0.1 * (1.0 - jaro);
+  }
+}

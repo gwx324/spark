@@ -1,0 +1,1451 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql
+
+import java.sql.{Date, Timestamp}
+import java.time.{LocalDateTime, LocalTime}
+
+import org.apache.datasketches.frequencies.ItemsSketch
+
+import org.apache.spark.{SparkArithmeticException, SparkRuntimeException}
+import org.apache.spark.sql.catalyst.ExtendedAnalysisException
+import org.apache.spark.sql.catalyst.expressions.aggregate.{ApproxTopK, ApproxTopKAggregateBuffer,
+  CombineInternal}
+import org.apache.spark.sql.errors.DataTypeErrors.toSQLType
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.test.SharedSparkSession
+import org.apache.spark.sql.types.{BooleanType, ByteType, DataType, DateType, DecimalType, DoubleType, FloatType, IntegerType, LongType, ShortType, StringType, TimestampNTZType, TimestampType, TimeType}
+
+
+class ApproxTopKSuite extends SharedSparkSession {
+
+  val itemsWithTopK: Seq[(String, Seq[Row])] = Seq(
+    ("0, 0, 1, 1, 2, 3, 4, 4",
+      Seq(Row(0, 2), Row(4, 2), Row(1, 2), Row(2, 1), Row(3, 1))), // Int
+    ("'a', 'b', 'c', 'c', 'c', 'c', 'd', 'd'",
+      Seq(Row("c", 4), Row("d", 2), Row("a", 1), Row("b", 1))), // String
+    ("(true), (true), (false), (true), (true), (false), (false)",
+      Seq(Row(true, 4), Row(false, 3))), // Boolean
+    ("cast(0 AS BYTE), cast(0 AS BYTE), cast(0 AS BYTE), cast(0 AS BYTE), " +
+      "cast(1 AS BYTE), cast(1 AS BYTE), cast(1 AS BYTE), cast(2 AS BYTE)",
+      Seq(Row(0, 4), Row(1, 3), Row(2, 1))), // Byte
+    ("cast(0 AS SHORT), cast(0 AS SHORT), cast(0 AS SHORT), cast(0 AS SHORT), " +
+      "cast(1 AS SHORT), cast(1 AS SHORT), cast(1 AS SHORT), cast(2 AS SHORT)",
+      Seq(Row(0, 4), Row(1, 3), Row(2, 1))), // Short
+    ("cast(0 AS LONG), cast(0 AS LONG), cast(0 AS LONG), cast(0 AS LONG), " +
+      "cast(1 AS LONG), cast(1 AS LONG), cast(1 AS LONG), cast(2 AS LONG)",
+      Seq(Row(0, 4), Row(1, 3), Row(2, 1))), // Long
+    ("cast(0.0 AS FLOAT), cast(0.0 AS FLOAT), cast(0.0 AS FLOAT), cast(0.0 AS FLOAT), " +
+      "cast(1.0 AS FLOAT), cast(1.0 AS FLOAT), cast(1.0 AS FLOAT), cast(2.0 AS FLOAT)",
+      Seq(Row(0.0, 4), Row(1.0, 3), Row(2.0, 1))), // Float
+    ("cast(0.0 AS DOUBLE), cast(0.0 AS DOUBLE), cast(0.0 AS DOUBLE), cast(0.0 AS DOUBLE), " +
+      "cast(1.0 AS DOUBLE), cast(1.0 AS DOUBLE), cast(1.0 AS DOUBLE), cast(2.0 AS DOUBLE)",
+      Seq(Row(0.0, 4), Row(1.0, 3), Row(2.0, 1))), // Double
+    ("DATE'2025-01-01', DATE'2025-01-01', DATE'2025-01-01', DATE'2025-01-01', " +
+      "DATE'2025-01-02', DATE'2025-01-02', DATE'2025-01-02', DATE'2025-01-03'",
+      Seq(Row(Date.valueOf("2025-01-01"), 4), Row(Date.valueOf("2025-01-02"), 3),
+        Row(Date.valueOf("2025-01-03"), 1))), // Date
+    ("TIMESTAMP'2025-01-01 00:00:00', TIMESTAMP'2025-01-01 00:00:00', " +
+      "TIMESTAMP'2025-01-01 00:00:00', TIMESTAMP'2025-01-02 00:00:00'",
+      Seq(Row(Timestamp.valueOf("2025-01-01 00:00:00"), 3),
+        Row(Timestamp.valueOf("2025-01-02 00:00:00"), 1))), // Timestamp
+    ("TIMESTAMP_NTZ'2025-01-01 00:00:00', TIMESTAMP_NTZ'2025-01-01 00:00:00', " +
+      "TIMESTAMP_NTZ'2025-01-01 00:00:00', TIMESTAMP_NTZ'2025-01-02 00:00:00'",
+      Seq(Row(LocalDateTime.of(2025, 1, 1, 0, 0), 3),
+        Row(LocalDateTime.of(2025, 1, 2, 0, 0), 1))), // Timestamp_ntz
+    ("TIME'00:00:00', TIME'00:00:00', TIME'06:00:00', TIME'06:00:00', TIME'06:00:00', " +
+      "TIME'08:30:00.123456', TIME'10:00:00', TIME'10:00:00', TIME'11:00:00'",
+      Seq(Row(LocalTime.of(6, 0, 0), 3), Row(LocalTime.of(0, 0, 0), 2),
+        Row(LocalTime.of(10, 0, 0), 2), Row(LocalTime.of(11, 0, 0), 1),
+        Row(LocalTime.of(8, 30, 0, 123456000), 1))), // Time
+    ("CAST(0.0 AS DECIMAL(4, 1)), CAST(0.0 AS DECIMAL(4, 1)), " +
+      "CAST(0.0 AS DECIMAL(4, 1)), CAST(1.0 AS DECIMAL(4, 1)), " +
+      "CAST(1.0 AS DECIMAL(4, 1)), CAST(2.0 AS DECIMAL(4, 1))",
+      Seq(Row(new java.math.BigDecimal("0.0"), 3),
+        Row(new java.math.BigDecimal("1.0"), 2),
+        Row(new java.math.BigDecimal("2.0"), 1))), // Decimal(4, 1)
+    ("CAST(0.0 AS DECIMAL(10, 2)), CAST(0.0 AS DECIMAL(10, 2)), " +
+      "CAST(0.0 AS DECIMAL(10, 2)), CAST(1.0 AS DECIMAL(10, 2)), " +
+      "CAST(1.0 AS DECIMAL(10, 2)), CAST(2.0 AS DECIMAL(10, 2))",
+      Seq(Row(new java.math.BigDecimal("0.00"), 3),
+        Row(new java.math.BigDecimal("1.00"), 2),
+        Row(new java.math.BigDecimal("2.00"), 1))), // Decimal(10, 2)
+    ("CAST(0.0 AS DECIMAL(20, 3)), CAST(0.0 AS DECIMAL(20, 3)), " +
+      "CAST(0.0 AS DECIMAL(20, 3)), CAST(1.0 AS DECIMAL(20, 3)), " +
+      "CAST(1.0 AS DECIMAL(20, 3)), CAST(2.0 AS DECIMAL(20, 3))",
+      Seq(Row(new java.math.BigDecimal("0.000"), 3),
+        Row(new java.math.BigDecimal("1.000"), 2),
+        Row(new java.math.BigDecimal("2.000"), 1))), // Decimal(20, 3)
+    ("(0.0), (0.0), (0.0), (0.0), (1.0), (1.0), (1.0), (2.0)",
+      Seq(Row(new java.math.BigDecimal("0.0"), 4),
+        Row(new java.math.BigDecimal("1.0"), 3),
+        Row(new java.math.BigDecimal("2.0"), 1))) // Decimal default
+  )
+
+  /////////////////////////////////
+  // approx_top_k tests
+  /////////////////////////////////
+
+  test("SPARK-52515: test of 1 parameter") {
+    val res = sql(
+      "SELECT approx_top_k(expr) FROM VALUES (0), (0), (1), (1), (2), (3), (4), (4) AS tab(expr);"
+    )
+    checkAnswer(res, Row(Seq(Row(0, 2), Row(4, 2), Row(1, 2), Row(2, 1), Row(3, 1))))
+  }
+
+  test("SPARK-52515: test of 2 parameter") {
+    val res = sql(
+      "SELECT approx_top_k(expr, 2) " +
+        "FROM VALUES 'a', 'b', 'c', 'c', 'c', 'c', 'd', 'd' AS tab(expr);")
+    checkAnswer(res, Row(Seq(Row("c", 4), Row("d", 2))))
+  }
+
+  test("SPARK-52515: test of 3 parameter") {
+    val res = sql(
+      "SELECT approx_top_k(expr, 10, 100) FROM VALUES (0), (1), (1), (2), (2), (2) AS tab(expr);"
+    )
+    checkAnswer(res, Row(Seq(Row(2, 3), Row(1, 2), Row(0, 1))))
+  }
+
+  gridTest("SPARK-52515: test of different types")(itemsWithTopK) {
+    case (input, expected) =>
+      val res = sql(s"SELECT approx_top_k(expr) FROM VALUES $input AS tab(expr);")
+      checkAnswer(res, Row(expected))
+  }
+
+  test("SPARK-52515: invalid k value null") {
+    checkError(
+      exception = intercept[SparkRuntimeException] {
+        sql("SELECT approx_top_k(expr, NULL) FROM VALUES (0), (1), (2) AS tab(expr);").collect()
+      },
+      condition = "APPROX_TOP_K_NULL_ARG",
+      parameters = Map("argName" -> "`k`")
+    )
+  }
+
+  test("SPARK-52515: invalid k value < 1") {
+    checkError(
+      exception = intercept[SparkRuntimeException] {
+        sql("SELECT approx_top_k(expr, 0) FROM VALUES (0), (1), (2) AS tab(expr);").collect()
+      },
+      condition = "APPROX_TOP_K_NON_POSITIVE_ARG",
+      parameters = Map("argName" -> "`k`", "argValue" -> "0")
+    )
+  }
+
+  test("SPARK-52515: invalid k value > Int.MaxValue") {
+    withSQLConf("spark.sql.ansi.enabled" -> true.toString) {
+      val k: Long = Int.MaxValue + 1L
+      checkError(
+        exception = intercept[SparkArithmeticException] {
+          sql(s"SELECT approx_top_k(expr, $k) FROM VALUES (0), (1), (2) AS tab(expr);").collect()
+        },
+        condition = "CAST_OVERFLOW",
+        parameters = Map(
+          "value" -> (k.toString + "L"),
+          "sourceType" -> "\"BIGINT\"",
+          "targetType" -> "\"INT\"",
+          "ansiConfig" -> "\"spark.sql.ansi.enabled\""
+        )
+      )
+    }
+  }
+
+  test("SPARK-52515: invalid maxItemsTracked value null") {
+    checkError(
+      exception = intercept[SparkRuntimeException] {
+        sql("SELECT approx_top_k(expr, 5, NULL) FROM VALUES (0), (1), (2) AS tab(expr);").collect()
+      },
+      condition = "APPROX_TOP_K_NULL_ARG",
+      parameters = Map("argName" -> "`maxItemsTracked`")
+    )
+  }
+
+  test("SPARK-52515: invalid maxItemsTracked value < 1") {
+    checkError(
+      exception = intercept[SparkRuntimeException] {
+        sql("SELECT approx_top_k(expr, 5, 0) FROM VALUES (0), (1), (2) AS tab(expr);").collect()
+      },
+      condition = "APPROX_TOP_K_NON_POSITIVE_ARG",
+      parameters = Map("argName" -> "`maxItemsTracked`", "argValue" -> "0")
+    )
+  }
+
+  test("SPARK-52515: invalid maxItemsTracked > 1000000") {
+    checkError(
+      exception = intercept[SparkRuntimeException] {
+        sql("SELECT approx_top_k(expr, 10, 1000001) FROM VALUES (0), (1) AS tab(expr);").collect()
+      },
+      condition = "APPROX_TOP_K_MAX_ITEMS_TRACKED_EXCEEDS_LIMIT",
+      parameters = Map("maxItemsTracked" -> "1000001", "limit" -> "1000000")
+    )
+  }
+
+  test("SPARK-52515: invalid maxItemsTracked < k") {
+    checkError(
+      exception = intercept[SparkRuntimeException] {
+        sql("SELECT approx_top_k(expr, 10, 5) FROM VALUES (0), (1), (2) AS tab(expr);").collect()
+      },
+      condition = "APPROX_TOP_K_MAX_ITEMS_TRACKED_LESS_THAN_K",
+      parameters = Map("maxItemsTracked" -> "5", "k" -> "10")
+    )
+  }
+
+  test("SPARK-53947: count NULL values") {
+    val res = sql(
+      "SELECT approx_top_k(expr, 2)" +
+        "FROM VALUES 'a', 'a', 'b', 'b', 'b', NULL, NULL, NULL, NULL AS tab(expr);")
+    checkAnswer(res, Row(Seq(Row(null, 4), Row("b", 3))))
+  }
+
+  test("SPARK-53947: null is not in top k") {
+    val res = sql(
+      "SELECT approx_top_k(expr, 2) FROM VALUES 'a', 'a', 'b', 'b', 'b', NULL AS tab(expr)"
+    )
+    checkAnswer(res, Row(Seq(Row("b", 3), Row("a", 2))))
+  }
+
+  test("SPARK-53947: null is the last in top k") {
+    val res = sql(
+      "SELECT approx_top_k(expr, 3) FROM VALUES 0, 0, 1, 1, 1, NULL AS tab(expr)"
+    )
+    checkAnswer(res, Row(Seq(Row(1, 3), Row(0, 2), Row(null, 1))))
+  }
+
+  test("SPARK-53947: null + frequent items < k") {
+    val res = sql(
+      """SELECT approx_top_k(expr, 5)
+        |FROM VALUES cast(0.0 AS DECIMAL(4, 1)), cast(0.0 AS DECIMAL(4, 1)),
+        |cast(0.1 AS DECIMAL(4, 1)), cast(0.1 AS DECIMAL(4, 1)), cast(0.1 AS DECIMAL(4, 1)),
+        |NULL AS tab(expr)""".stripMargin)
+    checkAnswer(
+      res,
+      Row(Seq(Row(new java.math.BigDecimal("0.1"), 3),
+        Row(new java.math.BigDecimal("0.0"), 2),
+        Row(null, 1))))
+  }
+
+  test("SPARK-53947: work on typed column with only NULL values") {
+    val res = sql(
+      "SELECT approx_top_k(expr) FROM VALUES cast(NULL AS INT), cast(NULL AS INT) AS tab(expr)"
+    )
+    checkAnswer(res, Row(Seq(Row(null, 2))))
+  }
+
+  test("SPARK-53947: invalid item void columns") {
+    checkError(
+      exception = intercept[ExtendedAnalysisException] {
+        sql("SELECT approx_top_k(expr) FROM VALUES (NULL), (NULL), (NULL) AS tab(expr)")
+      },
+      condition = "DATATYPE_MISMATCH.TYPE_CHECK_FAILURE_WITH_HINT",
+      parameters = Map(
+        "sqlExpr" -> "\"approx_top_k(expr, 5, 10000)\"",
+        "msg" -> "void columns are not supported",
+        "hint" -> ""
+      ),
+      queryContext = Array(ExpectedContext("approx_top_k(expr)", 7, 24))
+    )
+  }
+
+  /////////////////////////////////
+  // approx_top_k_accumulate and
+  // approx_top_k_estimate tests
+  /////////////////////////////////
+
+  test("SPARK-52588: accumulate and estimate of Integer with default parameters") {
+    val res = sql("SELECT approx_top_k_estimate(approx_top_k_accumulate(expr)) " +
+      "FROM VALUES (0), (0), (0), (1), (1), (2), (3), (4) AS tab(expr);")
+    checkAnswer(res, Row(Seq(Row(0, 3), Row(1, 2), Row(4, 1), Row(2, 1), Row(3, 1))))
+  }
+
+  test("SPARK-52588: accumulate and estimate of String") {
+    val res = sql("SELECT approx_top_k_estimate(approx_top_k_accumulate(expr), 2) " +
+      "FROM VALUES 'a', 'b', 'c', 'c', 'c', 'c', 'd', 'd' AS tab(expr);")
+    checkAnswer(res, Row(Seq(Row("c", 4), Row("d", 2))))
+  }
+
+  Seq("UTF8_LCASE", "UNICODE_CI").foreach { collation =>
+    test(s"SPARK-58069: approx_top_k returns an actual value, not the collation key ($collation)") {
+      val res = sql(
+        s"""SELECT approx_top_k(c, 2)
+           |FROM (SELECT CAST(col AS STRING COLLATE $collation) AS c
+           |      FROM VALUES ('HELLO'), ('HELLO'), ('HELLO'), ('world') AS t(col))
+           |""".stripMargin)
+      checkAnswer(res, Row(Seq(Row("HELLO", 3), Row("world", 1))))
+    }
+
+    test("SPARK-58069: approx_top_k_accumulate/estimate returns an actual value, " +
+      s"not the collation key ($collation)") {
+      val res = sql(
+        s"""SELECT approx_top_k_estimate(approx_top_k_accumulate(c), 2)
+           |FROM (SELECT CAST(col AS STRING COLLATE $collation) AS c
+           |      FROM VALUES ('HELLO'), ('HELLO'), ('HELLO'), ('world') AS t(col))
+           |""".stripMargin)
+      checkAnswer(res, Row(Seq(Row("HELLO", 3), Row("world", 1))))
+    }
+
+    test("SPARK-58069: approx_top_k_combine merges collation-equal values across sketches " +
+      s"and a shuffle ($collation)") {
+      withSQLConf("spark.sql.shuffle.partitions" -> "2") {
+        val sketches = sql(
+          s"""SELECT approx_top_k_accumulate(CAST(col AS STRING COLLATE $collation)) AS sketch
+             |  FROM VALUES ('HELLO'), ('HELLO') AS t(col)
+             |UNION ALL
+             |SELECT approx_top_k_accumulate(CAST(col AS STRING COLLATE $collation)) AS sketch
+             |  FROM VALUES ('hello'), ('WORLD') AS t(col)
+             |""".stripMargin).repartition(2)
+        sketches.createOrReplaceTempView("approx_top_k_sketches")
+        val res = sql(
+          "SELECT approx_top_k_estimate(approx_top_k_combine(sketch, 100), 2) " +
+            "FROM approx_top_k_sketches")
+        val items = res.collect()(0).getSeq[Row](0)
+          .map(r => (r.getString(0).toLowerCase(java.util.Locale.ROOT), r.getLong(1))).toSet
+        assert(items === Set(("hello", 3L), ("world", 1L)))
+      }
+    }
+  }
+
+  // scalastyle:off nonascii
+  test("SPARK-58096: approx_top_k keys on raw sort-key bytes, not a lossy-decoded String, " +
+    "so ICU-collation-distinct non-ASCII values are not over-merged") {
+    // U+4E14, U+4E15 and U+4E16 are distinct under UNICODE_CI, but their ICU sort keys are
+    // arbitrary bytes that decode to the same String via a lossy UTF-8 conversion. Keying the
+    // sketch on that decoded String would collapse them into a single item with an inflated
+    // count; keying on the raw sort-key bytes keeps them separate.
+    val res = sql(
+      """SELECT approx_top_k(c, 3)
+         |FROM (SELECT CAST(col AS STRING COLLATE UNICODE_CI) AS c
+         |      FROM VALUES ('且'), ('且'), ('且'),
+         |                  ('丕'), ('丕'), ('世') AS t(col))
+         |""".stripMargin)
+    checkAnswer(res, Row(Seq(Row("且", 3), Row("丕", 2), Row("世", 1))))
+  }
+
+  test("SPARK-58096: approx_top_k_accumulate/estimate keeps ICU-collation-distinct " +
+    "non-ASCII values separate through the serde round-trip") {
+    val res = sql(
+      """SELECT approx_top_k_estimate(approx_top_k_accumulate(c), 3)
+         |FROM (SELECT CAST(col AS STRING COLLATE UNICODE_CI) AS c
+         |      FROM VALUES ('且'), ('且'), ('且'),
+         |                  ('丕'), ('丕'), ('世') AS t(col))
+         |""".stripMargin)
+    checkAnswer(res, Row(Seq(Row("且", 3), Row("丕", 2), Row("世", 1))))
+  }
+
+  test("SPARK-58096: approx_top_k_combine keeps ICU-collation-distinct non-ASCII values " +
+    "separate across sketches and a shuffle") {
+    withSQLConf(SQLConf.SHUFFLE_PARTITIONS.key -> "2") {
+      val sketches = sql(
+        """SELECT approx_top_k_accumulate(CAST(col AS STRING COLLATE UNICODE_CI)) AS sketch
+           |  FROM VALUES ('且'), ('且'), ('且'), ('丕') AS t(col)
+           |UNION ALL
+           |SELECT approx_top_k_accumulate(CAST(col AS STRING COLLATE UNICODE_CI)) AS sketch
+           |  FROM VALUES ('丕'), ('世') AS t(col)
+           |""".stripMargin).repartition(2)
+      sketches.createOrReplaceTempView("approx_top_k_sketches")
+      val res = sql(
+        "SELECT approx_top_k_estimate(approx_top_k_combine(sketch, 100), 3) " +
+          "FROM approx_top_k_sketches")
+      checkAnswer(res, Row(Seq(Row("且", 3), Row("丕", 2), Row("世", 1))))
+    }
+  }
+  // scalastyle:on nonascii
+
+  test("SPARK-52588: accumulate and estimate of Decimal(4, 1)") {
+    val res = sql("SELECT approx_top_k_estimate(approx_top_k_accumulate(expr, 10)) " +
+      "FROM VALUES CAST(0.0 AS DECIMAL(4, 1)), CAST(0.0 AS DECIMAL(4, 1)), " +
+      "CAST(0.0 AS DECIMAL(4, 1)), CAST(1.0 AS DECIMAL(4, 1)), " +
+      "CAST(1.0 AS DECIMAL(4, 1)), CAST(2.0 AS DECIMAL(4, 1)) AS tab(expr);")
+    checkAnswer(res, Row(Seq(
+      Row(new java.math.BigDecimal("0.0"), 3),
+      Row(new java.math.BigDecimal("1.0"), 2),
+      Row(new java.math.BigDecimal("2.0"), 1))))
+  }
+
+  test("SPARK-52588: accumulate and estimate of Decimal(20, 3)") {
+    val res = sql("SELECT approx_top_k_estimate(approx_top_k_accumulate(expr, 10), 2) " +
+      "FROM VALUES CAST(0.0 AS DECIMAL(20, 3)), CAST(0.0 AS DECIMAL(20, 3)), " +
+      "CAST(0.0 AS DECIMAL(20, 3)), CAST(1.0 AS DECIMAL(20, 3)), " +
+      "CAST(1.0 AS DECIMAL(20, 3)), CAST(2.0 AS DECIMAL(20, 3)) AS tab(expr);")
+    checkAnswer(res, Row(Seq(
+      Row(new java.math.BigDecimal("0.000"), 3),
+      Row(new java.math.BigDecimal("1.000"), 2))))
+  }
+
+  gridTest("SPARK-52588: accumulate and estimate of different types")(itemsWithTopK) {
+    case (input, expected) =>
+      val res = sql(s"SELECT approx_top_k_estimate(approx_top_k_accumulate(expr)) " +
+        s"FROM VALUES $input AS tab(expr);")
+      checkAnswer(res, Row(expected))
+  }
+
+  test("SPARK-52588: invalid accumulate if maxItemsTracked is null") {
+    checkError(
+      exception = intercept[SparkRuntimeException] {
+        sql("SELECT approx_top_k_accumulate(expr, NULL) FROM VALUES 0, 1, 2 AS tab(expr);")
+          .collect()
+      },
+      condition = "APPROX_TOP_K_NULL_ARG",
+      parameters = Map("argName" -> "`maxItemsTracked`")
+    )
+  }
+
+  test("SPARK-52588: invalid accumulate if maxItemsTracked < 1") {
+    checkError(
+      exception = intercept[SparkRuntimeException] {
+        sql("SELECT approx_top_k_accumulate(expr, 0) FROM VALUES 0, 1, 2 AS tab(expr);")
+          .collect()
+      },
+      condition = "APPROX_TOP_K_NON_POSITIVE_ARG",
+      parameters = Map("argName" -> "`maxItemsTracked`", "argValue" -> "0")
+    )
+  }
+
+  test("SPARK-52588: invalid accumulate if maxItemsTracked > 1000000") {
+    checkError(
+      exception = intercept[SparkRuntimeException] {
+        sql("SELECT approx_top_k_accumulate(expr, 1000001) FROM VALUES (0) AS tab(expr);").collect()
+      },
+      condition = "APPROX_TOP_K_MAX_ITEMS_TRACKED_EXCEEDS_LIMIT",
+      parameters = Map("maxItemsTracked" -> "1000001", "limit" -> "1000000")
+    )
+  }
+
+  test("SPARK-52588: invalid estimate if k is null") {
+    checkError(
+      exception = intercept[SparkRuntimeException] {
+        sql("SELECT approx_top_k_estimate(approx_top_k_accumulate(expr), NULL) " +
+          "FROM VALUES 0, 1, 2 AS tab(expr);").collect()
+      },
+      condition = "APPROX_TOP_K_NULL_ARG",
+      parameters = Map("argName" -> "`k`")
+    )
+  }
+
+  test("SPARK-52588: invalid estimate if k < 1") {
+    checkError(
+      exception = intercept[SparkRuntimeException] {
+        sql("SELECT approx_top_k_estimate(approx_top_k_accumulate(expr), 0) " +
+          "FROM VALUES 0, 1, 2 AS tab(expr);").collect()
+      },
+      condition = "APPROX_TOP_K_NON_POSITIVE_ARG",
+      parameters = Map("argName" -> "`k`", "argValue" -> "0")
+    )
+  }
+
+  test("SPARK-52588: invalid estimate if k > Int.MaxValue") {
+    withSQLConf("spark.sql.ansi.enabled" -> true.toString) {
+      val k: Long = Int.MaxValue + 1L
+      checkError(
+        exception = intercept[SparkArithmeticException] {
+          sql(s"SELECT approx_top_k_estimate(approx_top_k_accumulate(expr), $k) " +
+            "FROM VALUES 0, 1, 2 AS tab(expr);").collect()
+        },
+        condition = "CAST_OVERFLOW",
+        parameters = Map(
+          "value" -> (k.toString + "L"),
+          "sourceType" -> "\"BIGINT\"",
+          "targetType" -> "\"INT\"",
+          "ansiConfig" -> "\"spark.sql.ansi.enabled\""
+        )
+      )
+    }
+  }
+
+  test("SPARK-52588: invalid estimate if k > maxItemsTracked") {
+    checkError(
+      exception = intercept[SparkRuntimeException] {
+        sql("SELECT approx_top_k_estimate(approx_top_k_accumulate(expr, 5), 10) " +
+          "FROM VALUES 0, 1, 2 AS tab(expr);").collect()
+      },
+      condition = "APPROX_TOP_K_MAX_ITEMS_TRACKED_LESS_THAN_K",
+      parameters = Map("maxItemsTracked" -> "5", "k" -> "10")
+    )
+  }
+
+  test("SPARK-53960: accumulate and estimate count NULL values") {
+    val res = sql(
+      """SELECT approx_top_k_estimate(approx_top_k_accumulate(expr), 2)
+        |FROM VALUES 'a', 'a', 'b', 'b', 'b', NULL, NULL, NULL, NULL AS tab(expr)""".stripMargin)
+    checkAnswer(res, Row(Seq(Row(null, 4), Row("b", 3))))
+  }
+
+  test("SPARK-53960: accumulate and estimate null is not in top k") {
+    val res = sql(
+      """SELECT approx_top_k_estimate(approx_top_k_accumulate(expr), 2)
+        |FROM VALUES 'a', 'a', 'b', 'b', 'b', NULL AS tab(expr)""".stripMargin)
+    checkAnswer(res, Row(Seq(Row("b", 3), Row("a", 2))))
+  }
+
+  test("SPARK-53960: accumulate and estimate null is the last in top k") {
+    val res = sql(
+      """SELECT approx_top_k_estimate(approx_top_k_accumulate(expr), 3)
+        |FROM VALUES 0, 0, 1, 1, 1, NULL AS tab(expr)""".stripMargin)
+    checkAnswer(res, Row(Seq(Row(1, 3), Row(0, 2), Row(null, 1))))
+  }
+
+  test("SPARK-53960: accumulate and estimate null + frequent items < k") {
+    val res = sql(
+      """SELECT approx_top_k_estimate(approx_top_k_accumulate(expr), 5)
+        |FROM VALUES cast(0.0 AS DECIMAL(4, 1)), cast(0.0 AS DECIMAL(4, 1)),
+        |cast(0.1 AS DECIMAL(4, 1)), cast(0.1 AS DECIMAL(4, 1)), cast(0.1 AS DECIMAL(4, 1)),
+        |NULL AS tab(expr)""".stripMargin)
+    checkAnswer(
+      res,
+      Row(Seq(Row(new java.math.BigDecimal("0.1"), 3),
+        Row(new java.math.BigDecimal("0.0"), 2),
+        Row(null, 1))))
+  }
+
+  test("SPARK-53960: accumulate and estimate work on typed column with only NULL values") {
+    val res = sql(
+      """SELECT approx_top_k_estimate(approx_top_k_accumulate(expr))
+        |FROM VALUES cast(NULL AS INT), cast(NULL AS INT) AS tab(expr)""".stripMargin)
+    checkAnswer(res, Row(Seq(Row(null, 2))))
+  }
+
+  test("SPARK-53960: accumulate a column of all nulls with type - success") {
+    withView("accumulation") {
+      val res = sql(
+        """SELECT approx_top_k_accumulate(expr) AS acc
+          |FROM VALUES cast(NULL AS INT), cast(NULL AS INT) AS tab(expr)""".stripMargin)
+
+      assert(res.collect().length == 1)
+      res.createOrReplaceTempView("accumulation")
+      val est = sql("SELECT approx_top_k_estimate(acc) FROM accumulation;")
+      checkAnswer(est, Row(Seq(Row(null, 2))))
+
+    }
+  }
+
+  test("SPARK-53960: accumulate a column of all nulls without type - fail") {
+    checkError(
+      exception = intercept[ExtendedAnalysisException] {
+        sql("""SELECT approx_top_k_accumulate(expr)
+            |FROM VALUES (NULL), (NULL), (NULL), (NULL) AS tab(expr)""".stripMargin)
+      },
+      condition = "DATATYPE_MISMATCH.TYPE_CHECK_FAILURE_WITH_HINT",
+      parameters = Map(
+        "sqlExpr" -> "\"approx_top_k_accumulate(expr, 10000)\"",
+        "msg" -> "void columns are not supported",
+        "hint" -> ""
+      ),
+      queryContext = Array(ExpectedContext("approx_top_k_accumulate(expr)", 7, 35))
+    )
+  }
+
+
+  private val nullSketchState =
+    """CAST(NULL AS STRUCT<sketch: BINARY, maxItemsTracked: INT,
+      |  itemDataType: INT, itemDataTypeDDL: STRING>)""".stripMargin
+
+  test("SPARK-59818: estimate of a foldable NULL state returns NULL") {
+    checkAnswer(sql(s"SELECT approx_top_k_estimate($nullSketchState, 5)"), Row(null))
+  }
+
+  test("SPARK-59818: estimate of a non-foldable NULL state returns NULL") {
+    withTempView("estimate_null_state") {
+      sql(
+        s"""SELECT approx_top_k_accumulate(expr) AS state
+           |FROM VALUES 0, 1, 1 AS tab(expr)
+           |UNION ALL
+           |SELECT $nullSketchState AS state""".stripMargin)
+        .createOrReplaceTempView("estimate_null_state")
+      val res = sql("SELECT approx_top_k_estimate(state, 2) FROM estimate_null_state")
+      checkAnswer(res, Seq(Row(Seq(Row(1, 2), Row(0, 1))), Row(null)))
+    }
+  }
+
+  test("SPARK-59818: estimate nullability follows the nullability of its state") {
+    withTempView("estimate_nullable_state") {
+      sql(s"SELECT $nullSketchState AS state")
+        .createOrReplaceTempView("estimate_nullable_state")
+      val nullableRes =
+        sql("SELECT approx_top_k_estimate(state, 2) FROM estimate_nullable_state")
+      assert(nullableRes.schema.fields.head.nullable)
+    }
+    // The common case: a sketch produced by approx_top_k_accumulate is non-nullable, so the
+    // estimate over it must stay non-nullable.
+    val nonNullableRes = sql(
+      """SELECT approx_top_k_estimate(approx_top_k_accumulate(expr), 2)
+        |FROM VALUES 0, 1, 1 AS tab(expr)""".stripMargin)
+    assert(!nonNullableRes.schema.fields.head.nullable)
+  }
+
+  test("SPARK-59818: estimate rejects a non-positive k even for a NULL state") {
+    Seq(0, -1).foreach { invalidK =>
+      checkError(
+        exception = intercept[SparkRuntimeException] {
+          sql(s"SELECT approx_top_k_estimate($nullSketchState, $invalidK)").collect()
+        },
+        condition = "APPROX_TOP_K_NON_POSITIVE_ARG",
+        parameters = Map("argName" -> "`k`", "argValue" -> invalidK.toString)
+      )
+    }
+    // Every row carries a NULL state, so no other row can raise the error on its own: the
+    // assertion holds only if the row-evaluated NULL state itself validates `k`.
+    withTempView("estimate_invalid_k") {
+      spark.range(2).selectExpr(s"$nullSketchState AS state")
+        .createOrReplaceTempView("estimate_invalid_k")
+      checkError(
+        exception = intercept[SparkRuntimeException] {
+          sql("SELECT approx_top_k_estimate(state, 0) FROM estimate_invalid_k").collect()
+        },
+        condition = "APPROX_TOP_K_NON_POSITIVE_ARG",
+        parameters = Map("argName" -> "`k`", "argValue" -> "0")
+      )
+    }
+  }
+
+  /////////////////////////////////
+  // approx_top_k_combine
+  /////////////////////////////////
+
+  def setupMixedSizeAccumulations(size1: Int, size2: Int): Unit = {
+    sql(s"SELECT approx_top_k_accumulate(expr, $size1) as acc " +
+      "FROM VALUES (0), (0), (0), (1), (1), (2), (2), (3) AS tab(expr);")
+      .createOrReplaceTempView("accumulation1")
+
+    sql(s"SELECT approx_top_k_accumulate(expr, $size2) as acc " +
+      "FROM VALUES (1), (1), (2), (2), (3), (3), (4), (4) AS tab(expr);")
+      .createOrReplaceTempView("accumulation2")
+
+    sql("SELECT acc from accumulation1 UNION ALL SELECT acc FROM accumulation2")
+      .createOrReplaceTempView("unioned")
+  }
+
+  def setupMixedTypeAccumulation(seq1: Seq[Any], seq2: Seq[Any]): Unit = {
+    sql(s"SELECT approx_top_k_accumulate(expr, 10) as acc " +
+      s"FROM VALUES ${seq1.mkString(", ")} AS tab(expr);")
+      .createOrReplaceTempView("accumulation1")
+
+    sql(s"SELECT approx_top_k_accumulate(expr, 10) as acc " +
+      s"FROM VALUES ${seq2.mkString(", ")} AS tab(expr);")
+      .createOrReplaceTempView("accumulation2")
+
+    sql("SELECT acc from accumulation1 UNION ALL SELECT acc FROM accumulation2")
+      .createOrReplaceTempView("unioned")
+  }
+
+  val mixedNumberTypes: Seq[(DataType, String, Seq[Any])] = Seq(
+    (IntegerType, "INT",
+      Seq(0, 0, 0, 1, 1, 2, 2, 3)),
+    (ByteType, "TINYINT",
+      Seq("cast(0 AS BYTE)", "cast(0 AS BYTE)", "cast(1 AS BYTE)")),
+    (ShortType, "SMALLINT",
+      Seq("cast(0 AS SHORT)", "cast(0 AS SHORT)", "cast(1 AS SHORT)")),
+    (LongType, "BIGINT",
+      Seq("cast(0 AS LONG)", "cast(0 AS LONG)", "cast(1 AS LONG)")),
+    (FloatType, "FLOAT",
+      Seq("cast(0 AS FLOAT)", "cast(0 AS FLOAT)", "cast(1 AS FLOAT)")),
+    (DoubleType, "DOUBLE",
+      Seq("cast(0 AS DOUBLE)", "cast(0 AS DOUBLE)", "cast(1 AS DOUBLE)")),
+    (DecimalType(4, 2), "DECIMAL(4,2)",
+      Seq("cast(0 AS DECIMAL(4, 2))", "cast(0 AS DECIMAL(4, 2))", "cast(1 AS DECIMAL(4, 2))")),
+    (DecimalType(10, 2), "DECIMAL(10,2)",
+      Seq("cast(0 AS DECIMAL(10, 2))", "cast(0 AS DECIMAL(10, 2))", "cast(1 AS DECIMAL(10, 2))")),
+    (DecimalType(20, 3), "DECIMAL(20,3)",
+      Seq("cast(0 AS DECIMAL(20, 3))", "cast(0 AS DECIMAL(20, 3))", "cast(1 AS DECIMAL(20, 3))"))
+  )
+
+  val mixedDateTimeTypes: Seq[(DataType, String, Seq[String])] = Seq(
+    (DateType, "DATE",
+      Seq("DATE'2025-01-01'", "DATE'2025-01-01'", "DATE'2025-01-02'")),
+    (TimestampType, "TIMESTAMP",
+      Seq("TIMESTAMP'2025-01-01 00:00:00'", "TIMESTAMP'2025-01-01 00:00:00'")),
+    (TimestampNTZType, "TIMESTAMP_NTZ",
+      Seq("TIMESTAMP_NTZ'2025-01-01 00:00:00'", "TIMESTAMP_NTZ'2025-01-01 00:00:00'")
+    )
+  )
+
+  // TIME has no common type with DATE/TIMESTAMP/TIMESTAMP_NTZ (unlike those three, which all
+  // mutually widen and so only fail at approx_top_k_combine runtime, not at UNION analysis), so
+  // it cannot join mixedDateTimeTypes: "among different ... types - fail at combine" below
+  // asserts every pair in that Seq unions successfully and only fails at the runtime combine.
+  // The two TIME entries below (different precisions) do widen against each other at UNION
+  // (findWiderDateTimeType(TimeType(p1), TimeType(p2)) = TimeType(max(p1, p2))), mirroring
+  // mixedDateTimeTypes's own internal widening -- see
+  // "SPARK-57848: among different time precisions - fail at combine" below.
+  val mixedTimeTypes: Seq[(DataType, String, Seq[String])] = Seq(
+    (TimeType(), "TIME(6)",
+      Seq("TIME'12:00:00'", "TIME'12:00:00'", "TIME'13:00:00'")),
+    (TimeType(3), "TIME(3)",
+      Seq("CAST('12:00:00.123' AS TIME(3))", "CAST('12:00:00.123' AS TIME(3))",
+        "CAST('13:00:00.123' AS TIME(3))"))
+  )
+
+  test("SPARK-58069: serialize an empty approx_top_k_combine buffer") {
+    Seq(100, ApproxTopK.VOID_MAX_ITEMS_TRACKED).foreach { maxItemsTracked =>
+      val buffer = new CombineInternal[Any](
+        new ApproxTopKAggregateBuffer[Any](new ItemsSketch[Any](128), 0L),
+        null,
+        maxItemsTracked)
+
+      val restored = CombineInternal.deserialize(buffer.serialize())
+
+      assert(restored.getItemDataType == null)
+      assert(restored.getMaxItemsTracked == maxItemsTracked)
+      assert(restored.getSketchWithNullCount.sketch.isEmpty)
+      assert(restored.serialize().sameElements(buffer.serialize()))
+    }
+  }
+
+  test("SPARK-58069: merge an empty approx_top_k_combine buffer") {
+    val initializedBuffer = new CombineInternal[Any](
+      new ApproxTopKAggregateBuffer[Any](new ItemsSketch[Any](128), 0L),
+      StringType,
+      100)
+    initializedBuffer.updateMaxItemsTracked(
+      combineSizeSpecified = false, ApproxTopK.VOID_MAX_ITEMS_TRACKED)
+    assert(initializedBuffer.getMaxItemsTracked == 100)
+  }
+
+  test("SPARK-58069: combine sketches with empty shuffle partitions") {
+    val sketches = sql(
+      "SELECT approx_top_k_accumulate(id) AS sketch FROM range(10) GROUP BY id")
+      .repartition(20)
+    val combined = sketches.selectExpr("approx_top_k_combine(sketch) AS sketch")
+
+    checkAnswer(
+      combined.selectExpr("inline(approx_top_k_estimate(sketch, 10))"),
+      (0L until 10L).map(Row(_, 1L)))
+  }
+
+  // positive tests for approx_top_k_combine on every types
+  gridTest("SPARK-52798: same type, same size, specified combine size - success")(itemsWithTopK) {
+    case (input, expected) =>
+      withView("accumulation1", "accumulation2", "combines") {
+        sql(s"SELECT approx_top_k_accumulate(expr) AS acc FROM VALUES $input AS tab(expr);")
+          .createOrReplaceTempView("accumulation1")
+        sql(s"SELECT approx_top_k_accumulate(expr) AS acc FROM VALUES $input AS tab(expr);")
+          .createOrReplaceTempView("accumulation2")
+        sql("SELECT approx_top_k_combine(acc, 30) as com " +
+          "FROM (SELECT acc from accumulation1 UNION ALL SELECT acc FROM accumulation2);")
+          .createOrReplaceTempView("combined")
+        val est = sql("SELECT approx_top_k_estimate(com) FROM combined;")
+        // expected should be doubled because we combine two identical sketches
+        val expectedDoubled = expected.map {
+          case Row(value: Any, count: Int) => Row(value, count * 2)
+        }
+        checkAnswer(est, Row(expectedDoubled))
+      }
+  }
+
+  test("SPARK-52798: same type, same size, specified combine size - success") {
+    withView("accumulation1", "accumulation2", "unioned", "combined") {
+      setupMixedSizeAccumulations(10, 10)
+
+      sql("SELECT approx_top_k_combine(acc, 30) as com FROM unioned")
+        .createOrReplaceTempView("combined")
+
+      val est = sql("SELECT approx_top_k_estimate(com) FROM combined;")
+      checkAnswer(est, Row(Seq(Row(2, 4), Row(1, 4), Row(0, 3), Row(3, 3), Row(4, 2))))
+    }
+  }
+
+  test("SPARK-52798: same type, same size, unspecified combine size - success") {
+    withView("accumulation1", "accumulation2", "unioned", "combined") {
+      setupMixedSizeAccumulations(10, 10)
+
+      sql("SELECT approx_top_k_combine(acc) as com FROM unioned")
+        .createOrReplaceTempView("combined")
+
+      val est = sql("SELECT approx_top_k_estimate(com) FROM combined;")
+      checkAnswer(est, Row(Seq(Row(2, 4), Row(1, 4), Row(0, 3), Row(3, 3), Row(4, 2))))
+    }
+  }
+
+  test("SPARK-52798: same type, different size, specified combine size - success") {
+    withView("accumulation1", "accumulation2", "unioned", "combined") {
+      setupMixedSizeAccumulations(10, 20)
+
+      sql("SELECT approx_top_k_combine(acc, 30) as com FROM unioned")
+        .createOrReplaceTempView("combined")
+
+      val est = sql("SELECT approx_top_k_estimate(com) FROM combined;")
+      checkAnswer(est, Row(Seq(Row(2, 4), Row(1, 4), Row(0, 3), Row(3, 3), Row(4, 2))))
+    }
+  }
+
+  test("SPARK-58095: approx_top_k_combine on empty input returns an empty sketch") {
+    // The inner aggregate produces a single sketch row, which WHERE false filters out, so
+    // approx_top_k_combine sees zero input rows. It must return a single empty sketch that
+    // estimates to an empty top-k result, instead of failing the query with a MatchError,
+    // whether or not the combine size is specified. When the size is specified, the empty
+    // result carries that size; when it is unspecified, the empty buffer never learns a size
+    // from input and eval falls back to DEFAULT_MAX_ITEMS_TRACKED (10000).
+    Seq(("approx_top_k_combine(sketch, 5)", 5), ("approx_top_k_combine(sketch)", 10000))
+      .foreach { case (combine, expectedMaxItemsTracked) =>
+        withView("combined") {
+          sql(
+            s"SELECT $combine AS com " +
+              "FROM (SELECT approx_top_k_accumulate(expr) AS sketch " +
+              "      FROM VALUES (1), (2) AS t(expr)) " +
+              "WHERE false")
+            .createOrReplaceTempView("combined")
+          checkAnswer(sql("SELECT approx_top_k_estimate(com) FROM combined"), Row(Seq.empty))
+          checkAnswer(
+            sql("SELECT com.maxItemsTracked FROM combined"), Row(expectedMaxItemsTracked))
+        }
+      }
+  }
+
+  test("SPARK-58095: approx_top_k_combine over mixed empty and non-empty partitions") {
+    Seq("approx_top_k_combine(sketch, 5)", "approx_top_k_combine(sketch)").foreach { combine =>
+      withView("combined") {
+        sql(
+          s"SELECT $combine AS com " +
+            "FROM (SELECT /*+ REPARTITION(4) */ sketch " +
+            "      FROM (SELECT approx_top_k_accumulate(expr) AS sketch " +
+            "            FROM VALUES (1), (1), (2) AS t(expr)))")
+          .createOrReplaceTempView("combined")
+        checkAnswer(
+          sql("SELECT approx_top_k_estimate(com) FROM combined"),
+          Row(Seq(Row(1, 2), Row(2, 1))))
+      }
+    }
+  }
+
+  test("SPARK-52798: same type, different size, unspecified combine size - fail") {
+    withView("accumulation1", "accumulation2", "unioned") {
+      setupMixedSizeAccumulations(10, 20)
+
+      val comb = sql("SELECT approx_top_k_combine(acc) as com FROM unioned")
+
+      checkError(
+        exception = intercept[SparkRuntimeException] {
+          comb.collect()
+        },
+        condition = "APPROX_TOP_K_SKETCH_SIZE_NOT_MATCH",
+        parameters = Map("size1" -> "10", "size2" -> "20")
+      )
+    }
+  }
+
+  gridTest("SPARK-52798: invalid combine size - fail")(Seq((10, 10), (10, 20))) {
+    case (size1, size2) =>
+      withView("accumulation1", "accumulation2", "unioned") {
+        setupMixedSizeAccumulations(size1, size2)
+        checkError(
+          exception = intercept[SparkRuntimeException] {
+            sql("SELECT approx_top_k_combine(acc, 0) as com FROM unioned").collect()
+          },
+          condition = "APPROX_TOP_K_NON_POSITIVE_ARG",
+          parameters = Map("argName" -> "`maxItemsTracked`", "argValue" -> "0")
+        )
+      }
+  }
+
+  test("SPARK-52798: among different number or datetime types - fail at combine") {
+    def checkMixedTypeError(mixedTypeSeq: Seq[(DataType, String, Seq[Any])]): Unit = {
+      for (i <- 0 until mixedTypeSeq.size - 1) {
+        for (j <- i + 1 until mixedTypeSeq.size) {
+          val (type1, _, seq1) = mixedTypeSeq(i)
+          val (type2, _, seq2) = mixedTypeSeq(j)
+          setupMixedTypeAccumulation(seq1, seq2)
+          withView("accumulation1", "accumulation2", "unioned") {
+            checkError(
+              exception = intercept[SparkRuntimeException] {
+                sql("SELECT approx_top_k_combine(acc, 30) as com FROM unioned;").collect()
+              },
+              condition = "APPROX_TOP_K_SKETCH_TYPE_NOT_MATCH",
+              parameters = Map("type1" -> toSQLType(type1), "type2" -> toSQLType(type2))
+            )
+          }
+        }
+      }
+    }
+
+    checkMixedTypeError(mixedNumberTypes)
+    checkMixedTypeError(mixedDateTimeTypes)
+  }
+
+  // TIME counterpart to the test above: TIME(3) and TIME(6) widen to TIME(6) at UNION via
+  // findWiderDateTimeType, so the UNION succeeds, but the two sketches still carry their
+  // original, different itemDataType (time(3) vs time(6)), so combine fails at runtime.
+  test("SPARK-57848: among different time precisions - fail at combine") {
+    for (i <- 0 until mixedTimeTypes.size - 1) {
+      for (j <- i + 1 until mixedTimeTypes.size) {
+        val (type1, _, seq1) = mixedTimeTypes(i)
+        val (type2, _, seq2) = mixedTimeTypes(j)
+        withView("accumulation1", "accumulation2", "unioned") {
+          setupMixedTypeAccumulation(seq1, seq2)
+          checkError(
+            exception = intercept[SparkRuntimeException] {
+              sql("SELECT approx_top_k_combine(acc, 30) as com FROM unioned;").collect()
+            },
+            condition = "APPROX_TOP_K_SKETCH_TYPE_NOT_MATCH",
+            parameters = Map("type1" -> toSQLType(type1), "type2" -> toSQLType(type2))
+          )
+        }
+      }
+    }
+  }
+
+  test("SPARK-58164: estimate over combine of a coercion-widened sketch (INT -> BIGINT)") {
+    val res = sql(
+      """SELECT approx_top_k_estimate(approx_top_k_combine(sketch, 5))
+        |FROM (SELECT approx_top_k_accumulate(c) AS sketch, 'int' AS tag
+        |        FROM VALUES (1), (1), (2) AS t(c)
+        |      UNION ALL
+        |      SELECT approx_top_k_accumulate(c) AS sketch, 'long' AS tag
+        |        FROM VALUES (CAST(9 AS BIGINT)) AS t(c))
+        |WHERE tag = 'int'""".stripMargin)
+    checkAnswer(res, Row(Seq(Row(1L, 2L), Row(2L, 1L))))
+  }
+
+  test("SPARK-58164: estimate over a coercion-widened accumulate sketch (INT -> BIGINT)") {
+    val res = sql(
+      """SELECT approx_top_k_estimate(sketch, 5)
+        |FROM (SELECT approx_top_k_accumulate(c) AS sketch, 'int' AS tag
+        |        FROM VALUES (1), (1), (2) AS t(c)
+        |      UNION ALL
+        |      SELECT approx_top_k_accumulate(c) AS sketch, 'long' AS tag
+        |        FROM VALUES (CAST(9 AS BIGINT)) AS t(c))
+        |WHERE tag = 'int'""".stripMargin)
+    checkAnswer(res, Row(Seq(Row(1L, 2L), Row(2L, 1L))))
+  }
+
+  test("SPARK-58164: estimate over combine of a coercion-widened sketch across SerDe " +
+    "families (INT -> DOUBLE)") {
+    val res = sql(
+      """SELECT approx_top_k_estimate(approx_top_k_combine(sketch, 5))
+        |FROM (SELECT approx_top_k_accumulate(c) AS sketch, 'int' AS tag
+        |        FROM VALUES (1), (1), (2) AS t(c)
+        |      UNION ALL
+        |      SELECT approx_top_k_accumulate(c) AS sketch, 'double' AS tag
+        |        FROM VALUES (CAST(9 AS DOUBLE)) AS t(c))
+        |WHERE tag = 'int'""".stripMargin)
+    checkAnswer(res, Row(Seq(Row(1.0d, 2L), Row(2.0d, 1L))))
+  }
+
+  test("SPARK-58164: estimate over combine of a coercion-widened sketch within a SerDe " +
+    "family (TINYINT -> INT)") {
+    val res = sql(
+      """SELECT approx_top_k_estimate(approx_top_k_combine(sketch, 5))
+        |FROM (SELECT approx_top_k_accumulate(c) AS sketch, 'byte' AS tag
+        |        FROM VALUES (CAST(1 AS BYTE)), (CAST(1 AS BYTE)), (CAST(2 AS BYTE)) AS t(c)
+        |      UNION ALL
+        |      SELECT approx_top_k_accumulate(c) AS sketch, 'int' AS tag
+        |        FROM VALUES (9) AS t(c))
+        |WHERE tag = 'byte'""".stripMargin)
+    checkAnswer(res, Row(Seq(Row(1, 2L), Row(2, 1L))))
+  }
+
+  test("SPARK-58164: estimate widens each row independently across a coerced union") {
+    val res = sql(
+      """SELECT approx_top_k_estimate(sketch, 5)
+        |FROM (SELECT approx_top_k_accumulate(c) AS sketch
+        |        FROM VALUES (1), (1), (2) AS t(c)
+        |      UNION ALL
+        |      SELECT approx_top_k_accumulate(c) AS sketch
+        |        FROM VALUES (CAST(9 AS BIGINT)), (CAST(9 AS BIGINT)) AS t(c))""".stripMargin)
+    checkAnswer(res, Seq(
+      Row(Seq(Row(1L, 2L), Row(2L, 1L))),
+      Row(Seq(Row(9L, 2L)))))
+  }
+
+  // enumerate all combinations of number and datetime types
+  gridTest("SPARK-52798: number vs datetime - fail on UNION")(
+    for {
+      (type1, typeName1, seq1) <- mixedNumberTypes
+      (type2, typeName2, seq2) <- mixedDateTimeTypes
+    } yield ((type1, typeName1, seq1), (type2, typeName2, seq2))) {
+    case ((_, type1, seq1), (_, type2, seq2)) =>
+      checkError(
+        exception = intercept[ExtendedAnalysisException] {
+          withView("accumulation1", "accumulation2", "unioned") {
+            setupMixedTypeAccumulation(seq1, seq2)
+          }
+        },
+        condition = "INCOMPATIBLE_COLUMN_TYPE",
+        parameters = Map(
+          "tableOrdinalNumber" -> "second",
+          "columnOrdinalNumber" -> "first",
+          "dataType2" -> ("\"STRUCT<sketch: BINARY NOT NULL, maxItemsTracked: INT NOT NULL, " +
+            "itemDataType: " + type1 + ", itemDataTypeDDL: STRING NOT NULL>\""),
+          "operator" -> "UNION",
+          "hint" -> "",
+          "dataType1" -> ("\"STRUCT<sketch: BINARY NOT NULL, maxItemsTracked: INT NOT NULL, " +
+            "itemDataType: " + type2 + ", itemDataTypeDDL: STRING NOT NULL>\"")
+        ),
+        queryContext = Array(
+          ExpectedContext(
+            "SELECT acc from accumulation1 UNION ALL SELECT acc FROM accumulation2", 0, 68))
+      )
+  }
+
+  gridTest("SPARK-52798: number vs string - fail at combine")(mixedNumberTypes) {
+    case (type1, _, seq1) =>
+      withView("accumulation1", "accumulation2", "unioned") {
+        setupMixedTypeAccumulation(
+          seq1, Seq("'a'", "'b'", "'c'", "'c'", "'c'", "'c'", "'d'", "'d'"))
+        checkError(
+          exception = intercept[SparkRuntimeException] {
+            sql("SELECT approx_top_k_combine(acc, 30) as com FROM unioned;").collect()
+          },
+          condition = "APPROX_TOP_K_SKETCH_TYPE_NOT_MATCH",
+          parameters = Map("type1" -> toSQLType(type1), "type2" -> toSQLType(StringType))
+        )
+      }
+  }
+
+  gridTest("SPARK-52798: number vs boolean - fail at UNION")(mixedNumberTypes) {
+    case (_, type1, seq1) =>
+      val seq2 = Seq("(true)", "(true)", "(false)", "(false)")
+      checkError(
+        exception = intercept[ExtendedAnalysisException] {
+          withView("accumulation1", "accumulation2", "unioned") {
+            setupMixedTypeAccumulation(seq1, seq2)
+          }
+        },
+        condition = "INCOMPATIBLE_COLUMN_TYPE",
+        parameters = Map(
+          "tableOrdinalNumber" -> "second",
+          "columnOrdinalNumber" -> "first",
+          "dataType2" -> ("\"STRUCT<sketch: BINARY NOT NULL, maxItemsTracked: INT NOT NULL, " +
+            "itemDataType: " + type1 + ", itemDataTypeDDL: STRING NOT NULL>\""),
+          "operator" -> "UNION",
+          "hint" -> "",
+          "dataType1" -> ("\"STRUCT<sketch: BINARY NOT NULL, maxItemsTracked: INT NOT NULL, " +
+            "itemDataType: BOOLEAN, itemDataTypeDDL: STRING NOT NULL>\"")
+        ),
+        queryContext = Array(
+          ExpectedContext(
+            "SELECT acc from accumulation1 UNION ALL SELECT acc FROM accumulation2", 0, 68))
+      )
+  }
+
+  gridTest("SPARK-52798: datetime vs string - fail at combine")(mixedDateTimeTypes) {
+    case (type1, _, seq1) =>
+      withView("accumulation1", "accumulation2", "unioned") {
+        setupMixedTypeAccumulation(
+          seq1, Seq("'a'", "'b'", "'c'", "'c'", "'c'", "'c'", "'d'", "'d'"))
+        checkError(
+          exception = intercept[SparkRuntimeException] {
+            sql("SELECT approx_top_k_combine(acc, 30) as com FROM unioned;").collect()
+          },
+          condition = "APPROX_TOP_K_SKETCH_TYPE_NOT_MATCH",
+          parameters = Map("type1" -> toSQLType(type1), "type2" -> toSQLType(StringType))
+        )
+      }
+  }
+
+  gridTest("SPARK-52798: datetime vs boolean - fail at UNION")(mixedDateTimeTypes) {
+    case (_, type1, seq1) =>
+      val seq2 = Seq("(true)", "(true)", "(false)", "(false)")
+      checkError(
+        exception = intercept[ExtendedAnalysisException] {
+          withView("accumulation1", "accumulation2", "unioned") {
+            setupMixedTypeAccumulation(seq1, seq2)
+          }
+        },
+        condition = "INCOMPATIBLE_COLUMN_TYPE",
+        parameters = Map(
+          "tableOrdinalNumber" -> "second",
+          "columnOrdinalNumber" -> "first",
+          "dataType2" -> ("\"STRUCT<sketch: BINARY NOT NULL, maxItemsTracked: INT NOT NULL, " +
+            "itemDataType: " + type1 + ", itemDataTypeDDL: STRING NOT NULL>\""),
+          "operator" -> "UNION",
+          "hint" -> "",
+          "dataType1" -> ("\"STRUCT<sketch: BINARY NOT NULL, maxItemsTracked: INT NOT NULL, " +
+            "itemDataType: BOOLEAN, itemDataTypeDDL: STRING NOT NULL>\"")
+        ),
+        queryContext = Array(
+          ExpectedContext(
+            "SELECT acc from accumulation1 UNION ALL SELECT acc FROM accumulation2", 0, 68))
+      )
+  }
+
+  // TIME has no common type with DATE/TIMESTAMP/TIMESTAMP_NTZ, so mixing it with any of them
+  // fails at UNION analysis, unlike combining two of those three which fails at combine runtime.
+  gridTest("SPARK-57848: time vs datetime - fail on UNION")(
+    for {
+      (type1, typeName1, seq1) <- mixedTimeTypes
+      (type2, typeName2, seq2) <- mixedDateTimeTypes
+    } yield ((type1, typeName1, seq1), (type2, typeName2, seq2))) {
+    case ((_, type1, seq1), (_, type2, seq2)) =>
+      checkError(
+        exception = intercept[ExtendedAnalysisException] {
+          withView("accumulation1", "accumulation2", "unioned") {
+            setupMixedTypeAccumulation(seq1, seq2)
+          }
+        },
+        condition = "INCOMPATIBLE_COLUMN_TYPE",
+        parameters = Map(
+          "tableOrdinalNumber" -> "second",
+          "columnOrdinalNumber" -> "first",
+          "dataType2" -> ("\"STRUCT<sketch: BINARY NOT NULL, maxItemsTracked: INT NOT NULL, " +
+            "itemDataType: " + type1 + ", itemDataTypeDDL: STRING NOT NULL>\""),
+          "operator" -> "UNION",
+          "hint" -> "",
+          "dataType1" -> ("\"STRUCT<sketch: BINARY NOT NULL, maxItemsTracked: INT NOT NULL, " +
+            "itemDataType: " + type2 + ", itemDataTypeDDL: STRING NOT NULL>\"")
+        ),
+        queryContext = Array(
+          ExpectedContext(
+            "SELECT acc from accumulation1 UNION ALL SELECT acc FROM accumulation2", 0, 68))
+      )
+  }
+
+  // TIME has no common type with any number type either, so it fails at UNION, same as
+  // number vs datetime above.
+  gridTest("SPARK-57848: time vs number - fail on UNION")(
+    for {
+      (type1, typeName1, seq1) <- mixedTimeTypes
+      (type2, typeName2, seq2) <- mixedNumberTypes
+    } yield ((type1, typeName1, seq1), (type2, typeName2, seq2))) {
+    case ((_, type1, seq1), (_, type2, seq2)) =>
+      checkError(
+        exception = intercept[ExtendedAnalysisException] {
+          withView("accumulation1", "accumulation2", "unioned") {
+            setupMixedTypeAccumulation(seq1, seq2)
+          }
+        },
+        condition = "INCOMPATIBLE_COLUMN_TYPE",
+        parameters = Map(
+          "tableOrdinalNumber" -> "second",
+          "columnOrdinalNumber" -> "first",
+          "dataType2" -> ("\"STRUCT<sketch: BINARY NOT NULL, maxItemsTracked: INT NOT NULL, " +
+            "itemDataType: " + type1 + ", itemDataTypeDDL: STRING NOT NULL>\""),
+          "operator" -> "UNION",
+          "hint" -> "",
+          "dataType1" -> ("\"STRUCT<sketch: BINARY NOT NULL, maxItemsTracked: INT NOT NULL, " +
+            "itemDataType: " + type2 + ", itemDataTypeDDL: STRING NOT NULL>\"")
+        ),
+        queryContext = Array(
+          ExpectedContext(
+            "SELECT acc from accumulation1 UNION ALL SELECT acc FROM accumulation2", 0, 68))
+      )
+  }
+
+  gridTest("SPARK-57848: time vs string - fail at combine")(mixedTimeTypes) {
+    case (type1, _, seq1) =>
+      withView("accumulation1", "accumulation2", "unioned") {
+        setupMixedTypeAccumulation(
+          seq1, Seq("'a'", "'b'", "'c'", "'c'", "'c'", "'c'", "'d'", "'d'"))
+        checkError(
+          exception = intercept[SparkRuntimeException] {
+            sql("SELECT approx_top_k_combine(acc, 30) as com FROM unioned;").collect()
+          },
+          condition = "APPROX_TOP_K_SKETCH_TYPE_NOT_MATCH",
+          parameters = Map("type1" -> toSQLType(type1), "type2" -> toSQLType(StringType))
+        )
+      }
+  }
+
+  gridTest("SPARK-57848: time vs boolean - fail at UNION")(mixedTimeTypes) {
+    case (_, type1, seq1) =>
+      val seq2 = Seq("(true)", "(true)", "(false)", "(false)")
+      checkError(
+        exception = intercept[ExtendedAnalysisException] {
+          withView("accumulation1", "accumulation2", "unioned") {
+            setupMixedTypeAccumulation(seq1, seq2)
+          }
+        },
+        condition = "INCOMPATIBLE_COLUMN_TYPE",
+        parameters = Map(
+          "tableOrdinalNumber" -> "second",
+          "columnOrdinalNumber" -> "first",
+          "dataType2" -> ("\"STRUCT<sketch: BINARY NOT NULL, maxItemsTracked: INT NOT NULL, " +
+            "itemDataType: " + type1 + ", itemDataTypeDDL: STRING NOT NULL>\""),
+          "operator" -> "UNION",
+          "hint" -> "",
+          "dataType1" -> ("\"STRUCT<sketch: BINARY NOT NULL, maxItemsTracked: INT NOT NULL, " +
+            "itemDataType: BOOLEAN, itemDataTypeDDL: STRING NOT NULL>\"")
+        ),
+        queryContext = Array(
+          ExpectedContext(
+            "SELECT acc from accumulation1 UNION ALL SELECT acc FROM accumulation2", 0, 68))
+      )
+  }
+
+  test("SPARK-57848: approx_top_k over time column") {
+    val res = sql(
+      "SELECT approx_top_k(expr, 10, 100) FROM VALUES (TIME '06:00:00'), (TIME '06:00:00'), " +
+        "(TIME '08:00:00'), (TIME '08:00:00'), (TIME '08:00:00'), (TIME '10:00:00') AS tab(expr);"
+    )
+    checkAnswer(res, Row(Seq(Row(LocalTime.of(8, 0, 0), 3), Row(LocalTime.of(6, 0, 0), 2),
+      Row(LocalTime.of(10, 0, 0), 1))))
+  }
+
+  test("SPARK-52798: string vs boolean - fail at combine") {
+    withSQLConf("spark.sql.ansi.enabled" -> "true") {
+      val seq1 = Seq("'a'", "'b'", "'c'", "'c'", "'c'", "'c'", "'d'", "'d'")
+      val seq2 = Seq("(true)", "(true)", "(false)", "(false)")
+      withView("accumulation1", "accumulation2", "unioned") {
+        setupMixedTypeAccumulation(seq1, seq2)
+        checkError(
+          exception = intercept[SparkRuntimeException] {
+            sql("SELECT approx_top_k_combine(acc, 30) as com FROM unioned;").collect()
+          },
+          condition = "APPROX_TOP_K_SKETCH_TYPE_NOT_MATCH",
+          parameters = Map("type1" -> toSQLType(StringType), "type2" -> toSQLType(BooleanType))
+        )
+      }
+    }
+  }
+
+  test("SPARK-52798: combine more than 2 sketches with specified size") {
+    withView("accumulation1", "accumulation2", "accumulation3", "unioned", "combined") {
+      sql(s"SELECT approx_top_k_accumulate(expr, 10) as acc " +
+        "FROM VALUES (0), (0), (0), (1), (1), (2), (2) AS tab(expr);")
+        .createOrReplaceTempView("accumulation1")
+
+      sql(s"SELECT approx_top_k_accumulate(expr, 10) as acc " +
+        "FROM VALUES (1), (1), (2), (2), (3), (3), (4) AS tab(expr);")
+        .createOrReplaceTempView("accumulation2")
+
+      sql(s"SELECT approx_top_k_accumulate(expr, 20) as acc " +
+        "FROM VALUES (2), (2), (3), (3), (3), (4), (5) AS tab(expr);")
+        .createOrReplaceTempView("accumulation3")
+
+      sql("SELECT acc from accumulation1 UNION ALL " +
+        "SELECT acc FROM accumulation2 UNION ALL " +
+        "SELECT acc FROM accumulation3")
+        .createOrReplaceTempView("unioned")
+
+      sql("SELECT approx_top_k_combine(acc, 30) as com FROM unioned")
+        .createOrReplaceTempView("combined")
+
+      val est = sql("SELECT approx_top_k_estimate(com) FROM combined;")
+      checkAnswer(est, Row(Seq(Row(2, 6), Row(3, 5), Row(1, 4), Row(0, 3), Row(4, 2))))
+    }
+  }
+
+  test("SPARK-52798: combine more than 2 sketches without specified size") {
+    withView("accumulation1", "accumulation2", "accumulation3", "unioned") {
+      sql(s"SELECT approx_top_k_accumulate(expr, 10) as acc " +
+        "FROM VALUES (0), (0), (0), (1), (1), (2), (2) AS tab(expr);")
+        .createOrReplaceTempView("accumulation1")
+
+      sql(s"SELECT approx_top_k_accumulate(expr, 10) as acc " +
+        "FROM VALUES (1), (1), (2), (2), (3), (3), (4) AS tab(expr);")
+        .createOrReplaceTempView("accumulation2")
+
+      sql(s"SELECT approx_top_k_accumulate(expr, 20) as acc " +
+        "FROM VALUES (2), (2), (3), (3), (3), (4), (5) AS tab(expr);")
+        .createOrReplaceTempView("accumulation3")
+
+      sql("SELECT acc from accumulation1 UNION ALL " +
+        "SELECT acc FROM accumulation2 UNION ALL " +
+        "SELECT acc FROM accumulation3")
+        .createOrReplaceTempView("unioned")
+
+      checkError(
+        exception = intercept[SparkRuntimeException] {
+          sql("SELECT approx_top_k_combine(acc) as com FROM unioned").collect()
+        },
+        condition = "APPROX_TOP_K_SKETCH_SIZE_NOT_MATCH",
+        parameters = Map("size1" -> "10", "size2" -> "20")
+      )
+    }
+  }
+
+  test("SPARK-53960: combine and estimate count NULL values") {
+    withView("accumulation1", "accumulation2", "unioned", "combined") {
+      sql(
+        """SELECT approx_top_k_accumulate(expr, 10) as acc
+          |FROM VALUES 'a', 'a', 'b', NULL, NULL AS tab(expr)""".stripMargin)
+        .createOrReplaceTempView("accumulation1")
+
+      sql(
+        """SELECT approx_top_k_accumulate(expr, 10) as acc
+          |FROM VALUES 'b', 'b', NULL, NULL AS tab(expr)""".stripMargin)
+        .createOrReplaceTempView("accumulation2")
+
+      sql("SELECT acc from accumulation1 UNION ALL SELECT acc FROM accumulation2")
+        .createOrReplaceTempView("unioned")
+
+      sql("SELECT approx_top_k_combine(acc, 20) as com FROM unioned")
+        .createOrReplaceTempView("combined")
+
+      val est = sql("SELECT approx_top_k_estimate(com, 2) FROM combined")
+      checkAnswer(est, Row(Seq(Row(null, 4), Row("b", 3))))
+    }
+  }
+
+  test("SPARK-53960: combine with a sketch of all nulls") {
+    withView("accumulation1", "accumulation2", "unioned", "combined") {
+      sql(
+        """SELECT approx_top_k_accumulate(expr, 10) as acc
+          |FROM VALUES cast(NULL AS INT), cast(NULL AS INT), cast(NULL AS INT)
+          |AS tab(expr)""".stripMargin)
+        .createOrReplaceTempView("accumulation1")
+
+      sql(
+        """SELECT approx_top_k_accumulate(expr, 10) as acc
+          |FROM VALUES 1, 1, 2, 2 AS tab(expr)""".stripMargin)
+        .createOrReplaceTempView("accumulation2")
+
+      sql("SELECT acc from accumulation1 UNION ALL SELECT acc FROM accumulation2")
+        .createOrReplaceTempView("unioned")
+
+      sql("SELECT approx_top_k_combine(acc, 20) as com FROM unioned")
+        .createOrReplaceTempView("combined")
+
+      val est = sql("SELECT approx_top_k_estimate(com) FROM combined")
+      checkAnswer(est, Row(Seq(Row(null, 3), Row(2, 2), Row(1, 2))))
+    }
+  }
+
+  test("SPARK-53960: combine sketches with nulls from more than 2 sketches") {
+    withView("accumulation1", "accumulation2", "accumulation3", "unioned", "combined") {
+      sql(
+        """SELECT approx_top_k_accumulate(expr, 10) as acc
+          |FROM VALUES 0, 0, 0, 1, 1, NULL AS tab(expr)""".stripMargin)
+        .createOrReplaceTempView("accumulation1")
+
+      sql(
+        """SELECT approx_top_k_accumulate(expr, 10) as acc
+          |FROM VALUES NULL, 1, 1, 2, 2, NULL AS tab(expr)""".stripMargin)
+        .createOrReplaceTempView("accumulation2")
+
+      sql(
+        """SELECT approx_top_k_accumulate(expr, 10) as acc
+          |FROM VALUES 2, 3, 3, NULL AS tab(expr)""".stripMargin)
+        .createOrReplaceTempView("accumulation3")
+
+      sql(
+        """SELECT acc from accumulation1 UNION ALL
+          |SELECT acc FROM accumulation2 UNION ALL
+          |SELECT acc FROM accumulation3""".stripMargin)
+        .createOrReplaceTempView("unioned")
+
+      sql("SELECT approx_top_k_combine(acc, 30) as com FROM unioned")
+        .createOrReplaceTempView("combined")
+
+      val est = sql("SELECT approx_top_k_estimate(com, 2) FROM combined")
+      checkAnswer(est, Row(Seq(Row(1, 4), Row(null, 4))))
+    }
+  }
+
+  test("SPARK-53960: combine 2 sketches with all nulls") {
+    withView("accumulation1", "accumulation2", "unioned", "combined") {
+      sql(
+        """SELECT approx_top_k_accumulate(expr, 10) as acc
+          |FROM VALUES cast(NULL AS INT), cast(NULL AS INT), cast(NULL AS INT)
+          |AS tab(expr)""".stripMargin)
+        .createOrReplaceTempView("accumulation1")
+
+      sql(
+        """SELECT approx_top_k_accumulate(expr, 10) as acc
+          |FROM VALUES cast(NULL AS INT), cast(NULL AS INT)
+          |AS tab(expr)""".stripMargin)
+        .createOrReplaceTempView("accumulation2")
+
+      sql("SELECT acc from accumulation1 UNION ALL SELECT acc FROM accumulation2")
+        .createOrReplaceTempView("unioned")
+
+      sql("SELECT approx_top_k_combine(acc, 20) as com FROM unioned")
+        .createOrReplaceTempView("combined")
+
+      val est = sql("SELECT approx_top_k_estimate(com) FROM combined")
+      checkAnswer(est, Row(Seq(Row(null, 5))))
+    }
+  }
+
+  test("SPARK-59818: combine over NULL sketches is independent of partition placement") {
+    withTempView("combine_null_partitions") {
+      // Many NULL rows alongside a single real sketch, so that some partial aggregates see
+      // only NULL rows and have to serialize a buffer no update ever populated.
+      sql(
+        """SELECT approx_top_k_accumulate(CAST(expr AS BIGINT)) AS state
+          |FROM VALUES 0, 1, 1 AS tab(expr)""".stripMargin)
+        .union(
+          spark.range(200).selectExpr(
+            """CAST(NULL AS STRUCT<sketch: BINARY, maxItemsTracked: INT,
+              |  itemDataType: BIGINT, itemDataTypeDDL: STRING>) AS state""".stripMargin))
+        .createOrReplaceTempView("combine_null_partitions")
+      Seq("1", "8", "64").foreach { partitions =>
+        withSQLConf(SQLConf.SHUFFLE_PARTITIONS.key -> partitions) {
+          val res = sql(
+            """SELECT approx_top_k_estimate(approx_top_k_combine(state), 2)
+              |FROM combine_null_partitions""".stripMargin)
+          checkAnswer(res, Row(Seq(Row(1L, 2), Row(0L, 1))))
+        }
+      }
+    }
+  }
+
+  test("SPARK-59818: combine of an INT sketch with widened BIGINT NULL states is independent " +
+    "of partition placement") {
+    withTempView("combine_widened_null_partitions") {
+      // The UNION widens the state's item type to BIGINT, while the real sketch still records INT
+      // (SPARK-58164). Partial aggregates that see only NULL rows must stay type-neutral instead
+      // of taking the widened type, which would not match the real sketch at the final merge.
+      sql("SELECT approx_top_k_accumulate(expr) AS state FROM VALUES 0, 1, 1 AS tab(expr)")
+        .union(
+          spark.range(200).selectExpr(
+            """CAST(NULL AS STRUCT<sketch: BINARY, maxItemsTracked: INT,
+              |  itemDataType: BIGINT, itemDataTypeDDL: STRING>) AS state""".stripMargin))
+        .createOrReplaceTempView("combine_widened_null_partitions")
+      Seq("1", "8", "64").foreach { partitions =>
+        withSQLConf(SQLConf.SHUFFLE_PARTITIONS.key -> partitions) {
+          val res = sql(
+            """SELECT approx_top_k_estimate(approx_top_k_combine(state), 2)
+              |FROM combine_widened_null_partitions""".stripMargin)
+          checkAnswer(res, Row(Seq(Row(1L, 2L), Row(0L, 1L))))
+        }
+      }
+    }
+  }
+
+  test("SPARK-59818: combine over only NULL sketches keeps usable state metadata") {
+    withTempView("combine_all_null") {
+      spark.range(4).selectExpr(s"$nullSketchState AS state")
+        .createOrReplaceTempView("combine_all_null")
+      val combined = sql("SELECT approx_top_k_combine(state) AS state FROM combine_all_null")
+      // The combined state must still carry a concrete item type, so that it can be estimated.
+      assert(combined.collect().head.getStruct(0).getString(3) === "item INT NOT NULL")
+      checkAnswer(
+        sql("""SELECT approx_top_k_estimate(approx_top_k_combine(state), 3)
+              |FROM combine_all_null""".stripMargin),
+        Row(Seq.empty))
+    }
+  }
+
+  test("SPARK-59818: combine still rejects sketches of different item types") {
+    withTempView("combine_int", "combine_string") {
+      sql("SELECT approx_top_k_accumulate(expr) AS state FROM VALUES 0, 1 AS tab(expr)")
+        .createOrReplaceTempView("combine_int")
+      sql("SELECT approx_top_k_accumulate(expr) AS state FROM VALUES 'x', 'y' AS tab(expr)")
+        .createOrReplaceTempView("combine_string")
+      intercept[SparkRuntimeException] {
+        sql(
+          """SELECT approx_top_k_combine(state) FROM (
+            |  SELECT state FROM combine_int UNION ALL SELECT state FROM combine_string)"""
+            .stripMargin).collect()
+      }
+    }
+  }
+
+  test("SPARK-59818: combine skips NULL sketches") {
+    withTempView("combine_null_state") {
+      sql(
+        s"""SELECT approx_top_k_accumulate(expr) AS state
+           |FROM VALUES 0, 1, 1 AS tab(expr)
+           |UNION ALL
+           |SELECT $nullSketchState AS state""".stripMargin)
+        .createOrReplaceTempView("combine_null_state")
+      val res = sql(
+        "SELECT approx_top_k_estimate(approx_top_k_combine(state), 2) FROM combine_null_state")
+      checkAnswer(res, Row(Seq(Row(1, 2), Row(0, 1))))
+    }
+  }
+}

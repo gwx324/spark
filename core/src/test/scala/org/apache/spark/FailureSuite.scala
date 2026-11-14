@@ -17,9 +17,11 @@
 
 package org.apache.spark
 
-import java.io.{IOException, NotSerializableException, ObjectInputStream}
+import java.io.{IOException, NotSerializableException, ObjectInputStream, ObjectOutputStream}
 
+import org.apache.spark.internal.config.UNSAFE_EXCEPTION_ON_MEMORY_LEAK
 import org.apache.spark.memory.TestMemoryConsumer
+import org.apache.spark.rdd.RDD
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.util.NonSerializable
 
@@ -30,7 +32,7 @@ object FailureSuiteState {
   var tasksRun = 0
   var tasksFailed = 0
 
-  def clear() {
+  def clear(): Unit = {
     synchronized {
       tasksRun = 0
       tasksFailed = 0
@@ -144,7 +146,7 @@ class FailureSuite extends SparkFunSuite with LocalSparkContext {
   }
 
   test("managed memory leak error should not mask other failures (SPARK-9266") {
-    val conf = new SparkConf().set("spark.unsafe.exceptionOnMemoryLeak", "true")
+    val conf = new SparkConf().set(UNSAFE_EXCEPTION_ON_MEMORY_LEAK, true)
     sc = new SparkContext("local[1,1]", "test", conf)
 
     // If a task leaks memory but fails due to some other cause, then make sure that the original
@@ -257,9 +259,58 @@ class FailureSuite extends SparkFunSuite with LocalSparkContext {
     sc = new SparkContext("local[1,2]", "test")
     intercept[SparkException] {
       sc.parallelize(1 to 2).foreach { i =>
+        // scalastyle:off throwerror
         throw new LinkageError()
+        // scalastyle:on throwerror
       }
     }
+  }
+
+  test("SPARK-61322: task that exceeds the Java array size limit fails with a clear error") {
+    sc = new SparkContext("local[1,1]", "test")
+    // The rows of a parallelized collection are shipped inside the task of their partition.
+    val error = intercept[JavaArraySizeLimitExceeded] {
+      sc.parallelize(Seq(new ArraySizeLimitBomb), 1).count()
+    }
+    checkError(
+      exception = error,
+      condition = "TASK_SERIALIZATION_TOO_LARGE.TASK",
+      sqlState = Some("54000"),
+      parameters = Map("stageId" -> "0", "partitionId" -> "0"))
+    // The OutOfMemoryError is not kept as cause, so the failure is not seen as heap exhaustion.
+    assert(error.getCause === null)
+    assert(error.jvmMessage === ArraySizeLimitBomb.message)
+
+    // The driver survives and keeps running jobs.
+    assert(sc.parallelize(1 to 10, 2).count() === 10)
+  }
+
+  test("SPARK-61322: task binary that exceeds the Java array size limit fails with a clear " +
+    "error") {
+    sc = new SparkContext("local[1,1]", "test")
+    // The RDD is serialized once per stage into the task binary shared by all of its tasks.
+    val error = intercept[JavaArraySizeLimitExceeded] {
+      new ArraySizeLimitBombRDD(sc).count()
+    }
+    checkError(
+      exception = error,
+      condition = "TASK_SERIALIZATION_TOO_LARGE.TASK_BINARY",
+      sqlState = Some("54000"),
+      parameters = Map("stageId" -> "0"))
+    assert(error.getCause === null)
+    assert(error.jvmMessage === ArraySizeLimitBomb.message)
+
+    assert(sc.parallelize(1 to 10, 2).count() === 10)
+  }
+
+  test("SPARK-61322: heap exhaustion during task serialization is not reported as too large") {
+    sc = new SparkContext("local[1,1]", "test")
+    val error = intercept[SparkException] {
+      new ArraySizeLimitBombRDD(sc, "Java heap space").count()
+    }
+    // A SparkException, not JavaArraySizeLimitExceeded, without the too-large error condition.
+    assert(!Option(error.getCondition).exists(_.startsWith("TASK_SERIALIZATION_TOO_LARGE")))
+    assert(error.getCause.isInstanceOf[OutOfMemoryError])
   }
 
   // TODO: Need to add tests with shuffle fetch failures.
@@ -276,4 +327,28 @@ class NonDeserializableUserException extends RuntimeException {
   private def readObject(in: ObjectInputStream): Unit = {
     throw new IOException("Intentional exception during deserialization.")
   }
+}
+
+/** Fails Java serialization the way the JVM does when a byte array cannot grow any further. */
+class ArraySizeLimitBomb(message: String = ArraySizeLimitBomb.message) extends Serializable {
+  private def writeObject(out: ObjectOutputStream): Unit = {
+    // scalastyle:off throwerror
+    throw new OutOfMemoryError(message)
+    // scalastyle:on throwerror
+  }
+}
+
+object ArraySizeLimitBomb {
+  val message = "Required array length 2147483639 + 626 is too large"
+}
+
+/** An RDD whose serialization, and so its stage task binary, fails like [[ArraySizeLimitBomb]]. */
+class ArraySizeLimitBombRDD(sc: SparkContext, message: String = ArraySizeLimitBomb.message)
+  extends RDD[Int](sc, Nil) {
+  private val bomb = new ArraySizeLimitBomb(message)
+
+  override def compute(split: Partition, context: TaskContext): Iterator[Int] = Iterator(1)
+
+  override protected def getPartitions: Array[Partition] =
+    Array(new Partition { override def index: Int = 0 })
 }

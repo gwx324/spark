@@ -17,14 +17,17 @@
 
 package org.apache.spark.sql.catalyst.util
 
+import java.util.Locale
+
 /**
  * Build a map with String type of key, and it also supports either key case
  * sensitive or insensitive.
  */
 object StringKeyHashMap {
-  def apply[T](caseSensitive: Boolean): StringKeyHashMap[T] = caseSensitive match {
-    case false => new StringKeyHashMap[T](_.toLowerCase)
-    case true => new StringKeyHashMap[T](identity)
+  def apply[T](caseSensitive: Boolean): StringKeyHashMap[T] = if (caseSensitive) {
+    new StringKeyHashMap[T](identity)
+  } else {
+    new StringKeyHashMap[T](_.toLowerCase(Locale.ROOT))
   }
 }
 
@@ -40,7 +43,7 @@ class StringKeyHashMap[T](normalizer: (String) => String) {
 
   def remove(key: String): Option[T] = base.remove(normalizer(key))
 
-  def iterator: Iterator[(String, T)] = base.toIterator
+  def iterator: Iterator[(String, T)] = base.iterator
 
   def clear(): Unit = base.clear()
 }

@@ -17,11 +17,14 @@
 
 package org.apache.spark.sql.catalyst.expressions.aggregate
 
-import scala.collection.immutable.HashMap
+import scala.collection.immutable.{HashMap, TreeMap}
+import scala.collection.mutable
 
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.util.GenericArrayData
+import org.apache.spark.sql.catalyst.trees.BinaryLike
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
+import org.apache.spark.sql.catalyst.util.{GenericArrayData, TypeUtils}
 import org.apache.spark.sql.types._
 
 object PivotFirst {
@@ -30,7 +33,7 @@ object PivotFirst {
 
   // Currently UnsafeRow does not support the generic update method (throws
   // UnsupportedOperationException), so we need to explicitly support each DataType.
-  private val updateFunction: PartialFunction[DataType, (MutableRow, Int, Any) => Unit] = {
+  private val updateFunction: PartialFunction[DataType, (InternalRow, Int, Any) => Unit] = {
     case DoubleType =>
       (row, offset, value) => row.setDouble(offset, value.asInstanceOf[Double])
     case IntegerType =>
@@ -73,11 +76,10 @@ case class PivotFirst(
   valueColumn: Expression,
   pivotColumnValues: Seq[Any],
   mutableAggBufferOffset: Int = 0,
-  inputAggBufferOffset: Int = 0) extends ImperativeAggregate {
+  inputAggBufferOffset: Int = 0) extends ImperativeAggregate with BinaryLike[Expression] {
 
-  override val children: Seq[Expression] = pivotColumn :: valueColumn :: Nil
-
-  override lazy val inputTypes: Seq[AbstractDataType] = children.map(_.dataType)
+  override val left: Expression = pivotColumn
+  override val right: Expression = valueColumn
 
   override val nullable: Boolean = false
 
@@ -85,27 +87,57 @@ case class PivotFirst(
 
   override val dataType: DataType = ArrayType(valueDataType)
 
-  val pivotIndex = HashMap(pivotColumnValues.zipWithIndex: _*)
+  private val usesTreeMap: Boolean = !TypeUtils.typeWithProperEquals(pivotColumn.dataType)
 
-  val indexSize = pivotIndex.size
+  private val (pivotIndex, slotOfValue, slotValues) = {
+    val slots = new Array[Int](pivotColumnValues.length)
+    val values = mutable.ArrayBuffer.empty[Any]
+    var index: Map[Any, Int] = if (usesTreeMap) {
+      TreeMap.empty[Any, Int](TypeUtils.getInterpretedOrdering(pivotColumn.dataType))
+    } else {
+      HashMap.empty[Any, Int]
+    }
+    pivotColumnValues.zipWithIndex.foreach { case (value, i) =>
+      index.get(value) match {
+        case Some(existingSlot) =>
+          slots(i) = existingSlot
+        case None =>
+          slots(i) = values.length
+          index = index.updated(value, values.length)
+          values += value
+      }
+    }
+    (index, slots, values.toSeq)
+  }
 
-  private val updateRow: (MutableRow, Int, Any) => Unit = PivotFirst.updateFunction(valueDataType)
+  // Null-safe lookup into pivotIndex. When pivotIndex is a TreeMap, its comparison-based lookup
+  // throws NPE on null keys. Returning -1 for null is safe on the TreeMap path because null can
+  // never be a TreeMap key (insertion would also NPE), so it can never match any pivot value.
+  // Otherwise, pivotIndex is a HashMap that handles null keys safely via hash-based lookup.
+  private def findPivotIndex(key: Any): Int = key match {
+    case null if usesTreeMap => -1
+    case _ => pivotIndex.getOrElse(key, -1)
+  }
 
-  override def update(mutableAggBuffer: MutableRow, inputRow: InternalRow): Unit = {
+  // Values that compare as equal share a slot, so this counts distinct slots; the output has one
+  // element per entry in slotOfValue.
+  val indexSize = slotValues.length
+
+  private val updateRow: (InternalRow, Int, Any) => Unit = PivotFirst.updateFunction(valueDataType)
+
+  override def update(mutableAggBuffer: InternalRow, inputRow: InternalRow): Unit = {
     val pivotColValue = pivotColumn.eval(inputRow)
-    if (pivotColValue != null) {
-      // We ignore rows whose pivot column value is not in the list of pivot column values.
-      val index = pivotIndex.getOrElse(pivotColValue, -1)
-      if (index >= 0) {
-        val value = valueColumn.eval(inputRow)
-        if (value != null) {
-          updateRow(mutableAggBuffer, mutableAggBufferOffset + index, value)
-        }
+    // We ignore rows whose pivot column value is not in the list of pivot column values.
+    val index = findPivotIndex(pivotColValue)
+    if (index >= 0) {
+      val value = valueColumn.eval(inputRow)
+      if (value != null) {
+        updateRow(mutableAggBuffer, mutableAggBufferOffset + index, value)
       }
     }
   }
 
-  override def merge(mutableAggBuffer: MutableRow, inputAggBuffer: InternalRow): Unit = {
+  override def merge(mutableAggBuffer: InternalRow, inputAggBuffer: InternalRow): Unit = {
     for (i <- 0 until indexSize) {
       if (!inputAggBuffer.isNullAt(inputAggBufferOffset + i)) {
         val value = inputAggBuffer.get(inputAggBufferOffset + i, valueDataType)
@@ -114,7 +146,7 @@ case class PivotFirst(
     }
   }
 
-  override def initialize(mutableAggBuffer: MutableRow): Unit = valueDataType match {
+  override def initialize(mutableAggBuffer: InternalRow): Unit = valueDataType match {
     case d: DecimalType =>
       // Per doc of setDecimal we need to do this instead of setNullAt for DecimalType.
       for (i <- 0 until indexSize) {
@@ -127,9 +159,9 @@ case class PivotFirst(
   }
 
   override def eval(input: InternalRow): Any = {
-    val result = new Array[Any](indexSize)
-    for (i <- 0 until indexSize) {
-      result(i) = input.get(mutableAggBufferOffset + i, valueDataType)
+    val result = new Array[Any](slotOfValue.length)
+    for (i <- slotOfValue.indices) {
+      result(i) = input.get(mutableAggBufferOffset + slotOfValue(i), valueDataType)
     }
     new GenericArrayData(result)
   }
@@ -142,11 +174,17 @@ case class PivotFirst(
 
 
   override val aggBufferAttributes: Seq[AttributeReference] =
-    pivotIndex.toList.sortBy(_._2).map(kv => AttributeReference(kv._1.toString, valueDataType)())
+    slotValues.map { value =>
+      AttributeReference(Option(value).getOrElse("null").toString, valueDataType)()
+    }
 
-  override val aggBufferSchema: StructType = StructType.fromAttributes(aggBufferAttributes)
+  override val aggBufferSchema: StructType = DataTypeUtils.fromAttributes(aggBufferAttributes)
 
   override val inputAggBufferAttributes: Seq[AttributeReference] =
     aggBufferAttributes.map(_.newInstance())
+
+  override protected def withNewChildrenInternal(
+      newLeft: Expression, newRight: Expression): PivotFirst =
+    copy(pivotColumn = newLeft, valueColumn = newRight)
 }
 

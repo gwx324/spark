@@ -22,15 +22,30 @@ import org.apache.spark.mllib.linalg.{Matrices, Vector, Vectors}
 import org.apache.spark.mllib.stat.distribution.MultivariateGaussian
 import org.apache.spark.mllib.util.MLlibTestSparkContext
 import org.apache.spark.mllib.util.TestingUtils._
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.Utils
 
 class GaussianMixtureSuite extends SparkFunSuite with MLlibTestSparkContext {
-  test("single cluster") {
-    val data = sc.parallelize(Array(
+
+  test("gmm fails on high dimensional data") {
+    val rdd = sc.parallelize(Seq(
+      Vectors.sparse(GaussianMixture.MAX_NUM_FEATURES + 1, Array(0, 4), Array(3.0, 8.0)),
+      Vectors.sparse(GaussianMixture.MAX_NUM_FEATURES + 1, Array(1, 5), Array(4.0, 9.0))))
+    val gm = new GaussianMixture()
+    withClue(s"GMM should restrict the maximum number of features to be < " +
+      s"${GaussianMixture.MAX_NUM_FEATURES}") {
+      intercept[IllegalArgumentException] {
+        gm.run(rdd)
+      }
+    }
+  }
+
+  test("single cluster with empty partitions") {
+    val data = sc.parallelize(Seq(
       Vectors.dense(6.0, 9.0),
       Vectors.dense(5.0, 10.0),
       Vectors.dense(4.0, 11.0)
-    ))
+    ), 4)
 
     // expectations
     val Ew = 1.0
@@ -48,7 +63,7 @@ class GaussianMixtureSuite extends SparkFunSuite with MLlibTestSparkContext {
   }
 
   test("two clusters") {
-    val data = sc.parallelize(GaussianTestData.data)
+    val data = sc.parallelize(GaussianTestData.data.toImmutableArraySeq)
 
     // we set an initial gaussian to induce expected results
     val initialGmm = new GaussianMixtureModel(
@@ -77,7 +92,7 @@ class GaussianMixtureSuite extends SparkFunSuite with MLlibTestSparkContext {
   }
 
   test("two clusters with distributed decompositions") {
-    val data = sc.parallelize(GaussianTestData.data2, 2)
+    val data = sc.parallelize(GaussianTestData.data2.toImmutableArraySeq, 2)
 
     val k = 5
     val d = data.first().size
@@ -91,7 +106,7 @@ class GaussianMixtureSuite extends SparkFunSuite with MLlibTestSparkContext {
   }
 
   test("single cluster with sparse data") {
-    val data = sc.parallelize(Array(
+    val data = sc.parallelize(Seq(
       Vectors.sparse(3, Array(0, 2), Array(4.0, 2.0)),
       Vectors.sparse(3, Array(0, 2), Array(2.0, 4.0)),
       Vectors.sparse(3, Array(1), Array(6.0))
@@ -113,7 +128,7 @@ class GaussianMixtureSuite extends SparkFunSuite with MLlibTestSparkContext {
   }
 
   test("two clusters with sparse data") {
-    val data = sc.parallelize(GaussianTestData.data)
+    val data = sc.parallelize(GaussianTestData.data.toImmutableArraySeq)
     val sparseData = data.map(point => Vectors.sparse(1, Array(0), point.toArray))
     // we set an initial gaussian to induce expected results
     val initialGmm = new GaussianMixtureModel(
@@ -141,7 +156,7 @@ class GaussianMixtureSuite extends SparkFunSuite with MLlibTestSparkContext {
   }
 
   test("model save / load") {
-    val data = sc.parallelize(GaussianTestData.data)
+    val data = sc.parallelize(GaussianTestData.data.toImmutableArraySeq)
 
     val gmm = new GaussianMixture().setK(2).setSeed(0).run(data)
     val tempDir = Utils.createTempDir()
@@ -163,7 +178,7 @@ class GaussianMixtureSuite extends SparkFunSuite with MLlibTestSparkContext {
   }
 
   test("model prediction, parallel and local") {
-    val data = sc.parallelize(GaussianTestData.data)
+    val data = sc.parallelize(GaussianTestData.data.toImmutableArraySeq)
     val gmm = new GaussianMixture().setK(2).setSeed(0).run(data)
 
     val batchPredictions = gmm.predict(data)

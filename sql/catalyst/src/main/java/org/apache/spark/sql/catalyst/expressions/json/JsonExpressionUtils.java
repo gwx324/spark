@@ -1,0 +1,120 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.catalyst.expressions.json;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.JsonToken;
+
+import org.apache.spark.sql.catalyst.json.CreateJacksonParser;
+import org.apache.spark.sql.catalyst.util.GenericArrayData;
+import org.apache.spark.unsafe.types.UTF8String;
+
+public class JsonExpressionUtils {
+
+  public static Integer lengthOfJsonArray(UTF8String json) {
+    try (JsonParser jsonParser =
+        CreateJacksonParser.utf8String(SharedFactory.jsonFactory(), json)) {
+      if (jsonParser.nextToken() == null) {
+        return null;
+      }
+      // Only JSON array are supported for this function.
+      if (jsonParser.currentToken() != JsonToken.START_ARRAY) {
+        return null;
+      }
+      // Parse the array to compute its length.
+      int length = 0;
+      // Keep traversing until the end of JSON array
+      while (jsonParser.nextToken() != JsonToken.END_ARRAY) {
+        length += 1;
+        // skip all the child of inner object or array
+        jsonParser.skipChildren();
+      }
+      return length;
+    } catch (IOException e) {
+      return null;
+    }
+  }
+
+  public static GenericArrayData jsonObjectKeys(UTF8String json) {
+    try (JsonParser jsonParser =
+        CreateJacksonParser.utf8String(SharedFactory.jsonFactory(), json)) {
+      // return null if an empty string or any other valid JSON string is encountered
+      if (jsonParser.nextToken() == null || jsonParser.currentToken() != JsonToken.START_OBJECT) {
+        return null;
+      }
+      // Parse the JSON string to get all the keys of outermost JSON object
+      List<UTF8String> arrayBufferOfKeys = new ArrayList<>();
+
+      // traverse until the end of input and ensure it returns valid key
+      while (jsonParser.nextValue() != null && jsonParser.currentName() != null) {
+        // add current fieldName to the ArrayBuffer
+        arrayBufferOfKeys.add(UTF8String.fromString(jsonParser.currentName()));
+
+        // skip all the children of inner object or array
+        jsonParser.skipChildren();
+      }
+      return new GenericArrayData(arrayBufferOfKeys.toArray());
+    } catch (IOException e) {
+      return null;
+    }
+  }
+
+  private static final UTF8String JSON_TYPE_OBJECT = UTF8String.fromString("object");
+  private static final UTF8String JSON_TYPE_ARRAY = UTF8String.fromString("array");
+  private static final UTF8String JSON_TYPE_STRING = UTF8String.fromString("string");
+  private static final UTF8String JSON_TYPE_NUMBER = UTF8String.fromString("number");
+  private static final UTF8String JSON_TYPE_BOOLEAN = UTF8String.fromString("boolean");
+  private static final UTF8String JSON_TYPE_NULL = UTF8String.fromString("null");
+
+  public static UTF8String jsonTypeof(UTF8String json) {
+    try (JsonParser jsonParser =
+        CreateJacksonParser.utf8String(SharedFactory.jsonFactory(), json)) {
+      JsonToken token = jsonParser.nextToken();
+      if (token == null) {
+        return null;
+      }
+      UTF8String type = switch (token) {
+        case START_OBJECT -> JSON_TYPE_OBJECT;
+        case START_ARRAY -> JSON_TYPE_ARRAY;
+        case VALUE_STRING -> JSON_TYPE_STRING;
+        case VALUE_NUMBER_INT, VALUE_NUMBER_FLOAT -> JSON_TYPE_NUMBER;
+        case VALUE_TRUE, VALUE_FALSE -> JSON_TYPE_BOOLEAN;
+        case VALUE_NULL -> JSON_TYPE_NULL;
+        default -> null;
+      };
+      if (type == null) {
+        return null;
+      }
+      // Consume the value so malformed input surfaces as a parse error and returns null,
+      // matching json_object_keys and json_array_length.
+      jsonParser.skipChildren();
+      // Reject trailing content after the first value, e.g. `123 true`, so only a single
+      // well-formed JSON value is accepted.
+      if (jsonParser.nextToken() != null) {
+        return null;
+      }
+      return type;
+    } catch (IOException e) {
+      return null;
+    }
+  }
+}

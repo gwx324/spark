@@ -1,0 +1,453 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.catalyst.expressions
+
+import org.apache.spark.sql.catalyst.analysis.FunctionRegistry
+import org.apache.spark.sql.catalyst.analysis.TypeCheckResult
+import org.apache.spark.sql.catalyst.util.ArrayBasedMapData
+import org.apache.spark.sql.errors.QueryCompilationErrors
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.types.{MapType, NullType, StringType}
+import org.apache.spark.unsafe.types.UTF8String
+import org.apache.spark.util.Utils
+
+/**
+ * Converts a binary column of Avro format into its corresponding Catalyst value.
+ * This is a thin wrapper over the [[AvroDataToCatalyst]] class to create a SQL function.
+ *
+ * @param child the Catalyst binary input column.
+ * @param jsonFormatSchema the Avro schema in JSON string format.
+ * @param options the options to use when performing the conversion.
+ *
+ * @since 4.0.0
+ */
+// scalastyle:off line.size.limit
+@ExpressionDescription(
+  usage = """
+    _FUNC_(child, jsonFormatSchema, options) - Converts a binary Avro value into a Catalyst value.
+    """,
+  arguments = """
+    Arguments:
+      * child - A binary value containing Avro-encoded data.
+      * jsonFormatSchema - A constant string with the Avro schema in JSON format used to
+          interpret the data.
+      * options - A constant map of string keys and values holding conversion options.
+  """,
+  examples = """
+    Examples:
+      > SELECT _FUNC_(s, '{"type": "record", "name": "struct", "fields": [{ "name": "u", "type": ["int","string"] }]}', map()) IS NULL AS result FROM (SELECT NAMED_STRUCT('u', NAMED_STRUCT('member0', member0, 'member1', member1)) AS s FROM VALUES (1, NULL), (NULL,  'a') tab(member0, member1));
+       [false]
+  """,
+  note = """
+    The specified schema must match actual schema of the read data, otherwise the behavior
+    is undefined: it may fail or return arbitrary result.
+    To deserialize the data with a compatible and evolved schema, the expected Avro schema can be
+    set via the corresponding option.
+    CHAR/VARCHAR come from the spark.sql.catalyst.type property on Avro string fields,
+    and for map keys from spark.sql.catalyst.mapKey.type on the Avro map schema
+    (both written by Spark's Avro writer). Assignment is accepted when CHAR/VARCHAR are
+    first-class (spark.sql.charVarchar.standardSemantics.enabled or
+    spark.sql.preserveCharVarcharTypeInfo). Then STRING values are assigned (CHAR padded).
+    Overflow is a malformed record: FAILFAST fails with EXCEED_LIMIT_LENGTH as the cause;
+    PERMISSIVE returns a struct with every field NULL (NULL for a non-struct schema).
+    When CHAR/VARCHAR are not first-class, CHAR/VARCHAR in the Avro schema are read as
+    STRING without padding or length checks. Avro ENUM symbols are not assigned.
+    CHAR/VARCHAR map-key length checks require
+    spark.sql.charVarchar.standardSemantics.enabled and do not pad or trim.
+  """,
+  group = "avro_funcs",
+  since = "4.0.0"
+)
+// scalastyle:on line.size.limit
+case class FromAvro(
+    child: Expression,
+    jsonFormatSchema: Expression,
+    options: Expression,
+    // PERSISTED: copy()/views keep analysis-time settings. FromAvro is
+    // RuntimeReplaceable, so a new replacement would otherwise re-read SQLConf.
+    // FunctionRegistry matches Expression-only ctors; keep 2-arg and 3-arg.
+    charVarcharStandardSemantics: Boolean,
+    charVarcharFirstClassTypes: Boolean,
+    mapKeyDedupPolicy: SQLConf.MapKeyDedupPolicy.Value,
+    disableMapKeyNormalization: Boolean)
+  extends TernaryExpression with RuntimeReplaceable {
+  override def first: Expression = child
+  override def second: Expression = jsonFormatSchema
+  override def third: Expression = options
+
+  // FunctionRegistry matches Expression-only ctors; keep 2-arg and 3-arg.
+  def this(child: Expression, jsonFormatSchema: Expression, options: Expression) =
+    this(
+      child,
+      jsonFormatSchema,
+      options,
+      SQLConf.get.charVarcharStandardSemantics,
+      SQLConf.get.charVarcharFirstClassTypes,
+      SQLConf.get.getConf(SQLConf.MAP_KEY_DEDUP_POLICY),
+      SQLConf.get.getConf(SQLConf.DISABLE_MAP_KEY_NORMALIZATION))
+
+  def this(child: Expression, jsonFormatSchema: Expression) =
+    this(child, jsonFormatSchema, Literal.create(null))
+
+  override def withNewChildrenInternal(
+      newFirst: Expression, newSecond: Expression, newThird: Expression): Expression = {
+    copy(child = newFirst, jsonFormatSchema = newSecond, options = newThird)
+  }
+
+  override def checkInputDataTypes(): TypeCheckResult = {
+    val schemaCheck = jsonFormatSchema.dataType match {
+      case _: StringType |
+           _: NullType
+        if jsonFormatSchema.foldable =>
+        None
+      case _ =>
+        Some(TypeCheckResult.TypeCheckFailure(
+          "The second argument of the FROM_AVRO SQL function must be a constant string " +
+            "containing the JSON representation of the schema to use for converting the value " +
+            "from AVRO format"))
+    }
+    val optionsCheck = options.dataType match {
+      case MapType(StringType, StringType, _) |
+           MapType(NullType, NullType, _) |
+           _: NullType
+        if options.foldable =>
+        None
+      case _ =>
+        Some(TypeCheckResult.TypeCheckFailure(
+          "The third argument of the FROM_AVRO SQL function must be a constant map of strings to " +
+            "strings containing the options to use for converting the value from AVRO format"))
+    }
+    schemaCheck.getOrElse(
+      optionsCheck.getOrElse(
+        TypeCheckResult.TypeCheckSuccess))
+  }
+
+  override lazy val replacement: Expression = {
+    val conf = SQLConf.get
+    if (conf.getConf(SQLConf.MAP_KEY_DEDUP_POLICY) == mapKeyDedupPolicy &&
+        conf.getConf(SQLConf.DISABLE_MAP_KEY_NORMALIZATION) == disableMapKeyNormalization) {
+      createReplacement()
+    } else {
+      val evalConf = conf.clone()
+      evalConf.setConf(SQLConf.MAP_KEY_DEDUP_POLICY, mapKeyDedupPolicy)
+      evalConf.setConf(SQLConf.DISABLE_MAP_KEY_NORMALIZATION, disableMapKeyNormalization)
+      SQLConf.withExistingConf(evalConf) {
+        createReplacement()
+      }
+    }
+  }
+
+  private def createReplacement(): Expression = {
+    // Concurrent canonicalization can evaluate the same CreateMap and corrupt its map builder.
+    // Copy stateful arguments to avoid duplicate-key errors and mismatched key/value array lengths.
+    val freshSchema = jsonFormatSchema.freshCopyIfContainsStatefulExpression()
+    val schemaValue: String = freshSchema.eval() match {
+      case s: UTF8String =>
+        s.toString
+      case null =>
+        ""
+    }
+    val freshOptions = options.freshCopyIfContainsStatefulExpression()
+    val optionsValue: Map[String, String] = freshOptions.eval() match {
+      case a: ArrayBasedMapData if a.keyArray.array.nonEmpty =>
+        val keys: Array[String] = a.keyArray.array.map(_.toString)
+        val values: Array[String] = a.valueArray.array.map(_.toString)
+        keys.zip(values).toMap
+      case _ =>
+        Map.empty
+    }
+    val constructor = try {
+      // 5-arg primary: child, schema, options, plus the two persisted CHAR/VARCHAR flags.
+      Utils.classForName("org.apache.spark.sql.avro.AvroDataToCatalyst").getConstructors
+        .find { c =>
+          val t = c.getParameterTypes
+          t.length == 5 && t(3) == classOf[Boolean] && t(4) == classOf[Boolean]
+        }.get
+    } catch {
+      case _: java.lang.ClassNotFoundException =>
+        throw QueryCompilationErrors.avroNotLoadedSqlFunctionsUnusable(functionName = "FROM_AVRO")
+    }
+    val expr = constructor.newInstance(
+      child,
+      schemaValue,
+      optionsValue,
+      Boolean.box(charVarcharStandardSemantics),
+      Boolean.box(charVarcharFirstClassTypes))
+    expr.asInstanceOf[Expression]
+  }
+
+  override def prettyName: String =
+    getTagValue(FunctionRegistry.FUNC_ALIAS).getOrElse("from_avro")
+
+  // Persisted settings are not user arguments; omit them from EXPLAIN / Connect goldens.
+  override protected def stringArgs: Iterator[Any] = super.stringArgs.take(3)
+}
+
+/**
+ * Converts a Catalyst binary input value into its corresponding AvroAvro format result.
+ * This is a thin wrapper over the [[CatalystDataToAvro]] class to create a SQL function.
+ *
+ * @param child the Catalyst binary input column.
+ * @param jsonFormatSchema the Avro schema in JSON string format.
+ *
+ * @since 4.0.0
+ */
+// scalastyle:off line.size.limit
+@ExpressionDescription(
+  usage = """
+    _FUNC_(child[, jsonFormatSchema]) - Converts a Catalyst binary input value into its
+      corresponding Avro format result.
+  """,
+  arguments = """
+    Arguments:
+      * child - A value to encode into Avro binary format.
+      * jsonFormatSchema - An optional constant string with the Avro schema in JSON format
+          used to encode the value. If omitted, the schema is inferred from the input type.
+  """,
+  examples = """
+    Examples:
+      > SELECT _FUNC_(s, '{"type": "record", "name": "struct", "fields": [{ "name": "u", "type": ["int","string"] }]}') IS NULL FROM (SELECT NULL AS s);
+       [true]
+      > SELECT _FUNC_(s) IS NULL FROM (SELECT NULL AS s);
+       [true]
+  """,
+  note = """
+    `_FUNC_` serializes the current string content. It does not pad CHAR values or trim
+    VARCHAR values.
+  """,
+  group = "avro_funcs",
+  since = "4.0.0"
+)
+// scalastyle:on line.size.limit
+case class ToAvro(
+    child: Expression,
+    jsonFormatSchema: Expression,
+    // PERSISTED: the map builder settings at analysis time, spark.sql.mapKeyDedupPolicy and
+    // spark.sql.legacy.disableMapKeyNormalization. Constructor parameters, so that copies keep
+    // them and evaluate the arguments the same way.
+    mapKeyDedupPolicy: SQLConf.MapKeyDedupPolicy.Value,
+    disableMapKeyNormalization: Boolean)
+  extends BinaryExpression with RuntimeReplaceable {
+
+  def this(child: Expression, jsonFormatSchema: Expression) =
+    this(
+      child,
+      jsonFormatSchema,
+      SQLConf.get.getConf(SQLConf.MAP_KEY_DEDUP_POLICY),
+      SQLConf.get.getConf(SQLConf.DISABLE_MAP_KEY_NORMALIZATION))
+
+  def this(child: Expression) = this(child, Literal(null))
+
+  override def left: Expression = child
+
+  override def right: Expression = jsonFormatSchema
+
+  override def withNewChildrenInternal(newLeft: Expression, newRight: Expression): Expression = {
+    copy(child = newLeft, jsonFormatSchema = newRight)
+  }
+
+  override def checkInputDataTypes(): TypeCheckResult = {
+    jsonFormatSchema.dataType match {
+      case _: StringType if jsonFormatSchema.foldable =>
+        TypeCheckResult.TypeCheckSuccess
+      case _: NullType =>
+        // The 'jsonFormatSchema' argument is optional.
+        TypeCheckResult.TypeCheckSuccess
+      case _ =>
+        TypeCheckResult.TypeCheckFailure(
+          "The second argument of the TO_AVRO SQL function must be a constant string " +
+            "containing the JSON representation of the schema to use for converting the value " +
+            "to AVRO format")
+    }
+  }
+
+  override lazy val replacement: Expression = {
+    val conf = SQLConf.get
+    if (conf.getConf(SQLConf.MAP_KEY_DEDUP_POLICY) == mapKeyDedupPolicy &&
+        conf.getConf(SQLConf.DISABLE_MAP_KEY_NORMALIZATION) == disableMapKeyNormalization) {
+      createReplacement()
+    } else {
+      val evalConf = conf.clone()
+      evalConf.setConf(SQLConf.MAP_KEY_DEDUP_POLICY, mapKeyDedupPolicy)
+      evalConf.setConf(SQLConf.DISABLE_MAP_KEY_NORMALIZATION, disableMapKeyNormalization)
+      SQLConf.withExistingConf(evalConf) {
+        createReplacement()
+      }
+    }
+  }
+
+  private def createReplacement(): Expression = {
+    // Concurrent canonicalization can evaluate the same CreateMap and corrupt its map builder.
+    // Copy stateful arguments to avoid duplicate-key errors and mismatched key/value array lengths.
+    val freshSchema = jsonFormatSchema.freshCopyIfContainsStatefulExpression()
+    val schemaValue: Option[String] = freshSchema.eval() match {
+      case null =>
+        None
+      case s: UTF8String =>
+        Some(s.toString)
+    }
+    val constructor = try {
+      Utils.classForName("org.apache.spark.sql.avro.CatalystDataToAvro").getConstructors().head
+    } catch {
+      case _: java.lang.ClassNotFoundException =>
+        throw QueryCompilationErrors.avroNotLoadedSqlFunctionsUnusable(functionName = "TO_AVRO")
+    }
+    val expr = constructor.newInstance(child, schemaValue)
+    expr.asInstanceOf[Expression]
+  }
+
+  // The map builder settings are not user arguments; keep them out of EXPLAIN output.
+  override protected def stringArgs: Iterator[Any] = super.stringArgs.take(2)
+
+  override def prettyName: String =
+    getTagValue(FunctionRegistry.FUNC_ALIAS).getOrElse("to_avro")
+}
+
+/**
+ * Returns schema in the DDL format of the avro schema in JSON string format.
+ * This is a thin wrapper over the [[SchemaOfAvro]] class to create a SQL function.
+ *
+ * @param jsonFormatSchema the Avro schema in JSON string format.
+ * @param options the options to use when performing the conversion.
+ *
+ * @since 4.0.0
+ */
+// scalastyle:off line.size.limit
+@ExpressionDescription(
+  usage = """
+    _FUNC_(jsonFormatSchema, options) - Returns schema in the DDL format of the avro schema in JSON string format.
+    """,
+  arguments = """
+    Arguments:
+      * jsonFormatSchema - A constant string with the Avro schema in JSON format.
+      * options - A constant map of string keys and values holding conversion options.
+  """,
+  examples = """
+    Examples:
+      > SELECT _FUNC_('{"type": "record", "name": "struct", "fields": [{"name": "u", "type": ["int", "string"]}]}', map());
+       STRUCT<u: STRUCT<member0: INT, member1: STRING> NOT NULL>
+  """,
+  group = "avro_funcs",
+  since = "4.0.0"
+)
+// scalastyle:on line.size.limit
+case class SchemaOfAvro(
+    jsonFormatSchema: Expression,
+    options: Expression,
+    // PERSISTED: the map builder settings at analysis time, spark.sql.mapKeyDedupPolicy and
+    // spark.sql.legacy.disableMapKeyNormalization. Constructor parameters, so that copies keep
+    // them and evaluate the arguments the same way.
+    mapKeyDedupPolicy: SQLConf.MapKeyDedupPolicy.Value,
+    disableMapKeyNormalization: Boolean)
+  extends BinaryExpression with RuntimeReplaceable {
+
+  override def left: Expression = jsonFormatSchema
+  override def right: Expression = options
+
+  override protected def withNewChildrenInternal(
+      newLeft: Expression, newRight: Expression): Expression =
+    copy(jsonFormatSchema = newLeft, options = newRight)
+
+  def this(jsonFormatSchema: Expression, options: Expression) =
+    this(
+      jsonFormatSchema,
+      options,
+      SQLConf.get.getConf(SQLConf.MAP_KEY_DEDUP_POLICY),
+      SQLConf.get.getConf(SQLConf.DISABLE_MAP_KEY_NORMALIZATION))
+
+  def this(jsonFormatSchema: Expression) =
+    this(jsonFormatSchema, Literal.create(null))
+
+  override def checkInputDataTypes(): TypeCheckResult = {
+    val schemaCheck = jsonFormatSchema.dataType match {
+      case _: StringType |
+           _: NullType
+        if jsonFormatSchema.foldable =>
+        None
+      case _ =>
+        Some(TypeCheckResult.TypeCheckFailure("The first argument of the SCHEMA_OF_AVRO SQL " +
+          "function must be a constant string containing the JSON representation of the schema " +
+          "to use for converting the value from AVRO format"))
+    }
+    val optionsCheck = options.dataType match {
+      case MapType(StringType, StringType, _) |
+           MapType(NullType, NullType, _) |
+           _: NullType
+        if options.foldable =>
+        None
+      case _ =>
+        Some(TypeCheckResult.TypeCheckFailure("The second argument of the SCHEMA_OF_AVRO SQL " +
+          "function must be a constant map of strings to strings containing the options to use " +
+          "for converting the value from AVRO format"))
+    }
+    schemaCheck.getOrElse(
+      optionsCheck.getOrElse(
+        TypeCheckResult.TypeCheckSuccess))
+  }
+
+  override lazy val replacement: Expression = {
+    val conf = SQLConf.get
+    if (conf.getConf(SQLConf.MAP_KEY_DEDUP_POLICY) == mapKeyDedupPolicy &&
+        conf.getConf(SQLConf.DISABLE_MAP_KEY_NORMALIZATION) == disableMapKeyNormalization) {
+      createReplacement()
+    } else {
+      val evalConf = conf.clone()
+      evalConf.setConf(SQLConf.MAP_KEY_DEDUP_POLICY, mapKeyDedupPolicy)
+      evalConf.setConf(SQLConf.DISABLE_MAP_KEY_NORMALIZATION, disableMapKeyNormalization)
+      SQLConf.withExistingConf(evalConf) {
+        createReplacement()
+      }
+    }
+  }
+
+  private def createReplacement(): Expression = {
+    // Copy stateful arguments so a failed evaluation cannot leave a partial map in the CreateMap's
+    // map builder, which, under the default EXCEPTION policy, makes every later evaluation fail.
+    val freshSchema = jsonFormatSchema.freshCopyIfContainsStatefulExpression()
+    val schemaValue: String = freshSchema.eval() match {
+      case s: UTF8String =>
+        s.toString
+      case null =>
+        ""
+    }
+    val freshOptions = options.freshCopyIfContainsStatefulExpression()
+    val optionsValue: Map[String, String] = freshOptions.eval() match {
+      case a: ArrayBasedMapData if a.keyArray.array.nonEmpty =>
+        val keys: Array[String] = a.keyArray.array.map(_.toString)
+        val values: Array[String] = a.valueArray.array.map(_.toString)
+        keys.zip(values).toMap
+      case _ =>
+        Map.empty
+    }
+    val constructor = try {
+      Utils.classForName("org.apache.spark.sql.avro.SchemaOfAvro").getConstructors.head
+    } catch {
+      case _: java.lang.ClassNotFoundException =>
+        throw QueryCompilationErrors.avroNotLoadedSqlFunctionsUnusable(
+          functionName = "SCHEMA_OF_AVRO")
+    }
+    val expr = constructor.newInstance(schemaValue, optionsValue)
+    expr.asInstanceOf[Expression]
+  }
+
+  // The map builder settings are not user arguments; keep them out of EXPLAIN output.
+  override protected def stringArgs: Iterator[Any] = super.stringArgs.take(2)
+
+  override def prettyName: String =
+    getTagValue(FunctionRegistry.FUNC_ALIAS).getOrElse("schema_of_avro")
+}

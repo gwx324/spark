@@ -17,13 +17,38 @@
 
 package org.apache.spark.sql.catalyst.trees
 
+import java.math.BigInteger
+import java.util.{IdentityHashMap, UUID}
+import java.util.concurrent.{CyclicBarrier, TimeUnit}
+import java.util.concurrent.atomic.AtomicInteger
+
+import scala.annotation.nowarn
 import scala.collection.mutable.ArrayBuffer
+import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.duration._
+import scala.util.hashing.MurmurHash3
+
+import org.json4s.JsonAST._
+import org.json4s.JsonDSL._
+import org.json4s.jackson.JsonMethods
+import org.json4s.jackson.JsonMethods._
 
 import org.apache.spark.SparkFunSuite
-import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.{AliasIdentifier, FunctionIdentifier, InternalRow, TableIdentifier}
+import org.apache.spark.sql.catalyst.catalog._
+import org.apache.spark.sql.catalyst.dsl.expressions.DslString
+import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.codegen.CodegenFallback
-import org.apache.spark.sql.types.{IntegerType, NullType, StringType}
+import org.apache.spark.sql.catalyst.plans.{LeftOuter, NaturalJoin, SQLHelper}
+import org.apache.spark.sql.catalyst.plans.logical._
+import org.apache.spark.sql.catalyst.plans.physical.{IdentityBroadcastMode, RoundRobinPartitioning, SinglePartition}
+import org.apache.spark.sql.catalyst.rules.RuleId
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.types._
+import org.apache.spark.storage.StorageLevel
+import org.apache.spark.util.ThreadUtils
+import org.apache.spark.util.collection.BitSet
 
 case class Dummy(optKey: Option[Expression]) extends Expression with CodegenFallback {
   override def children: Seq[Expression] = optKey.toSeq
@@ -31,6 +56,22 @@ case class Dummy(optKey: Option[Expression]) extends Expression with CodegenFall
   override def dataType: NullType = NullType
   override lazy val resolved = true
   override def eval(input: InternalRow): Any = null.asInstanceOf[Any]
+  override protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]): Expression =
+    copy(optKey = if (optKey.isDefined) Some(newChildren(0)) else None)
+}
+
+case class SpecializedUnary(child: Expression) extends Expression with CodegenFallback {
+  override def children: Seq[Expression] =
+    throw new IllegalStateException("children should not be materialized")
+  override def mapChildren(f: Expression => Expression): Expression = {
+    val newChild = f(child)
+    if (newChild fastEquals child) this else copy(child = newChild)
+  }
+  override def nullable: Boolean = child.nullable
+  override def dataType: DataType = child.dataType
+  override def eval(input: InternalRow): Any = child.eval(input)
+  override protected def withNewChildrenInternal(
+      newChildren: IndexedSeq[Expression]): Expression = copy(child = newChildren.head)
 }
 
 case class ComplexPlan(exprs: Seq[Seq[Expression]])
@@ -38,14 +79,144 @@ case class ComplexPlan(exprs: Seq[Seq[Expression]])
   override def output: Seq[Attribute] = Nil
 }
 
-case class ExpressionInMap(map: Map[String, Expression]) extends Expression with Unevaluable {
+case class ExpressionInMap(map: Map[String, Expression]) extends Unevaluable {
   override def children: Seq[Expression] = map.values.toSeq
   override def nullable: Boolean = true
   override def dataType: NullType = NullType
   override lazy val resolved = true
+  override protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]): Expression =
+    super.legacyWithNewChildren(newChildren)
 }
 
-class TreeNodeSuite extends SparkFunSuite {
+case class SeqTupleExpression(sons: Seq[(Expression, Expression)],
+    nonSons: Seq[(Expression, Expression)]) extends Unevaluable {
+  override def children: Seq[Expression] = sons.flatMap(t => Iterator(t._1, t._2))
+  override def nullable: Boolean = true
+  override def dataType: NullType = NullType
+  override lazy val resolved = true
+
+  override protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]): Expression =
+    super.legacyWithNewChildren(newChildren)
+}
+
+case class JsonTestTreeNode(arg: Any) extends LeafNode {
+  override def output: Seq[Attribute] = Seq.empty[Attribute]
+}
+
+case class NameValue(name: String, value: Any)
+
+case object DummyObject
+
+case class SelfReferenceUDF(
+    var config: Map[String, Any] = Map.empty[String, Any]) extends Function1[String, Boolean] {
+  config += "self" -> this
+  def apply(key: String): Boolean = config.contains(key)
+}
+
+case class FakeLeafPlan(child: LogicalPlan)
+  extends org.apache.spark.sql.catalyst.plans.logical.LeafNode {
+  override def output: Seq[Attribute] = child.output
+}
+
+case class FakeCurryingProduct(x: Expression)(val y: Int)
+
+case class ConcurrentTreeNode(barrier: CyclicBarrier, computeCount: AtomicInteger)
+  extends LeafNode {
+  override def output: Seq[Attribute] = Nil
+
+  override protected def getDefaultTreePatternBits: BitSet = {
+    computeCount.incrementAndGet()
+    barrier.await(10, TimeUnit.SECONDS)
+    new BitSet(TreePattern.maxId)
+  }
+}
+
+class TreeNodeSuite extends SparkFunSuite with SQLHelper {
+  test("constructing unused Literals does not allocate eager cache state") {
+    val literal = Literal(1)
+    val cacheFields = classOf[TreeNode[_]].getDeclaredFields
+      .filter(_.getName.endsWith("CacheValue"))
+
+    assert(cacheFields.length === 5)
+    cacheFields.foreach { field =>
+      field.setAccessible(true)
+      assert(field.get(literal) === null, s"${field.getName} was eagerly initialized")
+    }
+  }
+
+  test("concurrent cache initialization returns and reuses the selected value") {
+    val barrier = new CyclicBarrier(2)
+    val computeCount = new AtomicInteger
+    val node = ConcurrentTreeNode(barrier, computeCount)
+    val executor = ThreadUtils.newDaemonFixedThreadPool(2, "tree-node-cache-test")
+    val executionContext = ExecutionContext.fromExecutorService(executor)
+    try {
+      val first = Future(node.treePatternBits)(executionContext)
+      val second = Future(node.treePatternBits)(executionContext)
+      val firstResult = ThreadUtils.awaitResult(first, 10.seconds)
+      val secondResult = ThreadUtils.awaitResult(second, 10.seconds)
+
+      assert(firstResult eq secondResult)
+      assert(node.treePatternBits eq firstResult)
+      assert(computeCount.get() === 2)
+    } finally {
+      executor.shutdownNow()
+    }
+  }
+
+  test("TreeNode cache accessors retain computed values") {
+    val left = Literal(1)
+    val right = Literal(2)
+    val node = Add(left, right)
+    val expectedTreePatternBits = TreePatternBits.toPatternBits(
+      TreePattern.BINARY_ARITHMETIC, TreePattern.LITERAL)
+
+    def cacheField(name: String): java.lang.reflect.Field = {
+      val field = classOf[TreeNode[_]].getDeclaredField(name)
+      field.setAccessible(true)
+      field
+    }
+
+    val treePatternBits = node.treePatternBits
+    assert(treePatternBits == expectedTreePatternBits)
+    val treePatternBitsCache = cacheField("treePatternBitsCacheValue").get(node)
+    assert(treePatternBitsCache eq treePatternBits)
+    assert(node.treePatternBits eq treePatternBits)
+
+    val containsChild = node.containsChild
+    assert(containsChild == Set(left, right))
+    val containsChildCache = cacheField("containsChildCacheValue").get(node)
+    assert(containsChildCache eq containsChild)
+    assert(node.containsChild eq containsChild)
+
+    val height = node.height
+    assert(height === 2)
+    val heightCache = cacheField("heightCacheValue").get(node)
+    assert(heightCache == Integer.valueOf(height))
+    assert(node.height === height)
+    assert(cacheField("heightCacheValue").get(node) eq heightCache)
+
+    val expectedHashCode = MurmurHash3.caseClassHash(node)
+    val hashCode = node.hashCode()
+    assert(hashCode === expectedHashCode)
+    val hashCodeCache = cacheField("hashCodeCacheValue").get(node)
+    assert(hashCodeCache == Integer.valueOf(hashCode))
+    assert(node.hashCode() === hashCode)
+    assert(cacheField("hashCodeCacheValue").get(node) eq hashCodeCache)
+
+    val allChildrenMethod = classOf[TreeNode[_]].getDeclaredMethod("allChildren")
+    allChildrenMethod.setAccessible(true)
+    val allChildren = allChildrenMethod.invoke(node)
+      .asInstanceOf[IdentityHashMap[TreeNode[_], Any]]
+    assert(allChildren.size() === 2)
+    assert(allChildren.containsKey(left))
+    assert(allChildren.containsKey(right))
+    val allChildrenCache = cacheField("allChildrenCacheValue").get(node)
+    assert(allChildrenCache eq allChildren)
+    val secondAllChildren = allChildrenMethod.invoke(node)
+    assert(secondAllChildren eq allChildren)
+  }
+
   test("top node changed") {
     val after = Literal(1) transform { case Literal(1, _) => Literal(2) }
     assert(after === Literal(2))
@@ -82,8 +253,8 @@ class TreeNodeSuite extends SparkFunSuite {
     val expected = Seq("+", "1", "*", "2", "-", "3", "4")
     val expression = Add(Literal(1), Multiply(Literal(2), Subtract(Literal(3), Literal(4))))
     expression transformDown {
-      case b: BinaryOperator => actual.append(b.symbol); b
-      case l: Literal => actual.append(l.toString); l
+      case b: BinaryOperator => actual += b.symbol; b
+      case l: Literal => actual += l.toString; l
     }
 
     assert(expected === actual)
@@ -94,8 +265,8 @@ class TreeNodeSuite extends SparkFunSuite {
     val expected = Seq("1", "2", "3", "4", "-", "*", "+")
     val expression = Add(Literal(1), Multiply(Literal(2), Subtract(Literal(3), Literal(4))))
     expression transformUp {
-      case b: BinaryOperator => actual.append(b.symbol); b
-      case l: Literal => actual.append(l.toString); l
+      case b: BinaryOperator => actual += b.symbol; b
+      case l: Literal => actual += l.toString; l
     }
 
     assert(expected === actual)
@@ -116,6 +287,127 @@ class TreeNodeSuite extends SparkFunSuite {
     assert(actual === Dummy(None))
   }
 
+  test("mapChildren should only works on children") {
+    val children = Seq((Literal(1), Literal(2)))
+    val nonChildren = Seq((Literal(3), Literal(4)))
+    val before = SeqTupleExpression(children, nonChildren)
+    val toZero: PartialFunction[Expression, Expression] = { case Literal(_, _) => Literal(0) }
+    val expect = SeqTupleExpression(Seq((Literal(0), Literal(0))), nonChildren)
+
+    val actual = before mapChildren toZero
+    assert(actual === expect)
+  }
+
+  test("mapChildren returns the original node when all children are fast equal") {
+    val expression = Coalesce(Seq(Literal(1), Literal(2)))
+    val visited = new ArrayBuffer[Int]()
+    val result = expression.mapChildren {
+      case literal @ Literal(value: Int, _) =>
+        visited += value
+        literal
+      case other => other
+    }
+
+    assert(result eq expression)
+    assert(visited == Seq(1, 2))
+    val leaf = Dummy(None)
+    assert(leaf.mapChildren(identity) eq leaf)
+  }
+
+  test("mapChildren returns the original node when every child is equal but a distinct copy") {
+    val expression = Coalesce(Seq(Literal(1), Literal(2)))
+    // A fresh, structurally-equal copy for every child must still return `this`, since no child
+    // changes materially.
+    val result = expression.mapChildren {
+      case Literal(value: Int, dt) => Literal(value, dt)
+      case other => other
+    }
+    assert(result eq expression)
+  }
+
+  test("mapChildren retains an equal replacement when another child changes") {
+    val tag = TreeNodeTag[String]("equal-copy")
+    val expression = Coalesce(Seq(Literal(1), Literal(2)))
+    val equalCopy = Literal(1)
+    equalCopy.setTagValue(tag, "retained")
+
+    val result = expression.mapChildren {
+      case Literal(1, _) => equalCopy
+      case Literal(2, _) => Literal(3)
+      case other => other
+    }
+
+    assert(result.children.head eq equalCopy)
+    assert(result.children.head.getTagValue(tag).contains("retained"))
+    assert(result.children(1) == Literal(3))
+  }
+
+  test("mapChildren retains non-adjacent equal replacements when a later child changes") {
+    val c0 = Literal(10)
+    val c1 = Literal(11)
+    val c2 = Literal(12)
+    val c3 = Literal(13)
+    val c4 = Literal(14)
+    val origin = Origin(line = Some(10))
+    val expression = CurrentOrigin.withOrigin(origin) {
+      Coalesce(Seq(c0, c1, c2, c3, c4))
+    }
+    val tag = TreeNodeTag[String]("parent")
+    expression.setTagValue(tag, "retained")
+    val copy1 = Literal(11)
+    val copy3 = Literal(13)
+    val visited = new ArrayBuffer[Expression]()
+
+    // Keep a reference-equal prefix, retain non-adjacent equal copies, and change the last child.
+    val result = CurrentOrigin.withOrigin(Origin(line = Some(20))) {
+      expression.mapChildren { child =>
+        visited += child
+        child match {
+          case l if l eq c0 => c0
+          case l if l eq c1 => copy1
+          case l if l eq c2 => c2
+          case l if l eq c3 => copy3
+          case l if l eq c4 => Literal(99)
+          case other => other
+        }
+      }
+    }
+
+    assert(result ne expression)
+    assert(result.origin == origin)
+    assert(result.getTagValue(tag).contains("retained"))
+    assert(visited.size == expression.children.size)
+    visited.zip(expression.children).foreach { case (actual, expected) =>
+      assert(actual eq expected)
+    }
+    assert(result.children(0) eq c0)
+    assert(result.children(1) eq copy1)
+    assert(result.children(2) eq c2)
+    assert(result.children(3) eq copy3)
+    assert(result.children(4) == Literal(99))
+  }
+
+  test("mapChildren stops comparing children after a material change") {
+    var comparisons = 0
+    val last = new Literal(2, IntegerType) {
+      override def fastEquals(other: TreeNode[_]): Boolean = {
+        comparisons += 1
+        super.fastEquals(other)
+      }
+    }
+    val expression = Coalesce(Seq(Literal(1), last))
+    val replacements = Seq(Literal(3), Literal(4))
+    val result = expression.mapChildren {
+      case child if child eq last => replacements(1)
+      case _ => replacements.head
+    }
+
+    assert(comparisons == 0)
+    result.children.zip(replacements).foreach { case (actual, expected) =>
+      assert(actual eq expected)
+    }
+  }
+
   test("preserves origin") {
     CurrentOrigin.setPosition(1, 1)
     val add = Add(Literal(1), Literal(1))
@@ -129,13 +421,75 @@ class TreeNodeSuite extends SparkFunSuite {
     assert(transformed.origin.startPosition.isDefined)
   }
 
+  test("transform rules see node origins and restore the previous origin") {
+    val left = CurrentOrigin.withOrigin(Origin(line = Some(1))) {
+      Literal(1)
+    }
+    val right = CurrentOrigin.withOrigin(Origin(line = Some(2))) {
+      Literal(2)
+    }
+    val expression = CurrentOrigin.withOrigin(Origin(line = Some(3))) {
+      Add(left, right)
+    }
+    val previousOrigin = Origin(line = Some(4))
+    val visited = new ArrayBuffer[Expression]()
+
+    CurrentOrigin.set(previousOrigin)
+    try {
+      expression.transformUpWithPruning(AlwaysProcess.fn) {
+        case e =>
+          assert(CurrentOrigin.get == e.origin)
+          visited += e
+          e
+      }
+      assert(visited.size == 3)
+      assert(CurrentOrigin.get == previousOrigin)
+
+      intercept[RuntimeException] {
+        expression.transformDownWithPruning(AlwaysProcess.fn) {
+          case _: Literal => throw new RuntimeException("rule failed")
+        }
+      }
+      assert(CurrentOrigin.get == previousOrigin)
+    } finally {
+      CurrentOrigin.reset()
+    }
+  }
+
+  test("transformUpWithPruning does not materialize specialized children") {
+    val expression = SpecializedUnary(Literal(1))
+    assert(expression.transformUp { case e => e } eq expression)
+  }
+
+  test("transformUpWithPruning preserves pruning and ineffective rule tracking") {
+    val expression = Add(Literal(1), Literal(2))
+    val ruleId = RuleId(0)
+    var visited = 0
+    val rule: PartialFunction[Expression, Expression] = {
+      case e =>
+        visited += 1
+        e
+    }
+
+    expression.transformUpWithPruning(AlwaysProcess.fn, ruleId)(rule)
+    assert(visited == 3)
+
+    visited = 0
+    expression.transformUpWithPruning(AlwaysProcess.fn, ruleId)(rule)
+    assert(visited == 0)
+
+    visited = 0
+    Add(Literal(1), Literal(2)).transformUpWithPruning(_ => false)(rule)
+    assert(visited == 0)
+  }
+
   test("foreach up") {
     val actual = new ArrayBuffer[String]()
     val expected = Seq("1", "2", "3", "4", "-", "*", "+")
     val expression = Add(Literal(1), Multiply(Literal(2), Subtract(Literal(3), Literal(4))))
     expression foreachUp {
-      case b: BinaryOperator => actual.append(b.symbol);
-      case l: Literal => actual.append(l.toString);
+      case b: BinaryOperator => actual += b.symbol;
+      case l: Literal => actual += l.toString;
     }
 
     assert(expected === actual)
@@ -183,6 +537,44 @@ class TreeNodeSuite extends SparkFunSuite {
     }
     expected = None
     assert(expected === actual)
+  }
+
+  test("exists") {
+    val expression = Add(Literal(1), Multiply(Literal(2), Subtract(Literal(3), Literal(4))))
+    // Check the top node.
+    var exists = expression.exists {
+      case _: Add => true
+      case _ => false
+    }
+    assert(exists)
+
+    // Check the first children.
+    exists = expression.exists {
+      case Literal(1, IntegerType) => true
+      case _ => false
+    }
+    assert(exists)
+
+    // Check an internal node (Subtract).
+    exists = expression.exists {
+      case _: Subtract => true
+      case _ => false
+    }
+    assert(exists)
+
+    // Check a leaf node.
+    exists = expression.exists {
+      case Literal(3, IntegerType) => true
+      case _ => false
+    }
+    assert(exists)
+
+    // Check not exists.
+    exists = expression.exists {
+      case Literal(100, IntegerType) => true
+      case _ => false
+    }
+    assert(!exists)
   }
 
   test("collectFirst") {
@@ -260,5 +652,786 @@ class TreeNodeSuite extends SparkFunSuite {
       val expected = ExpressionInMap(Map("1" -> Literal(2), "2" -> Literal(3)))
       assert(actual === expected)
     }
+  }
+
+  test("toJSON") {
+    def assertJSON(input: Any, json: JValue): Unit = {
+      val expected =
+        s"""
+           |[{
+           |  "class": "${classOf[JsonTestTreeNode].getName}",
+           |  "num-children": 0,
+           |  "arg": ${compact(render(json))}
+           |}]
+         """.stripMargin
+      compareJSON(JsonTestTreeNode(input).toJSON, expected)
+    }
+
+    // Converts simple types to JSON
+    assertJSON(true, true)
+    assertJSON(33.toByte, 33)
+    assertJSON(44, 44)
+    assertJSON(55L, 55L)
+    assertJSON(3.0, 3.0)
+    assertJSON(4.0D, 4.0D)
+    assertJSON(BigInt(BigInteger.valueOf(88L)), 88L)
+    assertJSON(null, JNull)
+    assertJSON("text", "text")
+    assertJSON(Some("text"), "text")
+    compareJSON(JsonTestTreeNode(None).toJSON,
+      s"""[
+         |  {
+         |    "class": "${classOf[JsonTestTreeNode].getName}",
+         |    "num-children": 0
+         |  }
+         |]
+       """.stripMargin)
+
+    val uuid = UUID.randomUUID()
+    assertJSON(uuid, uuid.toString)
+
+    // Converts Spark Sql DataType to JSON
+    assertJSON(IntegerType, "integer")
+    assertJSON(Metadata.empty, JObject(Nil))
+    assertJSON(
+      StorageLevel.NONE,
+      JObject(
+        "useDisk" -> false,
+        "useMemory" -> false,
+        "useOffHeap" -> false,
+        "deserialized" -> false,
+        "replication" -> 1)
+    )
+
+    // Converts TreeNode argument to JSON
+    assertJSON(
+      Literal(333),
+      List(
+        JObject(
+          "class" -> classOf[Literal].getName,
+          "num-children" -> 0,
+          "value" -> "333",
+          "dataType" -> "integer")))
+
+    // Converts Seq[String] to JSON
+    assertJSON(Seq("1", "2", "3"), "[1, 2, 3]")
+
+    // Converts Seq[DataType] to JSON
+    assertJSON(Seq(IntegerType, DoubleType, FloatType), List("integer", "double", "float"))
+
+    // Converts Seq[Partitioning] to JSON
+    assertJSON(
+      Seq(SinglePartition, RoundRobinPartitioning(numPartitions = 3)),
+      List(
+        JObject("object" -> JString(SinglePartition.getClass.getName)),
+        JObject(
+          "product-class" -> classOf[RoundRobinPartitioning].getName,
+          "numPartitions" -> 3)))
+
+    // Converts case object to JSON
+    assertJSON(DummyObject, JObject("object" -> JString(DummyObject.getClass.getName)))
+
+    // Converts ExprId to JSON
+    assertJSON(
+      ExprId(0, uuid),
+      JObject(
+        "product-class" -> classOf[ExprId].getName,
+        "id" -> 0,
+        "jvmId" -> uuid.toString))
+
+    // Converts StructField to JSON
+    assertJSON(
+      StructField("field", IntegerType),
+      JObject(
+        "product-class" -> classOf[StructField].getName,
+        "name" -> "field",
+        "dataType" -> "integer",
+        "nullable" -> true,
+        "metadata" -> JObject(Nil)))
+
+    // Converts TableIdentifier to JSON
+    assertJSON(
+      TableIdentifier("table"),
+      JObject(
+        "product-class" -> classOf[TableIdentifier].getName,
+        "table" -> "table"))
+
+    // Converts JoinType to JSON
+    assertJSON(
+      NaturalJoin(LeftOuter),
+      JObject(
+        "product-class" -> classOf[NaturalJoin].getName,
+        "tpe" -> JObject("object" -> JString(LeftOuter.getClass.getName))))
+
+    // Converts FunctionIdentifier to JSON
+    assertJSON(
+      FunctionIdentifier("function", None),
+      JObject(
+        "product-class" -> JString(classOf[FunctionIdentifier].getName),
+          "funcName" -> "function"))
+
+    // Converts AliasIdentifier to JSON
+    assertJSON(
+      AliasIdentifier("alias", Seq("ns1", "ns2")),
+      JObject(
+        "product-class" -> JString(classOf[AliasIdentifier].getName),
+          "name" -> "alias",
+          "qualifier" -> "[ns1, ns2]"))
+
+    // Converts SubqueryAlias to JSON
+    assertJSON(
+      SubqueryAlias("t1", JsonTestTreeNode("0")),
+      List(
+        JObject(
+          "class" -> classOf[SubqueryAlias].getName,
+          "num-children" -> 1,
+          "identifier" -> JObject("product-class" -> JString(classOf[AliasIdentifier].getName),
+            "name" -> "t1",
+            "qualifier" -> JArray(Nil)),
+          "child" -> 0),
+        JObject(
+          "class" -> classOf[JsonTestTreeNode].getName,
+          "num-children" -> 0,
+          "arg" -> "0")))
+
+    // Converts BucketSpec to JSON
+    assertJSON(
+      BucketSpec(1, Seq("bucket"), Seq("sort")),
+      JObject(
+        "product-class" -> classOf[BucketSpec].getName,
+        "numBuckets" -> 1,
+        "bucketColumnNames" -> "[bucket]",
+        "sortColumnNames" -> "[sort]"))
+
+    // Converts WindowFrame to JSON
+    assertJSON(
+      SpecifiedWindowFrame(RowFrame, UnboundedPreceding, CurrentRow),
+      List(
+        JObject(
+          "class" -> classOf[SpecifiedWindowFrame].getName,
+          "num-children" -> 2,
+          "frameType" -> JObject("object" -> JString(RowFrame.getClass.getName)),
+          "lower" -> 0,
+          "upper" -> 1),
+        JObject(
+          "class" -> UnboundedPreceding.getClass.getName,
+          "num-children" -> 0),
+        JObject(
+          "class" -> CurrentRow.getClass.getName,
+          "num-children" -> 0)))
+
+    // Converts Partitioning to JSON
+    assertJSON(
+      RoundRobinPartitioning(numPartitions = 3),
+      JObject(
+        "product-class" -> classOf[RoundRobinPartitioning].getName,
+        "numPartitions" -> 3))
+
+    // Converts FunctionResource to JSON
+    assertJSON(
+      FunctionResource(JarResource, "file:///"),
+      JObject(
+        "product-class" -> JString(classOf[FunctionResource].getName),
+        "resourceType" -> JObject("object" -> JString(JarResource.getClass.getName)),
+        "uri" -> "file:///"))
+
+    // Converts BroadcastMode to JSON
+    assertJSON(
+      IdentityBroadcastMode,
+      JObject("object" -> JString(IdentityBroadcastMode.getClass.getName)))
+
+    // Converts CatalogTable to JSON
+    assertJSON(
+      CatalogTable(
+        TableIdentifier("table"),
+        CatalogTableType.MANAGED,
+        CatalogStorageFormat.empty,
+        StructType(StructField("a", IntegerType, true) :: Nil),
+        createTime = 0L,
+        createVersion = "2.x"),
+
+      JObject(
+        "product-class" -> classOf[CatalogTable].getName,
+        "identifier" -> JObject(
+          "product-class" -> classOf[TableIdentifier].getName,
+          "table" -> "table"
+        ),
+        "tableType" -> JObject(
+          "product-class" -> classOf[CatalogTableType].getName,
+          "name" -> "MANAGED"
+        ),
+        "storage" -> JObject(
+          "product-class" -> classOf[CatalogStorageFormat].getName,
+          "compressed" -> false,
+          "properties" -> JNull
+        ),
+        "schema" -> JObject(
+          "type" -> "struct",
+          "fields" -> List(
+            JObject(
+              "name" -> "a",
+              "type" -> "integer",
+              "nullable" -> true,
+              "metadata" -> JObject(Nil)))),
+        "partitionColumnNames" -> List.empty[String],
+        "owner" -> "",
+        "createTime" -> 0,
+        "lastAccessTime" -> -1,
+        "createVersion" -> "2.x",
+        "tracksPartitionsInCatalog" -> false,
+        "properties" -> JNull,
+        "unsupportedFeatures" -> List.empty[String],
+        "schemaPreservesCase" -> JBool(true),
+        "ignoredProperties" -> JNull))
+
+    // For unknown case class, returns JNull.
+    val bigValue = new Array[Int](10000)
+    assertJSON(NameValue("name", bigValue), JNull)
+
+    // Converts Seq[TreeNode] to JSON recursively
+    assertJSON(
+      Seq(Literal(1), Literal(2)),
+      List(
+        List(
+          JObject(
+            "class" -> JString(classOf[Literal].getName),
+            "num-children" -> 0,
+            "value" -> "1",
+            "dataType" -> "integer")),
+        List(
+          JObject(
+            "class" -> JString(classOf[Literal].getName),
+            "num-children" -> 0,
+            "value" -> "2",
+            "dataType" -> "integer"))))
+
+    // Other Seq is converted to JNull, to reduce the risk of out of memory
+    assertJSON(Seq(1, 2, 3), JNull)
+
+    // All Map type is converted to JNull, to reduce the risk of out of memory
+    assertJSON(Map("key" -> "value"), JNull)
+
+    // Unknown type is converted to JNull, to reduce the risk of out of memory
+    assertJSON(new Object {}, JNull)
+
+    // Convert all TreeNode children to JSON
+    assertJSON(
+      Union(Seq(JsonTestTreeNode("0"), JsonTestTreeNode("1"))),
+      List(
+        JObject(
+          "class" -> classOf[Union].getName,
+          "num-children" -> 2,
+          "children" -> List(0, 1),
+          "byName" -> JBool(false),
+          "allowMissingCol" -> JBool(false)),
+        JObject(
+          "class" -> classOf[JsonTestTreeNode].getName,
+          "num-children" -> 0,
+          "arg" -> "0"),
+        JObject(
+          "class" -> classOf[JsonTestTreeNode].getName,
+          "num-children" -> 0,
+          "arg" -> "1")))
+
+    // Convert Seq of Product contains TreeNode to JSON.
+    assertJSON(
+      Seq(("a", JsonTestTreeNode("0")), ("b", JsonTestTreeNode("1"))),
+      List(
+        JObject(
+          "product-class" -> "scala.Tuple2",
+          "_1" -> "a",
+          "_2" -> List(JObject(
+            "class" -> classOf[JsonTestTreeNode].getName,
+            "num-children" -> 0,
+            "arg" -> "0"
+          ))),
+        JObject(
+          "product-class" -> "scala.Tuple2",
+          "_1" -> "b",
+          "_2" -> List(JObject(
+            "class" -> classOf[JsonTestTreeNode].getName,
+            "num-children" -> 0,
+            "arg" -> "1"
+          )))))
+
+    // Convert currying product contains TreeNode to JSON.
+    assertJSON(
+      FakeCurryingProduct(Literal(1))(1),
+      JObject(
+        "product-class" -> classOf[FakeCurryingProduct].getName,
+        "x" -> List(
+          JObject(
+            "class" -> JString(classOf[Literal].getName),
+            "num-children" -> 0,
+            "value" -> "1",
+            "dataType" -> "integer")),
+        "y" -> 1
+      )
+    )
+  }
+
+  test("toJSON should not throws java.lang.StackOverflowError") {
+    val udf = ScalaUDF(SelfReferenceUDF(), BooleanType, Seq("col1".attr),
+      Option(ExpressionEncoder[String]()) :: Nil)
+    // Should not throw java.lang.StackOverflowError
+    udf.toJSON
+  }
+
+  private def compareJSON(leftJson: String, rightJson: String): Unit = {
+    val left = JsonMethods.parse(leftJson)
+    val right = JsonMethods.parse(rightJson)
+    assert(left == right)
+  }
+
+  test("transform works on stream of children") {
+    @nowarn("cat=deprecation")
+    val before = Coalesce(Stream(Literal(1), Literal(2)))
+    // Note it is a bit tricky to exhibit the broken behavior. Basically we want to create the
+    // situation in which the TreeNode.mapChildren function's change detection is not triggered. A
+    // stream's first element is typically materialized, so in order to not trip the TreeNode change
+    // detection logic, we should not change the first element in the sequence.
+    val result = before.transform {
+      case Literal(v: Int, IntegerType) if v != 1 =>
+        Literal(v + 1, IntegerType)
+    }
+    @nowarn("cat=deprecation")
+    val expected = Coalesce(Stream(Literal(1), Literal(3)))
+    assert(result === expected)
+  }
+
+  test("SPARK-45685: transform works on LazyList of children") {
+    val before = Coalesce(LazyList(Literal(1), Literal(2)))
+    // Note it is a bit tricky to exhibit the broken behavior. Basically we want to create the
+    // situation in which the TreeNode.mapChildren function's change detection is not triggered. A
+    // stream's first element is typically materialized, so in order to not trip the TreeNode change
+    // detection logic, we should not change the first element in the sequence.
+    val result = before.transform {
+      case Literal(v: Int, IntegerType) if v != 1 =>
+        Literal(v + 1, IntegerType)
+    }
+    val expected = Coalesce(LazyList(Literal(1), Literal(3)))
+    assert(result === expected)
+  }
+
+  test("withNewChildren on stream of children") {
+    @nowarn("cat=deprecation")
+    val before = Coalesce(Stream(Literal(1), Literal(2)))
+    @nowarn("cat=deprecation")
+    val result = before.withNewChildren(Stream(Literal(1), Literal(3)))
+    @nowarn("cat=deprecation")
+    val expected = Coalesce(Stream(Literal(1), Literal(3)))
+    assert(result === expected)
+  }
+
+  test("SPARK-45685: withNewChildren on LazyList of children") {
+    val before = Coalesce(LazyList(Literal(1), Literal(2)))
+    val result = before.withNewChildren(LazyList(Literal(1), Literal(3)))
+    val expected = Coalesce(LazyList(Literal(1), Literal(3)))
+    assert(result === expected)
+  }
+
+  test("treeString limits plan length") {
+    withSQLConf(SQLConf.MAX_PLAN_STRING_LENGTH.key -> "200") {
+      val ds = (1 until 20).foldLeft(Literal("TestLiteral"): Expression) { case (treeNode, x) =>
+        Add(Literal(x), treeNode)
+      }
+
+      val planString = ds.treeString
+      logWarning("Plan string: " + planString)
+      assert(planString.endsWith(" more characters"))
+      assert(planString.length <= SQLConf.get.maxPlanStringLength)
+    }
+  }
+
+  test("treeString limit at zero") {
+    withSQLConf(SQLConf.MAX_PLAN_STRING_LENGTH.key -> "0") {
+      val ds = (1 until 2).foldLeft(Literal("TestLiteral"): Expression) { case (treeNode, x) =>
+        Add(Literal(x), treeNode)
+      }
+
+      val planString = ds.treeString
+      assert(planString.startsWith("Truncated plan of"))
+    }
+  }
+
+  test("tags will be carried over after copy & transform") {
+    val tag = TreeNodeTag[String]("test")
+
+    withClue("makeCopy") {
+      val node = Dummy(None)
+      node.setTagValue(tag, "a")
+      val copied = node.makeCopy(Array(Some(Literal(1))))
+      assert(copied.getTagValue(tag) == Some("a"))
+    }
+
+    def checkTransform(
+        sameTypeTransform: Expression => Expression,
+        differentTypeTransform: Expression => Expression): Unit = {
+      val child = Dummy(None)
+      child.setTagValue(tag, "child")
+      val node = Dummy(Some(child))
+      node.setTagValue(tag, "parent")
+
+      val transformed = sameTypeTransform(node)
+      // Both the child and parent keep the tags
+      assert(transformed.getTagValue(tag) == Some("parent"))
+      assert(transformed.children.head.getTagValue(tag) == Some("child"))
+
+      val transformed2 = differentTypeTransform(node)
+      // Both the child and parent keep the tags, even if we transform the node to a new one of
+      // different type.
+      assert(transformed2.getTagValue(tag) == Some("parent"))
+      assert(transformed2.children.head.getTagValue(tag) == Some("child"))
+    }
+
+    withClue("transformDown") {
+      checkTransform(
+        sameTypeTransform = _ transformDown {
+          case Dummy(None) => Dummy(Some(Literal(1)))
+        },
+        differentTypeTransform = _ transformDown {
+          case Dummy(None) => Literal(1)
+
+        })
+    }
+
+    withClue("transformUp") {
+      checkTransform(
+        sameTypeTransform = _ transformUp {
+          case Dummy(None) => Dummy(Some(Literal(1)))
+        },
+        differentTypeTransform = _ transformUp {
+          case Dummy(None) => Literal(1)
+
+        })
+    }
+  }
+
+  test("clone") {
+    def assertDifferentInstance[T <: TreeNode[T]](before: TreeNode[T], after: TreeNode[T]): Unit = {
+      assert(before.ne(after) && before == after)
+      before.children.zip(after.children).foreach { case (beforeChild, afterChild) =>
+        assertDifferentInstance(
+          beforeChild.asInstanceOf[TreeNode[T]],
+          afterChild.asInstanceOf[TreeNode[T]])
+      }
+    }
+
+    // Empty constructor
+    val rowNumber = RowNumber()
+    assertDifferentInstance(rowNumber, rowNumber.clone())
+
+    // Overridden `makeCopy`
+    val oneRowRelation = OneRowRelation()
+    assertDifferentInstance(oneRowRelation, oneRowRelation.clone())
+
+    // Multi-way operators
+    val intersect =
+      Intersect(oneRowRelation, Union(Seq(oneRowRelation, oneRowRelation)), isAll = false)
+    assertDifferentInstance(intersect, intersect.clone())
+
+    // Leaf node with an inner child
+    val leaf = FakeLeafPlan(intersect)
+    val leafCloned = leaf.clone()
+    assertDifferentInstance(leaf, leafCloned)
+    assert(leaf.child.eq(leafCloned.asInstanceOf[FakeLeafPlan].child))
+  }
+
+  test("Expression.freshCopyIfContainsStatefulExpression()") {
+    val tag = TreeNodeTag[String]("test")
+
+    def makeExprWithPositionAndTag(block: => Expression): Expression = {
+      CurrentOrigin.setPosition(1, 1)
+      val expr = block
+      CurrentOrigin.reset()
+      expr.setTagValue(tag, "tagValue")
+      expr
+    }
+
+    // Test generic assertions which should always hold for any value returned
+    // from freshCopyIfContainsStatefulExpression()
+    def genericAssertions(before: Expression, after: Expression): Unit = {
+      assert(before == after)
+      assert(before.origin == after.origin)
+      assert(before.getTagValue(tag) == after.getTagValue(tag))
+    }
+
+    // Doesn't transform for non-stateful expressions:
+    val onePlusOneBefore = makeExprWithPositionAndTag(Add(Literal(1), Literal(1)))
+    val onePlusOneAfter = onePlusOneBefore.freshCopyIfContainsStatefulExpression()
+    genericAssertions(onePlusOneBefore, onePlusOneAfter)
+    assert(onePlusOneBefore eq onePlusOneAfter)
+
+    // Transforms stateful expressions with no nesting:
+    val statefulExprBefore = makeExprWithPositionAndTag(Rand(Literal(1)))
+    val statefulExprAfter = statefulExprBefore.freshCopyIfContainsStatefulExpression()
+    genericAssertions(statefulExprBefore, statefulExprAfter)
+    assert(statefulExprBefore ne statefulExprAfter)
+
+    // Transforms expressions nested three levels deep:
+    val withNestedStatefulBefore = makeExprWithPositionAndTag(
+      Add(Literal(1), Add(Literal(1), Rand(Literal(1))))
+    )
+    val withNestedStatefulAfter = withNestedStatefulBefore.freshCopyIfContainsStatefulExpression()
+    genericAssertions(withNestedStatefulBefore, withNestedStatefulAfter)
+    assert(withNestedStatefulBefore ne withNestedStatefulAfter)
+    def getStateful(e: Expression): Expression = {
+      e.collect { case e if e.stateful => e }.head
+    }
+    assert(getStateful(withNestedStatefulBefore) ne getStateful(withNestedStatefulAfter))
+  }
+
+  test("SPARK-37800: TreeNode.argString incorrectly formats arguments of type Set[_]") {
+    case class Node(set: Set[String], nested: Seq[Set[Int]]) extends LeafNode {
+      val output: Seq[Attribute] = Nil
+    }
+    val node = Node(Set("second", "first"), Seq(Set(3, 1), Set(2, 1)))
+    assert(node.argString(10) == "{first, second}, [{1, 3}, {1, 2}]")
+  }
+
+  test("SPARK-38676: truncate before/after sql text if too long") {
+    val text =
+      """
+        |
+        |SELECT
+        |1234567890 + 1234567890 + 1234567890, cast('a'
+        |as /* comment */
+        |int), 1234567890 + 1234567890 + 1234567890
+        |as foo
+        |""".stripMargin
+    val origin = Origin(
+      line = Some(3),
+      startPosition = Some(38),
+      startIndex = Some(47),
+      stopIndex = Some(77),
+      sqlText = Some(text),
+      objectType = Some("VIEW"),
+      objectName = Some("some_view"))
+    val expectedSummary =
+      """== SQL of VIEW some_view (line 3, position 39) ==
+        |...7890 + 1234567890 + 1234567890, cast('a'
+        |                                   ^^^^^^^^
+        |as /* comment */
+        |^^^^^^^^^^^^^^^^
+        |int), 1234567890 + 1234567890 + 12345...
+        |^^^^^
+        |""".stripMargin
+
+    val expectedFragment =
+      """cast('a'
+        |as /* comment */
+        |int),""".stripMargin
+    assert(origin.context.summary == expectedSummary)
+    assert(origin.context.startIndex == origin.startIndex.get)
+    assert(origin.context.stopIndex == origin.stopIndex.get)
+    assert(origin.context.objectType == origin.objectType.get)
+    assert(origin.context.objectName == origin.objectName.get)
+    assert(origin.context.fragment == expectedFragment)
+  }
+
+  test("SPARK-39046: Return an empty context string if TreeNode.origin is wrongly set") {
+    val text = Some("select a + b")
+    // missing start index
+    val origin1 = Origin(
+      startIndex = Some(7),
+      stopIndex = None,
+      sqlText = text)
+    // missing stop index
+    val origin2 = Origin(
+      startIndex = None,
+      stopIndex = Some(11),
+      sqlText = text)
+    // missing text
+    val origin3 = Origin(
+      startIndex = Some(7),
+      stopIndex = Some(11),
+      sqlText = None)
+    // negative start index
+    val origin4 = Origin(
+      startIndex = Some(-1),
+      stopIndex = Some(11),
+      sqlText = text)
+    // stop index >= text.length
+    val origin5 = Origin(
+      startIndex = Some(-1),
+      stopIndex = Some(text.get.length),
+      sqlText = text)
+    // start index > stop index
+    val origin6 = Origin(
+      startIndex = Some(2),
+      stopIndex = Some(1),
+      sqlText = text)
+    Seq(origin1, origin2, origin3, origin4, origin5, origin6).foreach { origin =>
+      assert(origin.context.summary.isEmpty)
+    }
+  }
+
+  private def newErrorAfterLazyList(es: Expression*) = {
+    es.to(LazyList).lazyAppendedAll(
+      throw new NoSuchElementException("LazyList should not return more elements")
+    )
+  }
+
+  test("multiTransformDown generates all alternatives") {
+    val e = Add(Add(Literal("a"), Literal("b")), Add(Literal("c"), Literal("d")))
+    val transformed = e.multiTransformDown {
+      case StringLiteral("a") => Seq(Literal(1), Literal(2), Literal(3))
+      case StringLiteral("b") => Seq(Literal(10), Literal(20), Literal(30))
+      case Add(StringLiteral("c"), StringLiteral("d"), _) =>
+        Seq(Literal(100), Literal(200), Literal(300))
+    }
+    val expected = for {
+      cd <- Seq(Literal(100), Literal(200), Literal(300))
+      b <- Seq(Literal(10), Literal(20), Literal(30))
+      a <- Seq(Literal(1), Literal(2), Literal(3))
+    } yield Add(Add(a, b), cd)
+    assert(transformed === expected)
+  }
+
+  test("multiTransformDown alternatives are accessed only if needed") {
+    val e = Add(Add(Literal("a"), Literal("b")), Add(Literal("c"), Literal("d")))
+    val transformed = e.multiTransformDown {
+      case StringLiteral("a") => Seq(Literal(1), Literal(2), Literal(3))
+      case StringLiteral("b") => newErrorAfterLazyList(Literal(10))
+      case Add(StringLiteral("c"), StringLiteral("d"), _) => newErrorAfterLazyList(Literal(100))
+    }
+    val expected = for {
+      a <- Seq(Literal(1), Literal(2), Literal(3))
+    } yield Add(Add(a, Literal(10)), Literal(100))
+    // We don't access alternatives for `b` after 10 and for `c` after 100
+    assert(transformed.take(3) == expected)
+    intercept[NoSuchElementException] {
+      transformed.take(3 + 1).toList
+    }
+
+    val transformed2 = e.multiTransformDown {
+      case StringLiteral("a") => Seq(Literal(1), Literal(2), Literal(3))
+      case StringLiteral("b") => Seq(Literal(10), Literal(20), Literal(30))
+      case Add(StringLiteral("c"), StringLiteral("d"), _) => newErrorAfterLazyList(Literal(100))
+    }
+    val expected2 = for {
+      b <- Seq(Literal(10), Literal(20), Literal(30))
+      a <- Seq(Literal(1), Literal(2), Literal(3))
+    } yield Add(Add(a, b), Literal(100))
+    // We don't access alternatives for `c` after 100
+    assert(transformed2.take(3 * 3) === expected2)
+    intercept[NoSuchElementException] {
+      transformed.take(3 * 3 + 1).toList
+    }
+  }
+
+  test("multiTransformDown rule return this") {
+    val e = Add(Add(Literal("a"), Literal("b")), Add(Literal("c"), Literal("d")))
+    val transformed = e.multiTransformDown {
+      case s @ StringLiteral("a") => Seq(Literal(1), Literal(2), s)
+      case s @ StringLiteral("b") => Seq(Literal(10), Literal(20), s)
+      case a @ Add(StringLiteral("c"), StringLiteral("d"), _) => Seq(Literal(100), Literal(200), a)
+    }
+    val expected = for {
+      cd <- Seq(Literal(100), Literal(200), Add(Literal("c"), Literal("d")))
+      b <- Seq(Literal(10), Literal(20), Literal("b"))
+      a <- Seq(Literal(1), Literal(2), Literal("a"))
+    } yield Add(Add(a, b), cd)
+    assert(transformed == expected)
+  }
+
+  test("multiTransformDown doesn't stop generating alternatives of descendants when non-leaf is " +
+    "transformed and itself is in the alternatives") {
+    val e = Add(Add(Literal("a"), Literal("b")), Add(Literal("c"), Literal("d")))
+    val transformed = e.multiTransformDown {
+      case a @ Add(StringLiteral("a"), StringLiteral("b"), _) =>
+        Seq(Literal(11), Literal(12), Literal(21), Literal(22), a)
+      case StringLiteral("a") => Seq(Literal(1), Literal(2))
+      case StringLiteral("b") => Seq(Literal(10), Literal(20))
+      case Add(StringLiteral("c"), StringLiteral("d"), _) => Seq(Literal(100), Literal(200))
+    }
+    val expected = for {
+      cd <- Seq(Literal(100), Literal(200))
+      ab <- Seq(Literal(11), Literal(12), Literal(21), Literal(22)) ++
+        (for {
+          b <- Seq(Literal(10), Literal(20))
+          a <- Seq(Literal(1), Literal(2))
+        } yield Add(a, b))
+    } yield Add(ab, cd)
+    assert(transformed == expected)
+  }
+
+  test("multiTransformDown can prune") {
+    val e = Add(Add(Literal("a"), Literal("b")), Add(Literal("c"), Literal("d")))
+    val transformed = e.multiTransformDown {
+      case StringLiteral("a") => Seq.empty
+    }
+    assert(transformed.isEmpty)
+
+    val transformed2 = e.multiTransformDown {
+      case Add(StringLiteral("c"), StringLiteral("d"), _) => Seq.empty
+    }
+    assert(transformed2.isEmpty)
+  }
+
+  test("multiTransformDown alternatives are generated only if needed") {
+    val e = Add(Add(Literal("a"), Literal("b")), Add(Literal("c"), Literal("d")))
+    val transformed = e.multiTransformDown {
+      case StringLiteral("a") => newErrorAfterLazyList()
+      case StringLiteral("b") => Seq.empty
+    }
+    assert(transformed.isEmpty)
+  }
+
+  test("multiTransformDown can do non-cartesian transformations") {
+    val e = Add(Add(Literal("a"), Literal("b")), Add(Literal("c"), Literal("d")))
+    // Suppose that we want to transform both `a` and `b` to `1` and `2`, but we want to have only
+    // those alternatives where these 2 are transformed equal. The first encounter with `a` or `b`
+    // will keep track of the current alternative in a "global" `a_or_b` cache. If we encounter `a`
+    // or `b` again at other places we can return the cached value to keep the transformations in
+    // sync.
+    var a_or_b = Option.empty[Seq[Expression]]
+    val transformed = e.multiTransformDown {
+      case StringLiteral("a") | StringLiteral("b") =>
+        // Return alternatives from cache if this is not the first encounter
+        a_or_b.getOrElse(
+          // Besides returning the alternatives for the first encounter, also set up a mechanism to
+          // update the cache when the new alternatives are requested.
+          LazyList(Literal(1), Literal(2)).map { x =>
+            a_or_b = Some(Seq(x))
+            x
+          }.lazyAppendedAll {
+            a_or_b = None
+            Seq.empty
+          })
+      case Add(StringLiteral("c"), StringLiteral("d"), _) => Seq(Literal(100), Literal(200))
+    }
+    val expected = for {
+      cd <- Seq(Literal(100), Literal(200))
+      a_or_b <- Seq(Literal(1), Literal(2))
+    } yield Add(Add(a_or_b, a_or_b), cd)
+    assert(transformed == expected)
+
+    var c_or_d = Option.empty[Seq[Expression]]
+    val transformed2 = e.multiTransformDown {
+      case StringLiteral("a") | StringLiteral("b") =>
+        a_or_b.getOrElse(
+          LazyList(Literal(1), Literal(2)).map { x =>
+            a_or_b = Some(Seq(x))
+            x
+          }.lazyAppendedAll {
+            a_or_b = None
+            Seq.empty
+          })
+      case StringLiteral("c") | StringLiteral("d") =>
+        c_or_d.getOrElse(
+          LazyList(Literal(10), Literal(20)).map { x =>
+            c_or_d = Some(Seq(x))
+            x
+          }.lazyAppendedAll {
+            c_or_d = None
+            Seq.empty
+          })
+    }
+    val expected2 = for {
+      c_or_d <- Seq(Literal(10), Literal(20))
+      a_or_b <- Seq(Literal(1), Literal(2))
+    } yield Add(Add(a_or_b, a_or_b), Add(c_or_d, c_or_d))
+    assert(transformed2 == expected2)
   }
 }

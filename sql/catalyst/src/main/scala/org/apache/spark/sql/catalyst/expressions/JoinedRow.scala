@@ -20,7 +20,7 @@ package org.apache.spark.sql.catalyst.expressions
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.util.{ArrayData, MapData}
 import org.apache.spark.sql.types._
-import org.apache.spark.unsafe.types.{CalendarInterval, UTF8String}
+import org.apache.spark.unsafe.types._
 
 /**
  * A mutable wrapper that makes two rows appear as a single concatenated row.  Designed to
@@ -53,6 +53,16 @@ class JoinedRow extends InternalRow {
   def withRight(newRight: InternalRow): JoinedRow = {
     row2 = newRight
     this
+  }
+
+  /** Gets this JoinedRow's left base row. */
+  def getLeft: InternalRow = {
+    row1
+  }
+
+  /** Gets this JoinedRow's right base row. */
+  def getRight: InternalRow = {
+    row2
   }
 
   override def toSeq(fieldTypes: Seq[DataType]): Seq[Any] = {
@@ -104,11 +114,25 @@ class JoinedRow extends InternalRow {
   override def getBinary(i: Int): Array[Byte] =
     if (i < row1.numFields) row1.getBinary(i) else row2.getBinary(i - row1.numFields)
 
+  override def getBinaryView(i: Int): BinaryView =
+    if (i < row1.numFields) row1.getBinaryView(i) else row2.getBinaryView(i - row1.numFields)
+
   override def getArray(i: Int): ArrayData =
     if (i < row1.numFields) row1.getArray(i) else row2.getArray(i - row1.numFields)
 
   override def getInterval(i: Int): CalendarInterval =
     if (i < row1.numFields) row1.getInterval(i) else row2.getInterval(i - row1.numFields)
+
+  override def getTimestampNTZNanos(i: Int): TimestampNanosVal =
+    if (i < row1.numFields) row1.getTimestampNTZNanos(i)
+    else row2.getTimestampNTZNanos(i - row1.numFields)
+
+  override def getTimestampLTZNanos(i: Int): TimestampNanosVal =
+    if (i < row1.numFields) row1.getTimestampLTZNanos(i)
+    else row2.getTimestampLTZNanos(i - row1.numFields)
+
+  override def getVariant(i: Int): VariantVal =
+    if (i < row1.numFields) row1.getVariant(i) else row2.getVariant(i - row1.numFields)
 
   override def getMap(i: Int): MapData =
     if (i < row1.numFields) row1.getMap(i) else row2.getMap(i - row1.numFields)
@@ -122,6 +146,22 @@ class JoinedRow extends InternalRow {
   }
 
   override def anyNull: Boolean = row1.anyNull || row2.anyNull
+
+  override def setNullAt(i: Int): Unit = {
+    if (i < row1.numFields) {
+      row1.setNullAt(i)
+    } else {
+      row2.setNullAt(i - row1.numFields)
+    }
+  }
+
+  override def update(i: Int, value: Any): Unit = {
+    if (i < row1.numFields) {
+      row1.update(i, value)
+    } else {
+      row2.update(i - row1.numFields, value)
+    }
+  }
 
   override def copy(): InternalRow = {
     val copy1 = row1.copy()

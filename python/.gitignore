@@ -1,5 +1,12 @@
 *.pyc
 docs/_build/
 pyspark.egg-info
+pyspark_client.egg-info
+pyspark_connect.egg-info
 build/
 dist/
+./setup.py
+./setup.cfg
+# Transient copies made by dev/make-distribution.sh while building the sdists.
+/LICENSE
+/NOTICE

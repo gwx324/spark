@@ -1,19 +1,19 @@
 /*
-* Licensed to the Apache Software Foundation (ASF) under one or more
-* contributor license agreements.  See the NOTICE file distributed with
-* this work for additional information regarding copyright ownership.
-* The ASF licenses this file to You under the Apache License, Version 2.0
-* (the "License"); you may not use this file except in compliance with
-* the License.  You may obtain a copy of the License at
-*
-*    http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
-*/
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package org.apache.spark.sql.sources
 
@@ -22,11 +22,15 @@ import java.sql.{Date, Timestamp}
 
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql._
-import org.apache.spark.sql.test.SharedSQLContext
+import org.apache.spark.sql.catalyst.util.CharVarcharUtils
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types._
 
 class DefaultSource extends SimpleScanSource
 
+// This class is used by pyspark tests. If this class is modified/moved, make sure pyspark
+// tests still pass.
 class SimpleScanSource extends RelationProvider {
   override def createRelation(
       sqlContext: SQLContext,
@@ -105,8 +109,20 @@ case class AllDataTypesScan(
   }
 }
 
-class TableScanSuite extends DataSourceTest with SharedSQLContext {
-  protected override lazy val sql = spark.sql _
+class LegacyTimestampSource extends RelationProvider {
+  override def createRelation(ctx: SQLContext, parameters: Map[String, String]): BaseRelation = {
+    new BaseRelation() with TableScan {
+      override val sqlContext: SQLContext = ctx
+      override val schema: StructType = StructType(StructField("col", TimestampType) :: Nil)
+      override def buildScan(): RDD[Row] = {
+        sqlContext.sparkContext.parallelize(
+          Row(java.sql.Timestamp.valueOf("2022-03-08 12:13:14")) :: Nil)
+      }
+    }
+  }
+}
+
+class TableScanSuite extends DataSourceTest with SharedSparkSession {
 
   private lazy val tableWithSchemaExpected = (1 to 10).map { i =>
     Row(
@@ -124,7 +140,7 @@ class TableScanSuite extends DataSourceTest with SharedSQLContext {
       Date.valueOf("1970-01-01"),
       new Timestamp(20000 + i),
       s"varchar_$i",
-      s"char_$i",
+      s"char_$i".padTo(18, ' '),
       Seq(i, i + 1),
       Seq(Map(s"str_$i" -> Row(i.toLong))),
       Map(i -> i.toString),
@@ -217,8 +233,8 @@ class TableScanSuite extends DataSourceTest with SharedSQLContext {
       StructField("decimalField2", DecimalType(9, 2), true) ::
       StructField("dateField", DateType, true) ::
       StructField("timestampField", TimestampType, true) ::
-      StructField("varcharField", StringType, true) ::
-      StructField("charField", StringType, true) ::
+      StructField("varcharField", VarcharType(12), true) ::
+      StructField("charField", CharType(18), true) ::
       StructField("arrayFieldSimple", ArrayType(IntegerType), true) ::
       StructField("arrayFieldComplex",
         ArrayType(
@@ -241,34 +257,37 @@ class TableScanSuite extends DataSourceTest with SharedSQLContext {
       Nil
     )
 
-    assert(expectedSchema == spark.table("tableWithSchema").schema)
+    assert(CharVarcharUtils.replaceCharVarcharWithStringInSchema(expectedSchema) ==
+      spark.table("tableWithSchema").schema)
 
-    checkAnswer(
-      sql(
-        """SELECT
-          | `string$%Field`,
-          | cast(binaryField as string),
-          | booleanField,
-          | byteField,
-          | shortField,
-          | int_Field,
-          | `longField_:,<>=+/~^`,
-          | floatField,
-          | doubleField,
-          | decimalField1,
-          | decimalField2,
-          | dateField,
-          | timestampField,
-          | varcharField,
-          | charField,
-          | arrayFieldSimple,
-          | arrayFieldComplex,
-          | mapFieldSimple,
-          | mapFieldComplex,
-          | structFieldSimple,
-          | structFieldComplex FROM tableWithSchema""".stripMargin),
-      tableWithSchemaExpected
-    )
+    withSQLConf(SQLConf.SUPPORT_QUOTED_REGEX_COLUMN_NAME.key -> "false") {
+        checkAnswer(
+          sql(
+            """SELECT
+            | `string$%Field`,
+            | cast(binaryField as string),
+            | booleanField,
+            | byteField,
+            | shortField,
+            | int_Field,
+            | `longField_:,<>=+/~^`,
+            | floatField,
+            | doubleField,
+            | decimalField1,
+            | decimalField2,
+            | dateField,
+            | timestampField,
+            | varcharField,
+            | charField,
+            | arrayFieldSimple,
+            | arrayFieldComplex,
+            | mapFieldSimple,
+            | mapFieldComplex,
+            | structFieldSimple,
+            | structFieldComplex FROM tableWithSchema""".stripMargin),
+        tableWithSchemaExpected
+      )
+    }
   }
 
   sqlTest(
@@ -348,31 +367,52 @@ class TableScanSuite extends DataSourceTest with SharedSQLContext {
   test("exceptions") {
     // Make sure we do throw correct exception when users use a relation provider that
     // only implements the RelationProvider or the SchemaRelationProvider.
-    val schemaNotAllowed = intercept[Exception] {
-      sql(
-        """
-          |CREATE TEMPORARY VIEW relationProvierWithSchema (i int)
-          |USING org.apache.spark.sql.sources.SimpleScanSource
-          |OPTIONS (
-          |  From '1',
-          |  To '10'
-          |)
-        """.stripMargin)
-    }
-    assert(schemaNotAllowed.getMessage.contains("does not allow user-specified schemas"))
+    Seq("TEMPORARY VIEW", "TABLE").foreach { tableType =>
+      val schemaNotMatch = intercept[Exception] {
+        sql(
+          s"""
+             |CREATE $tableType relationProviderWithSchema (i string)
+             |USING org.apache.spark.sql.sources.SimpleScanSource
+             |OPTIONS (
+             |  From '1',
+             |  To '10'
+             |)
+           """.stripMargin)
+      }
+      assert(schemaNotMatch.getMessage.contains(
+        "The user-specified schema doesn't match the actual schema"))
 
-    val schemaNeeded = intercept[Exception] {
-      sql(
-        """
-          |CREATE TEMPORARY VIEW schemaRelationProvierWithoutSchema
-          |USING org.apache.spark.sql.sources.AllDataTypesScanSource
-          |OPTIONS (
-          |  From '1',
-          |  To '10'
-          |)
-        """.stripMargin)
+      val schemaNeeded = intercept[Exception] {
+        sql(
+          s"""
+             |CREATE $tableType schemaRelationProviderWithoutSchema
+             |USING org.apache.spark.sql.sources.AllDataTypesScanSource
+             |OPTIONS (
+             |  From '1',
+             |  To '10'
+             |)
+           """.stripMargin)
+      }
+      assert(schemaNeeded.getMessage.contains("A schema needs to be specified when using"))
     }
-    assert(schemaNeeded.getMessage.contains("A schema needs to be specified when using"))
+  }
+
+  test("read the data source tables that do not extend SchemaRelationProvider") {
+    Seq("TEMPORARY VIEW", "TABLE").foreach { tableType =>
+      val tableName = "relationProviderWithSchema"
+      withTable (tableName) {
+        sql(
+          s"""
+             |CREATE $tableType $tableName
+             |USING org.apache.spark.sql.sources.SimpleScanSource
+             |OPTIONS (
+             |  From '1',
+             |  To '10'
+             |)
+           """.stripMargin)
+        checkAnswer(spark.table(tableName), spark.range(1, 11).toDF())
+      }
+    }
   }
 
   test("SPARK-5196 schema field with comment") {
@@ -391,5 +431,19 @@ class TableScanSuite extends DataSourceTest with SharedSQLContext {
     val planned = sql("SELECT * FROM student").queryExecution.executedPlan
     val comments = planned.schema.fields.map(_.getComment().getOrElse("NO_COMMENT")).mkString(",")
     assert(comments === "SN,SA,NO_COMMENT")
+  }
+
+  test("SPARK-38437: accept java.sql.Timestamp even when Java 8 API is enabled") {
+    val tableName = "relationProviderWithLegacyTimestamps"
+    withSQLConf(SQLConf.DATETIME_JAVA8API_ENABLED.key -> "true") {
+      withTable (tableName) {
+        sql(s"""
+          |CREATE TABLE $tableName (col TIMESTAMP)
+          |USING org.apache.spark.sql.sources.LegacyTimestampSource""".stripMargin)
+        checkAnswer(
+          spark.table(tableName),
+          Row(java.sql.Timestamp.valueOf("2022-03-08 12:13:14").toInstant) :: Nil)
+      }
+    }
   }
 }

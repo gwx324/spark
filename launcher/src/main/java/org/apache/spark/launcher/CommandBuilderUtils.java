@@ -19,8 +19,12 @@ package org.apache.spark.launcher;
 
 import java.io.File;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 /**
  * Helper methods for command builders.
@@ -30,11 +34,12 @@ class CommandBuilderUtils {
   static final String DEFAULT_MEM = "1g";
   static final String DEFAULT_PROPERTIES_FILE = "spark-defaults.conf";
   static final String ENV_SPARK_HOME = "SPARK_HOME";
-
-  /** The set of known JVM vendors. */
-  enum JavaVendor {
-    Oracle, IBM, OpenJDK, Unknown
-  }
+  // This should be consistent with org.apache.spark.internal.config.SECRET_REDACTION_PATTERN
+  // We maintain this copy to avoid depending on `core` module.
+  static final String SECRET_REDACTION_PATTERN =
+    "(?i)secret|password|token|access[.]?key|credential";
+  static final Pattern redactPattern = Pattern.compile(SECRET_REDACTION_PATTERN);
+  static final Pattern keyValuePattern = Pattern.compile("-D(.+?)=(.+)");
 
   /** Returns whether the given string is null or empty. */
   static boolean isEmpty(String s) {
@@ -43,16 +48,7 @@ class CommandBuilderUtils {
 
   /** Joins a list of strings using the given separator. */
   static String join(String sep, String... elements) {
-    StringBuilder sb = new StringBuilder();
-    for (String e : elements) {
-      if (e != null) {
-        if (sb.length() > 0) {
-          sb.append(sep);
-        }
-        sb.append(e);
-      }
-    }
-    return sb.toString();
+    return join(sep, Arrays.asList(elements));
   }
 
   /** Joins a list of strings using the given separator. */
@@ -60,7 +56,7 @@ class CommandBuilderUtils {
     StringBuilder sb = new StringBuilder();
     for (String e : elements) {
       if (e != null) {
-        if (sb.length() > 0) {
+        if (!sb.isEmpty()) {
           sb.append(sep);
         }
         sb.append(e);
@@ -112,21 +108,6 @@ class CommandBuilderUtils {
     return os.startsWith("Windows");
   }
 
-  /** Returns an enum value indicating whose JVM is being used. */
-  static JavaVendor getJavaVendor() {
-    String vendorString = System.getProperty("java.vendor");
-    if (vendorString.contains("Oracle")) {
-      return JavaVendor.Oracle;
-    }
-    if (vendorString.contains("IBM")) {
-      return JavaVendor.IBM;
-    }
-    if (vendorString.contains("OpenJDK")) {
-      return JavaVendor.OpenJDK;
-    }
-    return JavaVendor.Unknown;
-  }
-
   /**
    * Updates the user environment, appending the given pathList to the existing value of the given
    * environment variable (or setting it if it hasn't yet been set).
@@ -163,59 +144,61 @@ class CommandBuilderUtils {
         escapeNext = false;
       } else if (inOpt) {
         switch (c) {
-        case '\\':
-          if (inSingleQuote) {
-            opt.appendCodePoint(c);
-          } else {
-            escapeNext = true;
+          case '\\' -> {
+            if (inSingleQuote) {
+              opt.appendCodePoint(c);
+            } else {
+              escapeNext = true;
+            }
           }
-          break;
-        case '\'':
-          if (inDoubleQuote) {
-            opt.appendCodePoint(c);
-          } else {
-            inSingleQuote = !inSingleQuote;
+          case '\'' -> {
+            if (inDoubleQuote) {
+              opt.appendCodePoint(c);
+            } else {
+              inSingleQuote = !inSingleQuote;
+            }
           }
-          break;
-        case '"':
-          if (inSingleQuote) {
-            opt.appendCodePoint(c);
-          } else {
-            inDoubleQuote = !inDoubleQuote;
+          case '"' -> {
+            if (inSingleQuote) {
+              opt.appendCodePoint(c);
+            } else {
+              inDoubleQuote = !inDoubleQuote;
+            }
           }
-          break;
-        default:
-          if (!Character.isWhitespace(c) || inSingleQuote || inDoubleQuote) {
-            opt.appendCodePoint(c);
-          } else {
-            opts.add(opt.toString());
-            opt.setLength(0);
-            inOpt = false;
-            hasData = false;
+          default -> {
+            if (!Character.isWhitespace(c) || inSingleQuote || inDoubleQuote) {
+              opt.appendCodePoint(c);
+            } else {
+              opts.add(opt.toString());
+              opt.setLength(0);
+              inOpt = false;
+              hasData = false;
+            }
           }
         }
       } else {
         switch (c) {
-        case '\'':
-          inSingleQuote = true;
-          inOpt = true;
-          hasData = true;
-          break;
-        case '"':
-          inDoubleQuote = true;
-          inOpt = true;
-          hasData = true;
-          break;
-        case '\\':
-          escapeNext = true;
-          inOpt = true;
-          hasData = true;
-          break;
-        default:
-          if (!Character.isWhitespace(c)) {
+          case '\'' -> {
+            inSingleQuote = true;
             inOpt = true;
             hasData = true;
-            opt.appendCodePoint(c);
+          }
+          case '"' -> {
+            inDoubleQuote = true;
+            inOpt = true;
+            hasData = true;
+          }
+          case '\\' -> {
+            escapeNext = true;
+            inOpt = true;
+            hasData = true;
+          }
+          default -> {
+            if (!Character.isWhitespace(c)) {
+              inOpt = true;
+              hasData = true;
+              opt.appendCodePoint(c);
+            }
           }
         }
       }
@@ -276,12 +259,8 @@ class CommandBuilderUtils {
     for (int i = 0; i < arg.length(); i++) {
       int cp = arg.codePointAt(i);
       switch (cp) {
-      case '"':
-        quoted.append('"');
-        break;
-
-      default:
-        break;
+        case '"' -> quoted.append('"');
+        default -> {}
       }
       quoted.appendCodePoint(cp);
     }
@@ -313,27 +292,6 @@ class CommandBuilderUtils {
   }
 
   /**
-   * Adds the default perm gen size option for Spark if the VM requires it and the user hasn't
-   * set it.
-   */
-  static void addPermGenSizeOpt(List<String> cmd) {
-    // Don't set MaxPermSize for IBM Java, or Oracle Java 8 and later.
-    if (getJavaVendor() == JavaVendor.IBM) {
-      return;
-    }
-    if (javaMajorVersion(System.getProperty("java.version")) > 7) {
-      return;
-    }
-    for (String arg : cmd) {
-      if (arg.contains("-XX:MaxPermSize=")) {
-        return;
-      }
-    }
-
-    cmd.add("-XX:MaxPermSize=256m");
-  }
-
-  /**
    * Get the major version of the java version string supplied. This method
    * accepts any JEP-223-compliant strings (9-ea, 9+100), as well as legacy
    * version strings such as 1.7.0_79
@@ -356,22 +314,36 @@ class CommandBuilderUtils {
    */
   static String findJarsDir(String sparkHome, String scalaVersion, boolean failIfNotFound) {
     // TODO: change to the correct directory once the assembly build is changed.
-    File libdir;
-    if (new File(sparkHome, "RELEASE").isFile()) {
-      libdir = new File(sparkHome, "jars");
-      checkState(!failIfNotFound || libdir.isDirectory(),
-        "Library directory '%s' does not exist.",
-        libdir.getAbsolutePath());
-    } else {
+    File libdir = new File(sparkHome, "jars");
+    if (!libdir.isDirectory()) {
       libdir = new File(sparkHome, String.format("assembly/target/scala-%s/jars", scalaVersion));
       if (!libdir.isDirectory()) {
         checkState(!failIfNotFound,
           "Library directory '%s' does not exist; make sure Spark is built.",
           libdir.getAbsolutePath());
-        libdir = null;
+        return null;
       }
     }
-    return libdir != null ? libdir.getAbsolutePath() : null;
+    return libdir.getAbsolutePath();
   }
 
+  /**
+   * Redact a command-line argument's value part which matches `-Dkey=value` pattern.
+   * Note that this should be consistent with `org.apache.spark.util.Utils.redactCommandLineArgs`.
+   */
+  static List<String> redactCommandLineArgs(List<String> args) {
+    return args.stream().map(CommandBuilderUtils::redact).collect(Collectors.toList());
+  }
+
+  /**
+   * Redact a command-line argument's value part which matches `-Dkey=value` pattern.
+   */
+  static String redact(String arg) {
+    Matcher m = keyValuePattern.matcher(arg);
+    if (m.find() && redactPattern.matcher(m.group(1)).find()) {
+      return String.format("-D%s=%s", m.group(1), "*********(redacted)");
+    } else {
+      return arg;
+    }
+  }
 }

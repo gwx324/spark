@@ -19,15 +19,16 @@ package org.apache.spark.network.sasl;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.concurrent.TimeoutException;
 import javax.security.sasl.Sasl;
 import javax.security.sasl.SaslException;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
+import org.apache.spark.internal.SparkLogger;
+import org.apache.spark.internal.SparkLoggerFactory;
 import org.apache.spark.network.client.TransportClient;
 import org.apache.spark.network.client.TransportClientBootstrap;
 import org.apache.spark.network.util.JavaUtils;
@@ -38,26 +39,16 @@ import org.apache.spark.network.util.TransportConf;
  * server should be setup with a {@link SaslRpcHandler} with matching keys for the given appId.
  */
 public class SaslClientBootstrap implements TransportClientBootstrap {
-  private final Logger logger = LoggerFactory.getLogger(SaslClientBootstrap.class);
+  private static final SparkLogger logger = SparkLoggerFactory.getLogger(SaslClientBootstrap.class);
 
-  private final boolean encrypt;
   private final TransportConf conf;
   private final String appId;
   private final SecretKeyHolder secretKeyHolder;
 
   public SaslClientBootstrap(TransportConf conf, String appId, SecretKeyHolder secretKeyHolder) {
-    this(conf, appId, secretKeyHolder, false);
-  }
-
-  public SaslClientBootstrap(
-      TransportConf conf,
-      String appId,
-      SecretKeyHolder secretKeyHolder,
-      boolean encrypt) {
     this.conf = conf;
     this.appId = appId;
     this.secretKeyHolder = secretKeyHolder;
-    this.encrypt = encrypt;
   }
 
   /**
@@ -67,7 +58,7 @@ public class SaslClientBootstrap implements TransportClientBootstrap {
    */
   @Override
   public void doBootstrap(TransportClient client, Channel channel) {
-    SparkSaslClient saslClient = new SparkSaslClient(appId, secretKeyHolder, encrypt);
+    SparkSaslClient saslClient = new SparkSaslClient(appId, secretKeyHolder, conf.saslEncryption());
     try {
       byte[] payload = saslClient.firstToken();
 
@@ -75,22 +66,32 @@ public class SaslClientBootstrap implements TransportClientBootstrap {
         SaslMessage msg = new SaslMessage(appId, payload);
         ByteBuf buf = Unpooled.buffer(msg.encodedLength() + (int) msg.body().size());
         msg.encode(buf);
+        ByteBuffer response;
         buf.writeBytes(msg.body().nioByteBuffer());
-
-        ByteBuffer response = client.sendRpcSync(buf.nioBuffer(), conf.saslRTTimeoutMs());
+        try {
+          response = client.sendRpcSync(buf.nioBuffer(), conf.authRTTimeoutMs());
+        } catch (RuntimeException ex) {
+          // We know it is a Sasl timeout here if it is a TimeoutException.
+          if (ex.getCause() instanceof TimeoutException te) {
+            throw new SaslTimeoutException(te);
+          } else {
+            throw ex;
+          }
+        }
         payload = saslClient.response(JavaUtils.bufferToArray(response));
       }
 
       client.setClientId(appId);
 
-      if (encrypt) {
+      if (conf.saslEncryption()) {
         if (!SparkSaslServer.QOP_AUTH_CONF.equals(saslClient.getNegotiatedProperty(Sasl.QOP))) {
           throw new RuntimeException(
             new SaslException("Encryption requests by negotiated non-encrypted connection."));
         }
+
         SaslEncryption.addToChannel(channel, saslClient, conf.maxSaslEncryptedBlockSize());
         saslClient = null;
-        logger.debug("Channel {} configured for SASL encryption.", client);
+        logger.debug("Channel {} configured for encryption.", client);
       }
     } catch (IOException ioe) {
       throw new RuntimeException(ioe);

@@ -1,0 +1,2910 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql
+
+import java.lang.reflect.Modifier
+import java.sql.Date
+import java.util.concurrent.atomic.AtomicInteger
+
+import scala.collection.concurrent.TrieMap
+import scala.collection.mutable.ArrayBuffer
+
+import org.scalatest.GivenWhenThen
+
+import org.apache.spark.SparkException
+import org.apache.spark.sql.catalyst.expressions.{BroadcastValueProjection,
+  DynamicPruningExpression, DynamicPruningSubquery, Expression}
+import org.apache.spark.sql.catalyst.expressions.CodegenObjectFactoryMode._
+import org.apache.spark.sql.catalyst.optimizer.BuildRight
+import org.apache.spark.sql.catalyst.plans.{ExistenceJoin, Inner, LeftAnti}
+import org.apache.spark.sql.catalyst.plans.logical.LocalRelation
+import org.apache.spark.sql.connector.catalog.{BufferedRows, InMemoryTableCatalog, InMemoryTableCatalystRuntimeFilterCatalog, InMemoryTableWithV2FilterCatalog}
+import org.apache.spark.sql.execution._
+import org.apache.spark.sql.execution.adaptive._
+import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
+import org.apache.spark.sql.execution.dynamicpruning.PlanDynamicPruningFilters
+import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, ReusedExchangeExec,
+  ShuffleExchangeLike}
+import org.apache.spark.sql.execution.joins.BroadcastHashJoinExec
+import org.apache.spark.sql.execution.metric.SQLLastAttemptMetrics
+import org.apache.spark.sql.execution.streaming.runtime.{MemoryStream, StreamingQueryWrapper}
+import org.apache.spark.sql.execution.window.WindowExec
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.test.SharedSparkSession
+
+/**
+ * Test suite for the filtering ratio policy used to trigger dynamic partition pruning (DPP).
+ */
+abstract class DynamicPartitionPruningSuiteBase
+    extends QueryTest
+    with GivenWhenThen
+    with AdaptiveSparkPlanHelper {
+
+  val tableFormat: String = "parquet"
+
+  import testImplicits._
+
+  protected def initState(): Unit = {}
+  protected def runAnalyzeColumnCommands: Boolean = true
+
+  override protected def beforeAll(): Unit = {
+    super.beforeAll()
+
+    initState()
+
+    val factData = Seq[(Int, Int, Int, Int)](
+      (1000, 1, 1, 10),
+      (1010, 2, 1, 10),
+      (1020, 2, 1, 10),
+      (1030, 3, 2, 10),
+      (1040, 3, 2, 50),
+      (1050, 3, 2, 50),
+      (1060, 3, 2, 50),
+      (1070, 4, 2, 10),
+      (1080, 4, 3, 20),
+      (1090, 4, 3, 10),
+      (1100, 4, 3, 10),
+      (1110, 5, 3, 10),
+      (1120, 6, 4, 10),
+      (1130, 7, 4, 50),
+      (1140, 8, 4, 50),
+      (1150, 9, 1, 20),
+      (1160, 10, 1, 20),
+      (1170, 11, 1, 30),
+      (1180, 12, 2, 20),
+      (1190, 13, 2, 20),
+      (1200, 14, 3, 40),
+      (1200, 15, 3, 70),
+      (1210, 16, 4, 10),
+      (1220, 17, 4, 20),
+      (1230, 18, 4, 20),
+      (1240, 19, 5, 40),
+      (1250, 20, 5, 40),
+      (1260, 21, 5, 40),
+      (1270, 22, 5, 50),
+      (1280, 23, 1, 50),
+      (1290, 24, 1, 50),
+      (1300, 25, 1, 50)
+    )
+
+    val storeData = Seq[(Int, String, String)](
+      (1, "North-Holland", "NL"),
+      (2, "South-Holland", "NL"),
+      (3, "Bavaria", "DE"),
+      (4, "California", "US"),
+      (5, "Texas", "US"),
+      (6, "Texas", "US")
+    )
+
+    val storeCode = Seq[(Int, Int)](
+      (1, 10),
+      (2, 20),
+      (3, 30),
+      (4, 40),
+      (5, 50),
+      (6, 60)
+    )
+
+    if (tableFormat == "hive") {
+      spark.sql("set hive.exec.dynamic.partition.mode=nonstrict")
+    }
+
+    spark.range(1000)
+      .select($"id" as "product_id", ($"id" % 10) as "store_id", ($"id" + 1) as "code")
+      .write
+      .format(tableFormat)
+      .mode("overwrite")
+      .saveAsTable("product")
+
+    factData.toDF("date_id", "store_id", "product_id", "units_sold")
+      .write
+      .format(tableFormat)
+      .saveAsTable("fact_np")
+
+    factData.toDF("date_id", "store_id", "product_id", "units_sold")
+      .write
+      .partitionBy("store_id")
+      .format(tableFormat)
+      .saveAsTable("fact_sk")
+
+    factData.toDF("date_id", "store_id", "product_id", "units_sold")
+      .write
+      .partitionBy("store_id")
+      .format(tableFormat)
+      .saveAsTable("fact_stats")
+
+    storeData.toDF("store_id", "state_province", "country")
+      .write
+      .format(tableFormat)
+      .saveAsTable("dim_store")
+
+    storeData.toDF("store_id", "state_province", "country")
+      .write
+      .format(tableFormat)
+      .saveAsTable("dim_stats")
+
+    storeCode.toDF("store_id", "code")
+      .write
+      .partitionBy("store_id")
+      .format(tableFormat)
+      .saveAsTable("code_stats")
+
+    if (runAnalyzeColumnCommands) {
+      sql("ANALYZE TABLE fact_stats COMPUTE STATISTICS FOR COLUMNS store_id")
+      sql("ANALYZE TABLE dim_stats COMPUTE STATISTICS FOR COLUMNS store_id")
+      sql("ANALYZE TABLE dim_store COMPUTE STATISTICS FOR COLUMNS store_id")
+      sql("ANALYZE TABLE code_stats COMPUTE STATISTICS FOR COLUMNS store_id")
+    }
+  }
+
+  override protected def afterAll(): Unit = {
+    try {
+      sql("DROP TABLE IF EXISTS fact_np")
+      sql("DROP TABLE IF EXISTS fact_sk")
+      sql("DROP TABLE IF EXISTS product")
+      sql("DROP TABLE IF EXISTS dim_store")
+      sql("DROP TABLE IF EXISTS fact_stats")
+      sql("DROP TABLE IF EXISTS dim_stats")
+      sql("DROP TABLE IF EXISTS code_stats")
+    } finally {
+      spark.sessionState.conf.unsetConf(SQLConf.ADAPTIVE_EXECUTION_ENABLED)
+      spark.sessionState.conf.unsetConf(SQLConf.ADAPTIVE_EXECUTION_FORCE_APPLY)
+      super.afterAll()
+    }
+  }
+
+  /**
+   * Check if the query plan has a partition pruning filter inserted as
+   * a subquery duplicate or as a custom broadcast exchange.
+   */
+  def checkPartitionPruningPredicate(
+      df: DataFrame,
+      withSubquery: Boolean,
+      withBroadcast: Boolean): Unit = {
+    df.collect()
+
+    val plan = df.queryExecution.executedPlan
+    val dpExprs = collectDynamicPruningExpressions(plan)
+    val hasSubquery = dpExprs.exists {
+      case InSubqueryExec(_, _: SubqueryExec, _, _, _, _) => true
+      case _ => false
+    }
+    val subqueryBroadcast: Seq[BaseSubqueryExec with UnaryExecNode] = dpExprs.collect {
+      case InSubqueryExec(_, b: SubqueryBroadcastExec, _, _, _, _) => b
+      case InSubqueryExec(_, b: ProjectedBroadcastValueSubqueryExec, _, _, _, _) => b
+    }
+
+    val hasFilter = if (withSubquery) "Should" else "Shouldn't"
+    assert(hasSubquery == withSubquery,
+      s"$hasFilter trigger DPP with a subquery duplicate:\n${df.queryExecution}")
+    val hasBroadcast = if (withBroadcast) "Should" else "Shouldn't"
+    assert(subqueryBroadcast.nonEmpty == withBroadcast,
+      s"$hasBroadcast trigger DPP with a reused broadcast exchange:\n${df.queryExecution}")
+
+    subqueryBroadcast.foreach { s =>
+      s.child match {
+        case _: ReusedExchangeExec => // reuse check ok.
+        case BroadcastQueryStageExec(_, _: ReusedExchangeExec, _) => // reuse check ok.
+        case b: BroadcastExchangeLike =>
+          val hasReuse = plan.exists {
+            case ReusedExchangeExec(_, e) => e eq b
+            case _ => false
+          }
+          assert(hasReuse, s"$s\nshould have been reused in\n$plan")
+        case a: AdaptiveSparkPlanExec =>
+          val broadcastQueryStage = collectFirst(a) {
+            case b: BroadcastQueryStageExec => b
+          }
+          val broadcastPlan = broadcastQueryStage.get.broadcast
+          val hasReuse = find(plan) {
+            case ReusedExchangeExec(_, e) => e eq broadcastPlan
+            case b: BroadcastExchangeLike => b eq broadcastPlan
+            case _ => false
+          }.isDefined
+          assert(hasReuse, s"$s\nshould have been reused in\n$plan")
+        case _ =>
+          fail(s"Invalid child node found in\n$s")
+      }
+    }
+
+    val isMainQueryAdaptive = plan.isInstanceOf[AdaptiveSparkPlanExec]
+    subqueriesAll(plan).filterNot(subqueryBroadcast.contains).foreach { s =>
+      val subquery = s match {
+        case r: ReusedSubqueryExec => r.child
+        case o => o
+      }
+      assert(subquery.exists(_.isInstanceOf[AdaptiveSparkPlanExec]) == isMainQueryAdaptive)
+    }
+  }
+
+  /**
+   * Check if the plan has the given number of distinct broadcast exchange subqueries.
+   */
+  def checkDistinctSubqueries(df: DataFrame, n: Int): Unit = {
+    df.collect()
+
+    val buf = collectDynamicPruningExpressions(df.queryExecution.executedPlan).collect {
+      case InSubqueryExec(_, b: SubqueryBroadcastExec, _, _, _, _) =>
+        b.indices.map(idx => b.buildKeys(idx))
+    }
+    assert(buf.distinct.size == n)
+  }
+
+  test("reuse ancestor broadcast value rows for composite-key date partition pruning") {
+    withTable("dpp_projection_dates", "dpp_projection_users", "dpp_projection_target") {
+      Seq(
+        (Date.valueOf("2024-01-01"), "2024-01-01", "us"),
+        (Date.valueOf("2024-01-01"), "2024-01-01", "us"),
+        (Date.valueOf("2024-01-08"), "2024-01-08", "eu"),
+        (Date.valueOf("2024-01-15"), null, "us"),
+        (null.asInstanceOf[Date], "2024-01-22", "apac"),
+        (Date.valueOf("2024-01-29"), "2024-01-29", "latam"))
+        .toDF("cohort_date", "cohort_ds", "region")
+        .write.format(tableFormat).saveAsTable("dpp_projection_dates")
+
+      Seq(
+        ("2024-01-01", "us", "u1", true),
+        ("2024-01-08", "eu", "u2", true),
+        (null, "us", "null-key", true),
+        ("2024-01-22", "apac", "null-value", true),
+        ("2024-01-08", "us", "inactive", false))
+        .toDF("cohort_ds", "region", "user_id", "active")
+        .write.format(tableFormat).saveAsTable("dpp_projection_users")
+
+      Seq(
+        ("u1", "2024-01-07", "p1"),
+        ("u2", "2024-01-14", "p2"),
+        ("ghost", "2024-02-04", "extra-domain"),
+        ("u1", "2024-02-01", "unselected"))
+        .toDF("user_id", "ds", "payload")
+        .write.partitionBy("ds").format(tableFormat).saveAsTable("dpp_projection_target")
+
+      val query =
+        """
+          |WITH cohorts AS (
+          |  SELECT /*+ BROADCAST(d) */ d.cohort_date, u.user_id
+          |  FROM dpp_projection_dates d
+          |  JOIN dpp_projection_users u
+          |    ON d.cohort_ds = u.cohort_ds AND d.region = u.region
+          |  WHERE u.active AND u.user_id <> 'filtered'
+          |)
+          |SELECT c.user_id, w.payload
+          |FROM cohorts c LEFT JOIN dpp_projection_target w
+          |  ON w.user_id = c.user_id
+          | AND w.ds = date_format(date_add(c.cohort_date, 6), 'yyyy-MM-dd')
+          |ORDER BY c.user_id, w.payload
+          |""".stripMargin
+      val expected = Seq(
+        Row("null-value", null),
+        Row("u1", "p1"),
+        Row("u1", "p1"),
+        Row("u2", "p2"))
+
+      withSQLConf(
+          SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+          SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true",
+          SQLConf.DYNAMIC_PARTITION_PRUNING_BROADCAST_PROJECTION_ENABLED.key -> "false",
+          SQLConf.EXCHANGE_REUSE_ENABLED.key -> "true",
+          SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1") {
+        val df = sql(query)
+        checkAnswer(df, expected)
+        val projected = collectWithSubqueries(df.queryExecution.executedPlan) {
+          case subquery: ProjectedBroadcastValueSubqueryExec => subquery
+        }
+        assert(projected.isEmpty, df.queryExecution.executedPlan)
+      }
+
+      Seq("true", "false").foreach { ansiEnabled =>
+        withSQLConf(
+            SQLConf.ANSI_ENABLED.key -> ansiEnabled,
+            SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+            SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true",
+            SQLConf.DYNAMIC_PARTITION_PRUNING_BROADCAST_PROJECTION_ENABLED.key -> "true",
+            SQLConf.EXCHANGE_REUSE_ENABLED.key -> "true",
+            SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1") {
+          val df = sql(query)
+          val candidates = ArrayBuffer.empty[DynamicPruningSubquery]
+          df.queryExecution.optimizedPlan.transformAllExpressionsWithSubqueries {
+            case candidate: DynamicPruningSubquery =>
+              candidates += candidate
+              candidate
+          }
+          val projections = candidates.flatMap(_.broadcastValueProjection)
+          assert(projections.size === 1, df.queryExecution.optimizedPlan)
+          assert(projections.head.sourceHashKeys.map(_.references.head.name) ===
+            Seq("cohort_ds", "region"))
+
+          checkAnswer(df, expected)
+
+          val projected = collectWithSubqueries(df.queryExecution.executedPlan) {
+            case subquery: ProjectedBroadcastValueSubqueryExec => subquery
+          }
+          assert(projected.size === 1, df.queryExecution.executedPlan)
+          val lastAttemptMetric = SQLLastAttemptMetrics.createMetric(
+            spark.sparkContext, "projected broadcast pruning")
+          assert(lastAttemptMetric.lastAttemptValueForDataset(df) === Some(0L))
+          val pruning = collectDynamicPruningExpressions(df.queryExecution.executedPlan)
+            .collectFirst { case in: InSubqueryExec => in }.get
+          assert(pruning.values().get.map(String.valueOf).toSet ===
+            Set("2024-01-07", "2024-01-14", "2024-02-04"))
+          val projectedMetrics = projected.head.metrics.map {
+            case (name, metric) => name -> metric.value
+          }
+          assert(projected.head.metrics("numInputRows").value === 5, projectedMetrics)
+          assert(projected.head.metrics("numOutputRows").value === 3, projectedMetrics)
+        }
+      }
+
+      Seq(
+        SQLConf.DYNAMIC_PARTITION_PRUNING_BROADCAST_PROJECTION_MAX_ROWS.key,
+        SQLConf.DYNAMIC_PARTITION_PRUNING_BROADCAST_PROJECTION_MAX_BYTES.key,
+        SQLConf.DYNAMIC_PARTITION_PRUNING_BROADCAST_PROJECTION_MAX_SOURCE_BYTES.key
+      ).foreach { limitKey =>
+        withSQLConf(
+            SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+            SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true",
+            SQLConf.DYNAMIC_PARTITION_PRUNING_BROADCAST_PROJECTION_ENABLED.key -> "true",
+            limitKey -> "0",
+            SQLConf.EXCHANGE_REUSE_ENABLED.key -> "true",
+            SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1") {
+          val df = sql(query)
+          checkAnswer(df, expected)
+
+          val projected = collectWithSubqueries(df.queryExecution.executedPlan) {
+            case subquery: ProjectedBroadcastValueSubqueryExec => subquery
+          }
+          assert(projected.size === 1, df.queryExecution.executedPlan)
+          assert(projected.head.metrics("projectionDisabled").value === 1)
+
+          val pruning = collectDynamicPruningExpressions(df.queryExecution.executedPlan)
+            .collectFirst { case in: InSubqueryExec => in }.get
+          assert(pruning.isResultUnavailable)
+          assert(pruning.values().isEmpty)
+
+          val collectError = intercept[SparkException] {
+            projected.head.executeCollect()
+          }
+          assert(collectError.getCondition === "INTERNAL_ERROR")
+          assert(collectError.getMessage.contains("executeCollectResult"))
+
+          val ordinaryIn = pruning.copy(isDynamicPruning = false)
+          val ordinaryInError = intercept[AssertionError] {
+            ordinaryIn.updateResult()
+          }
+          assert(ordinaryInError.getMessage.contains("dynamic partition pruning"))
+        }
+      }
+    }
+  }
+
+  test("reuse ancestor broadcast string values with a residual join predicate") {
+    withTable("dpp_projection_products", "dpp_projection_promotions",
+        "dpp_projection_sales") {
+      Seq(
+        (101, "books", 10),
+        (202, "toys", 20),
+        (303, "clothing", 30),
+        (404, null.asInstanceOf[String], 40))
+        .toDF("product_id", "category", "price")
+        .write.format(tableFormat).saveAsTable("dpp_projection_products")
+
+      Seq((101, true, 15), (202, true, 25), (303, false, 35), (404, true, 45))
+        .toDF("product_id", "active", "max_price")
+        .write.format(tableFormat).saveAsTable("dpp_projection_promotions")
+
+      Seq(
+        (101, "books"),
+        (202, "toys"),
+        (303, "clothing"),
+        (909, "electronics"))
+        .toDF("product_id", "category")
+        .write.partitionBy("category").format(tableFormat)
+        .saveAsTable("dpp_projection_sales")
+
+      withSQLConf(
+          SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+          SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true",
+          SQLConf.DYNAMIC_PARTITION_PRUNING_BROADCAST_PROJECTION_ENABLED.key -> "true",
+          SQLConf.EXCHANGE_REUSE_ENABLED.key -> "true",
+          SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1") {
+        val df = sql(
+          """
+            |WITH eligible AS (
+            |  SELECT /*+ BROADCAST(p) */ p.product_id, p.category
+            |  FROM dpp_projection_products p
+            |  JOIN dpp_projection_promotions promo
+            |    ON p.product_id = promo.product_id
+            |   AND p.price <= promo.max_price
+            |  WHERE promo.active AND promo.product_id > 0
+            |)
+            |SELECT s.product_id, s.category
+            |FROM dpp_projection_sales s
+            |JOIN eligible e
+            |  ON s.product_id = e.product_id
+            | AND s.category = e.category
+            |ORDER BY s.product_id
+            |""".stripMargin)
+
+        checkAnswer(df, Seq(Row(101, "books"), Row(202, "toys")))
+
+        val projected = collectWithSubqueries(df.queryExecution.executedPlan) {
+          case subquery: ProjectedBroadcastValueSubqueryExec => subquery
+        }
+        assert(projected.size === 1, df.queryExecution.executedPlan)
+
+        val pruning = collectDynamicPruningExpressions(df.queryExecution.executedPlan)
+          .collectFirst { case in: InSubqueryExec => in }.get
+        assert(pruning.values().get.map(String.valueOf).toSet ===
+          Set("books", "toys", "clothing"))
+      }
+    }
+  }
+
+  test("bind reordered broadcast value columns for partition pruning") {
+    withTable("dpp_reordered_dates", "dpp_reordered_users", "dpp_reordered_target") {
+      Seq(
+        (Date.valueOf("2024-01-01"), "us", "2024-01-01"),
+        (Date.valueOf("2024-01-08"), "eu", "2024-01-08"),
+        (Date.valueOf("2024-01-15"), "us", "2024-01-15"))
+        .toDF("cohort_date", "region", "cohort_ds")
+        .write.format(tableFormat).saveAsTable("dpp_reordered_dates")
+
+      Seq(
+        ("2024-01-01", "us", "u1", true),
+        ("2024-01-08", "eu", "u2", true),
+        ("2024-01-15", "us", "inactive", false))
+        .toDF("cohort_ds", "region", "user_id", "active")
+        .write.format(tableFormat).saveAsTable("dpp_reordered_users")
+
+      Seq(
+        ("u1", "20240107", "p1"),
+        ("u2", "20240114", "p2"),
+        ("inactive", "20240121", "extra-domain"))
+        .toDF("user_id", "ds", "payload")
+        .write.partitionBy("ds").format(tableFormat).saveAsTable("dpp_reordered_target")
+
+      withSQLConf(
+          SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+          SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true",
+          SQLConf.DYNAMIC_PARTITION_PRUNING_BROADCAST_PROJECTION_ENABLED.key -> "true",
+          SQLConf.EXCHANGE_REUSE_ENABLED.key -> "true",
+          SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1") {
+        val df = sql(
+          """
+            |WITH reordered_dates AS (
+            |  SELECT cohort_date, region, cohort_ds
+            |  FROM dpp_reordered_dates
+            |), cohorts AS (
+            |  SELECT /*+ BROADCAST(d) */ u.user_id, d.cohort_date
+            |  FROM reordered_dates d
+            |  JOIN dpp_reordered_users u
+            |    ON d.cohort_ds = u.cohort_ds AND d.region = u.region
+            |  WHERE u.active AND u.user_id <> 'filtered'
+            |)
+            |SELECT c.user_id, w.payload
+            |FROM cohorts c
+            |LEFT JOIN dpp_reordered_target w
+            |  ON w.user_id = c.user_id
+            | AND w.ds = date_format(date_add(c.cohort_date, 6), 'yyyyMMdd')
+            |ORDER BY c.user_id, w.payload
+            |""".stripMargin)
+
+        checkAnswer(df, Seq(Row("u1", "p1"), Row("u2", "p2")))
+
+        val projected = collectWithSubqueries(df.queryExecution.executedPlan) {
+          case subquery: ProjectedBroadcastValueSubqueryExec => subquery
+        }
+        assert(projected.size === 1, df.queryExecution.executedPlan)
+        assert(projected.head.child.output.map(_.name) ===
+          Seq("cohort_date", "region", "cohort_ds"))
+
+        val pruning = collectDynamicPruningExpressions(df.queryExecution.executedPlan)
+          .collectFirst { case in: InSubqueryExec => in }.get
+        assert(pruning.values().get.map(String.valueOf).toSet ===
+          Set("20240107", "20240114", "20240121"))
+      }
+    }
+  }
+
+  test("project every value row from dense and sparse long-key hash broadcasts") {
+    Seq(2L, 1000000000L).foreach { otherKey =>
+      withTable("dpp_long_dates", "dpp_long_users", "dpp_long_target") {
+        Seq(
+          (1L, Date.valueOf("2024-01-01")),
+          (1L, Date.valueOf("2024-01-08")),
+          (otherKey, Date.valueOf("2024-01-15")))
+          .toDF("cohort_id", "cohort_date")
+          .write.format(tableFormat).saveAsTable("dpp_long_dates")
+
+        Seq((1L, "u1", true), (otherKey, "u2", true))
+          .toDF("cohort_id", "user_id", "active")
+          .write.format(tableFormat).saveAsTable("dpp_long_users")
+
+        Seq(
+          ("u1", "2024-01-07", "p1"),
+          ("u1", "2024-01-14", "p2"),
+          ("u2", "2024-01-21", "p3"))
+          .toDF("user_id", "ds", "payload")
+          .write.partitionBy("ds").format(tableFormat).saveAsTable("dpp_long_target")
+
+        withSQLConf(
+            SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+            SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true",
+            SQLConf.DYNAMIC_PARTITION_PRUNING_BROADCAST_PROJECTION_ENABLED.key -> "true",
+            SQLConf.EXCHANGE_REUSE_ENABLED.key -> "true",
+            SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1") {
+          val df = sql(
+            """
+              |WITH cohorts AS (
+              |  SELECT /*+ BROADCAST(d) */ d.cohort_date, u.user_id
+              |  FROM dpp_long_dates d
+              |  JOIN dpp_long_users u ON d.cohort_id = u.cohort_id
+              |  WHERE u.active AND u.user_id <> 'filtered'
+              |)
+              |SELECT c.user_id, w.payload
+              |FROM cohorts c
+              |LEFT JOIN dpp_long_target w
+              |  ON w.user_id = c.user_id
+              | AND w.ds = date_format(date_add(c.cohort_date, 6), 'yyyy-MM-dd')
+              |ORDER BY c.user_id, w.payload
+              |""".stripMargin)
+
+          checkAnswer(df, Seq(
+            Row("u1", "p1"),
+            Row("u1", "p2"),
+            Row("u2", "p3")))
+
+          val projected = collectWithSubqueries(df.queryExecution.executedPlan) {
+            case subquery: ProjectedBroadcastValueSubqueryExec => subquery
+          }
+          assert(projected.size === 1, df.queryExecution.executedPlan)
+          val pruning = collectDynamicPruningExpressions(df.queryExecution.executedPlan)
+            .collectFirst { case in: InSubqueryExec => in }.get
+          assert(pruning.values().get.map(String.valueOf).toSet ===
+            Set("2024-01-07", "2024-01-14", "2024-01-21"))
+          val projectedMetrics = projected.head.metrics.map {
+            case (name, metric) => name -> metric.value
+          }
+          assert(projected.head.metrics("numInputRows").value === 3, projectedMetrics)
+          assert(projected.head.metrics("numOutputRows").value === 3, projectedMetrics)
+        }
+      }
+    }
+  }
+
+  /**
+   * Collect the children of all correctly pushed down dynamic pruning expressions in a spark plan.
+   */
+  protected def collectDynamicPruningExpressions(plan: SparkPlan): Seq[Expression] = {
+    flatMap(plan) {
+      case s: FileSourceScanExec => s.partitionFilters.collect {
+        case d: DynamicPruningExpression => d.child
+      }
+      case s: BatchScanExec => s.runtimeFilters.collect {
+        case d: DynamicPruningExpression => d.child
+      }
+      case _ => Nil
+    }
+  }
+
+  /**
+   * Check if the plan contains unpushed dynamic pruning filters.
+   */
+  def checkUnpushedFilters(df: DataFrame): Boolean = {
+    find(df.queryExecution.executedPlan) {
+      case FilterExec(condition, _) =>
+        splitConjunctivePredicates(condition).exists {
+          case _: DynamicPruningExpression => true
+          case _ => false
+        }
+      case _ => false
+    }.isDefined
+  }
+
+  /**
+   * Test the result of a simple join on mock-up tables
+   */
+  test("simple inner join triggers DPP with mock-up tables") {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+      SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "false",
+      SQLConf.EXCHANGE_REUSE_ENABLED.key -> "false") {
+      val df = sql(
+        """
+          |SELECT f.date_id, f.store_id FROM fact_sk f
+          |JOIN dim_store s ON f.store_id = s.store_id AND s.country = 'NL'
+        """.stripMargin)
+
+      checkPartitionPruningPredicate(df, true, false)
+
+      checkAnswer(df, Row(1000, 1) :: Row(1010, 2) :: Row(1020, 2) :: Nil)
+    }
+  }
+
+  /**
+   * Test DPP is triggered by a self-join on a partitioned table
+   */
+  test("self-join on a partitioned table should not trigger DPP") {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+      SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "false",
+      SQLConf.EXCHANGE_REUSE_ENABLED.key -> "false") {
+      withTable("fact") {
+        sql(
+          s"""
+             |CREATE TABLE fact (
+             |  col1 varchar(14), col2 bigint, col3 bigint, col4 decimal(18,8), partCol1 varchar(1)
+             |) USING $tableFormat PARTITIONED BY (partCol1)
+        """.stripMargin)
+
+        val df = sql(
+          """
+            |SELECT b.col1 FROM fact a
+            |JOIN
+            |(SELECT * FROM (
+            |    SELECT *, Lag(col4) OVER (PARTITION BY partCol1, col1 ORDER BY col2) prev_col4
+            |    FROM (SELECT partCol1, col1, col2, col3, col4 FROM fact) subquery) subquery2
+            |  WHERE  col3 = 0 AND col4 = prev_col4
+            |) b
+            |ON a.partCol1 = b.partCol1
+          """.stripMargin)
+
+        checkPartitionPruningPredicate(df, false, false)
+      }
+    }
+  }
+
+  test("DPP should not be rewritten as an existential join") {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+      SQLConf.DYNAMIC_PARTITION_PRUNING_FALLBACK_FILTER_RATIO.key -> "1.5",
+      SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "false",
+      SQLConf.EXCHANGE_REUSE_ENABLED.key -> "false") {
+      val df = sql(
+        s"""
+           |SELECT * FROM product p WHERE p.store_id NOT IN
+           | (SELECT f.store_id FROM fact_sk f JOIN dim_store d ON f.store_id = d.store_id
+           |    WHERE d.state_province = 'NL'
+           | )
+       """.stripMargin)
+
+      val found = df.queryExecution.executedPlan.exists {
+        case BroadcastHashJoinExec(_, _, p: ExistenceJoin, _, _, _, _, _, _) => true
+        case _ => false
+      }
+
+      assert(!found)
+    }
+  }
+
+  /**
+   * (1) DPP should be disabled when the large (fact) table isn't partitioned by the join key
+   * (2) DPP should be triggered only for certain join types
+   * (3) DPP should trigger only when we have attributes on both sides of the join condition
+   */
+  test("DPP triggers only for certain types of query") {
+    withSQLConf(
+      SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "false") {
+      Given("dynamic partition pruning disabled")
+      withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "false") {
+        val df = sql(
+          """
+            |SELECT * FROM fact_sk f
+            |LEFT SEMI JOIN dim_store s
+            |ON f.store_id = s.store_id AND s.country = 'NL'
+          """.stripMargin)
+
+        checkPartitionPruningPredicate(df, false, false)
+      }
+
+      Given("not a partition column")
+      withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true") {
+        val df = sql(
+          """
+            |SELECT * FROM fact_np f
+            |JOIN dim_store s
+            |ON f.date_id = s.store_id WHERE s.country = 'NL'
+          """.stripMargin)
+
+        checkPartitionPruningPredicate(df, false, false)
+      }
+
+      Given("no predicate on the dimension table")
+      withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true") {
+        val df = sql(
+          """
+            |SELECT * FROM fact_sk f
+            |JOIN dim_store s
+            |ON f.store_id = s.store_id
+          """.stripMargin)
+
+        checkPartitionPruningPredicate(df, false, false)
+      }
+
+      Given("left-semi join with partition column on the left side")
+      withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+        SQLConf.EXCHANGE_REUSE_ENABLED.key -> "false") {
+        val df = sql(
+          """
+            |SELECT * FROM fact_sk f
+            |LEFT SEMI JOIN dim_store s
+            |ON f.store_id = s.store_id AND s.country = 'NL'
+          """.stripMargin)
+
+        checkPartitionPruningPredicate(df, true, false)
+      }
+
+      Given("left-semi join with partition column on the right side")
+      withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+        SQLConf.EXCHANGE_REUSE_ENABLED.key -> "false") {
+        val df = sql(
+          """
+            |SELECT * FROM dim_store s
+            |LEFT SEMI JOIN fact_sk f
+            |ON f.store_id = s.store_id AND s.country = 'NL'
+          """.stripMargin)
+
+        checkPartitionPruningPredicate(df, true, false)
+      }
+
+      Given("left outer with partition column on the left side")
+      withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true") {
+        val df = sql(
+          """
+            |SELECT * FROM fact_sk f
+            |LEFT OUTER JOIN dim_store s
+            |ON f.store_id = s.store_id WHERE f.units_sold = 10
+          """.stripMargin)
+
+        checkPartitionPruningPredicate(df, false, false)
+      }
+
+      Given("right outer join with partition column on the left side")
+      withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+        SQLConf.EXCHANGE_REUSE_ENABLED.key -> "false") {
+        val df = sql(
+          """
+            |SELECT * FROM fact_sk f RIGHT OUTER JOIN dim_store s
+            |ON f.store_id = s.store_id WHERE s.country = 'NL'
+          """.stripMargin)
+
+        checkPartitionPruningPredicate(df, true, false)
+      }
+    }
+  }
+
+  /**
+   * The filtering policy has a fallback when the stats are unavailable
+   */
+  test("filtering ratio policy fallback") {
+    withSQLConf(
+      SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "false",
+      SQLConf.EXCHANGE_REUSE_ENABLED.key -> "false",
+      SQLConf.ADAPTIVE_OPTIMIZER_EXCLUDED_RULES.key -> AQEPropagateEmptyRelation.ruleName) {
+      Given("no stats and selective predicate")
+      withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+        SQLConf.DYNAMIC_PARTITION_PRUNING_USE_STATS.key -> "true") {
+        val df = sql(
+          """
+            |SELECT f.date_id, f.product_id, f.units_sold, f.store_id FROM fact_sk f
+            |JOIN dim_store s
+            |ON f.store_id = s.store_id WHERE s.country LIKE '%C_%'
+          """.stripMargin)
+
+        checkPartitionPruningPredicate(df, true, false)
+      }
+
+      Given("no stats and selective predicate with the size of dim too large")
+      withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+          SQLConf.DYNAMIC_PARTITION_PRUNING_USE_STATS.key -> "true",
+          SQLConf.DYNAMIC_PARTITION_PRUNING_FALLBACK_FILTER_RATIO.key -> "0.02") {
+        withTable("fact_aux") {
+          sql(
+            """
+              |SELECT f.date_id, f.product_id, f.units_sold, f.store_id
+              |FROM fact_sk f WHERE store_id < 5
+            """.stripMargin)
+            .write
+            .partitionBy("store_id")
+            .saveAsTable("fact_aux")
+
+          val df = sql(
+            """
+              |SELECT f.date_id, f.product_id, f.units_sold, f.store_id
+              |FROM fact_aux f JOIN dim_store s
+              |ON f.store_id = s.store_id WHERE s.country = 'US'
+            """.stripMargin)
+
+          checkPartitionPruningPredicate(df, false, false)
+
+          checkAnswer(df,
+            Row(1070, 2, 10, 4) ::
+              Row(1080, 3, 20, 4) ::
+              Row(1090, 3, 10, 4) ::
+              Row(1100, 3, 10, 4) :: Nil
+          )
+        }
+      }
+
+      Given("no stats and selective predicate with the size of dim too large but cached")
+      withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+          SQLConf.DYNAMIC_PARTITION_PRUNING_USE_STATS.key -> "true") {
+        withTable("fact_aux") {
+          withTempView("cached_dim_store") {
+            sql(
+              """
+                |SELECT f.date_id, f.product_id, f.units_sold, f.store_id
+                |FROM fact_sk f WHERE store_id < 5
+              """.stripMargin)
+              .write
+              .partitionBy("store_id")
+              .saveAsTable("fact_aux")
+
+            spark.table("dim_store").cache()
+              .createOrReplaceTempView("cached_dim_store")
+
+            val df = sql(
+              """
+                |SELECT f.date_id, f.product_id, f.units_sold, f.store_id
+                |FROM fact_aux f JOIN cached_dim_store s
+                |ON f.store_id = s.store_id WHERE s.country = 'US'
+              """.stripMargin)
+
+            checkPartitionPruningPredicate(df, true, false)
+
+            checkAnswer(df,
+              Row(1070, 2, 10, 4) ::
+                Row(1080, 3, 20, 4) ::
+                Row(1090, 3, 10, 4) ::
+                Row(1100, 3, 10, 4) :: Nil
+            )
+          }
+        }
+      }
+
+      Given("no stats and selective predicate with the size of dim small")
+      withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+        SQLConf.DYNAMIC_PARTITION_PRUNING_USE_STATS.key -> "true") {
+        val df = sql(
+          """
+            |SELECT f.date_id, f.product_id, f.units_sold, f.store_id FROM fact_sk f
+            |JOIN dim_store s
+            |ON f.store_id = s.store_id WHERE s.country = 'NL'
+          """.stripMargin)
+
+        checkPartitionPruningPredicate(df, true, false)
+
+        checkAnswer(df,
+          Row(1010, 1, 10, 2) ::
+          Row(1020, 1, 10, 2) ::
+          Row(1000, 1, 10, 1) :: Nil
+        )
+      }
+    }
+  }
+
+  /**
+   *  The filtering ratio policy performs best when it uses cardinality estimates
+   */
+  test("filtering ratio policy with stats when the broadcast pruning is disabled") {
+    withSQLConf(
+      SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "false",
+      SQLConf.EXCHANGE_REUSE_ENABLED.key -> "false") {
+      Given("disabling the use of stats in the DPP heuristic")
+      withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+        SQLConf.DYNAMIC_PARTITION_PRUNING_USE_STATS.key -> "false") {
+        val df = sql(
+          """
+            |SELECT f.date_id, f.product_id, f.units_sold, f.store_id FROM fact_stats f
+            |JOIN dim_stats s
+            |ON f.store_id = s.store_id WHERE s.country = 'DE'
+          """.stripMargin)
+
+        checkPartitionPruningPredicate(df, true, false)
+      }
+
+      Given("filtering ratio with stats disables pruning")
+      withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+        SQLConf.DYNAMIC_PARTITION_PRUNING_USE_STATS.key -> "true") {
+        val df = sql(
+          """
+            |SELECT f.date_id, f.product_id, f.units_sold, f.store_id FROM fact_stats f
+            |JOIN dim_stats s
+            |ON (f.store_id = s.store_id) WHERE s.store_id > 0 AND s.store_id IN
+            |(SELECT p.store_id FROM product p)
+          """.stripMargin)
+
+        checkPartitionPruningPredicate(df, false, false)
+      }
+
+      Given("filtering ratio with stats enables pruning")
+      withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+        SQLConf.DYNAMIC_PARTITION_PRUNING_USE_STATS.key -> "true") {
+        val df = sql(
+          """
+            |SELECT f.date_id, f.product_id, f.units_sold, f.store_id FROM fact_stats f
+            |JOIN dim_stats s
+            |ON f.store_id = s.store_id WHERE s.country = 'DE'
+          """.stripMargin)
+
+        checkPartitionPruningPredicate(df, true, false)
+
+        checkAnswer(df,
+          Row(1030, 2, 10, 3) ::
+          Row(1040, 2, 50, 3) ::
+          Row(1050, 2, 50, 3) ::
+          Row(1060, 2, 50, 3) :: Nil
+        )
+      }
+
+      Given("join condition more complex than fact.attr = dim.attr")
+      withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+        SQLConf.DYNAMIC_PARTITION_PRUNING_USE_STATS.key -> "true") {
+        val df = sql(
+          """
+            |SELECT f.date_id, f.product_id, f.units_sold, f.store_id
+            |FROM fact_stats f JOIN dim_stats s
+            |ON f.store_id + 1 = s.store_id WHERE s.country = 'DE'
+          """.stripMargin)
+
+        checkPartitionPruningPredicate(df, true, false)
+
+        checkAnswer(df,
+          Row(1010, 1, 10, 2) ::
+          Row(1020, 1, 10, 2) :: Nil
+        )
+      }
+    }
+  }
+
+  test("partition pruning in broadcast hash joins with non-deterministic probe part") {
+    Given("alias with simple join condition, and non-deterministic query")
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true") {
+      val df = sql(
+        """
+          |SELECT f.date_id, f.pid, f.sid FROM
+          |(SELECT date_id, product_id AS pid, store_id AS sid
+          |   FROM fact_stats WHERE RAND() > 0.5) AS f
+          |JOIN dim_stats s
+          |ON f.sid = s.store_id WHERE s.country = 'DE'
+        """.stripMargin)
+
+      checkPartitionPruningPredicate(df, false, false)
+    }
+
+    Given("alias over multiple sub-queries with simple join condition")
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true") {
+      val df = sql(
+        """
+          |SELECT f.date_id, f.pid, f.sid FROM
+          |(SELECT date_id, pid_d AS pid, sid_d AS sid FROM
+          |  (SELECT date_id, product_id AS pid_d, store_id AS sid_d FROM fact_stats
+          |  WHERE RAND() > 0.5) fs
+          |  JOIN dim_store ds ON fs.sid_d = ds.store_id) f
+          |JOIN dim_stats s
+          |ON f.sid  = s.store_id  WHERE s.country = 'DE'
+        """.stripMargin)
+
+      checkPartitionPruningPredicate(df, false, false)
+    }
+  }
+
+  test("partition pruning in broadcast hash joins with aliases") {
+    Given("alias with simple join condition, using attribute names only")
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true") {
+      val df = sql(
+        """
+          |SELECT f.date_id, f.pid, f.sid FROM
+          |(select date_id, product_id as pid, store_id as sid from fact_stats) as f
+          |JOIN dim_stats s
+          |ON f.sid = s.store_id WHERE s.country = 'DE'
+        """.stripMargin)
+
+      checkPartitionPruningPredicate(df, false, true)
+
+      checkAnswer(df,
+        Row(1030, 2, 3) ::
+        Row(1040, 2, 3) ::
+        Row(1050, 2, 3) ::
+        Row(1060, 2, 3) :: Nil
+      )
+    }
+
+    Given("alias with expr as join condition")
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true") {
+      val df = sql(
+        """
+          |SELECT f.date_id, f.pid, f.sid FROM
+          |(SELECT date_id, product_id AS pid, store_id AS sid FROM fact_stats) AS f
+          |JOIN dim_stats s
+          |ON f.sid + 1 = s.store_id + 1 WHERE s.country = 'DE'
+        """.stripMargin)
+
+      checkPartitionPruningPredicate(df, false, true)
+
+      checkAnswer(df,
+        Row(1030, 2, 3) ::
+        Row(1040, 2, 3) ::
+        Row(1050, 2, 3) ::
+        Row(1060, 2, 3) :: Nil
+      )
+    }
+
+    Given("alias over multiple sub-queries with simple join condition")
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true") {
+      val df = sql(
+        """
+          |SELECT f.date_id, f.pid, f.sid FROM
+          |(SELECT date_id, pid_d AS pid, sid_d AS sid FROM
+          |  (select date_id, product_id AS pid_d, store_id AS sid_d FROM fact_stats) fs
+          |  JOIN dim_store ds ON fs.sid_d = ds.store_id) f
+          |JOIN dim_stats s
+          |ON f.sid  = s.store_id  WHERE s.country = 'DE'
+        """.stripMargin)
+
+      checkPartitionPruningPredicate(df, false, true)
+
+      checkAnswer(df,
+        Row(1030, 2, 3) ::
+          Row(1040, 2, 3) ::
+          Row(1050, 2, 3) ::
+          Row(1060, 2, 3) :: Nil
+      )
+    }
+
+    Given("alias over multiple sub-queries with simple join condition")
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true") {
+      val df = sql(
+        """
+          |SELECT f.date_id, f.pid_d as pid, f.sid_d as sid FROM
+          | (SELECT date_id, pid_dd AS pid_d, sid_dd AS sid_d FROM
+          |  (
+          |   (select date_id, product_id AS pid_dd, store_id AS sid_dd FROM fact_stats) fss
+          |     JOIN dim_store ds ON fss.sid_dd = ds.store_id
+          |   ) fs
+          |  JOIN dim_store ds ON fs.sid_dd = ds.store_id
+          | ) f
+          |JOIN dim_stats s
+          |ON f.sid_d  = s.store_id  WHERE s.country = 'DE'
+        """.stripMargin)
+
+      checkPartitionPruningPredicate(df, false, true)
+
+      checkAnswer(df,
+        Row(1030, 2, 3) ::
+          Row(1040, 2, 3) ::
+          Row(1050, 2, 3) ::
+          Row(1060, 2, 3) :: Nil
+      )
+    }
+  }
+
+  test("partition pruning in broadcast hash joins") {
+    Given("disable broadcast pruning and disable subquery duplication")
+    withSQLConf(
+      SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true",
+      SQLConf.EXCHANGE_REUSE_ENABLED.key -> "false") {
+      val df = sql(
+        """
+          |SELECT f.date_id, f.product_id, f.units_sold, f.store_id FROM fact_stats f
+          |JOIN dim_stats s
+          |ON f.store_id = s.store_id WHERE s.country = 'DE'
+        """.stripMargin)
+
+      checkPartitionPruningPredicate(df, false, false)
+
+      checkAnswer(df,
+        Row(1030, 2, 10, 3) ::
+        Row(1040, 2, 50, 3) ::
+        Row(1050, 2, 50, 3) ::
+        Row(1060, 2, 50, 3) :: Nil
+      )
+    }
+
+    Given("disable reuse broadcast results and enable subquery duplication")
+    withSQLConf(
+      SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "false",
+      SQLConf.DYNAMIC_PARTITION_PRUNING_USE_STATS.key -> "true",
+      SQLConf.DYNAMIC_PARTITION_PRUNING_FALLBACK_FILTER_RATIO.key -> "0.5",
+      SQLConf.EXCHANGE_REUSE_ENABLED.key -> "false") {
+      val df = sql(
+        """
+          |SELECT f.date_id, f.product_id, f.units_sold, f.store_id FROM fact_stats f
+          |JOIN dim_stats s
+          |ON f.store_id = s.store_id WHERE s.country = 'DE'
+        """.stripMargin)
+
+      checkPartitionPruningPredicate(df, true, false)
+
+      checkAnswer(df,
+        Row(1030, 2, 10, 3) ::
+        Row(1040, 2, 50, 3) ::
+        Row(1050, 2, 50, 3) ::
+        Row(1060, 2, 50, 3) :: Nil
+      )
+    }
+
+    Given("enable reuse broadcast results and disable query duplication")
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true") {
+      val df = sql(
+        """
+          |SELECT f.date_id, f.product_id, f.units_sold, f.store_id FROM fact_stats f
+          |JOIN dim_stats s
+          |ON f.store_id = s.store_id WHERE s.country = 'DE'
+        """.stripMargin)
+
+      checkPartitionPruningPredicate(df, false, true)
+
+      checkAnswer(df,
+        Row(1030, 2, 10, 3) ::
+        Row(1040, 2, 50, 3) ::
+        Row(1050, 2, 50, 3) ::
+        Row(1060, 2, 50, 3) :: Nil
+      )
+    }
+
+    Given("disable broadcast hash join and disable query duplication")
+    withSQLConf(
+      SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true",
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1") {
+      val df = sql(
+        """
+          |SELECT f.date_id, f.product_id, f.units_sold, f.store_id FROM fact_stats f
+          |JOIN dim_stats s
+          |ON f.store_id = s.store_id WHERE s.country = 'DE'
+        """.stripMargin)
+
+      checkPartitionPruningPredicate(df, false, false)
+
+      checkAnswer(df,
+        Row(1030, 2, 10, 3) ::
+        Row(1040, 2, 50, 3) ::
+        Row(1050, 2, 50, 3) ::
+        Row(1060, 2, 50, 3) :: Nil
+      )
+    }
+
+    Given("disable broadcast hash join and enable query duplication")
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "false",
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+      SQLConf.DYNAMIC_PARTITION_PRUNING_USE_STATS.key -> "true") {
+      val df = sql(
+        """
+          |SELECT f.date_id, f.product_id, f.units_sold, f.store_id FROM fact_stats f
+          |JOIN dim_stats s
+          |ON f.store_id = s.store_id WHERE s.country = 'DE'
+        """.stripMargin)
+
+      checkPartitionPruningPredicate(df, true, false)
+
+      checkAnswer(df,
+        Row(1030, 2, 10, 3) ::
+        Row(1040, 2, 50, 3) ::
+        Row(1050, 2, 50, 3) ::
+        Row(1060, 2, 50, 3) :: Nil
+      )
+    }
+  }
+
+  test("broadcast a single key in a HashedRelation") {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true") {
+      withTable("fact", "dim") {
+        spark.range(100).select(
+          $"id",
+          ($"id" + 1).cast("int").as("one"),
+          ($"id" + 2).cast("byte").as("two"),
+          ($"id" + 3).cast("short").as("three"),
+          (($"id" * 20) % 100).as("mod"),
+          ($"id" + 1).cast("string").as("str"))
+          .write.partitionBy("one", "two", "three", "str")
+          .format(tableFormat).mode("overwrite").saveAsTable("fact")
+
+        spark.range(10).select(
+          $"id",
+          ($"id" + 1).cast("int").as("one"),
+          ($"id" + 2).cast("byte").as("two"),
+          ($"id" + 3).cast("short").as("three"),
+          ($"id" * 10).as("prod"),
+          ($"id" + 1).cast("string").as("str"))
+          .write.format(tableFormat).mode("overwrite").saveAsTable("dim")
+
+        // broadcast a single Long key
+        val dfLong = sql(
+          """
+            |SELECT f.id, f.one, f.two, f.str FROM fact f
+            |JOIN dim d
+            |ON (f.one = d.one)
+            |WHERE d.prod > 80
+          """.stripMargin)
+
+        checkAnswer(dfLong, Row(9, 10, 11, "10") :: Nil)
+
+        // reuse a single Byte key
+        val dfByte = sql(
+          """
+            |SELECT f.id, f.one, f.two, f.str FROM fact f
+            |JOIN dim d
+            |ON (f.two = d.two)
+            |WHERE d.prod > 80
+          """.stripMargin)
+
+        checkAnswer(dfByte, Row(9, 10, 11, "10") :: Nil)
+
+        // reuse a single String key
+        val dfStr = sql(
+          """
+            |SELECT f.id, f.one, f.two, f.str FROM fact f
+            |JOIN dim d
+            |ON (f.str = d.str)
+            |WHERE d.prod > 80
+          """.stripMargin)
+
+        checkAnswer(dfStr, Row(9, 10, 11, "10") :: Nil)
+      }
+    }
+  }
+
+  test("broadcast multiple keys in a LongHashedRelation") {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true") {
+      withTable("fact", "dim") {
+        spark.range(100).select(
+          $"id",
+          ($"id" + 1).cast("int").as("one"),
+          ($"id" + 2).cast("byte").as("two"),
+          ($"id" + 3).cast("short").as("three"),
+          (($"id" * 20) % 100).as("mod"),
+          ($"id" % 10).cast("string").as("str"))
+          .write.partitionBy("one", "two", "three")
+          .format(tableFormat).mode("overwrite").saveAsTable("fact")
+
+        spark.range(10).select(
+          $"id",
+          ($"id" + 1).cast("int").as("one"),
+          ($"id" + 2).cast("byte").as("two"),
+          ($"id" + 3).cast("short").as("three"),
+          ($"id" * 10).as("prod"))
+          .write.format(tableFormat).mode("overwrite").saveAsTable("dim")
+
+        // broadcast multiple keys
+        val dfLong = sql(
+          """
+            |SELECT f.id, f.one, f.two, f.str FROM fact f
+            |JOIN dim d
+            |ON (f.one = d.one and f.two = d.two and f.three = d.three)
+            |WHERE d.prod > 80
+          """.stripMargin)
+
+        checkAnswer(dfLong, Row(9, 10, 11, "9") :: Nil)
+      }
+    }
+  }
+
+  test("broadcast multiple keys in an UnsafeHashedRelation") {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true") {
+      withTable("fact", "dim") {
+        spark.range(100).select(
+          $"id",
+          ($"id" + 1).cast("string").as("one"),
+          ($"id" + 2).cast("string").as("two"),
+          ($"id" + 3).cast("string").as("three"),
+          (($"id" * 20) % 100).as("mod"),
+          ($"id" % 10).cast("string").as("str"))
+          .write.partitionBy("one", "two", "three")
+          .format(tableFormat).mode("overwrite").saveAsTable("fact")
+
+        spark.range(10).select(
+          $"id",
+          ($"id" + 1).cast("string").as("one"),
+          ($"id" + 2).cast("string").as("two"),
+          ($"id" + 3).cast("string").as("three"),
+          ($"id" * 10).as("prod"))
+          .write.format(tableFormat).mode("overwrite").saveAsTable("dim")
+
+        // broadcast multiple keys
+        val df = sql(
+          """
+            |SELECT f.id, f.one, f.two, f.str FROM fact f
+            |JOIN dim d
+            |ON (f.one = d.one and f.two = d.two and f.three = d.three)
+            |WHERE d.prod > 80
+          """.stripMargin)
+
+        checkAnswer(df, Row(9, "10", "11", "9") :: Nil)
+      }
+    }
+  }
+
+  test("different broadcast subqueries with identical children") {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true") {
+      withTable("fact", "dim") {
+        spark.range(100).select(
+          $"id",
+          ($"id" + 1).cast("string").as("one"),
+          ($"id" + 2).cast("string").as("two"),
+          ($"id" + 3).cast("string").as("three"),
+          (($"id" * 20) % 100).as("mod"),
+          ($"id" % 10).cast("string").as("str"))
+          .write.partitionBy("one", "two", "three")
+          .format(tableFormat).mode("overwrite").saveAsTable("fact")
+
+        spark.range(10).select(
+          $"id",
+          ($"id" + 1).cast("string").as("one"),
+          ($"id" + 2).cast("string").as("two"),
+          ($"id" + 3).cast("string").as("three"),
+          ($"id" * 10).as("prod"))
+          .write.partitionBy("one", "two", "three", "prod")
+          .format(tableFormat).mode("overwrite").saveAsTable("dim")
+
+        // we are expecting three filters on different keys to be pushed down
+        val df = sql(
+          """
+            |SELECT f.id, f.one, f.two, f.str FROM fact f
+            |JOIN dim d
+            |ON (f.one = d.one and f.two = d.two and f.three = d.three)
+            |WHERE d.prod > 80
+          """.stripMargin)
+
+        checkDistinctSubqueries(df, 3)
+        checkAnswer(df, Row(9, "10", "11", "9") :: Nil)
+      }
+    }
+  }
+
+  test("avoid reordering broadcast join keys to match input hash partitioning") {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "false",
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1") {
+      withTable("large", "dimTwo", "dimThree") {
+        spark.range(100).select(
+          $"id",
+          ($"id" + 1).as("A"),
+          ($"id" + 2).as("B"))
+          .write.partitionBy("A")
+          .format(tableFormat).mode("overwrite").saveAsTable("large")
+
+        spark.range(10).select(
+          $"id",
+          ($"id" + 1).as("C"),
+          ($"id" + 2).as("D"))
+          .write.format(tableFormat).mode("overwrite").saveAsTable("dimTwo")
+
+        spark.range(10).select(
+          $"id",
+          ($"id" + 1).as("E"),
+          ($"id" + 2).as("F"),
+          ($"id" + 3).as("G"))
+          .write.format(tableFormat).mode("overwrite").saveAsTable("dimThree")
+
+        val fact = sql("SELECT * from large")
+        val dim = sql("SELECT * from dimTwo")
+        val prod = sql("SELECT * from dimThree")
+
+        // The query below first joins table fact with table dim on keys (A, B), and then joins
+        // table fact with table prod on keys (B, A). The join key reordering in EnsureRequirements
+        // ensured that the order of the keys stays the same (A, B) in both joins. The keys in a
+        // broadcast shuffle should not be reordered in order to trigger broadcast reuse.
+        val df = fact.join(dim,
+          fact.col("A") === dim.col("C") && fact.col("B") === dim.col("D"), "LEFT")
+          .join(broadcast(prod),
+            fact.col("B") === prod.col("F") && fact.col("A") === prod.col("E"))
+          .where(prod.col("G") > 5)
+
+        checkPartitionPruningPredicate(df, false, true)
+      }
+    }
+  }
+
+  /**
+   * This test is a small reproduction of the Query-23 of the TPCDS benchmark.
+   * The query employs an aggregation on the result of a join between a store table and a
+   * date dimension table which is further joined with item, date, and store tables using
+   * a disjoint filter. The outcome of this query is a sequence of nested joins that have
+   * duplicated partitioning keys, also used to uniquely identify the dynamic pruning filters.
+   */
+  test("dynamic partition pruning ambiguity issue across nested joins") {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true") {
+      withTable("store", "date", "item") {
+        spark.range(500)
+          .select((($"id" + 30) % 50).as("ss_item_sk"),
+            ($"id" % 20).as("ss_sold_date_sk"), ($"id" * 3).as("price"))
+          .write.partitionBy("ss_sold_date_sk")
+          .format("parquet").mode("overwrite").saveAsTable("store")
+
+        spark.range(20)
+          .select($"id".as("d_date_sk"), ($"id").as("d_year"))
+          .write.format("parquet").mode("overwrite").saveAsTable("date")
+
+        spark.range(20)
+          .select(($"id" + 30).as("i_item_sk"))
+          .write.format("parquet").mode("overwrite").saveAsTable("item")
+
+        val df = sql(
+          """
+            |WITH aux AS
+            |(SELECT i_item_sk as frequent_item_sk FROM store, item, date
+            |WHERE ss_sold_date_sk = d_date_sk
+            |AND ss_item_sk = i_item_sk
+            |AND d_year IN (2, 4, 6, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19)
+            |GROUP BY i_item_sk HAVING count(*) > 0)
+            |SELECT sum(sales) a
+            |    FROM (SELECT price sales FROM item, date, aux, store
+            |    WHERE d_year IN (1, 3, 5, 7)
+            |      AND ss_sold_date_sk = d_date_sk
+            |      AND ss_item_sk = i_item_sk
+            |      AND i_item_sk = frequent_item_sk) x
+          """.stripMargin)
+
+        checkAnswer(df, Row(28080) :: Nil)
+      }
+    }
+  }
+
+  test("cleanup any DPP filter that isn't pushed down due to expression id clashes") {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true") {
+      withTable("fact", "dim") {
+        spark.range(20).select($"id".as("A"), $"id".as("AA"))
+          .write.partitionBy("A").format(tableFormat).mode("overwrite").saveAsTable("fact")
+        spark.range(10).select($"id".as("B"), $"id".as("BB"))
+          .write.format(tableFormat).mode("overwrite").saveAsTable("dim")
+        val df = sql(
+          """
+            |SELECT A, AA FROM
+            | (SELECT A, AA from fact
+            | JOIN dim ON (A = B AND AA = BB) WHERE BB > 1)
+            | JOIN dim ON (AA = BB AND A = B)
+            |WHERE BB < 5
+          """.stripMargin)
+
+        assert(!checkUnpushedFilters(df))
+      }
+    }
+  }
+
+  test("cleanup any DPP filter that isn't pushed down due to non-determinism") {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true") {
+      val df = sql(
+        """
+          |SELECT f.date_id, f.pid, f.sid FROM
+          |(SELECT date_id, product_id AS pid, store_id AS sid
+          |   FROM fact_stats WHERE RAND() > 0.5) AS f
+          |JOIN dim_stats s
+          |ON f.sid = s.store_id WHERE s.country = 'DE'
+        """.stripMargin)
+
+      assert(!checkUnpushedFilters(df))
+    }
+  }
+
+  test("join key with multiple references on the filtering plan") {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true",
+      SQLConf.ADAPTIVE_OPTIMIZER_EXCLUDED_RULES.key -> AQEPropagateEmptyRelation.ruleName,
+      SQLConf.ANSI_ENABLED.key -> "false" // ANSI mode doesn't support "String + String"
+    ) {
+      // when enable AQE, the reusedExchange is inserted when executed.
+      withTable("fact", "dim") {
+        spark.range(100).select(
+          $"id",
+          ($"id" + 1).cast("string").as("a"),
+          ($"id" + 2).cast("string").as("b"))
+          .write.partitionBy("a", "b")
+          .format(tableFormat).mode("overwrite").saveAsTable("fact")
+
+        spark.range(10).select(
+          $"id",
+          ($"id" + 1).cast("string").as("x"),
+          ($"id" + 2).cast("string").as("y"),
+          ($"id" + 2).cast("string").as("z"),
+          ($"id" + 2).cast("string").as("w"))
+          .write
+          .format(tableFormat).mode("overwrite").saveAsTable("dim")
+
+        val df = sql(
+          """
+            |SELECT f.id, f.a, f.b FROM fact f
+            |JOIN dim d
+            |ON f.b + f.a = d.y + d.z
+            |WHERE d.x = (SELECT avg(p.w) FROM dim p)
+          """.stripMargin)
+
+        checkPartitionPruningPredicate(df, false, true)
+      }
+    }
+  }
+
+  test("Make sure dynamic pruning works on uncorrelated queries") {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true") {
+      val df = sql(
+        """
+          |SELECT d.store_id,
+          |       SUM(f.units_sold),
+          |       (SELECT SUM(f.units_sold)
+          |        FROM fact_stats f JOIN dim_stats d ON d.store_id = f.store_id
+          |        WHERE d.country = 'US') AS total_prod
+          |FROM fact_stats f JOIN dim_stats d ON d.store_id = f.store_id
+          |WHERE d.country = 'US'
+          |GROUP BY 1
+        """.stripMargin)
+      checkAnswer(df, Row(4, 50, 70) :: Row(5, 10, 70) :: Row(6, 10, 70) :: Nil)
+
+      val plan = df.queryExecution.executedPlan
+      val countSubqueryBroadcasts =
+        collectWithSubqueries(plan)({ case _: SubqueryBroadcastExec => 1 }).sum
+
+      val countReusedSubqueryBroadcasts =
+        collectWithSubqueries(plan)({ case ReusedSubqueryExec(_: SubqueryBroadcastExec) => 1}).sum
+
+      assert(countSubqueryBroadcasts == 1)
+      assert(countReusedSubqueryBroadcasts == 1)
+    }
+  }
+
+  test("SPARK-32509: Unused Dynamic Pruning filter shouldn't affect " +
+    "canonicalization and exchange reuse") {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true") {
+      withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+          SQLConf.V2_BUCKETING_ENABLED.key -> "false") {
+        val df = sql(
+          """ WITH view1 as (
+            |   SELECT f.store_id FROM fact_stats f WHERE f.units_sold = 70
+            | )
+            |
+            | SELECT * FROM view1 v1 join view1 v2 WHERE v1.store_id = v2.store_id
+          """.stripMargin)
+
+        checkPartitionPruningPredicate(df, false, false)
+        val reuseExchangeNodes = collect(df.queryExecution.executedPlan) {
+          case se: ReusedExchangeExec => se
+        }
+        assert(reuseExchangeNodes.size == 1, "Expected plan to contain 1 ReusedExchangeExec " +
+          s"nodes. Found ${reuseExchangeNodes.size}")
+
+        checkAnswer(df, Row(15, 15) :: Nil)
+      }
+    }
+  }
+
+  test("Plan broadcast pruning only when the broadcast can be reused") {
+    Given("dynamic pruning filter on the build side")
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true") {
+      val df = sql(
+        """
+          |SELECT f.date_id, f.store_id, f.product_id, f.units_sold FROM fact_np f
+          |JOIN code_stats s
+          |ON f.store_id = s.store_id WHERE f.date_id <= 1030
+        """.stripMargin)
+
+      checkPartitionPruningPredicate(df, false, false)
+
+      checkAnswer(df,
+        Row(1000, 1, 1, 10) ::
+        Row(1010, 2, 1, 10) ::
+        Row(1020, 2, 1, 10) ::
+        Row(1030, 3, 2, 10) :: Nil
+      )
+    }
+
+    Given("dynamic pruning filter on the probe side")
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true") {
+      val df = sql(
+        """
+          |SELECT /*+ BROADCAST(f)*/
+          |f.date_id, f.store_id, f.product_id, f.units_sold FROM fact_np f
+          |JOIN code_stats s
+          |ON f.store_id = s.store_id WHERE f.date_id <= 1030
+        """.stripMargin)
+
+      checkPartitionPruningPredicate(df, false, true)
+
+      checkAnswer(df,
+        Row(1000, 1, 1, 10) ::
+        Row(1010, 2, 1, 10) ::
+        Row(1020, 2, 1, 10) ::
+        Row(1030, 3, 2, 10) :: Nil
+      )
+    }
+  }
+
+  test("SPARK-32659: Fix the data issue when pruning DPP on non-atomic type") {
+    Seq(NO_CODEGEN, CODEGEN_ONLY).foreach { mode =>
+      Seq(true, false).foreach { pruning =>
+        withSQLConf(
+          SQLConf.CODEGEN_FACTORY_MODE.key -> mode.toString,
+          SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> s"$pruning") {
+          Seq("struct", "array").foreach { dataType =>
+            val df = sql(
+              s"""
+                 |SELECT f.date_id, f.product_id, f.units_sold, f.store_id FROM fact_stats f
+                 |JOIN dim_stats s
+                 |ON $dataType(f.store_id) = $dataType(s.store_id) WHERE s.country = 'DE'
+              """.stripMargin)
+
+            if (pruning) {
+              checkPartitionPruningPredicate(df, false, true)
+            } else {
+              checkPartitionPruningPredicate(df, false, false)
+            }
+
+            checkAnswer(df,
+              Row(1030, 2, 10, 3) ::
+              Row(1040, 2, 50, 3) ::
+              Row(1050, 2, 50, 3) ::
+              Row(1060, 2, 50, 3) :: Nil
+            )
+          }
+        }
+      }
+    }
+  }
+
+  test("SPARK-32817: DPP throws error when the broadcast side is empty") {
+    withSQLConf(
+      SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+      SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true",
+      SQLConf.ADAPTIVE_OPTIMIZER_EXCLUDED_RULES.key -> AQEPropagateEmptyRelation.ruleName) {
+      val df = sql(
+        """
+          |SELECT * FROM fact_sk f
+          |JOIN dim_store s
+          |ON f.store_id = s.store_id WHERE s.country = 'XYZ'
+        """.stripMargin)
+
+      checkPartitionPruningPredicate(df, false, true)
+
+      checkAnswer(df, Nil)
+    }
+  }
+
+  test("Subquery reuse across the whole plan",
+    DisableAdaptiveExecution("DPP in AQE must reuse broadcast")) {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+      SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "false",
+      SQLConf.EXCHANGE_REUSE_ENABLED.key -> "false") {
+      withTable("df1", "df2") {
+        spark.range(100)
+          .select(col("id"), col("id").as("k"))
+          .write
+          .partitionBy("k")
+          .format(tableFormat)
+          .mode("overwrite")
+          .saveAsTable("df1")
+
+        spark.range(10)
+          .select(col("id"), col("id").as("k"))
+          .write
+          .partitionBy("k")
+          .format(tableFormat)
+          .mode("overwrite")
+          .saveAsTable("df2")
+
+        val df = sql(
+          """
+            |SELECT df1.id, df2.k
+            |FROM df1 JOIN df2 ON df1.k = df2.k
+            |WHERE df2.id < (SELECT max(id) FROM df2 WHERE id <= 2)
+            |""".stripMargin)
+
+        checkPartitionPruningPredicate(df, true, false)
+
+        checkAnswer(df, Row(0, 0) :: Row(1, 1) :: Nil)
+
+        val plan = df.queryExecution.executedPlan
+
+        val subqueryIds = plan.collectWithSubqueries { case s: SubqueryExec => s.id }
+        val reusedSubqueryIds = plan.collectWithSubqueries {
+          case rs: ReusedSubqueryExec => rs.child.id
+        }
+
+        assert(subqueryIds.size == 2, "Whole plan subquery reusing not working correctly")
+        assert(reusedSubqueryIds.distinct.size == 1,
+          "Whole plan subquery reusing not working correctly")
+        assert(reusedSubqueryIds.forall(subqueryIds.contains(_)),
+          "ReusedSubqueryExec should reuse an existing subquery")
+      }
+    }
+  }
+
+  test("SPARK-34436: DPP support LIKE ANY/ALL expression") {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true") {
+      val df = sql(
+        """
+          |SELECT date_id, product_id FROM fact_sk f
+          |JOIN dim_store s
+          |ON f.store_id = s.store_id WHERE s.country LIKE ANY ('%D%E%', '%A%B%')
+        """.stripMargin)
+
+      checkPartitionPruningPredicate(df, false, true)
+
+      checkAnswer(df,
+        Row(1030, 2) ::
+        Row(1040, 2) ::
+        Row(1050, 2) ::
+        Row(1060, 2) :: Nil
+      )
+    }
+  }
+
+  test("SPARK-34595: DPP support RLIKE expression") {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true") {
+      val df = sql(
+        """
+          |SELECT date_id, product_id FROM fact_sk f
+          |JOIN dim_store s
+          |ON f.store_id = s.store_id WHERE s.country RLIKE '[DE|US]'
+        """.stripMargin)
+
+      checkPartitionPruningPredicate(df, false, true)
+
+      checkAnswer(df,
+        Row(1030, 2) ::
+        Row(1040, 2) ::
+        Row(1050, 2) ::
+        Row(1060, 2) ::
+        Row(1070, 2) ::
+        Row(1080, 3) ::
+        Row(1090, 3) ::
+        Row(1100, 3) ::
+        Row(1110, 3) ::
+        Row(1120, 4) :: Nil
+      )
+    }
+  }
+
+  test("SPARK-34637: DPP side broadcast query stage is created firstly") {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true") {
+      val df = sql(
+        """ WITH v as (
+          |   SELECT f.store_id FROM fact_stats f WHERE f.units_sold = 70 group by f.store_id
+          | )
+          |
+          | SELECT * FROM v v1 join v v2 WHERE v1.store_id = v2.store_id
+        """.stripMargin)
+
+      // A possible resulting query plan:
+      // BroadcastHashJoin
+      // +- HashAggregate
+      //    +- ShuffleQueryStage
+      //       +- Exchange
+      //          +- HashAggregate
+      //             +- Filter
+      //                +- FileScan [PartitionFilters: dynamicpruning#3385]
+      //                     +- SubqueryBroadcast dynamicpruning#3385
+      //                        +- AdaptiveSparkPlan
+      //                           +- BroadcastQueryStage
+      //                              +- BroadcastExchange
+      //
+      // +- BroadcastQueryStage
+      //    +- ReusedExchange
+
+      checkPartitionPruningPredicate(df, false, true)
+      checkAnswer(df, Row(15, 15) :: Nil)
+    }
+  }
+
+  test("SPARK-35568: Fix UnsupportedOperationException when enabling both AQE and DPP") {
+    val df = sql(
+      """
+        |SELECT s.store_id, f.product_id
+        |FROM (SELECT DISTINCT * FROM fact_sk) f
+        |  JOIN (SELECT
+        |          *,
+        |          ROW_NUMBER() OVER (PARTITION BY store_id ORDER BY state_province DESC) AS rn
+        |        FROM dim_store) s
+        |   ON f.store_id = s.store_id
+        |WHERE s.country = 'DE' AND s.rn = 1
+        |""".stripMargin)
+
+    checkAnswer(df, Row(3, 2) :: Row(3, 2) :: Row(3, 2) :: Row(3, 2) :: Nil)
+  }
+
+  test("SPARK-36444: Remove OptimizeSubqueries from batch of PartitionPruning") {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true") {
+      val df = sql(
+        """
+          |SELECT date_id, product_id FROM fact_sk f
+          |JOIN (select store_id + 3 as new_store_id from dim_store where country = 'US') s
+          |ON f.store_id = s.new_store_id
+        """.stripMargin)
+
+      checkPartitionPruningPredicate(df, false, true)
+      checkAnswer(df, Row(1150, 1) :: Row(1130, 4) :: Row(1140, 4) :: Nil)
+    }
+  }
+
+  test("SPARK-38148: Do not add dynamic partition pruning if there exists static partition " +
+    "pruning") {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true") {
+      Seq(
+        "f.store_id = 1" -> false,
+        "1 = f.store_id" -> false,
+        "f.store_id <=> 1" -> false,
+        "1 <=> f.store_id" -> false,
+        "f.store_id > 1" -> true,
+        "5 > f.store_id" -> true).foreach { case (condition, hasDPP) =>
+        // partitioned table at left side
+        val df1 = sql(
+          s"""
+             |SELECT /*+ broadcast(s) */ * FROM fact_sk f
+             |JOIN dim_store s ON f.store_id = s.store_id AND $condition
+            """.stripMargin)
+        checkPartitionPruningPredicate(df1, false, withBroadcast = hasDPP)
+
+        val df2 = sql(
+          s"""
+             |SELECT /*+ broadcast(s) */ * FROM fact_sk f
+             |JOIN dim_store s ON f.store_id = s.store_id
+             |WHERE $condition
+            """.stripMargin)
+        checkPartitionPruningPredicate(df2, false, withBroadcast = hasDPP)
+
+        // partitioned table at right side
+        val df3 = sql(
+          s"""
+             |SELECT /*+ broadcast(s) */ * FROM dim_store s
+             |JOIN fact_sk f ON f.store_id = s.store_id AND $condition
+            """.stripMargin)
+        checkPartitionPruningPredicate(df3, false, withBroadcast = hasDPP)
+
+        val df4 = sql(
+          s"""
+             |SELECT /*+ broadcast(s) */ * FROM dim_store s
+             |JOIN fact_sk f ON f.store_id = s.store_id
+             |WHERE $condition
+            """.stripMargin)
+        checkPartitionPruningPredicate(df4, false, withBroadcast = hasDPP)
+      }
+    }
+  }
+
+  test("SPARK-38570: Fix incorrect DynamicPartitionPruning caused by Literal") {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true") {
+      val df = sql(
+        """
+          |SELECT f.store_id,
+          |       f.date_id,
+          |       s.state_province
+          |FROM (SELECT 4 AS store_id,
+          |               date_id,
+          |               product_id
+          |      FROM   fact_sk
+          |      WHERE  date_id >= 1300
+          |      UNION ALL
+          |      SELECT 5 AS store_id,
+          |               date_id,
+          |               product_id
+          |      FROM   fact_stats
+          |      WHERE  date_id <= 1000) f
+          |JOIN dim_store s
+          |ON f.store_id = s.store_id
+          |WHERE s.country = 'US'
+          |""".stripMargin)
+
+      checkPartitionPruningPredicate(df, withSubquery = false, withBroadcast = false)
+      checkAnswer(df, Row(4, 1300, "California") :: Row(5, 1000, "Texas") :: Nil)
+    }
+  }
+
+  test("SPARK-38674: Remove useless deduplicate in SubqueryBroadcastExec") {
+    withTable("duplicate_keys") {
+      withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true") {
+        Seq[(Int, String)]((1, "NL"), (1, "NL"), (3, "US"), (3, "US"), (3, "US"))
+          .toDF("store_id", "country")
+          .write
+          .format(tableFormat)
+          .saveAsTable("duplicate_keys")
+
+        val df = sql(
+          """
+            |SELECT date_id, product_id FROM fact_sk f
+            |JOIN duplicate_keys s
+            |ON f.store_id = s.store_id WHERE s.country = 'US' AND date_id > 1050
+          """.stripMargin)
+
+        checkPartitionPruningPredicate(df, withSubquery = false, withBroadcast = true)
+
+        val subqueryBroadcastExecs = collectWithSubqueries(df.queryExecution.executedPlan) {
+          case s: SubqueryBroadcastExec => s
+        }
+        assert(subqueryBroadcastExecs.size === 1)
+        subqueryBroadcastExecs.foreach { subqueryBroadcastExec =>
+          assert(subqueryBroadcastExec.metrics("numOutputRows").value === 1)
+        }
+
+        checkAnswer(df, Row(1060, 2) :: Row(1060, 2) :: Row(1060, 2) :: Nil)
+      }
+    }
+  }
+
+  test("SPARK-39338: Remove dynamic pruning subquery if pruningKey's references is empty") {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true") {
+      val df = sql(
+        """
+          |SELECT f.store_id,
+          |       f.date_id,
+          |       s.state_province
+          |FROM (SELECT   store_id,
+          |               date_id,
+          |               product_id
+          |      FROM   fact_stats
+          |      WHERE  date_id <= 1000
+          |      UNION ALL
+          |      SELECT 4 AS store_id,
+          |               date_id,
+          |               product_id
+          |      FROM   fact_sk
+          |      WHERE  date_id >= 1300) f
+          |JOIN dim_store s
+          |ON f.store_id = s.store_id
+          |WHERE s.country IN ('US', 'NL')
+          |""".stripMargin)
+
+      checkPartitionPruningPredicate(df, withSubquery = false, withBroadcast = true)
+      checkAnswer(df, Row(4, 1300, "California") :: Row(1, 1000, "North-Holland") :: Nil)
+      assert(collectDynamicPruningExpressions(df.queryExecution.executedPlan).size === 1)
+    }
+  }
+
+  test("SPARK-39217: Makes DPP support the pruning side has Union") {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true") {
+      val df = sql(
+        """
+          |SELECT f.store_id,
+          |       f.date_id,
+          |       s.state_province
+          |FROM (SELECT 4 AS store_id,
+          |               date_id,
+          |               product_id
+          |      FROM   fact_sk
+          |      WHERE  date_id >= 1300
+          |      UNION ALL
+          |      SELECT   store_id,
+          |               date_id,
+          |               product_id
+          |      FROM   fact_stats
+          |      WHERE  date_id <= 1000) f
+          |JOIN dim_store s
+          |ON f.store_id = s.store_id
+          |WHERE s.country IN ('US', 'NL')
+          |""".stripMargin)
+
+      checkPartitionPruningPredicate(df, withSubquery = false, withBroadcast = true)
+      checkAnswer(df, Row(4, 1300, "California") :: Row(1, 1000, "North-Holland") :: Nil)
+      // CleanupDynamicPruningFilters should remove DPP in first child of union
+      assert(collectDynamicPruningExpressions(df.queryExecution.executedPlan).size === 1)
+    }
+  }
+}
+
+abstract class DynamicPartitionPruningDataSourceSuiteBase
+    extends DynamicPartitionPruningSuiteBase
+    with SharedSparkSession {
+
+  import testImplicits._
+
+  test("no partition pruning when the build side is a stream") {
+    withTable("fact") {
+      val input = MemoryStream[Int]
+      val stream = input.toDF().select($"value" as "one", ($"value" * 3) as "code")
+      spark.range(100).select(
+        $"id",
+        ($"id" + 1).as("one"),
+        ($"id" + 2).as("two"),
+        ($"id" + 3).as("three"))
+        .write.partitionBy("one")
+        .format(tableFormat).mode("overwrite").saveAsTable("fact")
+      val table = sql("SELECT * from fact f")
+
+      // join a partitioned table with a stream
+      val joined = table.join(stream, Seq("one")).where("code > 40")
+      val query = joined.writeStream.format("memory").queryName("test").start()
+      input.addData(1, 10, 20, 40, 50)
+      try {
+        query.processAllAvailable()
+      } finally {
+        query.stop()
+      }
+      // search dynamic pruning predicates on the executed plan
+      val plan = query.asInstanceOf[StreamingQueryWrapper].streamingQuery.lastExecution.executedPlan
+      val ret = plan.exists {
+        case s: FileSourceScanExec => s.partitionFilters.exists {
+          case _: DynamicPruningExpression => true
+          case _ => false
+        }
+        case _ => false
+      }
+      assert(!ret)
+    }
+  }
+}
+
+abstract class DynamicPartitionPruningV1Suite extends DynamicPartitionPruningDataSourceSuiteBase {
+
+  import testImplicits._
+
+  test("SPARK-60741: the DPP subquery keeps a bucketed build side's partitioning") {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+        SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "false",
+        SQLConf.DYNAMIC_PARTITION_PRUNING_FALLBACK_FILTER_RATIO.key -> "10",
+        SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1") {
+      withTable("bucketed_dim", "partitioned_fact") {
+        spark.range(100).selectExpr("id", "id % 10 AS k")
+          .write.bucketBy(4, "k").format(tableFormat).saveAsTable("bucketed_dim")
+        spark.range(100).selectExpr("id AS v", "id % 10 AS p")
+          .write.partitionBy("p").format(tableFormat).saveAsTable("partitioned_fact")
+        val df = sql("SELECT sum(f.v) FROM partitioned_fact f JOIN bucketed_dim d " +
+          "ON f.p = d.k WHERE d.id < 5")
+        checkAnswer(df, Row(2350))
+
+        // The subquery groups on the bucket column, so the bucketed scan is kept, and no shuffle
+        // is needed.
+        val subqueries = collectDynamicPruningExpressions(df.queryExecution.executedPlan)
+          .collect { case i: InSubqueryExec => i.plan }
+        assert(subqueries.nonEmpty)
+        subqueries.foreach {
+          case s: SubqueryExec =>
+            assert(collect(s.child) { case e: ShuffleExchangeLike => e }.isEmpty, s.child)
+            assert(collect(s.child) { case f: FileSourceScanExec => f.bucketedScan } === Seq(true),
+              s.child)
+          case other => fail(s"expected a SubqueryExec, got $other")
+        }
+      }
+    }
+  }
+
+  test("DPP with a checkpointed filtering side and an expression partition key") {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+        SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true") {
+      withTable("events") {
+        Seq((1, "hour1", "a"), (2, "hour1", "b"), (3, "hour2", "a"))
+          .toDF("id", "hour", "category")
+          .write
+          .partitionBy("hour", "category")
+          .format(tableFormat)
+          .mode("overwrite")
+          .saveAsTable("events")
+
+        val sampledKeys = Seq(("hour1", "a"))
+          .toDF("hour", "category")
+          .select(concat_ws("||", $"hour", $"category").as("hc_key"))
+          .localCheckpoint(eager = true)
+
+        assert(sampledKeys.queryExecution.optimizedPlan.exists {
+          case r: LogicalRDD => r.isCheckpointedInput
+          case _ => false
+        })
+
+        val events = spark.table("events").as("events")
+        val sampled = sampledKeys.as("sampled")
+        val df = events
+          .join(broadcast(sampled),
+            concat_ws("||", $"events.hour", $"events.category") === $"sampled.hc_key")
+          .select($"events.id")
+
+        checkPartitionPruningPredicate(df, withSubquery = false, withBroadcast = true)
+        checkAnswer(df, Row(1))
+      }
+    }
+  }
+
+  test("DPP with a local filtering side and an expression partition key") {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+        SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true") {
+      withTable("events") {
+        Seq((1, "hour1", "a"), (2, "hour1", "b"), (3, "hour2", "a"))
+          .toDF("id", "hour", "category")
+          .write
+          .partitionBy("hour", "category")
+          .format(tableFormat)
+          .mode("overwrite")
+          .saveAsTable("events")
+
+        val sampledKeys = Seq(("hour1", "a"))
+          .toDF("hour", "category")
+          .select(concat_ws("||", $"hour", $"category").as("hc_key"))
+
+        assert(sampledKeys.queryExecution.optimizedPlan.exists(_.isInstanceOf[LocalRelation]))
+
+        val events = spark.table("events").as("events")
+        val sampled = sampledKeys.as("sampled")
+        val df = events
+          .join(broadcast(sampled),
+            concat_ws("||", $"events.hour", $"events.category") === $"sampled.hc_key")
+          .select($"events.id")
+
+        checkPartitionPruningPredicate(df, withSubquery = false, withBroadcast = true)
+        checkAnswer(df, Row(1))
+      }
+    }
+  }
+
+  test("SPARK-54593: a materialized filtering side is not injected as a standalone DPP subquery " +
+    "without an estimated pruning benefit") {
+    // Broadcast joins are disabled, so the DPP filter cannot reuse a broadcast exchange. A
+    // materialized filtering side carries no selective predicate, so its pruning benefit cannot be
+    // estimated; it must therefore not be injected as an always-applied standalone subquery (which
+    // would re-execute the filtering side and prune nothing for a non-selective side).
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+        SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "false",
+        SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1") {
+      withTable("events") {
+        Seq((1, "hour1", "a"), (2, "hour1", "b"), (3, "hour2", "a"))
+          .toDF("id", "hour", "category")
+          .write
+          .partitionBy("hour", "category")
+          .format(tableFormat)
+          .mode("overwrite")
+          .saveAsTable("events")
+
+        // A materialized filtering side that covers every partition: it offers no pruning benefit.
+        val sampledKeys = Seq("hour1||a", "hour1||b", "hour2||a").toDF("hc_key")
+        assert(sampledKeys.queryExecution.optimizedPlan.exists(_.isInstanceOf[LocalRelation]))
+
+        val events = spark.table("events").as("events")
+        val sampled = sampledKeys.as("sampled")
+        val df = events
+          .join(sampled, concat_ws("||", $"events.hour", $"events.category") === $"sampled.hc_key")
+          .select($"events.id")
+
+        checkPartitionPruningPredicate(df, withSubquery = false, withBroadcast = false)
+        checkAnswer(df, Row(1) :: Row(2) :: Row(3) :: Nil)
+      }
+    }
+  }
+
+  test("SPARK-54593: a materialized filtering side keeps statistics-backed standalone DPP") {
+    // A checkpoint-derived LogicalRDD has no Filter but can retain column statistics. When those
+    // statistics establish a pruning benefit, DPP must still be injected as a standalone subquery
+    // when no broadcast can be reused -- the materialized-input handling gates only the
+    // no-statistics fallback ratio, not the statistics-based benefit.
+    withSQLConf(
+      SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+      SQLConf.DYNAMIC_PARTITION_PRUNING_USE_STATS.key -> "true",
+      SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "false",
+      // The fallback ratio offers no benefit, so DPP can only come from the statistics-based ratio.
+      SQLConf.DYNAMIC_PARTITION_PRUNING_FALLBACK_FILTER_RATIO.key -> "0",
+      // No broadcast can be reused, so an injected filter must be a standalone subquery.
+      SQLConf.EXCHANGE_REUSE_ENABLED.key -> "false",
+      SQLConf.CBO_ENABLED.key -> "true") {
+      withTable("dim_one") {
+        // A dimension with a single distinct store_id, with column statistics computed.
+        spark.range(20).selectExpr("1 AS store_id")
+          .write.format(tableFormat).saveAsTable("dim_one")
+        sql("ANALYZE TABLE dim_one COMPUTE STATISTICS FOR COLUMNS store_id")
+
+        // Checkpoint a projection of it: a LogicalRDD with no Filter that retains the NDV (= 1).
+        val keys = spark.table("dim_one").select("store_id").localCheckpoint(eager = true)
+        val keysPlan = keys.queryExecution.optimizedPlan
+        assert(keysPlan.exists {
+          case r: LogicalRDD => r.isCheckpointedInput
+          case _ => false
+        })
+        assert(keysPlan.stats.attributeStats.values.exists(_.distinctCount.contains(BigInt(1))),
+          s"checkpointed side should retain the NDV statistic:\n$keysPlan")
+
+        // fact_stats is partitioned by store_id (NDV > 1) and has column statistics, so the
+        // statistics-based ratio establishes a pruning benefit for this materialized side.
+        val df = spark.table("fact_stats").join(keys, "store_id").select("date_id")
+
+        checkPartitionPruningPredicate(df, withSubquery = true, withBroadcast = false)
+      }
+    }
+  }
+
+  test("SPARK-54593: a small materialized filtering side keeps standalone DPP via its row bound") {
+    // A LocalRelation has no column statistics but an exact maxRows, a conservative upper bound on
+    // its join-key NDV. A small, selective materialized side must still get standalone DPP when no
+    // broadcast can be reused -- the row bound, not the gated fallback ratio, supplies the benefit.
+    withSQLConf(
+      SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+      SQLConf.DYNAMIC_PARTITION_PRUNING_USE_STATS.key -> "true",
+      SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "false",
+      // The fallback ratio offers no benefit, so DPP can only come from the row-bound ratio.
+      SQLConf.DYNAMIC_PARTITION_PRUNING_FALLBACK_FILTER_RATIO.key -> "0",
+      // No broadcast can be reused, so an injected filter must be a standalone subquery.
+      SQLConf.EXCHANGE_REUSE_ENABLED.key -> "false",
+      SQLConf.CBO_ENABLED.key -> "true") {
+      // A one-row LocalRelation: no column statistics, but maxRows = 1 bounds the join-key NDV.
+      val keys = Seq(0).toDF("store_id")
+      val keysPlan = keys.queryExecution.optimizedPlan
+      assert(keysPlan.exists(_.isInstanceOf[LocalRelation]))
+      assert(keysPlan.maxRows.contains(1))
+      assert(!keysPlan.stats.attributeStats.values.exists(_.distinctCount.isDefined),
+        s"LocalRelation should not carry a distinct-count statistic:\n$keysPlan")
+
+      // fact_stats is partitioned by store_id (NDV > 1) and has column statistics, so the row bound
+      // (NDV <= 1) establishes a strong pruning benefit for this materialized side.
+      val df = spark.table("fact_stats").join(keys, "store_id").select("date_id")
+
+      checkPartitionPruningPredicate(df, withSubquery = true, withBroadcast = false)
+    }
+  }
+
+  test("DPP does not treat a non-checkpointed LogicalRDD as a selective filtering side") {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+        SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true") {
+      withTable("events") {
+        Seq((1, "hour1", "a"), (2, "hour1", "b"))
+          .toDF("id", "hour", "category")
+          .write
+          .partitionBy("hour", "category")
+          .format(tableFormat)
+          .mode("overwrite")
+          .saveAsTable("events")
+
+        val originalKeys = Seq("hour1||a").toDF("hc_key")
+        val keys: DataFrame = LogicalRDD.fromDataset(
+          rdd = originalKeys.queryExecution.toRdd,
+          originDataset = originalKeys,
+          isStreaming = false)
+        assert(keys.queryExecution.optimizedPlan.exists {
+          case r: LogicalRDD => !r.isCheckpointedInput
+          case _ => false
+        })
+
+        val events = spark.table("events").as("events")
+        val sampled = keys.as("sampled")
+        val df = events
+          .join(broadcast(sampled),
+            concat_ws("||", $"events.hour", $"events.category") === $"sampled.hc_key")
+          .select($"events.id")
+
+        checkPartitionPruningPredicate(df, withSubquery = false, withBroadcast = false)
+        checkAnswer(df, Row(1))
+      }
+    }
+  }
+
+  test("DPP requires every leaf of a materialized filtering side to be materialized") {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+        SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true") {
+      withTable("events") {
+        Seq((1, "hour1", "a"), (2, "hour1", "b"), (3, "hour2", "a"))
+          .toDF("id", "hour", "category")
+          .write
+          .partitionBy("hour", "category")
+          .format(tableFormat)
+          .mode("overwrite")
+          .saveAsTable("events")
+
+        val checkpointedKeys = Seq("hour1||a").toDF("hc_key").localCheckpoint(eager = true)
+        val originalKeys = Seq("hour2||a").toDF("hc_key")
+        val nonCheckpointedKeys: DataFrame = LogicalRDD.fromDataset(
+          rdd = originalKeys.queryExecution.toRdd,
+          originDataset = originalKeys,
+          isStreaming = false)
+        val mixedKeys = checkpointedKeys.union(nonCheckpointedKeys)
+
+        val events = spark.table("events").as("events")
+        def joinWith(keys: DataFrame): DataFrame = events
+          .join(broadcast(keys.as("sampled")),
+            concat_ws("||", $"events.hour", $"events.category") === $"sampled.hc_key")
+          .select($"events.id")
+
+        val mixedJoin = joinWith(mixedKeys)
+        checkPartitionPruningPredicate(mixedJoin, withSubquery = false, withBroadcast = false)
+        checkAnswer(mixedJoin, Row(1) :: Row(3) :: Nil)
+
+        val fullyMaterializedJoin = joinWith(
+          checkpointedKeys.union(nonCheckpointedKeys.localCheckpoint(eager = true)))
+        checkPartitionPruningPredicate(
+          fullyMaterializedJoin, withSubquery = false, withBroadcast = true)
+        checkAnswer(fullyMaterializedJoin, Row(1) :: Row(3) :: Nil)
+      }
+    }
+  }
+
+  test("DPP materialized-input eligibility requires an estimable pruning benefit") {
+    // A materialized filtering side is injected as a standalone DPP subquery only when it has an
+    // estimable pruning benefit. With CBO statistics on the partitioned table (the partition-side
+    // NDV) and a small row bound on the filtering side (a LocalRelation's exact maxRows), the
+    // benefit comes from the statistics-based ratio. The fallback ratio is no longer applied to a
+    // side without a selective predicate, so it is pinned to 0 to keep it out of the picture.
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+        SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "false",
+        SQLConf.DYNAMIC_PARTITION_PRUNING_USE_STATS.key -> "true",
+        SQLConf.DYNAMIC_PARTITION_PRUNING_FALLBACK_FILTER_RATIO.key -> "0",
+        SQLConf.CBO_ENABLED.key -> "true",
+        SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+        SQLConf.EXCHANGE_REUSE_ENABLED.key -> "false",
+        SQLConf.SUBQUERY_REUSE_ENABLED.key -> "false",
+        SQLConf.CONSTRAINT_PROPAGATION_ENABLED.key -> "false") {
+      withTable("events") {
+        val counterId = getClass.getName
+        spark.range(1, 11)
+          .select($"id".cast("int").as("p"), $"id".as("v"))
+          .write
+          .partitionBy("p")
+          .format(tableFormat)
+          .mode("overwrite")
+          .saveAsTable("events")
+
+        // Column statistics on the partitioned table supply the partition-side NDV used to estimate
+        // the pruning benefit for a materialized filtering side.
+        sql("ANALYZE TABLE events COMPUTE STATISTICS FOR COLUMNS p")
+
+        def activeDppSubqueries(df: DataFrame): Seq[InSubqueryExec] = {
+          collectDynamicPruningExpressions(df.queryExecution.executedPlan)
+            .collect { case in: InSubqueryExec => in }
+        }
+
+        def checkStandaloneDpp(keys: DataFrame): Unit = {
+          val df = spark.table("events").join(keys, Seq("p")).select("p")
+          DppMaterializedInputTestState.reset(counterId)
+          assert(df.collect().toSeq === Seq(Row(1)))
+          assert(activeDppSubqueries(df).exists {
+            case InSubqueryExec(_, _: SubqueryExec, _, _, _, _) => true
+            case _ => false
+          }, s"Should execute standalone DPP for a materialized plan with an estimable benefit:\n" +
+            df.queryExecution)
+        }
+
+        def checkNoDpp(keys: DataFrame): Unit = {
+          val df = spark.table("events").join(keys, Seq("p")).select("p")
+          DppMaterializedInputTestState.reset(counterId)
+          assert(df.collect().toSeq === Seq(Row(1)))
+          assert(activeDppSubqueries(df).isEmpty,
+            s"Shouldn't execute standalone DPP for this filtering side:\n" +
+              df.queryExecution)
+        }
+
+        // A LocalRelation is cheaply recomputable and exposes an exact maxRows, a conservative
+        // bound on its join-key NDV, so its pruning benefit is estimable and it gets a standalone
+        // DPP subquery.
+        checkStandaloneDpp(Seq(1).toDF("p"))
+        // A checkpoint-derived LogicalRDD is also cheaply recomputable, but a checkpointed
+        // LocalRelation retains no column statistics and exposes no maxRows, so its pruning benefit
+        // cannot be estimated; with no broadcast to reuse it is not injected as a DPP subquery at
+        // all. The statistics-backed checkpointed case (retained NDV) is covered by a dedicated
+        // test.
+        checkNoDpp(Seq(1).toDF("p").localCheckpoint(eager = true))
+
+        val checkpointed = Seq(1).toDS().localCheckpoint(eager = true)
+        val mappedKeys = checkpointed.mapPartitions { values =>
+          val key = DppMaterializedInputTestState.next(counterId)
+          values.map(_ => key)
+        }.toDF("p")
+        checkNoDpp(mappedKeys)
+
+        // An opaque side becomes DPP-eligible through a selective predicate, and a `limit` gives it
+        // an exact maxRows. That maxRows must not be a pruning-benefit NDV bound for a side that is
+        // not cheaply recomputable: a standalone subquery would re-evaluate the stateful
+        // mapPartitions, prune the fact to the first key, and drop the rows the join's second
+        // evaluation needs. With the maxRows bound gated on isCheaplyRecomputableMaterializedPlan,
+        // no benefit is estimated, no standalone DPP is injected, and the result stays correct.
+        checkNoDpp(mappedKeys.filter($"p" > 0).limit(1))
+
+        withSQLConf(SQLConf.EXCHANGE_REUSE_ENABLED.key -> "true") {
+          val broadcastJoin =
+            spark.table("events").join(broadcast(mappedKeys), Seq("p")).select("p")
+          DppMaterializedInputTestState.reset(counterId)
+          assert(broadcastJoin.collect().toSeq === Seq(Row(1)))
+          assert(activeDppSubqueries(broadcastJoin).isEmpty,
+            s"Shouldn't trigger DPP for an opaque broadcast plan:\n" +
+              broadcastJoin.queryExecution)
+
+          // The cheaply-recomputable structural branches of isCheaplyRecomputableMaterializedPlan
+          // are exercised through broadcast reuse: a checkpointed input carries no statistics and
+          // no maxRows, so it has no estimable benefit and only the eligibility decision (not the
+          // benefit term) determines whether the broadcast is reused for DPP.
+          val cpKeys = Seq(1).toDF("p").localCheckpoint(eager = true)
+
+          def checkBroadcastReuseEligible(side: DataFrame): Unit = {
+            checkPartitionPruningPredicate(
+              spark.table("events").join(broadcast(side), Seq("p")).select("p"),
+              withSubquery = false, withBroadcast = true)
+          }
+
+          def checkBroadcastReuseIneligible(side: DataFrame): Unit = {
+            checkPartitionPruningPredicate(
+              spark.table("events").join(broadcast(side), Seq("p")).select("p"),
+              withSubquery = false, withBroadcast = false)
+          }
+
+          // A non-selective Filter/Project above a materialized input stays eligible: its recompute
+          // cost is dominated by the materialized leaf, so it reuses the broadcast for DPP even
+          // though the boolean-cast filter is not classified selective by isLikelySelective.
+          checkBroadcastReuseEligible(cpKeys.filter($"p".cast("boolean")).select($"p"))
+
+          // An Aggregate over a materialized input is excluded: its shuffle/compute cost is
+          // invisible to the scan-bytes cost model, so it is not DPP-eligible even with a reusable
+          // broadcast.
+          checkBroadcastReuseIneligible(cpKeys.groupBy("p").count().select("p"))
+
+          // A UDF projection over a materialized input is excluded: an opaque user function adds
+          // CPU/IO the scan-bytes cost model cannot see.
+          val identityUdf = udf((x: Int) => x)
+          checkBroadcastReuseIneligible(cpKeys.select(identityUdf($"p").as("p")))
+
+          val target = spark.table("events").hint("merge")
+            .join(mappedKeys.hint("merge"), Seq("p"))
+            .select($"p", lit("target").as("branch"))
+          val decoy = Seq(-1).toDF("p")
+            .join(broadcast(mappedKeys), Seq("p"))
+            .select($"p", lit("decoy").as("branch"))
+          val withSiblingBroadcast = target.union(decoy)
+
+          DppMaterializedInputTestState.reset(counterId)
+          val rows = withSiblingBroadcast.collect().toSeq
+          assert(rows.size === 1)
+          assert(rows.head.getString(1) === "target")
+          assert(activeDppSubqueries(withSiblingBroadcast).isEmpty,
+            s"A sibling broadcast shouldn't make an opaque plan eligible for DPP:\n" +
+              withSiblingBroadcast.queryExecution)
+        }
+
+        withTempView("changing_keys") {
+          spark.sparkContext.parallelize(Seq(1), 1).mapPartitions { values =>
+            val key = DppMaterializedInputTestState.next(counterId)
+            values.map(_ => key)
+          }.toDF("p").createOrReplaceTempView("changing_keys")
+
+          val scalarSubqueryKeys = sql(
+            """SELECT CAST((SELECT max(p) FROM changing_keys) AS INT) AS p
+              |FROM VALUES (1) AS outer(dummy)""".stripMargin)
+          checkNoDpp(scalarSubqueryKeys)
+        }
+      }
+    }
+  }
+
+  /**
+   * Check the static scan metrics with and without DPP
+   */
+  test("static scan metrics",
+    DisableAdaptiveExecution("DPP in AQE must reuse broadcast")) {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+      SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "false",
+      SQLConf.EXCHANGE_REUSE_ENABLED.key -> "false") {
+      withTable("fact", "dim") {
+        val numPartitions = 10
+
+        spark.range(10)
+          .map { x => Tuple3(x, x + 1, 0) }
+          .toDF("did", "d1", "d2")
+          .write
+          .format(tableFormat)
+          .mode("overwrite")
+          .saveAsTable("dim")
+
+        spark.range(100)
+          .map { x => Tuple2(x, x % numPartitions) }
+          .toDF("f1", "fid")
+          .write.partitionBy("fid")
+          .format(tableFormat)
+          .mode("overwrite")
+          .saveAsTable("fact")
+
+        def getFactScan(plan: SparkPlan): SparkPlan = {
+          val scanOption =
+            find(plan) {
+              case s: FileSourceScanExec =>
+                s.output.exists(_.exists(_.argString(maxFields = 100).contains("fid")))
+              case s: BatchScanExec =>
+                // we use f1 col for v2 tables due to schema pruning
+                s.output.exists(_.exists(_.argString(maxFields = 100).contains("f1")))
+              case _ => false
+            }
+          assert(scanOption.isDefined)
+          scanOption.get
+        }
+
+        // No dynamic partition pruning, so no static metrics
+        // All files in fact table are scanned
+        val df1 = sql("SELECT sum(f1) FROM fact")
+        df1.collect()
+        val scan1 = getFactScan(df1.queryExecution.executedPlan)
+        assert(!scan1.metrics.contains("staticFilesNum"))
+        assert(!scan1.metrics.contains("staticFilesSize"))
+        val allFilesNum = scan1.metrics("numFiles").value
+        val allFilesSize = scan1.metrics("filesSize").value
+        assert(scan1.metrics("numPartitions").value === numPartitions)
+        assert(scan1.metrics("pruningTime").value === 0)
+
+        // No dynamic partition pruning, so no static metrics
+        // Only files from fid = 5 partition are scanned
+        val df2 = sql("SELECT sum(f1) FROM fact WHERE fid = 5")
+        df2.collect()
+        val scan2 = getFactScan(df2.queryExecution.executedPlan)
+        assert(!scan2.metrics.contains("staticFilesNum"))
+        assert(!scan2.metrics.contains("staticFilesSize"))
+        val partFilesNum = scan2.metrics("numFiles").value
+        val partFilesSize = scan2.metrics("filesSize").value
+        assert(0 < partFilesNum && partFilesNum < allFilesNum)
+        assert(0 < partFilesSize && partFilesSize < allFilesSize)
+        assert(scan2.metrics("numPartitions").value === 1)
+        assert(scan2.metrics("pruningTime").value === 0)
+
+        // Dynamic partition pruning is used
+        // Static metrics are as-if reading the whole fact table
+        // "Regular" metrics are as-if reading only the "fid = 5" partition
+        val df3 = sql("SELECT sum(f1) FROM fact, dim WHERE fid = did AND d1 = 6")
+        df3.collect()
+        val scan3 = getFactScan(df3.queryExecution.executedPlan)
+        assert(scan3.metrics("staticFilesNum").value == allFilesNum)
+        assert(scan3.metrics("staticFilesSize").value == allFilesSize)
+        assert(scan3.metrics("numFiles").value == partFilesNum)
+        assert(scan3.metrics("filesSize").value == partFilesSize)
+        assert(scan3.metrics("numPartitions").value === 1)
+        assert(scan3.metrics("pruningTime").value !== -1)
+      }
+    }
+  }
+}
+
+class DynamicPartitionPruningV1SuiteAEOff extends DynamicPartitionPruningV1Suite
+  with DisableAdaptiveExecutionSuite {
+
+  test("preserve direct broadcast pruning for existing hash and null-aware modes") {
+    withSQLConf(
+        SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+        SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true",
+        SQLConf.DYNAMIC_PARTITION_PRUNING_BROADCAST_PROJECTION_ENABLED.key -> "false",
+        SQLConf.EXCHANGE_REUSE_ENABLED.key -> "true") {
+      val source = spark.table("product").queryExecution.optimizedPlan
+      val build = QueryExecution.createSparkPlan(spark.sessionState.planner, source)
+      val probe = spark.range(4).queryExecution.sparkPlan
+      val mismatchedHashJoin = BroadcastHashJoinExec(
+        Seq(probe.output.head),
+        Seq(build.output(1)),
+        Inner,
+        BuildRight,
+        None,
+        probe,
+        build)
+      assert(!mismatchedHashJoin.rightKeys.head.semanticEquals(source.output.head))
+
+      val nullAwareJoin = BroadcastHashJoinExec(
+        Seq(probe.output.head),
+        Seq(build.output.head),
+        LeftAnti,
+        BuildRight,
+        None,
+        probe,
+        build,
+        isNullAwareAntiJoin = true)
+      assert(nullAwareJoin.isNullAwareAntiJoin)
+
+      Seq(
+        "mismatched hash mode" -> mismatchedHashJoin,
+        "null-aware anti join" -> nullAwareJoin).foreach { case (name, existingJoin) =>
+        val pruning = DynamicPruningSubquery(
+          probe.output.head,
+          source,
+          Seq(source.output.head),
+          Seq(0),
+          onlyInBroadcast = true)()
+        val plan = FilterExec(DynamicPruningExpression(pruning), existingJoin)
+        val rewritten = PlanDynamicPruningFilters(spark).apply(plan)
+        val directFilters = rewritten.expressions.flatMap(_.collect {
+          case in: InSubqueryExec => in
+        })
+
+        assert(directFilters.size === 1, s"$name:\n$rewritten")
+        assert(directFilters.head.plan.isInstanceOf[SubqueryBroadcastExec],
+          s"$name:\n$rewritten")
+      }
+    }
+  }
+}
+
+class DynamicPartitionPruningV1SuiteAEOn extends DynamicPartitionPruningV1Suite
+  with EnableAdaptiveExecutionSuite {
+
+  test("SPARK-60379: repeated union builds retain broadcast-only dynamic pruning") {
+    withSQLConf(
+        SQLConf.PUSH_DOWN_SHUFFLE_THROUGH_UNION_ENABLED.key -> "true",
+        SQLConf.PUSH_DOWN_SHUFFLE_THROUGH_UNION_ALLOW_WITH_SUBQUERIES_ENABLED.key -> "false",
+        SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true") {
+      val query = """WITH d AS (
+        | SELECT store_id, country, row_number() OVER
+        | (PARTITION BY store_id ORDER BY country) rn FROM (
+        |   SELECT store_id, country FROM (
+        |     SELECT store_id, country FROM dim_stats DISTRIBUTE BY store_id)
+        |   UNION ALL SELECT store_id, country FROM dim_stats))
+        | SELECT /*+ BROADCAST(d1, d2) */ f.date_id, d1.country, d2.country, d1.rn, d2.rn
+        | FROM fact_stats f
+        | JOIN d d1 ON f.store_id = d1.store_id AND d1.country = 'DE'
+        | JOIN d d2 ON f.store_id = d2.store_id""".stripMargin
+      def factPartitions(df: DataFrame): Long = {
+        val scans = collect(df.queryExecution.executedPlan) {
+          case scan: FileSourceScanExec if scan.output.exists(_.name == "date_id") => scan
+        }
+        assert(scans.size === 1)
+        scans.head.metrics("numPartitions").value
+      }
+      val (expected, expectedPartitions) = withSQLConf(
+          SQLConf.PUSH_DOWN_SHUFFLE_THROUGH_UNION_ENABLED.key -> "false") {
+        val baseline = sql(query)
+        checkPartitionPruningPredicate(baseline, withSubquery = false, withBroadcast = true)
+        (baseline.collect().toSeq, factPartitions(baseline))
+      }
+      val df = sql(query)
+      checkPartitionPruningPredicate(df, withSubquery = false, withBroadcast = true)
+      checkAnswer(df, expected)
+      assert(factPartitions(df) === expectedPartitions)
+      withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "false") {
+        val unpruned = sql(query)
+        checkAnswer(unpruned, expected)
+        assert(factPartitions(unpruned) > expectedPartitions,
+          "the broadcast pruning predicate must reduce scanned fact partitions")
+      }
+      assert(collect(df.queryExecution.executedPlan) { case window: WindowExec => window }.nonEmpty)
+    }
+  }
+
+  test("adaptive broadcast value projection survives Catalyst copies") {
+    val source = spark.table("product").queryExecution.optimizedPlan
+    val key = source.output.head
+    val child = QueryExecution.createSparkPlan(spark.sessionState.planner, source)
+    val projection = BroadcastValueProjection(source, Seq(key), key)
+    val adaptive = SubqueryAdaptiveBroadcastExec(
+      "dynamicpruning", Seq(0), true, source, Seq(key), child)(Some(projection))
+
+    assert(adaptive.productArity === 6)
+    assert(SubqueryAdaptiveBroadcastExec.unapply(adaptive).exists(_.productArity == 6))
+    assert(Modifier.isTransient(
+      classOf[SubqueryAdaptiveBroadcastExec].getDeclaredField("broadcastValueProjection")
+        .getModifiers))
+
+    Seq(
+      adaptive.copy()(adaptive.broadcastValueProjection),
+      adaptive.withNewChildren(Seq(ProjectExec(child.output, child)))
+        .asInstanceOf[SubqueryAdaptiveBroadcastExec],
+      adaptive.makeCopy(adaptive.productIterator.map(_.asInstanceOf[AnyRef]).toArray)
+        .asInstanceOf[SubqueryAdaptiveBroadcastExec]
+    ).foreach { rewritten =>
+      assert(rewritten.broadcastValueProjection.contains(projection))
+    }
+
+    val unprojected = adaptive.copy()(None)
+    assert(adaptive === unprojected)
+    assert(adaptive.canonicalized.asInstanceOf[SubqueryAdaptiveBroadcastExec]
+      .broadcastValueProjection.isEmpty)
+    assert(adaptive.canonicalized === unprojected.canonicalized)
+  }
+
+  test("SPARK-39447: Avoid AssertionError in AdaptiveSparkPlanExec.doExecuteBroadcast") {
+    val df = sql(
+      """
+        |WITH empty_result AS (
+        |  SELECT * FROM fact_stats WHERE product_id < 0
+        |)
+        |SELECT *
+        |FROM   (SELECT /*+ SHUFFLE_MERGE(fact_sk) */ empty_result.store_id
+        |        FROM   fact_sk
+        |               JOIN empty_result
+        |                 ON fact_sk.product_id = empty_result.product_id) t2
+        |       JOIN empty_result
+        |         ON t2.store_id = empty_result.store_id
+      """.stripMargin)
+
+    checkPartitionPruningPredicate(df, false, false)
+    checkAnswer(df, Nil)
+  }
+
+  test("SPARK-37995: PlanAdaptiveDynamicPruningFilters should use prepareExecutedPlan " +
+    "rather than createSparkPlan to re-plan subquery") {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+        SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "false",
+        SQLConf.EXCHANGE_REUSE_ENABLED.key -> "false") {
+      val df = sql(
+        """
+          |SELECT f.date_id, f.store_id FROM fact_sk f
+          |JOIN dim_store s ON f.store_id = s.store_id AND s.country = 'NL'
+          |WHERE s.state_province != (SELECT max(state_province) FROM dim_stats)
+        """.stripMargin)
+
+      checkPartitionPruningPredicate(df, true, false)
+      checkAnswer(df, Row(1000, 1) :: Row(1010, 2) :: Row(1020, 2) :: Nil)
+    }
+  }
+}
+
+abstract class DynamicPartitionPruningV2Suite extends DynamicPartitionPruningDataSourceSuiteBase {
+  import testImplicits._
+
+  override protected def runAnalyzeColumnCommands: Boolean = false
+
+  override protected def initState(): Unit = {
+    spark.conf.set("spark.sql.catalog.testcat", classOf[InMemoryTableCatalog].getName)
+    spark.conf.set("spark.sql.defaultCatalog", "testcat")
+  }
+
+  private def collectFactScan(df: DataFrame): BatchScanExec = {
+    val scans = collectWithSubqueries(df.queryExecution.executedPlan) {
+      case b: BatchScanExec if b.runtimeFilters.nonEmpty => b
+    }
+    assert(scans.size == 1, s"expected exactly 1 scan with runtime filters, got:\n$scans")
+    scans.head
+  }
+
+  test("SPARK-59250: DPP prunes all DSv2 partitions when the runtime IN filter is empty",
+    DisableAdaptiveExecution("an empty build side collapses the join under AQE")) {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+      SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "false",
+      SQLConf.EXCHANGE_REUSE_ENABLED.key -> "false") {
+      // no dim rows match, so the runtime filter degenerates into store_id IN ()
+      val df = sql(
+        """
+          |SELECT f.date_id, f.store_id FROM fact_sk f
+          |JOIN dim_store s ON f.store_id = s.store_id AND s.country = 'XX'
+        """.stripMargin)
+
+      checkPartitionPruningPredicate(df, withSubquery = true, withBroadcast = false)
+      checkAnswer(df, Nil)
+
+      val scan = collectFactScan(df)
+      assert(scan.filteredPartitions.flatten.isEmpty,
+        s"expected all partitions pruned by the empty runtime filter, " +
+          s"got ${scan.filteredPartitions.flatten.size} of ${scan.inputPartitions.size}")
+    }
+  }
+
+  test("SPARK-59250: DPP prunes all DSv2 partitions when the runtime IN filter " +
+    "on a cast key is empty",
+    DisableAdaptiveExecution("an empty build side collapses the join under AQE")) {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+      SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "false",
+      SQLConf.EXCHANGE_REUSE_ENABLED.key -> "false") {
+      withTable("dim_big") {
+        Seq[(Long, String)]((1L, "NL"), (2L, "NL"), (3L, "DE"), (4L, "US"), (5L, "US"))
+          .toDF("store_id", "country")
+          .write
+          .format(tableFormat)
+          .saveAsTable("dim_big")
+
+        // the BIGINT dim key adds cast(f.store_id as bigint) on the pruning key, and no dim
+        // rows match, so the runtime filter degenerates into cast(store_id) IN ()
+        val df = sql(
+          """
+            |SELECT f.date_id, f.store_id FROM fact_sk f
+            |JOIN dim_big s ON f.store_id = s.store_id AND s.country = 'XX'
+          """.stripMargin)
+
+        checkPartitionPruningPredicate(df, withSubquery = true, withBroadcast = false)
+        checkAnswer(df, Nil)
+
+        val scan = collectFactScan(df)
+        assert(scan.filteredPartitions.flatten.isEmpty,
+          s"expected all partitions pruned by the empty runtime filter, " +
+            s"got ${scan.filteredPartitions.flatten.size} of ${scan.inputPartitions.size}")
+      }
+    }
+  }
+
+  test("SPARK-59301: DPP prunes DSv2 partitions when the pruning key is wrapped in a cast") {
+    withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+      SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "false",
+      SQLConf.EXCHANGE_REUSE_ENABLED.key -> "false") {
+      withTable("dim_big") {
+        // the BIGINT keys of NL include one that does not fit in the INT partition column
+        Seq[(Long, String)](
+          (1L, "NL"), (2L, "NL"), (Int.MaxValue + 1L, "NL"), (3L, "DE"), (Int.MaxValue + 2L, "XX"))
+          .toDF("store_id", "country")
+          .write
+          .format(tableFormat)
+          .saveAsTable("dim_big")
+
+        // the BIGINT dim key adds cast(f.store_id as bigint) on the pruning key, which the
+        // runtime filter translation unwraps, dropping the key that does not fit in INT
+        val df = sql(
+          """
+            |SELECT f.date_id, f.store_id FROM fact_sk f
+            |JOIN dim_big s ON f.store_id = s.store_id AND s.country = 'NL'
+          """.stripMargin)
+
+        checkPartitionPruningPredicate(df, withSubquery = true, withBroadcast = false)
+        checkAnswer(df, Row(1000, 1) :: Row(1010, 2) :: Row(1020, 2) :: Nil)
+
+        val partitionKeys = collectFactScan(df).filteredPartitions.flatten
+          .map(_.asInstanceOf[BufferedRows].keyString())
+        assert(partitionKeys.toSet === Set("1", "2"),
+          s"expected the runtime filter to keep partitions 1 and 2, got $partitionKeys")
+
+        // no key fits in INT, so no partition can match
+        val df2 = sql(
+          """
+            |SELECT f.date_id, f.store_id FROM fact_sk f
+            |JOIN dim_big s ON f.store_id = s.store_id AND s.country = 'XX'
+          """.stripMargin)
+
+        checkPartitionPruningPredicate(df2, withSubquery = true, withBroadcast = false)
+        checkAnswer(df2, Nil)
+
+        val scan = collectFactScan(df2)
+        assert(scan.filteredPartitions.flatten.isEmpty,
+          s"expected all partitions pruned by the runtime filter, " +
+            s"got ${scan.filteredPartitions.flatten.size} of ${scan.inputPartitions.size}")
+      }
+    }
+  }
+}
+
+class DynamicPartitionPruningV2SuiteAEOff extends DynamicPartitionPruningV2Suite
+  with DisableAdaptiveExecutionSuite
+
+class DynamicPartitionPruningV2SuiteAEOn extends DynamicPartitionPruningV2Suite
+  with EnableAdaptiveExecutionSuite
+
+abstract class DynamicPartitionPruningV2FilterSuite
+    extends DynamicPartitionPruningV2Suite {
+
+  override protected def initState(): Unit = {
+    super.initState()
+    spark.conf.set("spark.sql.catalog.testcat", classOf[InMemoryTableWithV2FilterCatalog].getName)
+  }
+}
+
+class DynamicPartitionPruningV2FilterSuiteAEOff
+    extends DynamicPartitionPruningV2FilterSuite
+  with DisableAdaptiveExecutionSuite
+
+class DynamicPartitionPruningV2FilterSuiteAEOn
+    extends DynamicPartitionPruningV2FilterSuite
+  with EnableAdaptiveExecutionSuite
+
+/**
+ * Runs the DSv2 dynamic partition pruning tests against scans that receive runtime filters as
+ * Catalyst expressions, via
+ * [[org.apache.spark.sql.internal.connector.SupportsRuntimeCatalystFiltering]], rather than as
+ * connector predicates. This is the counterpart of [[DynamicPartitionPruningV2FilterSuite]],
+ * which covers the same tests for
+ * [[org.apache.spark.sql.connector.read.SupportsRuntimeV2Filtering]].
+ */
+abstract class DynamicPartitionPruningV2CatalystFilterSuite
+    extends DynamicPartitionPruningV2Suite {
+
+  override protected def initState(): Unit = {
+    super.initState()
+    spark.conf.set("spark.sql.catalog.testcat",
+      classOf[InMemoryTableCatalystRuntimeFilterCatalog].getName)
+  }
+}
+
+class DynamicPartitionPruningV2CatalystFilterSuiteAEOff
+    extends DynamicPartitionPruningV2CatalystFilterSuite
+  with DisableAdaptiveExecutionSuite
+
+class DynamicPartitionPruningV2CatalystFilterSuiteAEOn
+    extends DynamicPartitionPruningV2CatalystFilterSuite
+  with EnableAdaptiveExecutionSuite
+
+private object DppMaterializedInputTestState {
+  private val counters = TrieMap.empty[String, AtomicInteger]
+
+  def reset(id: String): Unit = counters.getOrElseUpdate(id, new AtomicInteger()).set(0)
+
+  def next(id: String): Int = counters.getOrElseUpdate(id, new AtomicInteger()).incrementAndGet()
+}

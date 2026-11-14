@@ -17,70 +17,91 @@
 
 package org.apache.spark.sql.catalyst.plans
 
+import org.scalactic.source
+import org.scalatest.Suite
+import org.scalatest.Tag
+
 import org.apache.spark.SparkFunSuite
+import org.apache.spark.sql.catalyst.analysis.SimpleAnalyzer
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
-import org.apache.spark.sql.catalyst.plans.logical.{Filter, LogicalPlan, OneRowRelation, Sample}
+import org.apache.spark.sql.catalyst.expressions.CodegenObjectFactoryMode
+import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.util._
+import org.apache.spark.sql.internal.SQLConf
 
 /**
  * Provides helper methods for comparing plans.
  */
-abstract class PlanTest extends SparkFunSuite with PredicateHelper {
-  /**
-   * Since attribute references are given globally unique ids during analysis,
-   * we must normalize them to check if two different queries are identical.
-   */
-  protected def normalizeExprIds(plan: LogicalPlan) = {
-    plan transformAllExpressions {
-      case s: ScalarSubquery =>
-        s.copy(exprId = ExprId(0))
-      case e: Exists =>
-        e.copy(exprId = ExprId(0))
-      case l: ListQuery =>
-        l.copy(exprId = ExprId(0))
-      case p: PredicateSubquery =>
-        p.copy(exprId = ExprId(0))
-      case a: AttributeReference =>
-        AttributeReference(a.name, a.dataType, a.nullable)(exprId = ExprId(0))
-      case a: Alias =>
-        Alias(a.child, a.name)(exprId = ExprId(0))
-      case ae: AggregateExpression =>
-        ae.copy(resultId = ExprId(0))
+trait PlanTest extends SparkFunSuite with PlanTestBase
+
+trait CodegenInterpretedPlanTest extends PlanTest {
+
+  override protected def test(
+      testName: String,
+      testTags: Tag*)(testFun: => Any)(implicit pos: source.Position): Unit = {
+    val codegenMode = CodegenObjectFactoryMode.CODEGEN_ONLY.toString
+    val interpretedMode = CodegenObjectFactoryMode.NO_CODEGEN.toString
+
+    super.test(testName + " (codegen path)", testTags: _*)(
+      withSQLConf(SQLConf.CODEGEN_FACTORY_MODE.key -> codegenMode) { testFun })(pos)
+    super.test(testName + " (interpreted path)", testTags: _*)(
+      withSQLConf(SQLConf.CODEGEN_FACTORY_MODE.key -> interpretedMode) { testFun })(pos)
+  }
+
+  protected def testFallback(
+      testName: String,
+      testTags: Tag*)(testFun: => Any)(implicit pos: source.Position): Unit = {
+    val codegenMode = CodegenObjectFactoryMode.FALLBACK.toString
+    super.test(testName + " (codegen fallback mode)", testTags: _*)(
+      withSQLConf(SQLConf.CODEGEN_FACTORY_MODE.key -> codegenMode) { testFun })(pos)
+  }
+}
+
+/**
+ * Provides helper methods for comparing plans, but without the overhead of
+ * mandating a FunSuite.
+ */
+trait PlanTestBase extends PredicateHelper with SQLHelper { self: Suite =>
+
+  protected def normalizeExprIds(plan: LogicalPlan): LogicalPlan =
+    NormalizePlan.normalizeExprIds(plan)
+
+  protected def rewriteNameFromAttrNullability(plan: LogicalPlan): LogicalPlan = {
+    plan.transformAllExpressions {
+      case a @ AttributeReference(name, _, false, _) =>
+        a.copy(name = s"*$name")(exprId = a.exprId, qualifier = a.qualifier)
     }
   }
 
-  /**
-   * Normalizes plans:
-   * - Filter the filter conditions that appear in a plan. For instance,
-   *   ((expr 1 && expr 2) && expr 3), (expr 1 && expr 2 && expr 3), (expr 3 && (expr 1 && expr 2)
-   *   etc., will all now be equivalent.
-   * - Sample the seed will replaced by 0L.
-   */
-  private def normalizePlan(plan: LogicalPlan): LogicalPlan = {
-    plan transform {
-      case filter @ Filter(condition: Expression, child: LogicalPlan) =>
-        Filter(splitConjunctivePredicates(condition).sortBy(_.hashCode()).reduce(And), child)
-      case sample: Sample =>
-        sample.copy(seed = 0L)(true)
-    }
-  }
+  protected def normalizePlan(plan: LogicalPlan): LogicalPlan =
+    NormalizePlan.normalizePlan(plan)
 
   /** Fails the test if the two plans do not match */
-  protected def comparePlans(plan1: LogicalPlan, plan2: LogicalPlan) {
+  protected def comparePlans(
+      plan1: LogicalPlan,
+      plan2: LogicalPlan,
+      checkAnalysis: Boolean = true): Unit = {
+    if (checkAnalysis) {
+      // Make sure both plan pass checkAnalysis.
+      SimpleAnalyzer.checkAnalysis(plan1)
+      SimpleAnalyzer.checkAnalysis(plan2)
+    }
+
     val normalized1 = normalizePlan(normalizeExprIds(plan1))
     val normalized2 = normalizePlan(normalizeExprIds(plan2))
     if (normalized1 != normalized2) {
       fail(
         s"""
           |== FAIL: Plans do not match ===
-          |${sideBySide(normalized1.treeString, normalized2.treeString).mkString("\n")}
+          |${sideBySide(
+            rewriteNameFromAttrNullability(normalized1).treeString,
+            rewriteNameFromAttrNullability(normalized2).treeString).mkString("\n")}
          """.stripMargin)
     }
   }
 
   /** Fails the test if the two expressions do not match */
   protected def compareExpressions(e1: Expression, e2: Expression): Unit = {
-    comparePlans(Filter(e1, OneRowRelation), Filter(e2, OneRowRelation))
+    comparePlans(Filter(e1, OneRowRelation()), Filter(e2, OneRowRelation()), checkAnalysis = false)
   }
 }

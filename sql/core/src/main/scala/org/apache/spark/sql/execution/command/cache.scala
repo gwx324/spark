@@ -17,60 +17,15 @@
 
 package org.apache.spark.sql.execution.command
 
-import org.apache.spark.sql.{Dataset, Row, SparkSession}
-import org.apache.spark.sql.catalyst.TableIdentifier
-import org.apache.spark.sql.catalyst.expressions.Attribute
-import org.apache.spark.sql.catalyst.plans.QueryPlan
-import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
-
-case class CacheTableCommand(
-    tableIdent: TableIdentifier,
-    plan: Option[LogicalPlan],
-    isLazy: Boolean) extends RunnableCommand {
-  require(plan.isEmpty || tableIdent.database.isEmpty,
-    "Database name is not allowed in CACHE TABLE AS SELECT")
-
-  override protected def innerChildren: Seq[QueryPlan[_]] = {
-    plan.toSeq
-  }
-
-  override def run(sparkSession: SparkSession): Seq[Row] = {
-    plan.foreach { logicalPlan =>
-      Dataset.ofRows(sparkSession, logicalPlan).createTempView(tableIdent.quotedString)
-    }
-    sparkSession.catalog.cacheTable(tableIdent.quotedString)
-
-    if (!isLazy) {
-      // Performs eager caching
-      sparkSession.table(tableIdent).count()
-    }
-
-    Seq.empty[Row]
-  }
-
-  override def output: Seq[Attribute] = Seq.empty
-}
-
-
-case class UncacheTableCommand(tableIdent: TableIdentifier) extends RunnableCommand {
-
-  override def run(sparkSession: SparkSession): Seq[Row] = {
-    sparkSession.catalog.uncacheTable(tableIdent.quotedString)
-    Seq.empty[Row]
-  }
-
-  override def output: Seq[Attribute] = Seq.empty
-}
+import org.apache.spark.sql.{Row, SparkSession}
 
 /**
  * Clear all cached data from the in-memory cache.
  */
-case object ClearCacheCommand extends RunnableCommand {
+case object ClearCacheCommand extends LeafRunnableCommand {
 
   override def run(sparkSession: SparkSession): Seq[Row] = {
     sparkSession.catalog.clearCache()
     Seq.empty[Row]
   }
-
-  override def output: Seq[Attribute] = Seq.empty
 }

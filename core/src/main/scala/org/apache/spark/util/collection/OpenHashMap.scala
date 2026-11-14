@@ -21,8 +21,9 @@ import scala.reflect.ClassTag
 
 /**
  * A fast hash map implementation for nullable keys. This hash map supports insertions and updates,
- * but not deletions. This map is about 5X faster than java.util.HashMap, while using much less
- * space overhead.
+ * but not deletions. This map uses much less space than java.util.HashMap and is competitive with
+ * it for aggregation workloads (`changeValue`), while java.util.HashMap is faster for pure
+ * insertions and lookups on modern JDKs. See `OpenHashMapBenchmark` for details.
  *
  * Under the hood, it uses our OpenHashSet implementation.
  *
@@ -75,8 +76,26 @@ class OpenHashMap[K : ClassTag, @specialized(Long, Int, Double) V: ClassTag](
     }
   }
 
+  /** Get the value for a given key, return None if the key doesn't exist */
+  def get(k: K): Option[V] = {
+    if (k == null) {
+      if (haveNullValue) {
+        Some(nullValue)
+      } else {
+        None
+      }
+    } else {
+      val pos = _keySet.getPos(k)
+      if (pos < 0) {
+        None
+      } else {
+        Some(_values(pos))
+      }
+    }
+  }
+
   /** Set the value for a key */
-  def update(k: K, v: V) {
+  def update(k: K, v: V): Unit = {
     if (k == null) {
       haveNullValue = true
       nullValue = v
@@ -149,17 +168,12 @@ class OpenHashMap[K : ClassTag, @specialized(Long, Int, Double) V: ClassTag](
     }
   }
 
-  // The following member variables are declared as protected instead of private for the
-  // specialization to work (specialized class extends the non-specialized one and needs access
-  // to the "private" variables).
-  // They also should have been val's. We use var's because there is a Scala compiler bug that
-  // would throw illegal access error at runtime if they are declared as val's.
-  protected var grow = (newCapacity: Int) => {
+  private def grow(newCapacity: Int): Unit = {
     _oldValues = _values
     _values = new Array[V](newCapacity)
   }
 
-  protected var move = (oldPos: Int, newPos: Int) => {
+  private def move(oldPos: Int, newPos: Int): Unit = {
     _values(newPos) = _oldValues(oldPos)
   }
 }

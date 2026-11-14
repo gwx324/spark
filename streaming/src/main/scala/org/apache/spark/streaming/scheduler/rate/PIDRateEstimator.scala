@@ -17,7 +17,7 @@
 
 package org.apache.spark.streaming.scheduler.rate
 
-import org.apache.spark.internal.Logging
+import org.apache.spark.internal.{Logging, LogKeys}
 
 /**
  * Implements a proportional-integral-derivative (PID) controller which acts on
@@ -26,7 +26,7 @@ import org.apache.spark.internal.Logging
  * case of Spark Streaming the error is the difference between the measured processing
  * rate (number of elements/processing delay) and the previous rate.
  *
- * @see https://en.wikipedia.org/wiki/PID_controller
+ * @see <a href="https://en.wikipedia.org/wiki/PID_controller">PID controller (Wikipedia)</a>
  *
  * @param batchIntervalMillis the batch duration, in milliseconds
  * @param proportional how much the correction should depend on the current
@@ -74,8 +74,11 @@ private[streaming] class PIDRateEstimator(
     minRate > 0,
     s"Minimum rate in PIDRateEstimator should be > 0")
 
-  logInfo(s"Created PIDRateEstimator with proportional = $proportional, integral = $integral, " +
-    s"derivative = $derivative, min rate = $minRate")
+  logInfo(log"Created PIDRateEstimator with proportional = " +
+    log"${MDC(LogKeys.PROPORTIONAL, proportional)}, integral = " +
+    log"${MDC(LogKeys.INTEGRAL, integral)}, derivative = " +
+    log"${MDC(LogKeys.DERIVATIVE, derivative)}, min rate = " +
+    log"${MDC(LogKeys.MIN_RATE, minRate)}")
 
   def compute(
       time: Long, // in milliseconds

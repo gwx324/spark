@@ -42,7 +42,7 @@ object ModelSelectionViaCrossValidationExample {
 
   def main(args: Array[String]): Unit = {
     val spark = SparkSession
-      .builder
+      .builder()
       .appName("ModelSelectionViaCrossValidationExample")
       .getOrCreate()
 
@@ -93,6 +93,7 @@ object ModelSelectionViaCrossValidationExample {
       .setEvaluator(new BinaryClassificationEvaluator)
       .setEstimatorParamMaps(paramGrid)
       .setNumFolds(2)  // Use 3+ in practice
+      .setParallelism(2)  // Evaluate up to 2 parameter settings in parallel
 
     // Run cross-validation, and choose the best set of parameters.
     val cvModel = cv.fit(training)

@@ -17,17 +17,16 @@
 
 package org.apache.spark.sql.execution.datasources.csv
 
-import java.nio.charset.{Charset, StandardCharsets}
-
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.FileStatus
-import org.apache.hadoop.io.{LongWritable, Text}
-import org.apache.hadoop.mapred.TextInputFormat
+import org.apache.hadoop.fs.{FileStatus, Path}
 import org.apache.hadoop.mapreduce._
 
-import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.csv.{CSVHeaderChecker, CSVOptions, UnivocityParser}
+import org.apache.spark.sql.catalyst.expressions.ExprUtils
+import org.apache.spark.sql.catalyst.util.CompressionCodecs
+import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.execution.datasources._
 import org.apache.spark.sql.sources._
 import org.apache.spark.sql.types._
@@ -36,47 +35,31 @@ import org.apache.spark.util.SerializableConfiguration
 /**
  * Provides access to CSV data from pure SQL statements.
  */
-class CSVFileFormat extends TextBasedFileFormat with DataSourceRegister {
+case class CSVFileFormat() extends TextBasedFileFormat with DataSourceRegister {
 
   override def shortName(): String = "csv"
 
-  override def toString: String = "CSV"
-
-  override def hashCode(): Int = getClass.hashCode()
-
-  override def equals(other: Any): Boolean = other.isInstanceOf[CSVFileFormat]
+  override def isSplitable(
+      sparkSession: SparkSession,
+      options: Map[String, String],
+      path: Path): Boolean = {
+    val parsedOptions = getCsvOptions(sparkSession, options)
+    // A tar archive is decompressed/unpacked as a sequential stream, so it must be read as a
+    // single split rather than carved into byte ranges.
+    if (parsedOptions.archiveFormatEnabled && SupportsArchiveFormat.isArchivePath(path)) {
+      SupportsArchiveFormat.checkNoDecompressionCodec(path, parsedOptions.decompressionCodec)
+      return false
+    }
+    CSVDataSource(parsedOptions).isSplitable && super.isSplitable(sparkSession, options, path)
+  }
 
   override def inferSchema(
       sparkSession: SparkSession,
       options: Map[String, String],
       files: Seq[FileStatus]): Option[StructType] = {
-    val csvOptions = new CSVOptions(options)
-
-    // TODO: Move filtering.
-    val paths = files.filterNot(_.getPath.getName startsWith "_").map(_.getPath.toString)
-    val rdd = baseRdd(sparkSession, csvOptions, paths)
-    val firstLine = findFirstLine(csvOptions, rdd)
-    val firstRow = new CsvReader(csvOptions).parseLine(firstLine)
-
-    val header = if (csvOptions.headerFlag) {
-      firstRow.zipWithIndex.map { case (value, index) =>
-        if (value == null || value.isEmpty || value == csvOptions.nullValue) s"_c$index" else value
-      }
-    } else {
-      firstRow.zipWithIndex.map { case (value, index) => s"_c$index" }
-    }
-
-    val parsedRdd = tokenRdd(sparkSession, csvOptions, header, paths)
-    val schema = if (csvOptions.inferSchemaFlag) {
-      CSVInferSchema.infer(parsedRdd, header, csvOptions)
-    } else {
-      // By default fields are assumed to be StringType
-      val schemaFields = header.map { fieldName =>
-        StructField(fieldName.toString, StringType, nullable = true)
-      }
-      StructType(schemaFields)
-    }
-    Some(schema)
+    val parsedOptions = getCsvOptions(sparkSession, options)
+    CSVDataSource(parsedOptions)
+      .inferSchema(sparkSession, files, parsedOptions, supportsArchiveScan = true)
   }
 
   override def prepareWrite(
@@ -84,14 +67,31 @@ class CSVFileFormat extends TextBasedFileFormat with DataSourceRegister {
       job: Job,
       options: Map[String, String],
       dataSchema: StructType): OutputWriterFactory = {
-    verifySchema(dataSchema)
-    val conf = job.getConfiguration
-    val csvOptions = new CSVOptions(options)
-    csvOptions.compressionCodec.foreach { codec =>
-      CompressionCodecs.setCodecConfiguration(conf, codec)
+    // This is a defensive check to ensure the schema doesn't have variant. It shouldn't be
+    // triggered if other part of the code is correct because `supportDataType` doesn't allow
+    // variant (in case the user is not using `supportDataType/supportReadDataType` correctly).
+    dataSchema.foreach { field =>
+      if (!supportDataType(field.dataType, allowVariant = false)) {
+        throw QueryCompilationErrors.dataTypeUnsupportedByDataSourceError("CSV", field)
+      }
+    }
+    val parsedOptions = getCsvOptions(sparkSession, options)
+    parsedOptions.compressionCodec.foreach { codec =>
+      CompressionCodecs.setCodecConfiguration(job.getConfiguration, codec)
     }
 
-    new CSVOutputWriterFactory(csvOptions)
+    new OutputWriterFactory {
+      override def newInstance(
+          path: String,
+          dataSchema: StructType,
+          context: TaskAttemptContext): OutputWriter = {
+        new CsvOutputWriter(path, dataSchema, context, parsedOptions)
+      }
+
+      override def getFileExtension(context: TaskAttemptContext): String = {
+        "." + parsedOptions.extension + CodecStreams.getCompressionExtension(context)
+      }
+    }
   }
 
   override def buildReader(
@@ -102,97 +102,91 @@ class CSVFileFormat extends TextBasedFileFormat with DataSourceRegister {
       filters: Seq[Filter],
       options: Map[String, String],
       hadoopConf: Configuration): (PartitionedFile) => Iterator[InternalRow] = {
-    val csvOptions = new CSVOptions(options)
-    val commentPrefix = csvOptions.comment.toString
-    val headers = requiredSchema.fields.map(_.name)
-
     val broadcastedHadoopConf =
-      sparkSession.sparkContext.broadcast(new SerializableConfiguration(hadoopConf))
+      SerializableConfiguration.broadcast(sparkSession.sparkContext, hadoopConf)
+    val parsedOptions = getCsvOptions(sparkSession, options)
+    val isColumnPruningEnabled = parsedOptions.isColumnPruningEnabled(requiredSchema)
+    // The effective `ignoredPathSegmentRegex` for skipping hidden archive entries. Reused from the
+    // options' lazily-compiled Pattern (Serializable) instead of re-compiling per file or entry.
+    val ignoredPathSegmentRegex = parsedOptions.ignoredPathSegmentRegexPattern
+
+    // Check a field requirement for corrupt records here to throw an exception in a driver side
+    ExprUtils.verifyColumnNameOfCorruptRecord(dataSchema, parsedOptions.columnNameOfCorruptRecord)
+
+    if (requiredSchema.length == 1 &&
+      requiredSchema.head.name == parsedOptions.columnNameOfCorruptRecord) {
+      throw QueryCompilationErrors.queryFromRawFilesIncludeCorruptRecordColumnError()
+    }
+
+    // Don't push any filter which refers to the "virtual" column which cannot present in the input.
+    // Such filters will be applied later on the upper layer.
+    val actualFilters =
+      filters.filterNot(_.references.contains(parsedOptions.columnNameOfCorruptRecord))
 
     (file: PartitionedFile) => {
-      val lineIterator = {
-        val conf = broadcastedHadoopConf.value.value
-        new HadoopFileLinesReader(file, conf).map { line =>
-          new String(line.getBytes, 0, line.getLength, csvOptions.charset)
-        }
-      }
+      val conf = broadcastedHadoopConf.value.value
+      val actualDataSchema = StructType(
+        dataSchema.filterNot(_.name == parsedOptions.columnNameOfCorruptRecord))
+      val actualRequiredSchema = StructType(
+        requiredSchema.filterNot(_.name == parsedOptions.columnNameOfCorruptRecord))
+      // Use column pruning when specified by Catalyst, except when one or more columns have
+      // existence default value(s), since in that case we instruct the CSV parser to disable column
+      // pruning and instead read each entire row in order to correctly assign the default value(s).
+      val schema = if (isColumnPruningEnabled) actualRequiredSchema else actualDataSchema
 
-      CSVRelation.dropHeaderLine(file, lineIterator, csvOptions)
+      def newParser(): UnivocityParser =
+        new UnivocityParser(actualDataSchema, actualRequiredSchema, parsedOptions, actualFilters)
+      def getHeaderChecker(isStartOfFile: Boolean, source: String): CSVHeaderChecker =
+        new CSVHeaderChecker(schema, parsedOptions, source, isStartOfFile)
 
-      val csvParser = new CsvReader(csvOptions)
-      val tokenizedIterator = lineIterator.filter { line =>
-        line.trim.nonEmpty && !line.startsWith(commentPrefix)
-      }.map { line =>
-        csvParser.parseLine(line)
-      }
-      val parser = CSVRelation.csvParser(dataSchema, requiredSchema.fieldNames, csvOptions)
-      var numMalformedRecords = 0
-      tokenizedIterator.flatMap { recordTokens =>
-        val row = parser(recordTokens, numMalformedRecords)
-        if (row.isEmpty) {
-          numMalformedRecords += 1
-        }
-        row
+      // A tar archive (always a single split, see `isSplitable`) is streamed entry by entry when
+      // archive reads are enabled; otherwise the file is parsed directly.
+      if (parsedOptions.archiveFormatEnabled && SupportsArchiveFormat.isArchivePath(file.toPath)) {
+        CSVDataSource(parsedOptions).readArchive(
+          conf, file, () => newParser(), getHeaderChecker, requiredSchema, ignoredPathSegmentRegex,
+          parsedOptions.archivePathFilterPattern)
+      } else {
+        val parser = newParser()
+        val headerChecker = getHeaderChecker(file.start == 0, s"CSV file: ${file.urlEncodedPath}")
+        CSVDataSource(parsedOptions).readFile(conf, file, parser, headerChecker, requiredSchema)
       }
     }
   }
 
-  private def baseRdd(
-      sparkSession: SparkSession,
-      options: CSVOptions,
-      inputPaths: Seq[String]): RDD[String] = {
-    readText(sparkSession, options, inputPaths.mkString(","))
-  }
-
-  private def tokenRdd(
-      sparkSession: SparkSession,
-      options: CSVOptions,
-      header: Array[String],
-      inputPaths: Seq[String]): RDD[Array[String]] = {
-    val rdd = baseRdd(sparkSession, options, inputPaths)
-    // Make sure firstLine is materialized before sending to executors
-    val firstLine = if (options.headerFlag) findFirstLine(options, rdd) else null
-    CSVRelation.univocityTokenizer(rdd, firstLine, options)
-  }
+  override def toString: String = "CSV"
 
   /**
-   * Returns the first line of the first non-empty file in path
+   * Allow reading variant from CSV, but don't allow writing variant into CSV. This is because the
+   * written data (the string representation of variant) may not be read back as the same variant.
    */
-  private def findFirstLine(options: CSVOptions, rdd: RDD[String]): String = {
-    if (options.isCommentSet) {
-      val comment = options.comment.toString
-      rdd.filter { line =>
-        line.trim.nonEmpty && !line.startsWith(comment)
-      }.first()
-    } else {
-      rdd.filter { line =>
-        line.trim.nonEmpty
-      }.first()
-    }
+  override def supportDataType(dataType: DataType): Boolean =
+    supportDataType(dataType, allowVariant = false)
+
+  override def supportReadDataType(dataType: DataType): Boolean =
+    supportDataType(dataType, allowVariant = true)
+
+  private def supportDataType(dataType: DataType, allowVariant: Boolean): Boolean = dataType match {
+    case _: VariantType => allowVariant
+
+    case _: GeometryType | _: GeographyType => false
+
+    case _: AtomicType => true
+
+    case udt: UserDefinedType[_] => supportDataType(udt.sqlType)
+
+    case _ => false
   }
 
-  private def readText(
+  override def allowDuplicatedColumnNames: Boolean = true
+
+  private def getCsvOptions(
       sparkSession: SparkSession,
-      options: CSVOptions,
-      location: String): RDD[String] = {
-    if (Charset.forName(options.charset) == StandardCharsets.UTF_8) {
-      sparkSession.sparkContext.textFile(location)
-    } else {
-      val charset = options.charset
-      sparkSession.sparkContext
-        .hadoopFile[LongWritable, Text, TextInputFormat](location)
-        .mapPartitions(_.map(pair => new String(pair._2.getBytes, 0, pair._2.getLength, charset)))
-    }
-  }
-
-  private def verifySchema(schema: StructType): Unit = {
-    schema.foreach { field =>
-      field.dataType match {
-        case _: ArrayType | _: MapType | _: StructType =>
-          throw new UnsupportedOperationException(
-            s"CSV data source does not support ${field.dataType.simpleString} data type.")
-        case _ =>
-      }
-    }
+      options: Map[String, String]): CSVOptions = {
+    val conf = getSqlConf(sparkSession)
+    new CSVOptions(
+      options,
+      conf.csvColumnPruning,
+      conf.sessionLocalTimeZone,
+      conf.columnNameOfCorruptRecord)
   }
 }

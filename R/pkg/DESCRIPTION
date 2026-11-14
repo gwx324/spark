@@ -1,19 +1,27 @@
 Package: SparkR
 Type: Package
-Title: R Frontend for Apache Spark
-Version: 2.0.0
-Date: 2016-07-07
-Author: The Apache Software Foundation
-Maintainer: Shivaram Venkataraman <shivaram@cs.berkeley.edu>
+Version: 5.0.0
+Title: R Front End for 'Apache Spark'
+Description: Provides an R Front end for 'Apache Spark' <https://spark.apache.org>.
+Authors@R:
+    person(family = "The Apache Software Foundation",
+           email = "dev@spark.apache.org",
+           role = c("aut", "cre", "cph"))
+License: Apache License (== 2.0)
+URL: https://www.apache.org https://spark.apache.org
+BugReports: https://spark.apache.org/contributing.html
+SystemRequirements: Java (>= 21, < 26)
 Depends:
-    R (>= 3.0),
+    R (>= 4.0),
     methods
 Suggests:
+    knitr,
+    rmarkdown,
+    markdown,
     testthat,
     e1071,
-    survival
-Description: The SparkR package provides an R frontend for Apache Spark.
-License: Apache License (== 2.0)
+    survival,
+    arrow (>= 10.0.0)
 Collate:
     'schema.R'
     'generics.R'
@@ -27,16 +35,30 @@ Collate:
     'WindowSpec.R'
     'backend.R'
     'broadcast.R'
+    'catalog.R'
     'client.R'
     'context.R'
     'deserialize.R'
     'functions.R'
     'install.R'
-    'mllib.R'
+    'jvm.R'
+    'mllib_classification.R'
+    'mllib_clustering.R'
+    'mllib_fpm.R'
+    'mllib_recommendation.R'
+    'mllib_regression.R'
+    'mllib_stat.R'
+    'mllib_tree.R'
+    'mllib_utils.R'
     'serialize.R'
     'sparkR.R'
     'stats.R'
+    'streaming.R'
     'types.R'
     'utils.R'
     'window.R'
-RoxygenNote: 5.0.1
+    'zzz.R'
+RoxygenNote: 7.1.2
+VignetteBuilder: knitr
+NeedsCompilation: no
+Encoding: UTF-8

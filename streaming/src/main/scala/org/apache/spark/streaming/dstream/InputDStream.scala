@@ -17,9 +17,12 @@
 
 package org.apache.spark.streaming.dstream
 
+import java.util.Locale
+
 import scala.reflect.ClassTag
 
 import org.apache.spark.SparkContext
+import org.apache.spark.internal.LogKeys.{LAST_VALID_TIME, TIME}
 import org.apache.spark.rdd.RDDOperationScope
 import org.apache.spark.streaming.{Duration, StreamingContext, Time}
 import org.apache.spark.streaming.scheduler.RateController
@@ -32,7 +35,7 @@ import org.apache.spark.util.Utils
  * Input streams that can generate RDDs from new data by running a service/thread only on
  * the driver node (that is, without running a receiver on worker nodes), can be
  * implemented by directly inheriting this InputDStream. For example,
- * FileInputDStream, a subclass of InputDStream, monitors a HDFS directory from the driver for
+ * FileInputDStream, a subclass of InputDStream, monitors an HDFS directory from the driver for
  * new files and generates RDDs with the new files. For implementing input streams
  * that requires running a receiver on the worker nodes, use
  * [[org.apache.spark.streaming.dstream.ReceiverInputDStream]] as the parent class.
@@ -46,7 +49,7 @@ abstract class InputDStream[T: ClassTag](_ssc: StreamingContext)
 
   ssc.graph.addInputStream(this)
 
-  /** This is an unique identifier for the input stream. */
+  /** This is a unique identifier for the input stream. */
   val id = ssc.getNewInputStreamId()
 
   // Keep track of the freshest rate for this stream using the rateEstimator
@@ -54,13 +57,12 @@ abstract class InputDStream[T: ClassTag](_ssc: StreamingContext)
 
   /** A human-readable name of this InputDStream */
   private[streaming] def name: String = {
-    // e.g. FlumePollingDStream -> "Flume polling stream"
     val newName = Utils.getFormattedClassName(this)
       .replaceAll("InputDStream", "Stream")
       .split("(?=[A-Z])")
       .filter(_.nonEmpty)
       .mkString(" ")
-      .toLowerCase
+      .toLowerCase(Locale.ROOT)
       .capitalize
     s"$newName [$id]"
   }
@@ -74,7 +76,7 @@ abstract class InputDStream[T: ClassTag](_ssc: StreamingContext)
   protected[streaming] override val baseScope: Option[String] = {
     val scopeName = Option(ssc.sc.getLocalProperty(SparkContext.RDD_SCOPE_KEY))
       .map { json => RDDOperationScope.fromJson(json).name + s" [$id]" }
-      .getOrElse(name.toLowerCase)
+      .getOrElse(name.toLowerCase(Locale.ROOT))
     Some(new RDDOperationScope(scopeName).toJson)
   }
 
@@ -88,10 +90,10 @@ abstract class InputDStream[T: ClassTag](_ssc: StreamingContext)
     if (!super.isTimeValid(time)) {
       false // Time not valid
     } else {
-      // Time is valid, but check it it is more than lastValidTime
+      // Time is valid, but check it is more than lastValidTime
       if (lastValidTime != null && time < lastValidTime) {
-        logWarning(s"isTimeValid called with $time whereas the last valid time " +
-          s"is $lastValidTime")
+        logWarning(log"isTimeValid called with ${MDC(TIME, time)} whereas the last valid time " +
+          log"is ${MDC(LAST_VALID_TIME, lastValidTime)}")
       }
       lastValidTime = time
       true

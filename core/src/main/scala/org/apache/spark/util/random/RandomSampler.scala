@@ -19,7 +19,6 @@ package org.apache.spark.util.random
 
 import java.util.Random
 
-import scala.collection.mutable.ArrayBuffer
 import scala.reflect.ClassTag
 
 import org.apache.commons.math3.distribution.PoissonDistribution
@@ -40,7 +39,7 @@ trait RandomSampler[T, U] extends Pseudorandom with Cloneable with Serializable 
 
   /** take a random sample */
   def sample(items: Iterator[T]): Iterator[U] =
-    items.filter(_ => sample > 0).asInstanceOf[Iterator[U]]
+    items.filter(_ => sample() > 0).asInstanceOf[Iterator[U]]
 
   /**
    * Whether to sample the next item or not.
@@ -50,7 +49,7 @@ trait RandomSampler[T, U] extends Pseudorandom with Cloneable with Serializable 
 
   /** return a copy of the RandomSampler object */
   override def clone: RandomSampler[T, U] =
-    throw new NotImplementedError("clone() is not implemented.")
+    throw new UnsupportedOperationException("clone() is not implemented.")
 }
 
 private[spark]
@@ -202,7 +201,7 @@ class PoissonSampler[T](
   private val rng = new PoissonDistribution(if (fraction > 0.0) fraction else 1.0)
   private val rngGap = RandomSampler.newDefaultRNG
 
-  override def setSeed(seed: Long) {
+  override def setSeed(seed: Long): Unit = {
     rng.reseedRandomGenerator(seed)
     rngGap.setSeed(seed)
   }

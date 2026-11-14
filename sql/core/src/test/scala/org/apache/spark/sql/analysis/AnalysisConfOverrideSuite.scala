@@ -1,0 +1,287 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.analysis
+
+import org.apache.spark.SparkConf
+import org.apache.spark.SparkNoSuchElementException
+import org.apache.spark.internal.config.ConfigBindingPolicy
+import org.apache.spark.sql.{Row, SparkSessionExtensions}
+import org.apache.spark.sql.catalyst.analysis.Analyzer
+import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.catalyst.rules.Rule
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.test.SharedSparkSession
+
+class AnalysisConfOverrideSuite extends SharedSparkSession {
+
+  override protected def sparkConf: SparkConf = {
+    super.sparkConf
+      .set("spark.sql.extensions", classOf[ConfOverrideValidationExtensions].getName)
+  }
+
+  override def beforeAll(): Unit = {
+    super.beforeAll()
+    spark.sql("SELECT id as a FROM range(10)").createTempView("table")
+    spark.sql("SELECT id as a, (id + 1) as b FROM range(10)").createTempView("table2")
+  }
+
+  override def afterAll(): Unit = {
+    spark.catalog.dropTempView("table")
+    spark.catalog.dropTempView("table2")
+    super.afterAll()
+  }
+
+  private def testOverride(testName: String)(f: (String, String) => Unit): Unit = {
+    test(testName) {
+      val key = "spark.sql.catalog.x.y"
+      val value = "true"
+      withSQLConf(key -> value) {
+        f(key, value)
+      }
+    }
+  }
+
+  test("resolution config retention follows binding policies") {
+    val sessionKey = SQLConf.ALLOW_CREATING_UDT_FROM_STRING.key
+    val notApplicableKey = SQLConf.SPLIT_PROJECTION_FOR_EXPENSIVE_FILTERS.key
+    val persistedKey = SQLConf.CHAR_VARCHAR_STANDARD_SEMANTICS.key
+    val catalogKey = "spark.sql.catalog.analysisConfOverrideSuite.option"
+    val unknownKey = "spark.sql.analysisConfOverrideSuite.unknown." +
+      java.util.UUID.randomUUID().toString.replace("-", "")
+
+    val existingConf = new SQLConf()
+    existingConf.setConfString(sessionKey, "false")
+    existingConf.setConfString(notApplicableKey, "false")
+    existingConf.setConfString(persistedKey, "false")
+    existingConf.setConfString(catalogKey, "session-catalog")
+    existingConf.setConfString(unknownKey, "session")
+
+    val newConf = new SQLConf()
+    newConf.setConfString(sessionKey, "true")
+    newConf.setConfString(notApplicableKey, "true")
+    newConf.setConfString(persistedKey, "true")
+    newConf.setConfString(catalogKey, "captured-catalog")
+    newConf.setConfString(unknownKey, "captured")
+
+    withSQLConf(SQLConf.ASSUME_ANSI_FALSE_IF_NOT_PERSISTED.key -> "true") {
+      Analyzer.retainResolutionConfigsForAnalysis(
+        newConf, existingConf, createSparkVersion = "4.0.0")
+    }
+
+    assert(newConf.getConfString(sessionKey) == "false")
+    assert(newConf.getConfString(notApplicableKey) == "false")
+    assert(newConf.getConfString(persistedKey) == "true")
+    assert(newConf.getConfString(catalogKey) == "session-catalog")
+    assert(newConf.getConfString(unknownKey) == "captured")
+    assert(newConf.getConfString(SQLConf.ANSI_ENABLED.key) == "true")
+
+    val dynamicEntry = SQLConf.buildConf(unknownKey)
+      .withBindingPolicy(ConfigBindingPolicy.SESSION)
+      .stringConf
+      .createWithDefault("default")
+    try {
+      Analyzer.retainResolutionConfigsForAnalysis(newConf, existingConf)
+      assert(newConf.getConfString(unknownKey) == "session")
+
+      SQLConf.unregister(dynamicEntry)
+      newConf.setConfString(unknownKey, "captured after unregistration")
+      Analyzer.retainResolutionConfigsForAnalysis(newConf, existingConf)
+      assert(newConf.getConfString(unknownKey) == "captured after unregistration")
+    } finally {
+      SQLConf.unregister(dynamicEntry)
+    }
+  }
+
+  gridTest("view and SQL function bodies follow a SESSION-bound config changed between queries")(
+      Seq(true, false)) { memoize =>
+    val key = SQLConf.LOWER_EMPTY_GROUPING_SET_TO_GLOBAL_AGGREGATE.key
+    // Over empty input, this grand total returns one row when the config is on and none when off.
+    val grandTotal =
+      "SELECT count(*) AS c FROM VALUES (1) AS t(k) WHERE k > 1 GROUP BY GROUPING SETS (())"
+    def checkBodies(enabled: Boolean): Unit = {
+      val viewRows = if (enabled) Seq(Row(0L)) else Seq.empty
+      checkAnswer(spark.table("grand_total_temp_view"), viewRows)
+      checkAnswer(spark.table("grand_total_view"), viewRows)
+      // A scalar subquery that returns no rows evaluates to NULL.
+      checkAnswer(spark.sql("SELECT grand_total_func()"), Row(if (enabled) 0L else null))
+    }
+
+    withSQLConf(
+        key -> "true",
+        SQLConf.ANALYZER_MEMOIZE_RETAINED_RESOLUTION_CONFIGS.key -> memoize.toString) {
+      withTempView("grand_total_temp_view") {
+        withView("grand_total_view") {
+          withUserDefinedFunction("grand_total_func" -> true) {
+            spark.sql(s"CREATE TEMPORARY VIEW grand_total_temp_view AS $grandTotal")
+            spark.sql(s"CREATE VIEW grand_total_view AS $grandTotal")
+            spark.sql(
+              s"CREATE TEMPORARY FUNCTION grand_total_func() RETURNS BIGINT RETURN ($grandTotal)")
+            checkBodies(enabled = true)
+
+            spark.sql(s"SET $key=false")
+            checkBodies(enabled = false)
+
+            spark.sql(s"SET $key=true")
+            checkBodies(enabled = true)
+          }
+        }
+      }
+    }
+  }
+
+  testOverride("simple plan") { case (key, value) =>
+    ValidateConfOverrideRule.withConfValidationEnabled(key, value) {
+      spark.sql("SELECT * FROM TaBlE")
+    }
+  }
+
+  testOverride("CTE") { case (key, value) =>
+    ValidateConfOverrideRule.withConfValidationEnabled(key, value) {
+      spark.sql(
+        """WITH cte AS (SELECT * FROM TaBlE)
+          |SELECT * FROM cte
+          |""".stripMargin)
+    }
+  }
+
+  testOverride("Subquery") { case (key, value) =>
+    ValidateConfOverrideRule.withConfValidationEnabled(key, value) {
+      spark.sql(
+        """
+          |SELECT * FROM TaBlE WHERE a in (SELECT a FROM table2)
+          |""".stripMargin)
+    }
+  }
+
+  testOverride("View") { case (key, value) =>
+    withTable("test_table", "test_table2") {
+      spark.sql("CREATE TABLE test_table AS SELECT id as a FROM range(10)")
+      spark.sql("CREATE TABLE test_table2 AS SELECT id as a, (id + 1) as b FROM range(10)")
+      withView("test_view") {
+        spark.sql("CREATE VIEW test_view AS " +
+          "SELECT * FROM test_table WHERE a in (SELECT a FROM test_table2)")
+
+        ValidateConfOverrideRule.withConfValidationEnabled(key, value) {
+          spark.sql("SELECT * FROM test_view")
+        }
+      }
+    }
+  }
+
+  testOverride("user defined SQL functions") { case (key, value) =>
+    withTable("test_table", "test_table2") {
+      spark.sql("CREATE TABLE test_table AS SELECT id as a FROM range(10)")
+      spark.sql("CREATE TABLE test_table2 AS SELECT id as a, (id + 1) as b FROM range(10)")
+      withUserDefinedFunction("f1" -> true, "f2" -> false, "f3" -> false) {
+        spark.sql(
+          """CREATE OR REPLACE TEMPORARY FUNCTION f1() RETURNS TABLE (a bigint)
+            |RETURN SELECT * FROM test_table WHERE a in (SELECT a FROM test_table2)
+            |""".stripMargin
+        )
+        spark.sql(
+          """CREATE OR REPLACE FUNCTION f2() RETURNS TABLE (a bigint)
+            |RETURN SELECT * FROM test_table WHERE a in (SELECT a FROM test_table2)
+            |""".stripMargin
+        )
+        spark.sql(
+          """CREATE OR REPLACE FUNCTION f3(in bigint) RETURNS bigint
+            |RETURN in + 1
+            |""".stripMargin
+        )
+
+        ("SELECT * FROM f1()" :: "SELECT * FROM f2()" :: "SELECT f3(1)" :: Nil).foreach { query =>
+          ValidateConfOverrideRule.withConfValidationEnabled(key, value) {
+            spark.sql(query)
+          }
+        }
+      }
+    }
+  }
+
+  testOverride("user defined SQL functions - test conf disabled") { case (key, value) =>
+    withTable("test_table", "test_table2") {
+      spark.sql("CREATE TABLE test_table AS SELECT id as a FROM range(10)")
+      spark.sql("CREATE TABLE test_table2 AS SELECT id as a, (id + 1) as b FROM range(10)")
+      // turn the flag off to maintain former behavior
+      withSQLConf("spark.sql.analyzer.sqlFunctionResolution.applyConfOverrides" -> "false") {
+        withUserDefinedFunction("f1" -> true, "f2" -> false, "f3" -> false) {
+          spark.sql(
+            """CREATE OR REPLACE TEMPORARY FUNCTION f1() RETURNS TABLE (a bigint)
+              |RETURN SELECT * FROM test_table WHERE a in (SELECT a FROM test_table2)
+              |""".stripMargin
+          )
+          spark.sql(
+            """CREATE OR REPLACE FUNCTION f2() RETURNS TABLE (a bigint)
+              |RETURN SELECT * FROM test_table WHERE a in (SELECT a FROM test_table2)
+              |""".stripMargin
+          )
+          spark.sql(
+            """CREATE OR REPLACE FUNCTION f3(in bigint) RETURNS bigint
+              |RETURN in + 1
+              |""".stripMargin
+          )
+
+          ("SELECT * FROM f1()" :: "SELECT * FROM f2()" :: "SELECT f3(1)" :: Nil).foreach { query =>
+            checkError(
+              exception = intercept[SparkNoSuchElementException] {
+                ValidateConfOverrideRule.withConfValidationEnabled(key, value) {
+                  spark.sql(query)
+                }
+              },
+              condition = "SQL_CONF_NOT_FOUND",
+              parameters = Map("sqlConf" -> "\"spark.sql.catalog.x.y\""))
+          }
+        }
+      }
+    }
+  }
+}
+
+/** Utility singleton object to orchestrate the test. */
+object ValidateConfOverrideRule {
+  private var confToCheck: Option[(String, String)] = None
+  private var isCalled: Boolean = false
+
+  def withConfValidationEnabled(key: String, value: String)(f: => Unit): Unit = {
+    try {
+      confToCheck = Some(key -> value)
+      f
+      assert(isCalled, "The rule was enabled, but not called. This is a test setup error.")
+    } finally {
+      isCalled = false
+      confToCheck = None
+    }
+  }
+}
+
+class ValidateConfOverrideRule extends Rule[LogicalPlan] {
+  override def apply(plan: LogicalPlan): LogicalPlan = {
+    ValidateConfOverrideRule.confToCheck.foreach { case (k, v) =>
+      assert(conf.getConfString(k) == v,
+        s"The feature wasn't enabled within plan:\n$plan")
+      ValidateConfOverrideRule.isCalled = true
+    }
+    plan
+  }
+}
+
+class ConfOverrideValidationExtensions extends (SparkSessionExtensions => Unit) {
+  override def apply(extensions: SparkSessionExtensions): Unit = {
+    extensions.injectResolutionRule(_ => new ValidateConfOverrideRule)
+  }
+}

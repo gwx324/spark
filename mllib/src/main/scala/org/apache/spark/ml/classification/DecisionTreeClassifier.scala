@@ -22,18 +22,22 @@ import org.json4s.{DefaultFormats, JObject}
 import org.json4s.JsonDSL._
 
 import org.apache.spark.annotation.Since
-import org.apache.spark.ml.feature.LabeledPoint
+import org.apache.spark.ml.feature._
 import org.apache.spark.ml.linalg.{DenseVector, SparseVector, Vector, Vectors}
 import org.apache.spark.ml.param.ParamMap
 import org.apache.spark.ml.tree._
+import org.apache.spark.ml.tree.{DecisionTreeModel, Node, TreeClassifierParams}
 import org.apache.spark.ml.tree.DecisionTreeModelReadWrite._
 import org.apache.spark.ml.tree.impl.RandomForest
 import org.apache.spark.ml.util._
+import org.apache.spark.ml.util.DatasetUtils._
+import org.apache.spark.ml.util.Instrumentation.instrumented
 import org.apache.spark.mllib.tree.configuration.{Algo => OldAlgo, Strategy => OldStrategy}
 import org.apache.spark.mllib.tree.model.{DecisionTreeModel => OldDecisionTreeModel}
-import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.Dataset
-
+import org.apache.spark.sql._
+import org.apache.spark.sql.functions.{col, udf}
+import org.apache.spark.sql.types.StructType
+import org.apache.spark.storage.StorageLevel
 
 /**
  * Decision tree learning algorithm (http://en.wikipedia.org/wiki/Decision_tree_learning)
@@ -52,38 +56,77 @@ class DecisionTreeClassifier @Since("1.4.0") (
 
   // Override parameter setters from parent trait for Java API compatibility.
 
+  /** @group setParam */
   @Since("1.4.0")
-  override def setMaxDepth(value: Int): this.type = super.setMaxDepth(value)
+  def setMaxDepth(value: Int): this.type = set(maxDepth, value)
+
+  /** @group setParam */
+  @Since("1.4.0")
+  def setMaxBins(value: Int): this.type = set(maxBins, value)
+
+  /** @group setParam */
+  @Since("1.4.0")
+  def setMinInstancesPerNode(value: Int): this.type = set(minInstancesPerNode, value)
+
+  /** @group setParam */
+  @Since("3.0.0")
+  def setMinWeightFractionPerNode(value: Double): this.type = set(minWeightFractionPerNode, value)
 
   @Since("1.4.0")
-  override def setMaxBins(value: Int): this.type = super.setMaxBins(value)
+  def setMinInfoGain(value: Double): this.type = set(minInfoGain, value)
 
+  /** @group setParam */
+  @Since("4.3.0")
+  def setPruneTree(value: Boolean): this.type = set(pruneTree, value)
+
+  /** @group expertSetParam */
   @Since("1.4.0")
-  override def setMinInstancesPerNode(value: Int): this.type =
-    super.setMinInstancesPerNode(value)
+  def setMaxMemoryInMB(value: Int): this.type = set(maxMemoryInMB, value)
 
+  /** @group expertSetParam */
   @Since("1.4.0")
-  override def setMinInfoGain(value: Double): this.type = super.setMinInfoGain(value)
+  def setCacheNodeIds(value: Boolean): this.type = set(cacheNodeIds, value)
 
+  /**
+   * Specifies how often to checkpoint the cached node IDs.
+   * E.g. 10 means that the cache will get checkpointed every 10 iterations.
+   * This is only used if cacheNodeIds is true and if the checkpoint directory is set in
+   * [[org.apache.spark.SparkContext]].
+   * Must be at least 1.
+   * (default = 10)
+   * @group setParam
+   */
   @Since("1.4.0")
-  override def setMaxMemoryInMB(value: Int): this.type = super.setMaxMemoryInMB(value)
+  def setCheckpointInterval(value: Int): this.type = set(checkpointInterval, value)
 
+  /** @group expertSetParam */
+  @Since("4.4.0")
+  def setIntermediateStorageLevel(value: String): this.type = set(intermediateStorageLevel, value)
+
+  /** @group setParam */
   @Since("1.4.0")
-  override def setCacheNodeIds(value: Boolean): this.type = super.setCacheNodeIds(value)
+  def setImpurity(value: String): this.type = set(impurity, value)
 
-  @Since("1.4.0")
-  override def setCheckpointInterval(value: Int): this.type = super.setCheckpointInterval(value)
-
-  @Since("1.4.0")
-  override def setImpurity(value: String): this.type = super.setImpurity(value)
-
+  /** @group setParam */
   @Since("1.6.0")
-  override def setSeed(value: Long): this.type = super.setSeed(value)
+  def setSeed(value: Long): this.type = set(seed, value)
 
-  override protected def train(dataset: Dataset[_]): DecisionTreeClassificationModel = {
-    val categoricalFeatures: Map[Int, Int] =
-      MetadataUtils.getCategoricalFeatures(dataset.schema($(featuresCol)))
-    val numClasses: Int = getNumClasses(dataset)
+  /**
+   * Sets the value of param [[weightCol]].
+   * If this is not set or empty, we treat all instance weights as 1.0.
+   * Default is not set, so all instances have weight one.
+   *
+   * @group setParam
+   */
+  @Since("3.0.0")
+  def setWeightCol(value: String): this.type = set(weightCol, value)
+
+  override protected def train(
+      dataset: Dataset[_]): DecisionTreeClassificationModel = instrumented { instr =>
+    instr.logPipelineStage(this)
+    instr.logDataset(dataset)
+    val categoricalFeatures = MetadataUtils.getCategoricalFeatures(dataset.schema($(featuresCol)))
+    val numClasses = getNumClasses(dataset)
 
     if (isDefined(thresholds)) {
       require($(thresholds).length == numClasses, this.getClass.getSimpleName +
@@ -91,32 +134,28 @@ class DecisionTreeClassifier @Since("1.4.0") (
         s" numClasses=$numClasses, but thresholds has length ${$(thresholds).length}")
     }
 
-    val oldDataset: RDD[LabeledPoint] = extractLabeledPoints(dataset, numClasses)
+    val instances = dataset.select(
+      checkClassificationLabels($(labelCol), Some(numClasses)),
+      checkNonNegativeWeights(get(weightCol)),
+      checkNonNanVectors($(featuresCol))
+    ).rdd.map { case Row(l: Double, w: Double, v: Vector) => Instance(l, w, v)
+    }.setName("training instances")
+
     val strategy = getOldStrategy(categoricalFeatures, numClasses)
+    require(!strategy.bootstrap, "DecisionTreeClassifier does not need bootstrap sampling")
+    strategy.pruneTree = $(pruneTree)
 
-    val instr = Instrumentation.create(this, oldDataset)
-    instr.logParams(params: _*)
+    instr.logNumClasses(numClasses)
+    instr.logParams(this, labelCol, featuresCol, predictionCol, rawPredictionCol,
+      probabilityCol, leafCol, maxDepth, maxBins, minInstancesPerNode, minInfoGain, pruneTree,
+      maxMemoryInMB, cacheNodeIds, checkpointInterval, impurity, seed, thresholds,
+      intermediateStorageLevel)
 
-    val trees = RandomForest.run(oldDataset, strategy, numTrees = 1, featureSubsetStrategy = "all",
-      seed = $(seed), instr = Some(instr), parentUID = Some(uid))
+    val trees = RandomForest.run(instances, strategy, numTrees = 1, featureSubsetStrategy = "all",
+      seed = $(seed), instr = Some(instr), parentUID = Some(uid),
+      intermediateStorageLevel = StorageLevel.fromString($(intermediateStorageLevel)))
 
-    val m = trees.head.asInstanceOf[DecisionTreeClassificationModel]
-    instr.logSuccess(m)
-    m
-  }
-
-  /** (private[ml]) Train a decision tree on an RDD */
-  private[ml] def train(data: RDD[LabeledPoint],
-      oldStrategy: OldStrategy): DecisionTreeClassificationModel = {
-    val instr = Instrumentation.create(this, data)
-    instr.logParams(params: _*)
-
-    val trees = RandomForest.run(data, oldStrategy, numTrees = 1, featureSubsetStrategy = "all",
-      seed = 0L, instr = Some(instr), parentUID = Some(uid))
-
-    val m = trees.head.asInstanceOf[DecisionTreeClassificationModel]
-    instr.logSuccess(m)
-    m
+    trees.head.asInstanceOf[DecisionTreeClassificationModel]
   }
 
   /** (private[ml]) Create a Strategy instance to use with the old API. */
@@ -160,17 +199,89 @@ class DecisionTreeClassificationModel private[ml] (
 
   /**
    * Construct a decision tree classification model.
+   *
    * @param rootNode  Root node of tree, with other nodes attached.
    */
   private[ml] def this(rootNode: Node, numFeatures: Int, numClasses: Int) =
     this(Identifiable.randomUID("dtc"), rootNode, numFeatures, numClasses)
 
-  override protected def predict(features: Vector): Double = {
+  // For ml connect only
+  private[ml] def this() = this("", Node.dummyNode, -1, -1)
+
+  override private[ml] val treeStats: NodeStats = rootNode.computeStats
+
+  private[spark] override def estimatedSize: Long = estimateMatadataSize + getEstimatedSize()
+
+  override def predict(features: Vector): Double = {
     rootNode.predictImpl(features).prediction
   }
 
-  override protected def predictRaw(features: Vector): Vector = {
-    Vectors.dense(rootNode.predictImpl(features).impurityStats.stats.clone())
+  override protected def predictRawColumn(features: Column): Column = {
+    val localRootNode = rootNode
+    udf((features: Vector) =>
+      DecisionTreeClassificationModel.predictRaw(features, localRootNode)
+    ).apply(features)
+  }
+
+  override protected def raw2probabilityColumn(rawPrediction: Column): Column = {
+    udf((rawPrediction: Vector) =>
+      DecisionTreeClassificationModel.raw2probability(rawPrediction)
+    ).apply(rawPrediction)
+  }
+
+  override protected def predictProbabilityColumn(features: Column): Column = {
+    val localRootNode = rootNode
+    udf((features: Vector) => {
+      val rawPrediction = DecisionTreeClassificationModel.predictRaw(features, localRootNode)
+      DecisionTreeClassificationModel.raw2probability(rawPrediction)
+    }).apply(features)
+  }
+
+  override protected def raw2predictionColumn(rawPrediction: Column): Column = {
+    if (isDefined(thresholds)) {
+      val localThresholds = getThresholds.clone()
+      udf((rawPrediction: Vector) => {
+        val probability = DecisionTreeClassificationModel.raw2probability(rawPrediction)
+        ProbabilisticClassificationModel.probability2prediction(probability, localThresholds)
+      }).apply(rawPrediction)
+    } else {
+      udf((rawPrediction: Vector) => rawPrediction.argmax.toDouble).apply(rawPrediction)
+    }
+  }
+
+  override protected def predictionColumn(features: Column): Column = {
+    val localRootNode = rootNode
+    udf((features: Vector) => localRootNode.predictImpl(features).prediction).apply(features)
+  }
+
+  @Since("3.0.0")
+  override def transformSchema(schema: StructType): StructType = {
+    var outputSchema = super.transformSchema(schema)
+    if ($(leafCol).nonEmpty) {
+      outputSchema = SchemaUtils.updateField(outputSchema, getLeafField($(leafCol)))
+    }
+    outputSchema
+  }
+
+  override def transform(dataset: Dataset[_]): DataFrame = {
+    val outputSchema = transformSchema(dataset.schema, logging = true)
+
+    val outputData = super.transform(dataset)
+    if ($(leafCol).nonEmpty) {
+      val localRootNode = rootNode
+      val leafUDF = udf { features: Vector =>
+        DecisionTreeModel.predictLeaf(features, localRootNode)
+      }
+      outputData.withColumn($(leafCol), leafUDF(col($(featuresCol))),
+        outputSchema($(leafCol)).metadata)
+    } else {
+      outputData
+    }
+  }
+
+  @Since("3.0.0")
+  override def predictRaw(features: Vector): Vector = {
+    DecisionTreeClassificationModel.predictRaw(features, rootNode)
   }
 
   override protected def raw2probabilityInPlace(rawPrediction: Vector): Vector = {
@@ -192,7 +303,8 @@ class DecisionTreeClassificationModel private[ml] (
 
   @Since("1.4.0")
   override def toString: String = {
-    s"DecisionTreeClassificationModel (uid=$uid) of depth $depth with $numNodes nodes"
+    s"DecisionTreeClassificationModel: uid=$uid, depth=$depth, numNodes=$numNodes, " +
+      s"numClasses=$numClasses, numFeatures=$numFeatures"
   }
 
   /**
@@ -207,9 +319,9 @@ class DecisionTreeClassificationModel private[ml] (
    *     where gain is scaled by the number of instances passing through node
    *   - Normalize importances for tree to sum to 1.
    *
-   * Note: Feature importance for single decision trees can have high variance due to
-   *       correlated predictor variables. Consider using a [[RandomForestClassifier]]
-   *       to determine feature importance instead.
+   * @note Feature importance for single decision trees can have high variance due to
+   * correlated predictor variables. Consider using a [[RandomForestClassifier]]
+   * to determine feature importance instead.
    */
   @Since("2.0.0")
   lazy val featureImportances: Vector = TreeEnsembleModel.featureImportances(this, numFeatures)
@@ -227,6 +339,16 @@ class DecisionTreeClassificationModel private[ml] (
 @Since("2.0.0")
 object DecisionTreeClassificationModel extends MLReadable[DecisionTreeClassificationModel] {
 
+  private def predictRaw(features: Vector, rootNode: Node): Vector = {
+    Vectors.dense(rootNode.predictImpl(features).impurityStats.stats.clone())
+  }
+
+  private def raw2probability(rawPrediction: Vector): Vector = {
+    val probability = rawPrediction.copy.toDense
+    ProbabilisticClassificationModel.normalizeToProbabilitiesInPlace(probability)
+    probability
+  }
+
   @Since("2.0.0")
   override def read: MLReader[DecisionTreeClassificationModel] =
     new DecisionTreeClassificationModelReader
@@ -242,10 +364,13 @@ object DecisionTreeClassificationModel extends MLReadable[DecisionTreeClassifica
       val extraMetadata: JObject = Map(
         "numFeatures" -> instance.numFeatures,
         "numClasses" -> instance.numClasses)
-      DefaultParamsWriter.saveMetadata(instance, path, sc, Some(extraMetadata))
+      DefaultParamsWriter.saveMetadata(instance, path, sparkSession, Some(extraMetadata))
       val (nodeData, _) = NodeData.build(instance.rootNode, 0)
       val dataPath = new Path(path, "data").toString
-      sparkSession.createDataFrame(nodeData).write.parquet(dataPath)
+      val numDataParts = NodeData.inferNumPartitions(instance.numNodes)
+      ReadWriteUtils.saveArray(
+        dataPath, nodeData.toArray, sparkSession, NodeData.serializeData, numDataParts
+      )
     }
   }
 
@@ -257,12 +382,12 @@ object DecisionTreeClassificationModel extends MLReadable[DecisionTreeClassifica
 
     override def load(path: String): DecisionTreeClassificationModel = {
       implicit val format = DefaultFormats
-      val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
+      val metadata = DefaultParamsReader.loadMetadata(path, sparkSession, className)
       val numFeatures = (metadata.metadata \ "numFeatures").extract[Int]
       val numClasses = (metadata.metadata \ "numClasses").extract[Int]
       val root = loadTreeNodes(path, metadata, sparkSession)
       val model = new DecisionTreeClassificationModel(metadata.uid, root, numFeatures, numClasses)
-      DefaultParamsReader.getAndSetParams(model, metadata)
+      metadata.getAndSetParams(model)
       model
     }
   }

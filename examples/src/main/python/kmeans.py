@@ -22,19 +22,18 @@ examples/src/main/python/ml/kmeans_example.py.
 
 This example requires NumPy (http://www.numpy.org/).
 """
-from __future__ import print_function
-
 import sys
+from typing import List
 
 import numpy as np
 from pyspark.sql import SparkSession
 
 
-def parseVector(line):
+def parseVector(line: str) -> np.ndarray:
     return np.array([float(x) for x in line.split(' ')])
 
 
-def closestPoint(p, centers):
+def closestPoint(p: np.ndarray, centers: List[np.ndarray]) -> int:
     bestIndex = 0
     closest = float("+inf")
     for i in range(len(centers)):
@@ -49,7 +48,7 @@ if __name__ == "__main__":
 
     if len(sys.argv) != 4:
         print("Usage: kmeans <file> <k> <convergeDist>", file=sys.stderr)
-        exit(-1)
+        sys.exit(-1)
 
     print("""WARN: This is a naive implementation of KMeans Clustering and is given
        as an example! Please refer to examples/src/main/python/ml/kmeans_example.py for an

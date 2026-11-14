@@ -11,25 +11,29 @@
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
+ * See the License for the specific language governing permissions and
  * limitations under the License.
  */
 
 package org.apache.spark.deploy.rest
 
-import javax.servlet.http.{HttpServlet, HttpServletRequest, HttpServletResponse}
-
-import scala.io.Source
+import java.nio.charset.StandardCharsets
+import java.util.EnumSet
+import java.util.concurrent.Executors
 
 import com.fasterxml.jackson.core.JsonProcessingException
-import org.eclipse.jetty.server.{Server, ServerConnector}
-import org.eclipse.jetty.servlet.{ServletContextHandler, ServletHolder}
-import org.eclipse.jetty.util.thread.QueuedThreadPool
+import jakarta.servlet.DispatcherType
+import jakarta.servlet.http.{HttpServlet, HttpServletRequest, HttpServletResponse}
+import org.eclipse.jetty.ee10.servlet.{FilterHolder, ServletContextHandler, ServletHolder}
+import org.eclipse.jetty.server.{HttpConfiguration, HttpConnectionFactory, Server, ServerConnector}
+import org.eclipse.jetty.util.thread.{QueuedThreadPool, ScheduledExecutorScheduler}
 import org.json4s._
 import org.json4s.jackson.JsonMethods._
 
 import org.apache.spark.{SPARK_VERSION => sparkVersion, SparkConf}
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.LogKeys._
+import org.apache.spark.internal.config.{MASTER_REST_SERVER_FILTERS, MASTER_REST_SERVER_MAX_REQUEST_BODY_SIZE, MASTER_REST_SERVER_MAX_THREADS, MASTER_REST_SERVER_VIRTUAL_THREADS}
 import org.apache.spark.util.Utils
 
 /**
@@ -38,6 +42,7 @@ import org.apache.spark.util.Utils
  * This server responds with different HTTP codes depending on the situation:
  *   200 OK - Request was processed successfully
  *   400 BAD REQUEST - Request was malformed, not successfully validated, or of unexpected type
+ *   413 REQUEST ENTITY TOO LARGE - Request body exceeded the configured maximum size
  *   468 UNKNOWN PROTOCOL VERSION - Request specified a protocol this server does not understand
  *   500 INTERNAL SERVER ERROR - Server throws an exception internally while processing the request
  *
@@ -51,18 +56,30 @@ private[spark] abstract class RestSubmissionServer(
     val host: String,
     val requestedPort: Int,
     val masterConf: SparkConf) extends Logging {
+
   protected val submitRequestServlet: SubmitRequestServlet
   protected val killRequestServlet: KillRequestServlet
+  protected val killAllRequestServlet: KillAllRequestServlet
+  protected val holdRequestServlet: HoldRequestServlet
+  protected val resumeRequestServlet: HoldRequestServlet
   protected val statusRequestServlet: StatusRequestServlet
+  protected val clearRequestServlet: ClearRequestServlet
+  protected val readyzRequestServlet: ReadyzRequestServlet
 
-  private var _server: Option[Server] = None
+  // Visible for testing
+  private[rest] var _server: Option[Server] = None
 
   // A mapping from URL prefixes to servlets that serve them. Exposed for testing.
   protected val baseContext = s"/${RestSubmissionServer.PROTOCOL_VERSION}/submissions"
   protected lazy val contextToServlet = Map[String, RestServlet](
     s"$baseContext/create/*" -> submitRequestServlet,
     s"$baseContext/kill/*" -> killRequestServlet,
+    s"$baseContext/killall/*" -> killAllRequestServlet,
+    s"$baseContext/hold/*" -> holdRequestServlet,
+    s"$baseContext/resume/*" -> resumeRequestServlet,
     s"$baseContext/status/*" -> statusRequestServlet,
+    s"$baseContext/clear/*" -> clearRequestServlet,
+    s"$baseContext/readyz/*" -> readyzRequestServlet,
     "/*" -> new ErrorServlet // default handler
   )
 
@@ -70,7 +87,8 @@ private[spark] abstract class RestSubmissionServer(
   def start(): Int = {
     val (server, boundPort) = Utils.startServiceOnPort[Server](requestedPort, doStart, masterConf)
     _server = Some(server)
-    logInfo(s"Started REST server for submitting applications on port $boundPort")
+    logInfo(log"Started REST server for submitting applications on ${MDC(HOST, host)}" +
+      log" with port ${MDC(PORT, boundPort)}")
     boundPort
   }
 
@@ -79,13 +97,33 @@ private[spark] abstract class RestSubmissionServer(
    * Return a 2-tuple of the started server and the bound port.
    */
   private def doStart(startPort: Int): (Server, Int) = {
-    val threadPool = new QueuedThreadPool
+    val threadPool = new QueuedThreadPool(masterConf.get(MASTER_REST_SERVER_MAX_THREADS))
+    threadPool.setName(getClass().getSimpleName())
+    if (masterConf.get(MASTER_REST_SERVER_VIRTUAL_THREADS)) {
+      threadPool.setVirtualThreadsExecutor(Executors.newVirtualThreadPerTaskExecutor())
+    }
     threadPool.setDaemon(true)
     val server = new Server(threadPool)
 
-    val connector = new ServerConnector(server)
+    // Hide information.
+    val httpConfig = new HttpConfiguration()
+    logDebug("Using setSendServerVersion: false")
+    httpConfig.setSendServerVersion(false)
+    logDebug("Using setSendXPoweredBy: false")
+    httpConfig.setSendXPoweredBy(false)
+
+    val connector = new ServerConnector(
+      server,
+      null,
+      // Call this full constructor to set this, which forces daemon threads:
+      new ScheduledExecutorScheduler("RestSubmissionServer-JettyScheduler", true),
+      null,
+      -1,
+      -1,
+      new HttpConnectionFactory(httpConfig))
     connector.setHost(host)
     connector.setPort(startPort)
+    connector.setReuseAddress(!Utils.isWindows)
     server.addConnector(connector)
 
     val mainHandler = new ServletContextHandler
@@ -94,10 +132,24 @@ private[spark] abstract class RestSubmissionServer(
     contextToServlet.foreach { case (prefix, servlet) =>
       mainHandler.addServlet(new ServletHolder(servlet), prefix)
     }
+    addFilters(mainHandler)
     server.setHandler(mainHandler)
     server.start()
     val boundPort = connector.getLocalPort
     (server, boundPort)
+  }
+
+  /**
+   * Add filters, if any, to the given ServletContextHandlers.
+   */
+  private def addFilters(handler: ServletContextHandler): Unit = {
+    masterConf.get(MASTER_REST_SERVER_FILTERS).foreach { filter =>
+      val params = masterConf.getAllWithPrefix(s"spark.$filter.param.").toMap
+      val holder = new FilterHolder()
+      holder.setClassName(filter)
+      params.foreach { case (k, v) => holder.setInitParameter(k, v) }
+      handler.addFilter(holder, "/*", EnumSet.allOf(classOf[DispatcherType]))
+    }
   }
 
   def stop(): Unit = {
@@ -218,6 +270,95 @@ private[rest] abstract class KillRequestServlet extends RestServlet {
 }
 
 /**
+ * A servlet for handling killAll requests passed to the [[RestSubmissionServer]].
+ */
+private[rest] abstract class KillAllRequestServlet extends RestServlet {
+
+  /**
+   * Have the Master kill all drivers and return an appropriate response to the client.
+   * Otherwise, return error.
+   */
+  protected override def doPost(
+      request: HttpServletRequest,
+      response: HttpServletResponse): Unit = {
+    val responseMessage = handleKillAll()
+    sendResponse(responseMessage, response)
+  }
+
+  protected def handleKillAll(): KillAllSubmissionResponse
+}
+
+/**
+ * A servlet for handling hold or resume requests passed to the [[RestSubmissionServer]].
+ *
+ * @param hold whether this servlet holds or resumes the application
+ */
+private[rest] abstract class HoldRequestServlet(hold: Boolean) extends RestServlet {
+
+  /**
+   * If an application ID is specified in the URL, have the Master forward the hold or resume
+   * request to the corresponding driver and return an appropriate response to the client.
+   * Otherwise, return error.
+   */
+  protected override def doPost(
+      request: HttpServletRequest,
+      response: HttpServletResponse): Unit = {
+    val appId = parseSubmissionId(request.getPathInfo)
+    val responseMessage = appId.map(handleHold).getOrElse {
+      response.setStatus(HttpServletResponse.SC_BAD_REQUEST)
+      val action = if (hold) "hold" else "resume"
+      handleError(s"Application ID is missing in $action request.")
+    }
+    sendResponse(responseMessage, response)
+  }
+
+  protected def handleHold(appId: String): HoldApplicationResponse
+}
+
+/**
+ * A servlet for handling clear requests passed to the [[RestSubmissionServer]].
+ */
+private[rest] abstract class ClearRequestServlet extends RestServlet {
+
+  /**
+   * Clear the completed drivers and apps.
+   */
+  protected override def doPost(
+      request: HttpServletRequest,
+      response: HttpServletResponse): Unit = {
+    val responseMessage = handleClear()
+    sendResponse(responseMessage, response)
+  }
+
+  protected def handleClear(): ClearResponse
+}
+
+/**
+ * A servlet for handling readyz requests passed to the [[RestSubmissionServer]].
+ */
+private[rest] abstract class ReadyzRequestServlet extends RestServlet {
+
+  /**
+   * Return the status of master is ready or not.
+   */
+  protected override def doGet(
+      request: HttpServletRequest,
+      response: HttpServletResponse): Unit = {
+    val readyzResponse = handleReadyz()
+    val responseMessage = if (readyzResponse.success) {
+      response.setStatus(HttpServletResponse.SC_OK)
+      readyzResponse
+    } else {
+      response.setStatus(HttpServletResponse.SC_SERVICE_UNAVAILABLE)
+      handleError("Master is not ready.")
+    }
+    sendResponse(responseMessage, response)
+  }
+
+  protected def handleReadyz(): ReadyzResponse
+}
+
+/**
  * A servlet for handling status requests passed to the [[RestSubmissionServer]].
  */
 private[rest] abstract class StatusRequestServlet extends RestServlet {
@@ -245,6 +386,24 @@ private[rest] abstract class StatusRequestServlet extends RestServlet {
  */
 private[rest] abstract class SubmitRequestServlet extends RestServlet {
 
+  /** The maximum size in bytes of a request body this servlet will read. */
+  protected def maxRequestSizeBytes: Long =
+    MASTER_REST_SERVER_MAX_REQUEST_BODY_SIZE.defaultValue.get
+
+  /**
+   * Read the request body as a UTF-8 string, or return `None` if it exceeds `limit` bytes.
+   * The read is bounded so an oversized body cannot exhaust memory even when the
+   * Content-Length header is missing or understates the actual size.
+   */
+  private def readRequestBody(request: HttpServletRequest, limit: Long): Option[String] = {
+    if (request.getContentLengthLong > limit) {
+      None
+    } else {
+      val bytes = request.getInputStream.readNBytes(math.min(limit + 1, Int.MaxValue).toInt)
+      if (bytes.length > limit) None else Some(new String(bytes, StandardCharsets.UTF_8))
+    }
+  }
+
   /**
    * Submit an application to the Master with parameters specified in the request.
    *
@@ -255,9 +414,16 @@ private[rest] abstract class SubmitRequestServlet extends RestServlet {
   protected override def doPost(
       requestServlet: HttpServletRequest,
       responseServlet: HttpServletResponse): Unit = {
+    val limit = maxRequestSizeBytes
+    val requestMessageJson = readRequestBody(requestServlet, limit).getOrElse {
+      responseServlet.setStatus(HttpServletResponse.SC_REQUEST_ENTITY_TOO_LARGE)
+      val msg = s"The request body exceeds the maximum allowed size ($limit bytes). " +
+        s"Adjust ${MASTER_REST_SERVER_MAX_REQUEST_BODY_SIZE.key} to change the limit."
+      sendResponse(handleError(msg), responseServlet)
+      return
+    }
     val responseMessage =
       try {
-        val requestMessageJson = Source.fromInputStream(requestServlet.getInputStream).mkString
         val requestMessage = SubmitRestProtocolMessage.fromJson(requestMessageJson)
         // The response should have already been validated on the client.
         // In case this is not true, validate it ourselves to avoid potential NPEs.
@@ -301,14 +467,14 @@ private class ErrorServlet extends RestServlet {
           "Missing the /submissions prefix."
         case `serverVersion` :: "submissions" :: tail =>
           // http://host:port/correct-version/submissions/*
-          "Missing an action: please specify one of /create, /kill, or /status."
+          "Missing an action: please specify one of /create, /kill, /killall, /hold, /resume, " +
+            "/clear, /status, or /readyz."
         case unknownVersion :: tail =>
           // http://host:port/unknown-version/*
           versionMismatch = true
           s"Unknown protocol version '$unknownVersion'."
         case _ =>
-          // never reached
-          s"Malformed path $path."
+          "Malformed path."
       }
     msg += s" Please submit requests through http://[host]:[port]/$serverVersion/submissions/..."
     val error = handleError(msg)

@@ -1,0 +1,270 @@
+---
+layout: global
+title: CREATE DATASOURCE TABLE
+displayTitle: CREATE DATASOURCE TABLE
+license: |
+  Licensed to the Apache Software Foundation (ASF) under one or more
+  contributor license agreements.  See the NOTICE file distributed with
+  this work for additional information regarding copyright ownership.
+  The ASF licenses this file to You under the Apache License, Version 2.0
+  (the "License"); you may not use this file except in compliance with
+  the License.  You may obtain a copy of the License at
+ 
+     http://www.apache.org/licenses/LICENSE-2.0
+ 
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+---
+
+### Description
+
+The `CREATE TABLE` statement defines a new table using a Data Source. 
+
+### Syntax
+
+```sql
+CREATE [ EXTERNAL ] TABLE [ IF NOT EXISTS ] table_identifier
+    [ ( col_name1 col_type1 [ COMMENT col_comment1 ], ... ) ]
+    USING data_source
+    [ OPTIONS ( key1=val1, key2=val2, ... ) ]
+    [ PARTITIONED BY ( col_name1, col_name2, ... ) ]
+    [ CLUSTERED BY ( col_name3, col_name4, ... ) 
+        [ SORTED BY ( col_name [ ASC | DESC ], ... ) ] 
+        INTO num_buckets BUCKETS ]
+    [ LOCATION path ]
+    [ COMMENT table_comment ]
+    [ TBLPROPERTIES ( key1=val1, key2=val2, ... ) ]
+    [ DISTRIBUTED BY PARTITION ]
+    [ [ LOCALLY ] ORDERED BY { ( write_order_field [ , ... ] ) | write_order_field [ , ... ] }
+        | UNORDERED ]
+    [ AS select_statement ]
+```
+
+```sql
+write_order_field
+    { col_name | transform ( { col_name | constant } [ , ... ] ) }
+        [ ASC | DESC ] [ NULLS { FIRST | LAST } ]
+```
+
+Note that, the clauses between the USING clause and the AS SELECT clause can come in
+as any order. For example, you can write COMMENT table_comment after TBLPROPERTIES.
+
+### Parameters
+
+* **table_identifier**
+
+    Specifies a table name, which may be optionally qualified with a database name.
+
+    **Syntax:** `[ database_name. ] table_name`
+
+* **USING data_source**
+
+    Data Source is the input format used to create the table. Data source can be CSV, TXT, ORC, JDBC, PARQUET, etc.
+
+* **OPTIONS**
+
+    Options of data source which will be injected to storage properties.
+
+* **PARTITIONED BY**
+
+    Partitions are created on the table, based on the columns specified.
+
+* **CLUSTERED BY**
+
+    Partitions created on the table will be bucketed into fixed buckets based on the column specified for bucketing.
+
+    **NOTE:** Bucketing is an optimization technique that uses buckets (and bucketing columns) to determine data partitioning and avoid data shuffle.
+
+* **SORTED BY**
+
+    Specifies an ordering of bucket columns. Optionally, one can use ASC for an ascending order or DESC for a descending order after any column names in the SORTED BY clause.
+    If not specified, ASC is assumed by default.
+   
+* **INTO num_buckets BUCKETS**
+
+    Specifies buckets numbers, which is used in `CLUSTERED BY` clause.
+
+* **EXTERNAL**
+
+    The table is defined using the path provided as `LOCATION` and does not use the default location for this table.
+    Dropping an external table removes catalog metadata and leaves the data files in place.
+    `CREATE EXTERNAL TABLE` for a data source table must include `LOCATION`.
+    A data source table created with `LOCATION` is also external even without the
+    `EXTERNAL` keyword.
+
+* **LOCATION**
+
+    Path to the directory where table data is stored, which could be a path on distributed storage like HDFS, etc.
+
+* **COMMENT**
+
+    A string literal to describe the table.
+
+* **TBLPROPERTIES**
+
+    A list of key-value pairs that is used to tag the table definition.
+
+* **DISTRIBUTED BY PARTITION**
+
+    Requests that writes to the table be clustered by the table's partitioning, so the rows
+    of each partition are written by as few tasks as possible rather than by every task that holds
+    rows for it.
+
+    Requires the table to actually be partitioned, with `PARTITIONED BY` or with
+    `CLUSTERED BY ... INTO ... BUCKETS`. Note that `CLUSTER BY` -- a different clause from
+    `CLUSTERED BY ... INTO ... BUCKETS` -- does **not** qualify: it lists clustering columns for the
+    data source to interpret rather than defining a partitioning, and it cannot be combined with
+    `PARTITIONED BY` or `CLUSTERED BY ... INTO ... BUCKETS`, so a table using it has no partitioning
+    to distribute by. To distribute such a table by partition, replace `CLUSTER BY` with one of
+    those clauses. A `cluster_by(...)` transform in `PARTITIONED BY` is clustering too, so it does
+    not qualify either.
+
+    A statement that defines no schema (no column list, no typed partition columns, and no
+    `AS SELECT`) cannot declare partitioning, so it cannot use this clause either.
+
+* **ORDERED BY**
+
+    Requests a sort order for writes to the table, recorded on the table as the default for later
+    writes. `UNORDERED` asks for no ordering at all, which is different from omitting the
+    clause -- omitting it leaves the choice to the catalog. The parentheses are optional:
+    `ORDERED BY (a, b)` and `ORDERED BY a, b` are the same. The sort keys must resolve against the
+    table's columns, so a statement that defines no schema (no column list, no typed partition
+    columns, and no `AS SELECT`) cannot use `ORDERED BY` or `LOCALLY ORDERED BY`. `UNORDERED` needs
+    no schema.
+
+    The distribution decides how far the order reaches, and this clause picks one when
+    `DISTRIBUTED BY PARTITION` is absent: a bare `ORDERED BY` asks for each write to be
+    range-partitioned, so that the order holds across the tasks of a write, not only within one,
+    while `LOCALLY ORDERED BY` asks for it to hold within each write task only, without a shuffle.
+    `UNORDERED` on its own asks for no distribution either.
+
+    When `DISTRIBUTED BY PARTITION` is given it decides the distribution instead, and the order then
+    holds within each write task. `LOCALLY` therefore adds nothing beside it, and `UNORDERED` beside
+    it contributes only "no sort keys":
+
+    ```sql
+    -- range-partition each write by id, so the order holds across that write's tasks
+    CREATE TABLE t (id INT, c STRING) USING iceberg PARTITIONED BY (c) ORDERED BY (id);
+
+    -- cluster each write by partition instead, and sort by id within each task
+    CREATE TABLE t (id INT, c STRING) USING iceberg PARTITIONED BY (c)
+        DISTRIBUTED BY PARTITION ORDERED BY (id);
+
+    -- cluster each write by partition, with no sort order; UNORDERED here is the same as
+    -- omitting it, since DISTRIBUTED BY PARTITION already fixed the distribution
+    CREATE TABLE t (id INT, c STRING) USING iceberg PARTITIONED BY (c)
+        DISTRIBUTED BY PARTITION UNORDERED;
+    ```
+
+    Both clauses are passed to the catalog, which has to support them. If the catalog does not
+    advertise support for a write distribution and ordering, Spark rejects the statement rather
+    than creating a table that silently lacks the requested layout. The built-in catalogs do not
+    support them. In the session catalog, Spark also rejects the clauses when the statement would
+    create a v1 table, for example with a file source such as `parquet` or with `STORED AS`, even
+    if a catalog extension registered as `spark_catalog` advertises support. `ORDERED BY`,
+    `LOCALLY ORDERED BY`, and `UNORDERED` may also be combined with `CLUSTER BY`, subject to the
+    catalog accepting the combination: Spark passes the clustering columns and the requested
+    distribution and ordering to the catalog without reconciling them, so the catalog decides how
+    they interact and may reject a combination it does not support. `DISTRIBUTED BY PARTITION`
+    cannot be combined with `CLUSTER BY`, as described above.
+
+    What the catalog records is a *default* for later writes, not a statement about the data
+    already in the table: an individual write may override it, and rewriting existing data to match
+    a newly requested layout is a separate operation. `SHOW CREATE TABLE` reproduces the clauses
+    only when the pair can be written as clauses (`DISTRIBUTED BY PARTITION` needs a partitioned
+    table), the catalog accepts them, the statement would not create a v1 table, every sort key
+    renders, every column they reference exists, and parsing them in the current session gives
+    back the same pair. A sort key with a `TRUE`, `FALSE` or `NULL` argument, for example, is read
+    back as a column reference when that keyword is not reserved, so it is not reproduced.
+    `DESCRIBE TABLE EXTENDED` reports the write distribution and ordering that the table declares,
+    which can differ from the requested ones, whether or not `SHOW CREATE TABLE` can reproduce
+    them.
+
+* **AS select_statement**
+
+    The table is populated using the data from the select statement.
+
+### Data Source Interaction
+
+A Data Source table acts like a pointer to the underlying data source. For example, you can create
+a table "foo" in Spark which points to a table "bar" in MySQL using JDBC Data Source. When you
+read/write table "foo", you actually read/write table "bar".
+ 
+In general CREATE TABLE is creating a "pointer", and you need to make sure it points to something
+existing. An exception is file source such as parquet, json. If you don't specify the LOCATION,
+Spark will create a default table location for you.
+
+For CREATE TABLE AS SELECT with LOCATION, Spark throws analysis exceptions if the given location
+exists as a non-empty directory. If `spark.sql.legacy.allowNonEmptyLocationInCTAS` is set to true,
+Spark overwrites the underlying data source with the data of the
+input query, to make sure the table gets created contains exactly the same data as the input query.
+
+### Examples
+
+```sql
+
+--Use data source
+CREATE TABLE student (id INT, name STRING, age INT) USING CSV;
+
+-- External data source table. DROP TABLE keeps the files at the location.
+CREATE EXTERNAL TABLE student (id INT, name STRING, age INT)
+    USING parquet
+    LOCATION '/tmp/student';
+
+--Use data from another table
+CREATE TABLE student_copy USING CSV
+    AS SELECT * FROM student;
+  
+--Omit the USING clause, which uses the default data source (parquet by default)
+CREATE TABLE student (id INT, name STRING, age INT);
+
+--Use parquet data source with parquet storage options
+--The columns 'id' and 'name' enable the bloom filter during writing parquet file,
+--column 'age' does not enable
+CREATE TABLE student_parquet(id INT, name STRING, age INT) USING PARQUET
+    OPTIONS (
+      'parquet.bloom.filter.enabled'='true',
+      'parquet.bloom.filter.enabled#age'='false'
+    );
+
+--Specify table comment and properties
+CREATE TABLE student (id INT, name STRING, age INT) USING CSV
+    COMMENT 'this is a comment'
+    TBLPROPERTIES ('foo'='bar');
+
+--Specify table comment and properties with different clauses order
+CREATE TABLE student (id INT, name STRING, age INT) USING CSV
+    TBLPROPERTIES ('foo'='bar')
+    COMMENT 'this is a comment';
+
+--Create partitioned and bucketed table
+CREATE TABLE student (id INT, name STRING, age INT)
+    USING CSV
+    PARTITIONED BY (age)
+    CLUSTERED BY (Id) INTO 4 buckets;
+
+--Create partitioned and bucketed table through CTAS
+CREATE TABLE student_partition_bucket
+    USING parquet
+    PARTITIONED BY (age)
+    CLUSTERED BY (id) INTO 4 buckets
+    AS SELECT * FROM student;
+
+--Create bucketed table through CTAS and CTE
+CREATE TABLE student_bucket
+    USING parquet
+    CLUSTERED BY (id) INTO 4 buckets (
+    WITH tmpTable AS (
+        SELECT * FROM student WHERE id > 100
+    )
+    SELECT * FROM tmpTable
+);
+```
+
+### Related Statements
+
+* [CREATE TABLE USING HIVE FORMAT](sql-ref-syntax-ddl-create-table-hiveformat.html)
+* [CREATE TABLE LIKE](sql-ref-syntax-ddl-create-table-like.html)

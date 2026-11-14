@@ -17,456 +17,19 @@
 
 package org.apache.spark.sql.catalyst.expressions
 
-import java.security.{MessageDigest, NoSuchAlgorithmException}
-import java.util.zip.CRC32
-
-import scala.annotation.tailrec
-
-import org.apache.commons.codec.digest.DigestUtils
-
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.analysis.TypeCheckResult
+import org.apache.spark.sql.catalyst.analysis.{ExpressionBuilder, FunctionRegistry, UnresolvedSeed}
 import org.apache.spark.sql.catalyst.expressions.codegen._
-import org.apache.spark.sql.catalyst.util.{ArrayData, MapData}
+import org.apache.spark.sql.catalyst.expressions.codegen.Block._
+import org.apache.spark.sql.catalyst.expressions.objects.StaticInvoke
+import org.apache.spark.sql.catalyst.trees.TreePattern.{CURRENT_LIKE, TreePattern}
+import org.apache.spark.sql.catalyst.util.{toPrettySQL, MapData, RandomUUIDGenerator}
+import org.apache.spark.sql.errors.QueryCompilationErrors
+import org.apache.spark.sql.errors.QueryExecutionErrors.raiseError
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.internal.types.{AbstractMapType, StringTypeWithCollation}
 import org.apache.spark.sql.types._
-import org.apache.spark.unsafe.hash.Murmur3_x86_32
-import org.apache.spark.unsafe.types.{CalendarInterval, UTF8String}
-import org.apache.spark.unsafe.Platform
-
-/**
- * A function that calculates an MD5 128-bit checksum and returns it as a hex string
- * For input of type [[BinaryType]]
- */
-@ExpressionDescription(
-  usage = "_FUNC_(input) - Returns an MD5 128-bit checksum as a hex string of the input",
-  extended = "> SELECT _FUNC_('Spark');\n '8cde774d6f7333752ed72cacddb05126'")
-case class Md5(child: Expression) extends UnaryExpression with ImplicitCastInputTypes {
-
-  override def dataType: DataType = StringType
-
-  override def inputTypes: Seq[DataType] = Seq(BinaryType)
-
-  protected override def nullSafeEval(input: Any): Any =
-    UTF8String.fromString(DigestUtils.md5Hex(input.asInstanceOf[Array[Byte]]))
-
-  override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
-    defineCodeGen(ctx, ev, c =>
-      s"UTF8String.fromString(org.apache.commons.codec.digest.DigestUtils.md5Hex($c))")
-  }
-}
-
-/**
- * A function that calculates the SHA-2 family of functions (SHA-224, SHA-256, SHA-384, and SHA-512)
- * and returns it as a hex string. The first argument is the string or binary to be hashed. The
- * second argument indicates the desired bit length of the result, which must have a value of 224,
- * 256, 384, 512, or 0 (which is equivalent to 256). SHA-224 is supported starting from Java 8. If
- * asking for an unsupported SHA function, the return value is NULL. If either argument is NULL or
- * the hash length is not one of the permitted values, the return value is NULL.
- */
-// scalastyle:off line.size.limit
-@ExpressionDescription(
-  usage = """_FUNC_(input, bitLength) - Returns a checksum of SHA-2 family as a hex string of the input.
-            SHA-224, SHA-256, SHA-384, and SHA-512 are supported. Bit length of 0 is equivalent to 256.""",
-  extended = """> SELECT _FUNC_('Spark', 0);
-               '529bc3b07127ecb7e53a4dcf1991d9152c24537d919178022b2c42657f79a26b'""")
-// scalastyle:on line.size.limit
-case class Sha2(left: Expression, right: Expression)
-  extends BinaryExpression with Serializable with ImplicitCastInputTypes {
-
-  override def dataType: DataType = StringType
-  override def nullable: Boolean = true
-
-  override def inputTypes: Seq[DataType] = Seq(BinaryType, IntegerType)
-
-  protected override def nullSafeEval(input1: Any, input2: Any): Any = {
-    val bitLength = input2.asInstanceOf[Int]
-    val input = input1.asInstanceOf[Array[Byte]]
-    bitLength match {
-      case 224 =>
-        // DigestUtils doesn't support SHA-224 now
-        try {
-          val md = MessageDigest.getInstance("SHA-224")
-          md.update(input)
-          UTF8String.fromBytes(md.digest())
-        } catch {
-          // SHA-224 is not supported on the system, return null
-          case noa: NoSuchAlgorithmException => null
-        }
-      case 256 | 0 =>
-        UTF8String.fromString(DigestUtils.sha256Hex(input))
-      case 384 =>
-        UTF8String.fromString(DigestUtils.sha384Hex(input))
-      case 512 =>
-        UTF8String.fromString(DigestUtils.sha512Hex(input))
-      case _ => null
-    }
-  }
-
-  override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
-    val digestUtils = "org.apache.commons.codec.digest.DigestUtils"
-    nullSafeCodeGen(ctx, ev, (eval1, eval2) => {
-      s"""
-        if ($eval2 == 224) {
-          try {
-            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-224");
-            md.update($eval1);
-            ${ev.value} = UTF8String.fromBytes(md.digest());
-          } catch (java.security.NoSuchAlgorithmException e) {
-            ${ev.isNull} = true;
-          }
-        } else if ($eval2 == 256 || $eval2 == 0) {
-          ${ev.value} =
-            UTF8String.fromString($digestUtils.sha256Hex($eval1));
-        } else if ($eval2 == 384) {
-          ${ev.value} =
-            UTF8String.fromString($digestUtils.sha384Hex($eval1));
-        } else if ($eval2 == 512) {
-          ${ev.value} =
-            UTF8String.fromString($digestUtils.sha512Hex($eval1));
-        } else {
-          ${ev.isNull} = true;
-        }
-      """
-    })
-  }
-}
-
-/**
- * A function that calculates a sha1 hash value and returns it as a hex string
- * For input of type [[BinaryType]] or [[StringType]]
- */
-@ExpressionDescription(
-  usage = "_FUNC_(input) - Returns a sha1 hash value as a hex string of the input",
-  extended = "> SELECT _FUNC_('Spark');\n '85f5955f4b27a9a4c2aab6ffe5d7189fc298b92c'")
-case class Sha1(child: Expression) extends UnaryExpression with ImplicitCastInputTypes {
-
-  override def dataType: DataType = StringType
-
-  override def inputTypes: Seq[DataType] = Seq(BinaryType)
-
-  protected override def nullSafeEval(input: Any): Any =
-    UTF8String.fromString(DigestUtils.sha1Hex(input.asInstanceOf[Array[Byte]]))
-
-  override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
-    defineCodeGen(ctx, ev, c =>
-      s"UTF8String.fromString(org.apache.commons.codec.digest.DigestUtils.sha1Hex($c))"
-    )
-  }
-}
-
-/**
- * A function that computes a cyclic redundancy check value and returns it as a bigint
- * For input of type [[BinaryType]]
- */
-@ExpressionDescription(
-  usage = "_FUNC_(input) - Returns a cyclic redundancy check value as a bigint of the input",
-  extended = "> SELECT _FUNC_('Spark');\n '1557323817'")
-case class Crc32(child: Expression) extends UnaryExpression with ImplicitCastInputTypes {
-
-  override def dataType: DataType = LongType
-
-  override def inputTypes: Seq[DataType] = Seq(BinaryType)
-
-  protected override def nullSafeEval(input: Any): Any = {
-    val checksum = new CRC32
-    checksum.update(input.asInstanceOf[Array[Byte]], 0, input.asInstanceOf[Array[Byte]].length)
-    checksum.getValue
-  }
-
-  override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
-    val CRC32 = "java.util.zip.CRC32"
-    val checksum = ctx.freshName("checksum")
-    nullSafeCodeGen(ctx, ev, value => {
-      s"""
-        $CRC32 $checksum = new $CRC32();
-        $checksum.update($value, 0, $value.length);
-        ${ev.value} = $checksum.getValue();
-      """
-    })
-  }
-}
-
-
-/**
- * A function that calculates hash value for a group of expressions.  Note that the `seed` argument
- * is not exposed to users and should only be set inside spark SQL.
- *
- * The hash value for an expression depends on its type and seed:
- *  - null:               seed
- *  - boolean:            turn boolean into int, 1 for true, 0 for false, and then use murmur3 to
- *                        hash this int with seed.
- *  - byte, short, int:   use murmur3 to hash the input as int with seed.
- *  - long:               use murmur3 to hash the long input with seed.
- *  - float:              turn it into int: java.lang.Float.floatToIntBits(input), and hash it.
- *  - double:             turn it into long: java.lang.Double.doubleToLongBits(input), and hash it.
- *  - decimal:            if it's a small decimal, i.e. precision <= 18, turn it into long and hash
- *                        it. Else, turn it into bytes and hash it.
- *  - calendar interval:  hash `microseconds` first, and use the result as seed to hash `months`.
- *  - binary:             use murmur3 to hash the bytes with seed.
- *  - string:             get the bytes of string and hash it.
- *  - array:              The `result` starts with seed, then use `result` as seed, recursively
- *                        calculate hash value for each element, and assign the element hash value
- *                        to `result`.
- *  - map:                The `result` starts with seed, then use `result` as seed, recursively
- *                        calculate hash value for each key-value, and assign the key-value hash
- *                        value to `result`.
- *  - struct:             The `result` starts with seed, then use `result` as seed, recursively
- *                        calculate hash value for each field, and assign the field hash value to
- *                        `result`.
- *
- * Finally we aggregate the hash values for each expression by the same way of struct.
- */
-abstract class HashExpression[E] extends Expression {
-  /** Seed of the HashExpression. */
-  val seed: E
-
-  override def foldable: Boolean = children.forall(_.foldable)
-
-  override def nullable: Boolean = false
-
-  override def checkInputDataTypes(): TypeCheckResult = {
-    if (children.isEmpty) {
-      TypeCheckResult.TypeCheckFailure("function hash requires at least one argument")
-    } else {
-      TypeCheckResult.TypeCheckSuccess
-    }
-  }
-
-  override def eval(input: InternalRow): Any = {
-    var hash = seed
-    var i = 0
-    val len = children.length
-    while (i < len) {
-      hash = computeHash(children(i).eval(input), children(i).dataType, hash)
-      i += 1
-    }
-    hash
-  }
-
-  protected def computeHash(value: Any, dataType: DataType, seed: E): E
-
-  override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
-    ev.isNull = "false"
-    val childrenHash = children.map { child =>
-      val childGen = child.genCode(ctx)
-      childGen.code + ctx.nullSafeExec(child.nullable, childGen.isNull) {
-        computeHash(childGen.value, child.dataType, ev.value, ctx)
-      }
-    }.mkString("\n")
-
-    ev.copy(code = s"""
-      ${ctx.javaType(dataType)} ${ev.value} = $seed;
-      $childrenHash""")
-  }
-
-  private def nullSafeElementHash(
-      input: String,
-      index: String,
-      nullable: Boolean,
-      elementType: DataType,
-      result: String,
-      ctx: CodegenContext): String = {
-    val element = ctx.freshName("element")
-
-    ctx.nullSafeExec(nullable, s"$input.isNullAt($index)") {
-      s"""
-        final ${ctx.javaType(elementType)} $element = ${ctx.getValue(input, elementType, index)};
-        ${computeHash(element, elementType, result, ctx)}
-      """
-    }
-  }
-
-  @tailrec
-  private def computeHash(
-      input: String,
-      dataType: DataType,
-      result: String,
-      ctx: CodegenContext): String = {
-    val hasher = hasherClassName
-
-    def hashInt(i: String): String = s"$result = $hasher.hashInt($i, $result);"
-    def hashLong(l: String): String = s"$result = $hasher.hashLong($l, $result);"
-    def hashBytes(b: String): String =
-      s"$result = $hasher.hashUnsafeBytes($b, Platform.BYTE_ARRAY_OFFSET, $b.length, $result);"
-
-    dataType match {
-      case NullType => ""
-      case BooleanType => hashInt(s"$input ? 1 : 0")
-      case ByteType | ShortType | IntegerType | DateType => hashInt(input)
-      case LongType | TimestampType => hashLong(input)
-      case FloatType => hashInt(s"Float.floatToIntBits($input)")
-      case DoubleType => hashLong(s"Double.doubleToLongBits($input)")
-      case d: DecimalType =>
-        if (d.precision <= Decimal.MAX_LONG_DIGITS) {
-          hashLong(s"$input.toUnscaledLong()")
-        } else {
-          val bytes = ctx.freshName("bytes")
-          s"""
-            final byte[] $bytes = $input.toJavaBigDecimal().unscaledValue().toByteArray();
-            ${hashBytes(bytes)}
-          """
-        }
-      case CalendarIntervalType =>
-        val microsecondsHash = s"$hasher.hashLong($input.microseconds, $result)"
-        s"$result = $hasher.hashInt($input.months, $microsecondsHash);"
-      case BinaryType => hashBytes(input)
-      case StringType =>
-        val baseObject = s"$input.getBaseObject()"
-        val baseOffset = s"$input.getBaseOffset()"
-        val numBytes = s"$input.numBytes()"
-        s"$result = $hasher.hashUnsafeBytes($baseObject, $baseOffset, $numBytes, $result);"
-
-      case ArrayType(et, containsNull) =>
-        val index = ctx.freshName("index")
-        s"""
-          for (int $index = 0; $index < $input.numElements(); $index++) {
-            ${nullSafeElementHash(input, index, containsNull, et, result, ctx)}
-          }
-        """
-
-      case MapType(kt, vt, valueContainsNull) =>
-        val index = ctx.freshName("index")
-        val keys = ctx.freshName("keys")
-        val values = ctx.freshName("values")
-        s"""
-          final ArrayData $keys = $input.keyArray();
-          final ArrayData $values = $input.valueArray();
-          for (int $index = 0; $index < $input.numElements(); $index++) {
-            ${nullSafeElementHash(keys, index, false, kt, result, ctx)}
-            ${nullSafeElementHash(values, index, valueContainsNull, vt, result, ctx)}
-          }
-        """
-
-      case StructType(fields) =>
-        fields.zipWithIndex.map { case (field, index) =>
-          nullSafeElementHash(input, index.toString, field.nullable, field.dataType, result, ctx)
-        }.mkString("\n")
-
-      case udt: UserDefinedType[_] => computeHash(input, udt.sqlType, result, ctx)
-    }
-  }
-
-  protected def hasherClassName: String
-}
-
-/**
- * Base class for interpreted hash functions.
- */
-abstract class InterpretedHashFunction {
-  protected def hashInt(i: Int, seed: Long): Long
-
-  protected def hashLong(l: Long, seed: Long): Long
-
-  protected def hashUnsafeBytes(base: AnyRef, offset: Long, length: Int, seed: Long): Long
-
-  def hash(value: Any, dataType: DataType, seed: Long): Long = {
-    value match {
-      case null => seed
-      case b: Boolean => hashInt(if (b) 1 else 0, seed)
-      case b: Byte => hashInt(b, seed)
-      case s: Short => hashInt(s, seed)
-      case i: Int => hashInt(i, seed)
-      case l: Long => hashLong(l, seed)
-      case f: Float => hashInt(java.lang.Float.floatToIntBits(f), seed)
-      case d: Double => hashLong(java.lang.Double.doubleToLongBits(d), seed)
-      case d: Decimal =>
-        val precision = dataType.asInstanceOf[DecimalType].precision
-        if (precision <= Decimal.MAX_LONG_DIGITS) {
-          hashLong(d.toUnscaledLong, seed)
-        } else {
-          val bytes = d.toJavaBigDecimal.unscaledValue().toByteArray
-          hashUnsafeBytes(bytes, Platform.BYTE_ARRAY_OFFSET, bytes.length, seed)
-        }
-      case c: CalendarInterval => hashInt(c.months, hashLong(c.microseconds, seed))
-      case a: Array[Byte] =>
-        hashUnsafeBytes(a, Platform.BYTE_ARRAY_OFFSET, a.length, seed)
-      case s: UTF8String =>
-        hashUnsafeBytes(s.getBaseObject, s.getBaseOffset, s.numBytes(), seed)
-
-      case array: ArrayData =>
-        val elementType = dataType match {
-          case udt: UserDefinedType[_] => udt.sqlType.asInstanceOf[ArrayType].elementType
-          case ArrayType(et, _) => et
-        }
-        var result = seed
-        var i = 0
-        while (i < array.numElements()) {
-          result = hash(array.get(i, elementType), elementType, result)
-          i += 1
-        }
-        result
-
-      case map: MapData =>
-        val (kt, vt) = dataType match {
-          case udt: UserDefinedType[_] =>
-            val mapType = udt.sqlType.asInstanceOf[MapType]
-            mapType.keyType -> mapType.valueType
-          case MapType(kt, vt, _) => kt -> vt
-        }
-        val keys = map.keyArray()
-        val values = map.valueArray()
-        var result = seed
-        var i = 0
-        while (i < map.numElements()) {
-          result = hash(keys.get(i, kt), kt, result)
-          result = hash(values.get(i, vt), vt, result)
-          i += 1
-        }
-        result
-
-      case struct: InternalRow =>
-        val types: Array[DataType] = dataType match {
-          case udt: UserDefinedType[_] =>
-            udt.sqlType.asInstanceOf[StructType].map(_.dataType).toArray
-          case StructType(fields) => fields.map(_.dataType)
-        }
-        var result = seed
-        var i = 0
-        val len = struct.numFields
-        while (i < len) {
-          result = hash(struct.get(i, types(i)), types(i), result)
-          i += 1
-        }
-        result
-    }
-  }
-}
-
-/**
- * A MurMur3 Hash expression.
- *
- * We should use this hash function for both shuffle and bucket, so that we can guarantee shuffle
- * and bucketing have same data distribution.
- */
-@ExpressionDescription(
-  usage = "_FUNC_(a1, a2, ...) - Returns a hash value of the arguments.")
-case class Murmur3Hash(children: Seq[Expression], seed: Int) extends HashExpression[Int] {
-  def this(arguments: Seq[Expression]) = this(arguments, 42)
-
-  override def dataType: DataType = IntegerType
-
-  override def prettyName: String = "hash"
-
-  override protected def hasherClassName: String = classOf[Murmur3_x86_32].getName
-
-  override protected def computeHash(value: Any, dataType: DataType, seed: Int): Int = {
-    Murmur3HashFunction.hash(value, dataType, seed).toInt
-  }
-}
-
-object Murmur3HashFunction extends InterpretedHashFunction {
-  override protected def hashInt(i: Int, seed: Long): Long = {
-    Murmur3_x86_32.hashInt(i, seed.toInt)
-  }
-
-  override protected def hashLong(l: Long, seed: Long): Long = {
-    Murmur3_x86_32.hashLong(l, seed.toInt)
-  }
-
-  override protected def hashUnsafeBytes(base: AnyRef, offset: Long, len: Int, seed: Long): Long = {
-    Murmur3_x86_32.hashUnsafeBytes(base, offset, len, seed.toInt)
-  }
-}
+import org.apache.spark.unsafe.types.UTF8String
 
 /**
  * Print the result of an expression to stderr (used for debugging codegen).
@@ -475,77 +38,186 @@ case class PrintToStderr(child: Expression) extends UnaryExpression {
 
   override def dataType: DataType = child.dataType
 
-  protected override def nullSafeEval(input: Any): Any = input
+  protected override def nullSafeEval(input: Any): Any = {
+    // scalastyle:off println
+    System.err.println(outputPrefix + input)
+    // scalastyle:on println
+    input
+  }
+
+  private val outputPrefix = s"Result of ${child.simpleString(SQLConf.get.maxToStringFields)} is "
 
   override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
+    val outputPrefixField = ctx.addReferenceObj("outputPrefix", outputPrefix)
     nullSafeCodeGen(ctx, ev, c =>
       s"""
-         | System.err.println("Result of ${child.simpleString} is " + $c);
+         | System.err.println($outputPrefixField + $c);
          | ${ev.value} = $c;
        """.stripMargin)
   }
+
+  override protected def withNewChildInternal(newChild: Expression): PrintToStderr =
+    copy(child = newChild)
 }
 
 /**
- * A function throws an exception if 'condition' is not true.
+ * Throw with the result of an expression (used for debugging).
+ * Caller can specify the errorClass to be thrown and parameters to be passed to this error class.
+ * Default is to throw USER_RAISED_EXCEPTION with provided string literal.
  */
-@ExpressionDescription(
-  usage = "_FUNC_(condition) - Throw an exception if 'condition' is not true.")
-case class AssertTrue(child: Expression) extends UnaryExpression with ImplicitCastInputTypes {
+case class RaiseError(errorClass: Expression, errorParms: Expression, dataType: DataType)
+  extends BinaryExpression with ImplicitCastInputTypes {
 
+  def this(str: Expression) = {
+    this(Literal(
+      if (SQLConf.get.getConf(SQLConf.LEGACY_RAISE_ERROR_WITHOUT_ERROR_CLASS)) {
+        "_LEGACY_ERROR_USER_RAISED_EXCEPTION"
+      } else {
+        "USER_RAISED_EXCEPTION"
+      }),
+      CreateMap(Seq(Literal("errorMessage"), str)), NullType)
+  }
+
+  def this(errorClass: Expression, errorParms: Expression) = {
+    this(errorClass, errorParms, NullType)
+  }
+
+  override def foldable: Boolean = false
   override def nullable: Boolean = true
+  override lazy val throwable: Boolean = true
+  override def inputTypes: Seq[AbstractDataType] =
+    Seq(
+      StringTypeWithCollation(supportsTrimCollation = true),
+      AbstractMapType(
+        StringTypeWithCollation(supportsTrimCollation = true),
+        StringTypeWithCollation(supportsTrimCollation = true)
+      ))
 
-  override def inputTypes: Seq[DataType] = Seq(BooleanType)
+  override def left: Expression = errorClass
+  override def right: Expression = errorParms
 
-  override def dataType: DataType = NullType
+  override def prettyName: String = "raise_error"
 
-  override def prettyName: String = "assert_true"
-
-  override def eval(input: InternalRow) : Any = {
-    val v = child.eval(input)
-    if (v == null || java.lang.Boolean.FALSE.equals(v)) {
-      throw new RuntimeException(s"'${child.simpleString}' is not true!")
-    } else {
-      null
+  override def sql: String = {
+    // When constructed from the single-argument form (just an error message string),
+    // output only the original message to produce valid, roundtrippable SQL.
+    (errorClass, errorParms) match {
+      case (Literal(cls, _), CreateMap(Seq(Literal(key, _), msg), _))
+        if cls != null &&
+          (cls.toString == "USER_RAISED_EXCEPTION" ||
+            cls.toString == "_LEGACY_ERROR_USER_RAISED_EXCEPTION") &&
+          key != null && key.toString == "errorMessage" =>
+        s"$prettyName(${msg.sql})"
+      case _ =>
+        super.sql
     }
   }
 
-  override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
-    val eval = child.genCode(ctx)
-    ExprCode(code = s"""${eval.code}
-       |if (${eval.isNull} || !${eval.value}) {
-       |  throw new RuntimeException("'${child.simpleString}' is not true.");
-       |}""".stripMargin, isNull = "true", value = "null")
+  override def eval(input: InternalRow): Any = {
+    val error = errorClass.eval(input).asInstanceOf[UTF8String]
+    val parms: MapData = errorParms.eval(input).asInstanceOf[MapData]
+    throw raiseError(error, parms)
   }
 
-  override def sql: String = s"assert_true(${child.sql})"
+  // if (true) is to avoid codegen compilation exception that statement is unreachable
+  override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
+    val error = errorClass.genCode(ctx)
+    val parms = errorParms.genCode(ctx)
+    ExprCode(
+      code = code"""${error.code}
+        |${parms.code}
+        |if (true) {
+        |  throw QueryExecutionErrors.raiseError(
+        |    ${error.value},
+        |    ${parms.value});
+        |}""".stripMargin,
+      isNull = TrueLiteral,
+      value = JavaCode.defaultLiteral(dataType)
+    )
+  }
+
+  override protected def withNewChildrenInternal(
+    newLeft: Expression, newRight: Expression): RaiseError = {
+    copy(errorClass = newLeft, errorParms = newRight)
+  }
+}
+
+object RaiseError {
+  def apply(str: Expression): RaiseError = new RaiseError(str)
+
+  def apply(errorClass: Expression, parms: Expression): RaiseError =
+    new RaiseError(errorClass, parms)
 }
 
 /**
- * A xxHash64 64-bit hash expression.
+ * Throw with the result of an expression (used for debugging).
  */
-case class XxHash64(children: Seq[Expression], seed: Long) extends HashExpression[Long] {
-  def this(arguments: Seq[Expression]) = this(arguments, 42L)
-
-  override def dataType: DataType = LongType
-
-  override def prettyName: String = "xxHash"
-
-  override protected def hasherClassName: String = classOf[XXH64].getName
-
-  override protected def computeHash(value: Any, dataType: DataType, seed: Long): Long = {
-    XxHash64Function.hash(value, dataType, seed)
+// scalastyle:off line.size.limit
+@ExpressionDescription(
+  usage = "_FUNC_( expr ) - Throws a USER_RAISED_EXCEPTION with `expr` as message.",
+  arguments = """
+    Arguments:
+      * expr - The message for the raised exception.
+        An expression that evaluates to a string.
+  """,
+  examples = """
+    Examples:
+      > SELECT _FUNC_('custom error message');
+       [USER_RAISED_EXCEPTION] custom error message
+  """,
+  since = "3.1.0",
+  group = "misc_funcs")
+// scalastyle:on line.size.limit
+object RaiseErrorExpressionBuilder extends ExpressionBuilder {
+  override def build(funcName: String, expressions: Seq[Expression]): Expression = {
+    if (expressions.length != 1) {
+      throw QueryCompilationErrors.wrongNumArgsError(funcName, Seq(1), expressions.length)
+    } else {
+      RaiseError(expressions.head)
+    }
   }
 }
 
-object XxHash64Function extends InterpretedHashFunction {
-  override protected def hashInt(i: Int, seed: Long): Long = XXH64.hashInt(i, seed)
+/**
+ * A function that throws an exception if 'condition' is not true.
+ */
+@ExpressionDescription(
+  usage = "_FUNC_(expr [, message]) - Throws an exception if `expr` is not true.",
+  arguments = """
+    Arguments:
+      * expr - The expression that is expected to be true.
+        An expression that evaluates to a boolean.
+      * message - The message for the exception thrown when the expression is not true.
+        An expression that evaluates to a string.
+  """,
+  examples = """
+    Examples:
+      > SELECT _FUNC_(0 < 1);
+       NULL
+  """,
+  since = "2.0.0",
+  group = "misc_funcs")
+case class AssertTrue(left: Expression, right: Expression, replacement: Expression)
+  extends RuntimeReplaceable with InheritAnalysisRules {
 
-  override protected def hashLong(l: Long, seed: Long): Long = XXH64.hashLong(l, seed)
+  override def prettyName: String = "assert_true"
 
-  override protected def hashUnsafeBytes(base: AnyRef, offset: Long, len: Int, seed: Long): Long = {
-    XXH64.hashUnsafeBytes(base, offset, len, seed)
+  def this(left: Expression, right: Expression) = {
+    this(left, right, If(left, Literal(null), RaiseError(right)))
   }
+
+  def this(left: Expression) = {
+    this(left, Literal(s"'${toPrettySQL(left)}' is not true!"))
+  }
+
+  override def parameters: Seq[Expression] = Seq(left, right)
+
+  override protected def withNewChildInternal(newChild: Expression): AssertTrue =
+    copy(replacement = newChild)
+}
+
+object AssertTrue {
+  def apply(left: Expression): AssertTrue = new AssertTrue(left)
 }
 
 /**
@@ -553,9 +225,477 @@ object XxHash64Function extends InterpretedHashFunction {
  */
 @ExpressionDescription(
   usage = "_FUNC_() - Returns the current database.",
-  extended = "> SELECT _FUNC_()")
-case class CurrentDatabase() extends LeafExpression with Unevaluable {
-  override def dataType: DataType = StringType
-  override def foldable: Boolean = true
+  examples = """
+    Examples:
+      > SELECT _FUNC_();
+       default
+  """,
+  since = "1.6.0",
+  group = "misc_funcs")
+case class CurrentDatabase()
+  extends LeafExpression
+  with DefaultStringProducingExpression
+  with Unevaluable {
   override def nullable: Boolean = false
+  override def prettyName: String = "current_schema"
+  final override val nodePatterns: Seq[TreePattern] = Seq(CURRENT_LIKE)
+}
+
+/**
+ * Returns the current catalog.
+ */
+@ExpressionDescription(
+  usage = "_FUNC_() - Returns the current catalog.",
+  examples = """
+    Examples:
+      > SELECT _FUNC_();
+       spark_catalog
+  """,
+  since = "3.1.0",
+  group = "misc_funcs")
+case class CurrentCatalog()
+  extends LeafExpression
+  with DefaultStringProducingExpression
+  with Unevaluable {
+  override def nullable: Boolean = false
+  override def prettyName: String = "current_catalog"
+  final override val nodePatterns: Seq[TreePattern] = Seq(CURRENT_LIKE)
+}
+
+/**
+ * Returns the current SQL path as a comma-separated list of qualified schema names
+ * (catalog.schema). The result reflects the current catalog and schema context.
+ */
+@ExpressionDescription(
+  usage = "_FUNC_() - Returns the current SQL path (qualified schema names).",
+  examples = """
+    Examples:
+      > SELECT _FUNC_();
+       system.builtin,system.session,spark_catalog.default
+  """,
+  since = "4.2.0",
+  group = "misc_funcs")
+case class CurrentPath()
+  extends LeafExpression
+  with DefaultStringProducingExpression
+  with Unevaluable {
+  override def nullable: Boolean = false
+  override def prettyName: String = "current_path"
+  final override val nodePatterns: Seq[TreePattern] = Seq(CURRENT_LIKE)
+}
+
+// scalastyle:off line.size.limit
+@ExpressionDescription(
+  usage = """_FUNC_() - Returns an universally unique identifier (UUID) string. The value is returned as a canonical UUID 36-character string.""",
+  examples = """
+    Examples:
+      > SELECT _FUNC_();
+       46707d92-02f4-4817-8116-a4c3b23e6266
+  """,
+  note = """
+    The function is non-deterministic.
+  """,
+  since = "2.3.0",
+  group = "misc_funcs")
+// scalastyle:on line.size.limit
+case class Uuid(randomSeed: Option[Long] = None) extends LeafExpression with Nondeterministic
+  with DefaultStringProducingExpression
+  with ExpressionWithRandomSeed {
+
+  def this() = this(None)
+
+  def this(seed: Expression) = this(ExpressionWithRandomSeed.expressionToSeed(seed, "UUID"))
+
+  override def seedExpression: Expression = randomSeed.map(Literal.apply).getOrElse(UnresolvedSeed)
+
+  override def withNewSeed(seed: Long): Uuid = Uuid(Some(seed))
+
+  override def withShiftedSeed(shift: Long): Uuid = Uuid(randomSeed.map(_ + shift))
+
+  override lazy val resolved: Boolean = randomSeed.isDefined
+
+  override def nullable: Boolean = false
+
+  override def stateful: Boolean = true
+
+  // Stateful fresh copies use this hook even for leaves. The default leaf hook returns this,
+  // which would share randomGenerator across evaluators; copy preserves the seed without
+  // sharing the initialized generator.
+  override def withNewChildrenInternal(newChildren: IndexedSeq[Expression]): Expression = copy()
+
+  @transient private[this] var randomGenerator: RandomUUIDGenerator = _
+
+  override protected def initializeInternal(partitionIndex: Int): Unit =
+    randomGenerator = RandomUUIDGenerator(randomSeed.get + partitionIndex)
+
+  override protected def evalInternal(input: InternalRow): Any =
+    randomGenerator.getNextUUIDUTF8String()
+
+  override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
+    val randomGen = ctx.freshName("randomGen")
+    ctx.addMutableState("org.apache.spark.sql.catalyst.util.RandomUUIDGenerator", randomGen,
+      forceInline = true,
+      useFreshName = false)
+    ctx.addPartitionInitializationStatement(s"$randomGen = " +
+      "new org.apache.spark.sql.catalyst.util.RandomUUIDGenerator(" +
+      s"${randomSeed.get}L + partitionIndex);")
+    ev.copy(code = code"final UTF8String ${ev.value} = $randomGen.getNextUUIDUTF8String();",
+      isNull = FalseLiteral)
+  }
+}
+
+// scalastyle:off line.size.limit
+@ExpressionDescription(
+  usage = """_FUNC_() - Returns the Spark version. The string contains 2 fields, the first being a release version and the second being a git revision.""",
+  examples = """
+    Examples:
+      > SELECT _FUNC_();
+       3.1.0 a6d6ea3efedbad14d99c24143834cd4e2e52fb40
+  """,
+  since = "3.0.0",
+  group = "misc_funcs")
+// scalastyle:on line.size.limit
+case class SparkVersion()
+  extends LeafExpression
+  with RuntimeReplaceable
+  with DefaultStringProducingExpression {
+  override def prettyName: String = "version"
+
+  override lazy val replacement: Expression = StaticInvoke(
+    classOf[ExpressionImplUtils],
+    dataType,
+    "getSparkVersion",
+    returnNullable = false)
+}
+
+@ExpressionDescription(
+  usage = """_FUNC_(expr) - Return DDL-formatted type string for the data type of the input.""",
+  arguments = """
+    Arguments:
+      * expr - An expression of any type whose data type is returned as a DDL-formatted string.
+  """,
+  examples = """
+    Examples:
+      > SELECT _FUNC_(1);
+       int
+      > SELECT _FUNC_(array(1));
+       array<int>
+  """,
+  since = "3.0.0",
+  group = "misc_funcs")
+case class TypeOf(child: Expression) extends UnaryExpression with DefaultStringProducingExpression {
+  override def nullable: Boolean = false
+  override def foldable: Boolean = true
+  override def contextIndependentFoldable: Boolean = true
+  override def eval(input: InternalRow): Any = UTF8String.fromString(child.dataType.catalogString)
+
+  override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
+    defineCodeGen(ctx, ev, _ => s"""UTF8String.fromString(${child.dataType.catalogString})""")
+  }
+
+  override protected def withNewChildInternal(newChild: Expression): TypeOf = copy(child = newChild)
+}
+
+// scalastyle:off line.size.limit
+@ExpressionDescription(
+  usage = """_FUNC_() - user name of current execution context.""",
+  examples = """
+    Examples:
+      > SELECT _FUNC_();
+       mockingjay
+  """,
+  since = "3.2.0",
+  group = "misc_funcs")
+// scalastyle:on line.size.limit
+case class CurrentUser()
+  extends LeafExpression
+  with DefaultStringProducingExpression
+  with Unevaluable {
+  override def nullable: Boolean = false
+  override def prettyName: String =
+    getTagValue(FunctionRegistry.FUNC_ALIAS).getOrElse("current_user")
+  final override val nodePatterns: Seq[TreePattern] = Seq(CURRENT_LIKE)
+}
+
+/**
+ * A function that encrypts input using AES. Key lengths of 128, 192 or 256 bits can be used.
+ * If either argument is NULL or the key length is not one of the permitted values,
+ * the return value is NULL.
+ */
+// scalastyle:off line.size.limit
+@ExpressionDescription(
+  usage = """
+    _FUNC_(expr, key[, mode[, padding[, iv[, aad]]]]) - Returns an encrypted value of `expr` using AES in given `mode` with the specified `padding`.
+      Key lengths of 16, 24 and 32 bits are supported. Supported combinations of (`mode`, `padding`) are ('ECB', 'PKCS'), ('GCM', 'NONE') and ('CBC', 'PKCS').
+      Optional initialization vectors (IVs) are only supported for CBC and GCM modes. These must be 16 bytes for CBC and 12 bytes for GCM. If not provided, a random vector will be generated and prepended to the output.
+      Optional additional authenticated data (AAD) is only supported for GCM. If provided for encryption, the identical AAD value must be provided for decryption.
+      The default mode is GCM.
+  """,
+  arguments = """
+    Arguments:
+      * expr - The binary value to encrypt.
+        An expression that evaluates to a binary.
+      * key - The passphrase to use to encrypt the data.
+        An expression that evaluates to a binary.
+      * mode - Specifies which block cipher mode should be used to encrypt messages.
+               Valid modes: ECB, GCM, CBC.
+        An expression that evaluates to a string.
+      * padding - Specifies how to pad messages whose length is not a multiple of the block size.
+                  Valid values: PKCS, NONE, DEFAULT. The DEFAULT padding means PKCS for ECB, NONE for GCM and PKCS for CBC.
+        An expression that evaluates to a string.
+      * iv - Optional initialization vector. Only supported for CBC and GCM modes.
+             Valid values: None or ''. 16-byte array for CBC mode. 12-byte array for GCM mode.
+        An expression that evaluates to a binary.
+      * aad - Optional additional authenticated data. Only supported for GCM mode. This can be any free-form input and
+              must be provided for both encryption and decryption.
+        An expression that evaluates to a binary.
+  """,
+  examples = """
+    Examples:
+      > SELECT hex(_FUNC_('Spark', '0000111122223333'));
+       83F16B2AA704794132802D248E6BFD4E380078182D1544813898AC97E709B28A94
+      > SELECT hex(_FUNC_('Spark SQL', '0000111122223333', 'GCM'));
+       6E7CA17BBB468D3084B5744BCA729FB7B2B7BCB8E4472847D02670489D95FA97DBBA7D3210
+      > SELECT base64(_FUNC_('Spark SQL', '1234567890abcdef', 'ECB', 'PKCS'));
+       3lmwu+Mw0H3fi5NDvcu9lg==
+      > SELECT base64(_FUNC_('Apache Spark', '1234567890abcdef', 'CBC', 'DEFAULT'));
+       2NYmDCjgXTbbxGA3/SnJEfFC/JQ7olk2VQWReIAAFKo=
+      > SELECT base64(_FUNC_('Spark', 'abcdefghijklmnop12345678ABCDEFGH', 'CBC', 'DEFAULT', unhex('00000000000000000000000000000000')));
+       AAAAAAAAAAAAAAAAAAAAAPSd4mWyMZ5mhvjiAPQJnfg=
+      > SELECT base64(_FUNC_('Spark', 'abcdefghijklmnop12345678ABCDEFGH', 'GCM', 'DEFAULT', unhex('000000000000000000000000'), 'This is an AAD mixed into the input'));
+       AAAAAAAAAAAAAAAAQiYi+sTLm7KD9UcZ2nlRdYDe/PX4
+  """,
+  since = "3.3.0",
+  group = "misc_funcs")
+case class AesEncrypt(
+    input: Expression,
+    key: Expression,
+    mode: Expression,
+    padding: Expression,
+    iv: Expression,
+    aad: Expression)
+  extends RuntimeReplaceable with ImplicitCastInputTypes {
+
+  override lazy val replacement: Expression = StaticInvoke(
+    classOf[ExpressionImplUtils],
+    BinaryType,
+    "aesEncrypt",
+    Seq(input, key, mode, padding, iv, aad),
+    inputTypes)
+
+  def this(input: Expression, key: Expression, mode: Expression, padding: Expression, iv: Expression) =
+    this(input, key, mode, padding, iv, Literal(""))
+  def this(input: Expression, key: Expression, mode: Expression, padding: Expression) =
+    this(input, key, mode, padding, Literal(""))
+  def this(input: Expression, key: Expression, mode: Expression) =
+    this(input, key, mode, Literal("DEFAULT"))
+  def this(input: Expression, key: Expression) =
+    this(input, key, Literal("GCM"))
+
+  override def prettyName: String = "aes_encrypt"
+
+  override def inputTypes: Seq[AbstractDataType] =
+    Seq(BinaryType, BinaryType,
+      StringTypeWithCollation(supportsTrimCollation = true),
+      StringTypeWithCollation(supportsTrimCollation = true),
+      BinaryType, BinaryType)
+
+  override def children: Seq[Expression] = Seq(input, key, mode, padding, iv, aad)
+
+  override protected def withNewChildrenInternal(
+      newChildren: IndexedSeq[Expression]): Expression = {
+    copy(newChildren(0), newChildren(1), newChildren(2), newChildren(3), newChildren(4), newChildren(5))
+  }
+}
+
+/**
+ * A function that decrypts input using AES. Key lengths of 128, 192 or 256 bits can be used.
+ * If either argument is NULL or the key length is not one of the permitted values,
+ * the return value is NULL.
+ */
+@ExpressionDescription(
+  usage = """
+    _FUNC_(expr, key[, mode[, padding[, aad]]]) - Returns a decrypted value of `expr` using AES in `mode` with `padding`.
+      Key lengths of 16, 24 and 32 bits are supported. Supported combinations of (`mode`, `padding`) are ('ECB', 'PKCS'), ('GCM', 'NONE') and ('CBC', 'PKCS').
+      Optional additional authenticated data (AAD) is only supported for GCM. If provided for encryption, the identical AAD value must be provided for decryption.
+      The default mode is GCM.
+  """,
+  arguments = """
+    Arguments:
+      * expr - The binary value to decrypt.
+        An expression that evaluates to a binary.
+      * key - The passphrase to use to decrypt the data.
+        An expression that evaluates to a binary.
+      * mode - Specifies which block cipher mode should be used to decrypt messages.
+               Valid modes: ECB, GCM, CBC.
+        An expression that evaluates to a string.
+      * padding - Specifies how to pad messages whose length is not a multiple of the block size.
+                  Valid values: PKCS, NONE, DEFAULT. The DEFAULT padding means PKCS for ECB, NONE for GCM and PKCS for CBC.
+        An expression that evaluates to a string.
+      * aad - Optional additional authenticated data. Only supported for GCM mode. This can be any free-form input and
+              must be provided for both encryption and decryption.
+        An expression that evaluates to a binary.
+  """,
+  examples = """
+    Examples:
+      > SELECT _FUNC_(unhex('83F16B2AA704794132802D248E6BFD4E380078182D1544813898AC97E709B28A94'), '0000111122223333');
+       Spark
+      > SELECT _FUNC_(unhex('6E7CA17BBB468D3084B5744BCA729FB7B2B7BCB8E4472847D02670489D95FA97DBBA7D3210'), '0000111122223333', 'GCM');
+       Spark SQL
+      > SELECT _FUNC_(unbase64('3lmwu+Mw0H3fi5NDvcu9lg=='), '1234567890abcdef', 'ECB', 'PKCS');
+       Spark SQL
+      > SELECT _FUNC_(unbase64('2NYmDCjgXTbbxGA3/SnJEfFC/JQ7olk2VQWReIAAFKo='), '1234567890abcdef', 'CBC');
+       Apache Spark
+      > SELECT _FUNC_(unbase64('AAAAAAAAAAAAAAAAAAAAAPSd4mWyMZ5mhvjiAPQJnfg='), 'abcdefghijklmnop12345678ABCDEFGH', 'CBC', 'DEFAULT');
+       Spark
+      > SELECT _FUNC_(unbase64('AAAAAAAAAAAAAAAAQiYi+sTLm7KD9UcZ2nlRdYDe/PX4'), 'abcdefghijklmnop12345678ABCDEFGH', 'GCM', 'DEFAULT', 'This is an AAD mixed into the input');
+       Spark
+  """,
+  since = "3.3.0",
+  group = "misc_funcs")
+case class AesDecrypt(
+    input: Expression,
+    key: Expression,
+    mode: Expression,
+    padding: Expression,
+    aad: Expression)
+  extends RuntimeReplaceable with ImplicitCastInputTypes {
+
+  override lazy val replacement: Expression = StaticInvoke(
+    classOf[ExpressionImplUtils],
+    BinaryType,
+    "aesDecrypt",
+    Seq(input, key, mode, padding, aad),
+    inputTypes)
+
+  def this(input: Expression, key: Expression, mode: Expression, padding: Expression) =
+    this(input, key, mode, padding, Literal(""))
+  def this(input: Expression, key: Expression, mode: Expression) =
+    this(input, key, mode, Literal("DEFAULT"))
+  def this(input: Expression, key: Expression) =
+    this(input, key, Literal("GCM"))
+
+  override def inputTypes: Seq[AbstractDataType] = {
+    Seq(BinaryType,
+      BinaryType,
+      StringTypeWithCollation(supportsTrimCollation = true),
+      StringTypeWithCollation(supportsTrimCollation = true), BinaryType)
+  }
+
+  override def prettyName: String = "aes_decrypt"
+
+  override def children: Seq[Expression] = Seq(input, key, mode, padding, aad)
+
+  override protected def withNewChildrenInternal(
+      newChildren: IndexedSeq[Expression]): Expression = {
+    copy(newChildren(0), newChildren(1), newChildren(2), newChildren(3), newChildren(4))
+  }
+}
+
+@ExpressionDescription(
+  usage = "_FUNC_(expr, key[, mode[, padding[, aad]]]) - This is a special version of `aes_decrypt` that performs the same operation, but returns a NULL value instead of raising an error if the decryption cannot be performed.",
+  arguments = """
+    Arguments:
+      * expr - The encrypted value to decrypt.
+        An expression that evaluates to a binary.
+      * key - The key used to decrypt the value.
+        An expression that evaluates to a binary.
+      * mode - The block cipher mode used for decryption.
+        An expression that evaluates to a string.
+      * padding - The padding scheme used for decryption.
+        An expression that evaluates to a string.
+      * aad - The additional authenticated data.
+        An expression that evaluates to a binary.
+  """,
+  examples = """
+    Examples:
+      > SELECT _FUNC_(unhex('6E7CA17BBB468D3084B5744BCA729FB7B2B7BCB8E4472847D02670489D95FA97DBBA7D3210'), '0000111122223333', 'GCM');
+       Spark SQL
+      > SELECT _FUNC_(unhex('----------468D3084B5744BCA729FB7B2B7BCB8E4472847D02670489D95FA97DBBA7D3210'), '0000111122223333', 'GCM');
+       NULL
+  """,
+  since = "3.5.0",
+  group = "misc_funcs")
+// scalastyle:on line.size.limit
+case class TryAesDecrypt(
+    input: Expression,
+    key: Expression,
+    mode: Expression,
+    padding: Expression,
+    aad: Expression,
+    replacement: Expression) extends RuntimeReplaceable with InheritAnalysisRules {
+
+  def this(input: Expression,
+           key: Expression,
+           mode: Expression,
+           padding: Expression,
+           aad: Expression) =
+    this(input, key, mode, padding, aad, TryEval(AesDecrypt(input, key, mode, padding, aad)))
+  def this(input: Expression, key: Expression, mode: Expression, padding: Expression) =
+    this(input, key, mode, padding, Literal(""))
+  def this(input: Expression, key: Expression, mode: Expression) =
+    this(input, key, mode, Literal("DEFAULT"))
+  def this(input: Expression, key: Expression) =
+    this(input, key, Literal("GCM"))
+
+  override def prettyName: String = "try_aes_decrypt"
+
+  override def parameters: Seq[Expression] = Seq(input, key, mode, padding, aad)
+
+  override protected def withNewChildInternal(newChild: Expression): Expression =
+    this.copy(replacement = newChild)
+}
+// scalastyle:on line.size.limit
+
+/**
+ * A function that computes a keyed-hash message authentication code (HMAC) of the `message`
+ * using the given `key` and hash `algorithm`. The result is returned as raw MAC bytes, which
+ * can be fed back in as the `key` of a subsequent HMAC to chain derivations, or wrapped with
+ * `hex`/`base64` for a textual representation.
+ */
+// scalastyle:off line.size.limit
+@ExpressionDescription(
+  usage = """
+    _FUNC_(key, message[, algorithm]) - Returns the keyed-hash message authentication code (HMAC) of `message` using `key` and the hash `algorithm`. The result is returned as raw MAC bytes; wrap it with `hex` or `base64` for a textual value. The default algorithm is 'SHA-256'.
+  """,
+  arguments = """
+    Arguments:
+      * key - The secret key, as a binary value.
+      * message - The message to authenticate, as a binary value.
+      * algorithm - Optional hash algorithm. Valid values: SHA-224, SHA-256, SHA-384, SHA-512, SHA-1, MD5. The default is SHA-256.
+  """,
+  examples = """
+    Examples:
+      > SELECT hex(_FUNC_('key', 'message'));
+       6E9EF29B75FFFC5B7ABAE527D58FDADB2FE42E7219011976917343065F58ED4A
+      > SELECT hex(_FUNC_('key', 'message', 'SHA-512'));
+       E477384D7CA229DD1426E64B63EBF2D36EBD6D7E669A6735424E72EA6C01D3F8B56EB39C36D8232F5427999B8D1A3F9CD1128FC69F4D75B434216810FA367E98
+  """,
+  since = "4.3.0",
+  group = "misc_funcs")
+// scalastyle:on line.size.limit
+case class Hmac(key: Expression, message: Expression, algorithm: Expression)
+  extends RuntimeReplaceable with ImplicitCastInputTypes {
+
+  override lazy val replacement: Expression = StaticInvoke(
+    classOf[ExpressionImplUtils],
+    BinaryType,
+    "hmac",
+    Seq(key, message, algorithm),
+    inputTypes)
+
+  def this(key: Expression, message: Expression) =
+    this(key, message, Literal("SHA-256"))
+
+  override def prettyName: String = "hmac"
+
+  override def inputTypes: Seq[AbstractDataType] =
+    Seq(BinaryType, BinaryType, StringTypeWithCollation(supportsTrimCollation = true))
+
+  override def children: Seq[Expression] = Seq(key, message, algorithm)
+
+  override protected def withNewChildrenInternal(
+      newChildren: IndexedSeq[Expression]): Expression = {
+    copy(newChildren(0), newChildren(1), newChildren(2))
+  }
 }

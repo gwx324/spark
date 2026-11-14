@@ -17,10 +17,10 @@
 
 package org.apache.spark.mllib.clustering;
 
-import com.google.common.collect.Lists;
+import java.util.Arrays;
 
-import org.junit.Assert;
-import org.junit.Test;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Test;
 
 import org.apache.spark.SharedSparkSession;
 import org.apache.spark.api.java.JavaRDD;
@@ -31,7 +31,7 @@ public class JavaBisectingKMeansSuite extends SharedSparkSession {
 
   @Test
   public void twoDimensionalData() {
-    JavaRDD<Vector> points = jsc.parallelize(Lists.newArrayList(
+    JavaRDD<Vector> points = jsc.parallelize(Arrays.asList(
       Vectors.dense(4, -1),
       Vectors.dense(4, 1),
       Vectors.sparse(2, new int[]{0}, new double[]{1.0})
@@ -42,16 +42,16 @@ public class JavaBisectingKMeansSuite extends SharedSparkSession {
       .setMaxIterations(2)
       .setSeed(1L);
     BisectingKMeansModel model = bkm.run(points);
-    Assert.assertEquals(3, model.k());
-    Assert.assertArrayEquals(new double[]{3.0, 0.0}, model.root().center().toArray(), 1e-12);
+    Assertions.assertEquals(3, model.k());
+    Assertions.assertArrayEquals(new double[]{3.0, 0.0}, model.root().center().toArray(), 1e-12);
     for (ClusteringTreeNode child : model.root().children()) {
       double[] center = child.center().toArray();
       if (center[0] > 2) {
-        Assert.assertEquals(2, child.size());
-        Assert.assertArrayEquals(new double[]{4.0, 0.0}, center, 1e-12);
+        Assertions.assertEquals(2, child.size());
+        Assertions.assertArrayEquals(new double[]{4.0, 0.0}, center, 1e-12);
       } else {
-        Assert.assertEquals(1, child.size());
-        Assert.assertArrayEquals(new double[]{1.0, 0.0}, center, 1e-12);
+        Assertions.assertEquals(1, child.size());
+        Assertions.assertArrayEquals(new double[]{1.0, 0.0}, center, 1e-12);
       }
     }
   }

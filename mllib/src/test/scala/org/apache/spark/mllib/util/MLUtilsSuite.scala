@@ -18,24 +18,25 @@
 package org.apache.spark.mllib.util
 
 import java.io.File
-import java.nio.charset.StandardCharsets
+import java.nio.file.Files
 
 import scala.io.Source
 
-import breeze.linalg.{squaredDistance => breezeSquaredDistance}
-import com.google.common.io.Files
-
-import org.apache.spark.{SparkException, SparkFunSuite}
-import org.apache.spark.mllib.linalg.{DenseVector, Matrices, SparseVector, Vectors}
+import org.apache.spark.{SparkException, SparkFunSuite, SparkRuntimeException}
+import org.apache.spark.ml.linalg.{MatrixUDT => MLMatrixUDT, VectorUDT => MLVectorUDT}
+import org.apache.spark.mllib.linalg.{DenseVector, Matrices, MatrixUDT => OldMatrixUDT,
+  SparseVector, Vector, Vectors, VectorUDT => OldVectorUDT}
 import org.apache.spark.mllib.regression.LabeledPoint
 import org.apache.spark.mllib.util.MLUtils._
 import org.apache.spark.mllib.util.TestingUtils._
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.functions.col
-import org.apache.spark.sql.types.MetadataBuilder
+import org.apache.spark.sql.types.{IntegerType, MetadataBuilder, StructField, StructType}
 import org.apache.spark.util.Utils
 
 class MLUtilsSuite extends SparkFunSuite with MLlibTestSparkContext {
+
+  import testImplicits._
 
   test("epsilon computation") {
     assert(1.0 + EPSILON > 1.0, s"EPSILON is too small: $EPSILON.")
@@ -48,6 +49,12 @@ class MLUtilsSuite extends SparkFunSuite with MLlibTestSparkContext {
     val v1 = Vectors.dense(a)
     val norm1 = Vectors.norm(v1, 2.0)
     val precision = 1e-6
+
+    def squaredDistance(v1: Vector, v2: Vector): Double =
+      v1.toArray.zip(v2.toArray).map {
+        case (a, b) => (a - b) * (a - b)
+      }.sum
+
     for (m <- 0 until n) {
       val indices = (0 to m).toArray
       val values = indices.map(i => a(i))
@@ -55,13 +62,13 @@ class MLUtilsSuite extends SparkFunSuite with MLlibTestSparkContext {
       val norm2 = Vectors.norm(v2, 2.0)
       val v3 = Vectors.sparse(n, indices, indices.map(i => a(i) + 0.5))
       val norm3 = Vectors.norm(v3, 2.0)
-      val squaredDist = breezeSquaredDistance(v1.asBreeze, v2.asBreeze)
+      val squaredDist = squaredDistance(v1, v2)
       val fastSquaredDist1 = fastSquaredDistance(v1, norm1, v2, norm2, precision)
       assert((fastSquaredDist1 - squaredDist) <= precision * squaredDist, s"failed with m = $m")
       val fastSquaredDist2 =
         fastSquaredDistance(v1, norm1, Vectors.dense(v2.toArray), norm2, precision)
       assert((fastSquaredDist2 - squaredDist) <= precision * squaredDist, s"failed with m = $m")
-      val squaredDist2 = breezeSquaredDistance(v2.asBreeze, v3.asBreeze)
+      val squaredDist2 = squaredDistance(v2, v3)
       val fastSquaredDist3 =
         fastSquaredDistance(v2, norm2, v3, norm3, precision)
       assert((fastSquaredDist3 - squaredDist2) <= precision * squaredDist2, s"failed with m = $m")
@@ -69,7 +76,7 @@ class MLUtilsSuite extends SparkFunSuite with MLlibTestSparkContext {
         val v4 = Vectors.sparse(n, indices.slice(0, m - 10),
           indices.map(i => a(i) + 0.5).slice(0, m - 10))
         val norm4 = Vectors.norm(v4, 2.0)
-        val squaredDist = breezeSquaredDistance(v2.asBreeze, v4.asBreeze)
+        val squaredDist = squaredDistance(v2, v4)
         val fastSquaredDist =
           fastSquaredDistance(v2, norm2, v4, norm4, precision)
         assert((fastSquaredDist - squaredDist) <= precision * squaredDist, s"failed with m = $m")
@@ -86,7 +93,7 @@ class MLUtilsSuite extends SparkFunSuite with MLlibTestSparkContext {
       """.stripMargin
     val tempDir = Utils.createTempDir()
     val file = new File(tempDir.getPath, "part-00000")
-    Files.write(lines, file, StandardCharsets.UTF_8)
+    Files.writeString(file.toPath, lines)
     val path = tempDir.toURI.toString
 
     val pointsWithNumFeatures = loadLibSVMFile(sc, path, 6).collect()
@@ -119,7 +126,7 @@ class MLUtilsSuite extends SparkFunSuite with MLlibTestSparkContext {
       """.stripMargin
     val tempDir = Utils.createTempDir()
     val file = new File(tempDir.getPath, "part-00000")
-    Files.write(lines, file, StandardCharsets.UTF_8)
+    Files.writeString(file.toPath, lines)
     val path = tempDir.toURI.toString
 
     intercept[SparkException] {
@@ -136,7 +143,7 @@ class MLUtilsSuite extends SparkFunSuite with MLlibTestSparkContext {
       """.stripMargin
     val tempDir = Utils.createTempDir()
     val file = new File(tempDir.getPath, "part-00000")
-    Files.write(lines, file, StandardCharsets.UTF_8)
+    Files.writeString(file.toPath, lines)
     val path = tempDir.toURI.toString
 
     intercept[SparkException] {
@@ -153,13 +160,17 @@ class MLUtilsSuite extends SparkFunSuite with MLlibTestSparkContext {
     val tempDir = Utils.createTempDir()
     val outputDir = new File(tempDir, "output")
     MLUtils.saveAsLibSVMFile(examples, outputDir.toURI.toString)
-    val lines = outputDir.listFiles()
+    val sources = outputDir.listFiles()
       .filter(_.getName.startsWith("part-"))
-      .flatMap(Source.fromFile(_).getLines())
-      .toSet
-    val expected = Set("1.1 1:1.23 3:4.56", "0.0 1:1.01 2:2.02 3:3.03")
-    assert(lines === expected)
-    Utils.deleteRecursively(tempDir)
+      .map(Source.fromFile)
+    Utils.tryWithSafeFinally {
+      val lines = sources.flatMap(_.getLines()).toSet
+      val expected = Set("1.1 1:1.23 3:4.56", "0.0 1:1.01 2:2.02 3:3.03")
+      assert(lines === expected)
+    } {
+      sources.foreach(_.close())
+      Utils.deleteRecursively(tempDir)
+    }
   }
 
   test("appendBias") {
@@ -187,7 +198,7 @@ class MLUtilsSuite extends SparkFunSuite with MLlibTestSparkContext {
         assert(foldedRdds.length === folds)
         foldedRdds.foreach { case (training, validation) =>
           val result = validation.union(training).collect().sorted
-          val validationSize = validation.collect().size.toFloat
+          val validationSize = validation.collect().length.toFloat
           assert(validationSize > 0, "empty validation data")
           val p = 1 / folds.toFloat
           // Within 3 standard deviations of the mean
@@ -199,7 +210,7 @@ class MLUtilsSuite extends SparkFunSuite with MLlibTestSparkContext {
             s"Validation data ($validationSize) smaller than expected ($lowerBound)" )
           assert(validationSize < upperBound,
             s"Validation data ($validationSize) larger than expected ($upperBound)" )
-          assert(training.collect().size > 0, "empty training data")
+          assert(training.collect().length > 0, "empty training data")
           assert(result ===  collectedData,
             "Each training+validation set combined should contain all of the data.")
         }
@@ -255,9 +266,7 @@ class MLUtilsSuite extends SparkFunSuite with MLlibTestSparkContext {
     val z = Vectors.dense(4.0)
     val p = (5.0, z)
     val w = Vectors.dense(6.0).asML
-    val df = spark.createDataFrame(Seq(
-      (0, x, y, p, w)
-    )).toDF("id", "x", "y", "p", "w")
+    val df = Seq((0, x, y, p, w)).toDF("id", "x", "y", "p", "w")
       .withColumn("x", col("x"), metadata)
     val newDF1 = convertVectorColumnsToML(df)
     assert(newDF1.schema("x").metadata === metadata, "Metadata should be preserved.")
@@ -282,9 +291,7 @@ class MLUtilsSuite extends SparkFunSuite with MLlibTestSparkContext {
     val z = Vectors.dense(4.0).asML
     val p = (5.0, z)
     val w = Vectors.dense(6.0)
-    val df = spark.createDataFrame(Seq(
-      (0, x, y, p, w)
-    )).toDF("id", "x", "y", "p", "w")
+    val df = Seq((0, x, y, p, w)).toDF("id", "x", "y", "p", "w")
       .withColumn("x", col("x"), metadata)
     val newDF1 = convertVectorColumnsFromML(df)
     assert(newDF1.schema("x").metadata === metadata, "Metadata should be preserved.")
@@ -302,6 +309,30 @@ class MLUtilsSuite extends SparkFunSuite with MLlibTestSparkContext {
     }
   }
 
+  test("convert nullable vector columns") {
+    val oldVector = Vectors.sparse(2, Array(1), Array(1.0))
+    val oldSchema = StructType(Seq(
+      StructField("id", IntegerType, nullable = false),
+      StructField("x", new OldVectorUDT, nullable = true)))
+    val oldDF = spark.createDataFrame(
+      sc.parallelize(Seq(Row(0, oldVector), Row(1, null))),
+      oldSchema)
+    val toML = convertVectorColumnsToML(oldDF)
+    assert(toML.schema("x").dataType === new MLVectorUDT)
+    assert(toML.collect().toSeq === Seq(Row(0, oldVector.asML), Row(1, null)))
+
+    val mlVector = oldVector.asML
+    val mlSchema = StructType(Seq(
+      StructField("id", IntegerType, nullable = false),
+      StructField("x", new MLVectorUDT, nullable = true)))
+    val mlDF = spark.createDataFrame(
+      sc.parallelize(Seq(Row(0, mlVector), Row(1, null))),
+      mlSchema)
+    val fromML = convertVectorColumnsFromML(mlDF)
+    assert(fromML.schema("x").dataType === new OldVectorUDT)
+    assert(fromML.collect().toSeq === Seq(Row(0, oldVector), Row(1, null)))
+  }
+
   test("convertMatrixColumnsToML") {
     val x = Matrices.sparse(3, 2, Array(0, 2, 3), Array(0, 2, 1), Array(0.0, -1.2, 0.0))
     val metadata = new MetadataBuilder().putLong("numFeatures", 2L).build()
@@ -309,9 +340,7 @@ class MLUtilsSuite extends SparkFunSuite with MLlibTestSparkContext {
     val z = Matrices.ones(1, 1)
     val p = (5.0, z)
     val w = Matrices.dense(1, 1, Array(4.5)).asML
-    val df = spark.createDataFrame(Seq(
-      (0, x, y, p, w)
-    )).toDF("id", "x", "y", "p", "w")
+    val df = Seq((0, x, y, p, w)).toDF("id", "x", "y", "p", "w")
       .withColumn("x", col("x"), metadata)
     val newDF1 = convertMatrixColumnsToML(df)
     assert(newDF1.schema("x").metadata === metadata, "Metadata should be preserved.")
@@ -336,9 +365,7 @@ class MLUtilsSuite extends SparkFunSuite with MLlibTestSparkContext {
     val z = Matrices.ones(1, 1).asML
     val p = (5.0, z)
     val w = Matrices.dense(1, 1, Array(4.5))
-    val df = spark.createDataFrame(Seq(
-      (0, x, y, p, w)
-    )).toDF("id", "x", "y", "p", "w")
+    val df = Seq((0, x, y, p, w)).toDF("id", "x", "y", "p", "w")
       .withColumn("x", col("x"), metadata)
     val newDF1 = convertMatrixColumnsFromML(df)
     assert(newDF1.schema("x").metadata === metadata, "Metadata should be preserved.")
@@ -354,5 +381,60 @@ class MLUtilsSuite extends SparkFunSuite with MLlibTestSparkContext {
     intercept[IllegalArgumentException] {
       convertMatrixColumnsFromML(df, "p._2")
     }
+  }
+
+  test("convert nullable matrix columns") {
+    val oldMatrix = Matrices.sparse(
+      3, 2, Array(0, 2, 3), Array(0, 2, 1), Array(0.0, -1.2, 0.0))
+    val oldSchema = StructType(Seq(
+      StructField("id", IntegerType, nullable = false),
+      StructField("x", new OldMatrixUDT, nullable = true)))
+    val oldDF = spark.createDataFrame(
+      sc.parallelize(Seq(Row(0, oldMatrix), Row(1, null))),
+      oldSchema)
+    val toML = convertMatrixColumnsToML(oldDF)
+    assert(toML.schema("x").dataType === new MLMatrixUDT)
+    assert(toML.collect().toSeq === Seq(Row(0, oldMatrix.asML), Row(1, null)))
+
+    val mlMatrix = oldMatrix.asML
+    val mlSchema = StructType(Seq(
+      StructField("id", IntegerType, nullable = false),
+      StructField("x", new MLMatrixUDT, nullable = true)))
+    val mlDF = spark.createDataFrame(
+      sc.parallelize(Seq(Row(0, mlMatrix), Row(1, null))),
+      mlSchema)
+    val fromML = convertMatrixColumnsFromML(mlDF)
+    assert(fromML.schema("x").dataType === new OldMatrixUDT)
+    assert(fromML.collect().toSeq === Seq(Row(0, oldMatrix), Row(1, null)))
+  }
+
+  test("kFold with fold column") {
+    val data = sc.parallelize(1 to 100, 2).map(x => (x, if (x <= 50) 0 else 1)).toDF("i", "fold")
+    val collectedData = data.collect().map(_.getInt(0)).sorted
+    val twoFoldedRdd = kFold(data, 2, "fold")
+    assert(twoFoldedRdd(0)._1.collect().map(_.getInt(0)).sorted ===
+      twoFoldedRdd(1)._2.collect().map(_.getInt(0)).sorted)
+    assert(twoFoldedRdd(0)._2.collect().map(_.getInt(0)).sorted ===
+      twoFoldedRdd(1)._1.collect().map(_.getInt(0)).sorted)
+
+    val result1 = twoFoldedRdd(0)._1.union(twoFoldedRdd(0)._2).collect().map(_.getInt(0)).sorted
+    assert(result1 ===  collectedData,
+      "Each training+validation set combined should contain all of the data.")
+    val result2 = twoFoldedRdd(1)._1.union(twoFoldedRdd(1)._2).collect().map(_.getInt(0)).sorted
+    assert(result2 ===  collectedData,
+      "Each training+validation set combined should contain all of the data.")
+  }
+
+  test("kFold with fold column: invalid fold numbers") {
+    val data = sc.parallelize(Seq(0, 1, 2), 2).toDF( "fold")
+    val err1 = intercept[SparkRuntimeException] {
+      kFold(data, 2, "fold")(0)._1.collect()
+    }
+    assert(err1.getMessage.contains("Fold number must be in range [0, 2), but got 2."))
+
+    val err2 = intercept[SparkException] {
+      kFold(data, 4, "fold")(0)._1.collect()
+    }
+    assert(err2.getMessage.contains("The validation data at fold 3 is empty."))
   }
 }

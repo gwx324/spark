@@ -18,26 +18,38 @@
 package org.apache.spark.sql.catalyst.expressions.aggregate
 
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult
+import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.trees.TreePattern.{MAX, TreePattern}
+import org.apache.spark.sql.catalyst.trees.UnaryLike
 import org.apache.spark.sql.catalyst.util.TypeUtils
 import org.apache.spark.sql.types._
 
 @ExpressionDescription(
-  usage = "_FUNC_(expr) - Returns the maximum value of expr.")
-case class Max(child: Expression) extends DeclarativeAggregate {
-
-  override def children: Seq[Expression] = child :: Nil
+  usage = "_FUNC_(expr) - Returns the maximum value of `expr`.",
+  arguments = """
+    Arguments:
+      * expr - An expression of any orderable type whose maximum value across the group is
+          returned. NULL values are ignored.
+  """,
+  examples = """
+    Examples:
+      > SELECT _FUNC_(col) FROM VALUES (10), (50), (20) AS tab(col);
+       50
+  """,
+  group = "agg_funcs",
+  since = "1.0.0")
+case class Max(child: Expression) extends DeclarativeAggregate with UnaryLike[Expression] {
 
   override def nullable: Boolean = true
 
   // Return data type.
   override def dataType: DataType = child.dataType
 
-  // Expected input data type.
-  override def inputTypes: Seq[AbstractDataType] = Seq(AnyDataType)
-
   override def checkInputDataTypes(): TypeCheckResult =
-    TypeUtils.checkForOrderingExpr(child.dataType, "function max")
+    TypeUtils.checkForOrderingExpr(child.dataType, prettyName)
+
+  final override val nodePatterns: Seq[TreePattern] = Seq(MAX)
 
   private lazy val max = AttributeReference("max", child.dataType)()
 
@@ -48,14 +60,16 @@ case class Max(child: Expression) extends DeclarativeAggregate {
   )
 
   override lazy val updateExpressions: Seq[Expression] = Seq(
-    /* max = */ Greatest(Seq(max, child))
+    /* max = */ greatest(max, child)
   )
 
   override lazy val mergeExpressions: Seq[Expression] = {
     Seq(
-      /* max = */ Greatest(Seq(max.left, max.right))
+      /* max = */ greatest(max.left, max.right)
     )
   }
 
   override lazy val evaluateExpression: AttributeReference = max
+
+  override protected def withNewChildInternal(newChild: Expression): Max = copy(child = newChild)
 }

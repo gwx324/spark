@@ -28,12 +28,14 @@ class ChunkedByteBufferOutputStreamSuite extends SparkFunSuite {
 
   test("empty output") {
     val o = new ChunkedByteBufferOutputStream(1024, ByteBuffer.allocate)
+    o.close()
     assert(o.toChunkedByteBuffer.size === 0)
   }
 
   test("write a single byte") {
     val o = new ChunkedByteBufferOutputStream(1024, ByteBuffer.allocate)
     o.write(10)
+    o.close()
     val chunkedByteBuffer = o.toChunkedByteBuffer
     assert(chunkedByteBuffer.getChunks().length === 1)
     assert(chunkedByteBuffer.getChunks().head.array().toSeq === Seq(10.toByte))
@@ -43,6 +45,7 @@ class ChunkedByteBufferOutputStreamSuite extends SparkFunSuite {
     val o = new ChunkedByteBufferOutputStream(10, ByteBuffer.allocate)
     o.write(new Array[Byte](9))
     o.write(99)
+    o.close()
     val chunkedByteBuffer = o.toChunkedByteBuffer
     assert(chunkedByteBuffer.getChunks().length === 1)
     assert(chunkedByteBuffer.getChunks().head.array()(9) === 99.toByte)
@@ -52,6 +55,7 @@ class ChunkedByteBufferOutputStreamSuite extends SparkFunSuite {
     val o = new ChunkedByteBufferOutputStream(10, ByteBuffer.allocate)
     o.write(new Array[Byte](10))
     o.write(99)
+    o.close()
     val arrays = o.toChunkedByteBuffer.getChunks().map(_.array())
     assert(arrays.length === 2)
     assert(arrays(1).length === 1)
@@ -63,6 +67,7 @@ class ChunkedByteBufferOutputStreamSuite extends SparkFunSuite {
     Random.nextBytes(ref)
     val o = new ChunkedByteBufferOutputStream(10, ByteBuffer.allocate)
     o.write(ref)
+    o.close()
     val arrays = o.toChunkedByteBuffer.getChunks().map(_.array())
     assert(arrays.length === 1)
     assert(arrays.head.length === ref.length)
@@ -74,6 +79,7 @@ class ChunkedByteBufferOutputStreamSuite extends SparkFunSuite {
     Random.nextBytes(ref)
     val o = new ChunkedByteBufferOutputStream(10, ByteBuffer.allocate)
     o.write(ref)
+    o.close()
     val arrays = o.toChunkedByteBuffer.getChunks().map(_.array())
     assert(arrays.length === 1)
     assert(arrays.head.length === ref.length)
@@ -85,6 +91,7 @@ class ChunkedByteBufferOutputStreamSuite extends SparkFunSuite {
     Random.nextBytes(ref)
     val o = new ChunkedByteBufferOutputStream(10, ByteBuffer.allocate)
     o.write(ref)
+    o.close()
     val arrays = o.toChunkedByteBuffer.getChunks().map(_.array())
     assert(arrays.length === 3)
     assert(arrays(0).length === 10)
@@ -101,6 +108,7 @@ class ChunkedByteBufferOutputStreamSuite extends SparkFunSuite {
     Random.nextBytes(ref)
     val o = new ChunkedByteBufferOutputStream(10, ByteBuffer.allocate)
     o.write(ref)
+    o.close()
     val arrays = o.toChunkedByteBuffer.getChunks().map(_.array())
     assert(arrays.length === 3)
     assert(arrays(0).length === 10)
@@ -110,5 +118,16 @@ class ChunkedByteBufferOutputStreamSuite extends SparkFunSuite {
     assert(arrays(0).toSeq === ref.slice(0, 10))
     assert(arrays(1).toSeq === ref.slice(10, 20))
     assert(arrays(2).toSeq === ref.slice(20, 30))
+  }
+
+  test("SPARK-36464: size returns correct positive number even with over 2GB data") {
+    val data4M = 1024 * 1024 * 4
+    val writeTimes = 513
+    val ref = new Array[Byte](data4M)
+    val o = new ChunkedByteBufferOutputStream(data4M, ByteBuffer.allocate)
+    (0 until writeTimes).foreach(_ => o.write(ref))
+    o.close()
+    assert(o.size > 0L) // make sure it is not overflowing
+    assert(o.size == ref.length.toLong * writeTimes)
   }
 }

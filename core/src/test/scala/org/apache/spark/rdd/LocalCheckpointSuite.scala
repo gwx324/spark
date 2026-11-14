@@ -17,7 +17,12 @@
 
 package org.apache.spark.rdd
 
-import org.apache.spark.{LocalSparkContext, SparkContext, SparkException, SparkFunSuite}
+import scala.concurrent.duration._
+
+import org.scalatest.concurrent.Eventually.{eventually, interval, timeout}
+
+import org.apache.spark.{LocalSparkContext, SparkConf, SparkContext, SparkException, SparkFunSuite}
+import org.apache.spark.internal.config.{LOCAL_CHECKPOINT_VERIFY_CHECKSUM_ENABLED, LOCAL_CHECKPOINT_VERIFY_CHECKSUM_FORCE_SERIALIZED}
 import org.apache.spark.storage.{RDDBlockId, StorageLevel}
 
 /**
@@ -32,7 +37,7 @@ class LocalCheckpointSuite extends SparkFunSuite with LocalSparkContext {
   }
 
   test("transform storage level") {
-    val transform = LocalRDDCheckpointData.transformStorageLevel _
+    val transform = (level: StorageLevel) => LocalRDDCheckpointData.transformStorageLevel(level)
     assert(transform(StorageLevel.NONE) === StorageLevel.DISK_ONLY)
     assert(transform(StorageLevel.MEMORY_ONLY) === StorageLevel.MEMORY_AND_DISK)
     assert(transform(StorageLevel.MEMORY_ONLY_SER) === StorageLevel.MEMORY_AND_DISK_SER)
@@ -40,10 +45,43 @@ class LocalCheckpointSuite extends SparkFunSuite with LocalSparkContext {
     assert(transform(StorageLevel.MEMORY_ONLY_SER_2) === StorageLevel.MEMORY_AND_DISK_SER_2)
     assert(transform(StorageLevel.DISK_ONLY) === StorageLevel.DISK_ONLY)
     assert(transform(StorageLevel.DISK_ONLY_2) === StorageLevel.DISK_ONLY_2)
+    assert(transform(StorageLevel.DISK_ONLY_3) === StorageLevel.DISK_ONLY_3)
     assert(transform(StorageLevel.MEMORY_AND_DISK) === StorageLevel.MEMORY_AND_DISK)
     assert(transform(StorageLevel.MEMORY_AND_DISK_SER) === StorageLevel.MEMORY_AND_DISK_SER)
     assert(transform(StorageLevel.MEMORY_AND_DISK_2) === StorageLevel.MEMORY_AND_DISK_2)
     assert(transform(StorageLevel.MEMORY_AND_DISK_SER_2) === StorageLevel.MEMORY_AND_DISK_SER_2)
+  }
+
+  test("checksum verification is marked only for serialized checkpoints") {
+    // Verification off: never marked, default (deserialized) level untouched.
+    assert(markAndLevel() === (false, LocalRDDCheckpointData.DEFAULT_STORAGE_LEVEL))
+
+    // Verification on, default deserialized level: not marked (nothing to checksum), level kept.
+    assert(
+      markAndLevel(LOCAL_CHECKPOINT_VERIFY_CHECKSUM_ENABLED.key -> "true") ===
+        (false, LocalRDDCheckpointData.DEFAULT_STORAGE_LEVEL))
+  }
+
+  test("checksum verification force-serialized bumps a default checkpoint to a serialized level") {
+    // Verification on plus force-serialized: default level bumped to serialized and marked.
+    val (forcedMark, forcedLevel) = markAndLevel(
+      LOCAL_CHECKPOINT_VERIFY_CHECKSUM_ENABLED.key -> "true",
+      LOCAL_CHECKPOINT_VERIFY_CHECKSUM_FORCE_SERIALIZED.key -> "true")
+    assert(forcedMark)
+    assert(!forcedLevel.deserialized)
+    assert(forcedLevel === StorageLevel.MEMORY_AND_DISK_SER)
+  }
+
+  test("checksum verification is marked for an explicit serialized checkpoint") {
+    resetSparkContext()
+    val conf = new SparkConf().setMaster("local[2]").setAppName("test")
+      .set(LOCAL_CHECKPOINT_VERIFY_CHECKSUM_ENABLED.key, "true")
+    sc = new SparkContext(conf)
+
+    // An explicit serialized level (e.g. DISK_ONLY) is verifiable without the force flag.
+    val rdd = newRdd.persist(StorageLevel.DISK_ONLY).localCheckpoint()
+    assert(rdd.verifyCheckpointChecksums)
+    assert(!rdd.getStorageLevel.deserialized)
   }
 
   test("basic lineage truncation") {
@@ -65,7 +103,7 @@ class LocalCheckpointSuite extends SparkFunSuite with LocalSparkContext {
     filteredRdd.localCheckpoint()
     assert(filteredRdd.checkpointData.isDefined)
     assert(!filteredRdd.checkpointData.get.isCheckpointed)
-    assert(!filteredRdd.checkpointData.get.checkpointRDD.isDefined)
+    assert(filteredRdd.checkpointData.get.checkpointRDD.isEmpty)
     assert(filteredRdd.getStorageLevel === LocalRDDCheckpointData.DEFAULT_STORAGE_LEVEL)
 
     // After an action, the lineage is truncated
@@ -154,7 +192,7 @@ class LocalCheckpointSuite extends SparkFunSuite with LocalSparkContext {
 
   test("missing checkpoint block fails with informative message") {
     val rdd = newRdd.localCheckpoint()
-    val numPartitions = rdd.partitions.size
+    val numPartitions = rdd.partitions.length
     val partitionIndices = rdd.partitions.map(_.index)
     val bmm = sc.env.blockManager.master
 
@@ -168,6 +206,10 @@ class LocalCheckpointSuite extends SparkFunSuite with LocalSparkContext {
     // Collecting the RDD should now fail with an informative exception
     val blockId = RDDBlockId(rdd.id, numPartitions - 1)
     bmm.removeBlock(blockId)
+    // Wait until the block has been removed successfully.
+    eventually(timeout(1.second), interval(100.milliseconds)) {
+      assert(bmm.getBlockStatus(blockId).isEmpty)
+    }
     try {
       rdd.collect()
       fail("Collect should have failed if local checkpoint block is removed...")
@@ -177,6 +219,19 @@ class LocalCheckpointSuite extends SparkFunSuite with LocalSparkContext {
         assert(se.getMessage.contains("rdd.checkpoint()")) // suggest an alternative
         assert(se.getMessage.contains("fault-tolerant")) // justify the alternative
     }
+  }
+
+  /**
+   * Rebuild the context with the given configs, then localCheckpoint a fresh RDD and report
+   * whether it was marked for verification and what storage level it ended up with.
+   */
+  private def markAndLevel(configs: (String, String)*): (Boolean, StorageLevel) = {
+    resetSparkContext()
+    val conf = new SparkConf().setMaster("local[2]").setAppName("test")
+    configs.foreach { case (k, v) => conf.set(k, v) }
+    sc = new SparkContext(conf)
+    val rdd = newRdd.localCheckpoint()
+    (rdd.verifyCheckpointChecksums, rdd.getStorageLevel)
   }
 
   /**
@@ -227,7 +282,7 @@ class LocalCheckpointSuite extends SparkFunSuite with LocalSparkContext {
       targetStorageLevel: StorageLevel): Unit = {
     require(targetStorageLevel !== StorageLevel.NONE)
     require(rdd.isLocallyCheckpointed)
-    val rdd1 = rdd.map { i => i + "1" }
+    val rdd1 = rdd.map { i => i.toString + "1" }
     val rdd2 = rdd1.map { i => i + "2" }
     val rdd3 = rdd2.map { i => i + "3" }
     val rddDependencies = rdd.dependencies

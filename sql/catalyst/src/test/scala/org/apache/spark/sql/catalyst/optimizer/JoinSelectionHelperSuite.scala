@@ -1,0 +1,441 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.catalyst.optimizer
+
+import org.apache.spark.sql.catalyst.dsl.expressions._
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeMap, EqualTo, IsNull, Or}
+import org.apache.spark.sql.catalyst.plans.{ExistenceJoin, FullOuter, Inner, JoinType, LeftAnti, LeftOuter, LeftSemi, LeftSingle, PlanTest, RightOuter}
+import org.apache.spark.sql.catalyst.plans.logical.{BROADCAST, HintInfo, Join, JoinHint, LeafNode, LogicalPlan, NO_BROADCAST_AND_REPLICATION, NO_BROADCAST_HASH, SHUFFLE_HASH, SHUFFLE_REPLICATE_NL, Statistics}
+import org.apache.spark.sql.catalyst.statsEstimation.StatsTestPlan
+import org.apache.spark.sql.internal.SQLConf
+
+class JoinSelectionHelperSuite extends PlanTest with JoinSelectionHelper {
+
+  private val left = StatsTestPlan(
+    outputList = Seq($"a".int, $"b".int, $"c".int),
+    rowCount = 20000000,
+    size = Some(20000000),
+    attributeStats = AttributeMap(Seq()))
+
+  private val right = StatsTestPlan(
+    outputList = Seq($"d".int),
+    rowCount = 1000,
+    size = Some(1000),
+    attributeStats = AttributeMap(Seq()))
+
+  private val join = Join(left, right, Inner, None, JoinHint(None, None))
+
+  private def nullAwareAntiJoin(rightPlan: LogicalPlan = right): Join = {
+    val equality = EqualTo(left.output.head, rightPlan.output.head)
+    Join(left, rightPlan, LeftAnti, Some(Or(equality, IsNull(equality))), JoinHint.NONE)
+  }
+
+  private val hintBroadcast = Some(HintInfo(Some(BROADCAST)))
+  private val hintNotToBroadcast = Some(HintInfo(Some(NO_BROADCAST_HASH)))
+  private val hintShuffleHash = Some(HintInfo(Some(SHUFFLE_HASH)))
+
+  test("getBroadcastBuildSide (hintOnly = true) return BuildLeft with only a left hint") {
+    val broadcastSide = getBroadcastBuildSide(
+      join.copy(hint = JoinHint(hintBroadcast, None)),
+      hintOnly = true,
+      SQLConf.get
+    )
+    assert(broadcastSide === Some(BuildLeft))
+  }
+
+  test("getBroadcastBuildSide (hintOnly = true) return BuildRight with only a right hint") {
+    val broadcastSide = getBroadcastBuildSide(
+      join.copy(hint = JoinHint(None, hintBroadcast)),
+      hintOnly = true,
+      SQLConf.get
+    )
+    assert(broadcastSide === Some(BuildRight))
+  }
+
+  test("getBroadcastBuildSide (hintOnly = true) return smaller side with both having hints") {
+    val broadcastSide = getBroadcastBuildSide(
+      join.copy(hint = JoinHint(hintBroadcast, hintBroadcast)),
+      hintOnly = true,
+      SQLConf.get
+    )
+    assert(broadcastSide === Some(BuildRight))
+  }
+
+  test("getBroadcastBuildSide (hintOnly = true) return None when no side has a hint") {
+    val broadcastSide = getBroadcastBuildSide(
+      join.copy(hint = JoinHint(None, None)),
+      hintOnly = true,
+      SQLConf.get
+    )
+    assert(broadcastSide === None)
+  }
+
+  test("getBroadcastBuildSide (hintOnly = false) return BuildRight when right is broadcastable") {
+    val broadcastSide = getBroadcastBuildSide(
+      join.copy(hint = JoinHint(None, None)),
+      hintOnly = false,
+      SQLConf.get
+    )
+    assert(broadcastSide === Some(BuildRight))
+  }
+
+  test("getBroadcastBuildSide (hintOnly = false) return None when right has no broadcast hint") {
+    withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "10MB") {
+      val broadcastSide = getBroadcastBuildSide(
+        join.copy(hint = JoinHint(None, hintNotToBroadcast)),
+        hintOnly = false,
+        SQLConf.get
+      )
+      assert(broadcastSide === None)
+    }
+  }
+
+  test("getShuffleHashJoinBuildSide (hintOnly = true) return BuildLeft with only a left hint") {
+    val broadcastSide = getShuffleHashJoinBuildSide(
+      join.copy(hint = JoinHint(hintShuffleHash, None)),
+      hintOnly = true,
+      SQLConf.get
+    )
+    assert(broadcastSide === Some(BuildLeft))
+  }
+
+  test("getShuffleHashJoinBuildSide (hintOnly = true) return BuildRight with only a right hint") {
+    val broadcastSide = getShuffleHashJoinBuildSide(
+      join.copy(hint = JoinHint(None, hintShuffleHash)),
+      hintOnly = true,
+      SQLConf.get
+    )
+    assert(broadcastSide === Some(BuildRight))
+  }
+
+  test("getShuffleHashJoinBuildSide (hintOnly = true) return smaller side when both have hints") {
+    val broadcastSide = getShuffleHashJoinBuildSide(
+      join.copy(hint = JoinHint(hintShuffleHash, hintShuffleHash)),
+      hintOnly = true,
+      SQLConf.get
+    )
+    assert(broadcastSide === Some(BuildRight))
+  }
+
+  test("getShuffleHashJoinBuildSide (hintOnly = true) return None when no side has a hint") {
+    val broadcastSide = getShuffleHashJoinBuildSide(
+      join.copy(hint = JoinHint(None, None)),
+      hintOnly = true,
+      SQLConf.get
+    )
+    assert(broadcastSide === None)
+  }
+
+  test("getShuffleHashJoinBuildSide (hintOnly = false) return BuildRight when right is smaller") {
+    val broadcastSide = getBroadcastBuildSide(
+      join.copy(hint = JoinHint(None, None)),
+      hintOnly = false,
+      SQLConf.get
+    )
+    assert(broadcastSide === Some(BuildRight))
+  }
+
+  test("getSmallerSide should return BuildRight") {
+    assert(getSmallerSide(left, right) === BuildRight)
+  }
+
+  test("canBroadcastBySize should return true if the plan size is less than 10MB") {
+    withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "10MB") {
+      assert(canBroadcastBySize(left, SQLConf.get) === false)
+      assert(canBroadcastBySize(right, SQLConf.get) === true)
+    }
+  }
+
+  test("getBroadcastHashJoinBuildSide returns the hinted side") {
+    val equiJoin = join.copy(condition = Some(EqualTo(left.output.head, right.output.head)))
+    withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1") {
+      assert(getBroadcastHashJoinBuildSide(
+        equiJoin.copy(hint = JoinHint(hintBroadcast, None)), SQLConf.get) === Some(BuildLeft))
+      assert(getBroadcastHashJoinBuildSide(
+        equiJoin.copy(hint = JoinHint(None, hintBroadcast)), SQLConf.get) === Some(BuildRight))
+      // Both sides hinted: the smaller one wins, as in `getBroadcastBuildSide`.
+      assert(getBroadcastHashJoinBuildSide(
+        equiJoin.copy(hint = JoinHint(hintBroadcast, hintBroadcast)), SQLConf.get) ===
+        Some(BuildRight))
+    }
+  }
+
+  test("getBroadcastHashJoinBuildSide falls back to the smaller side") {
+    val equiJoin = join.copy(condition = Some(EqualTo(left.output.head, right.output.head)))
+    withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "10MB") {
+      // Only the right side is under the threshold, so it is the only candidate.
+      assert(getBroadcastHashJoinBuildSide(equiJoin, SQLConf.get) === Some(BuildRight))
+    }
+    withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1") {
+      assert(getBroadcastHashJoinBuildSide(equiJoin, SQLConf.get).isEmpty)
+    }
+  }
+
+  test("getBroadcastHashJoinBuildSide returns None when a shuffle hash hint applies") {
+    val equiJoin = join.copy(condition = Some(EqualTo(left.output.head, right.output.head)))
+    withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "10MB") {
+      assert(getBroadcastHashJoinBuildSide(
+        equiJoin.copy(hint = JoinHint(None, hintShuffleHash)), SQLConf.get).isEmpty)
+    }
+  }
+
+  test("getBroadcastHashJoinBuildSide returns None without equi-join keys") {
+    withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "10MB") {
+      assert(getBroadcastHashJoinBuildSide(join, SQLConf.get).isEmpty)
+    }
+  }
+
+  test("getNonEquiJoinBuildSide builds a side small enough to broadcast") {
+    withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "10MB") {
+      assert(getNonEquiJoinBuildSide(join, SQLConf.get) === Some(BuildRight))
+      // A left join builds its left side when only that side is small enough.
+      val smallLeft = Join(right, left, LeftOuter, None, JoinHint.NONE)
+      assert(getNonEquiJoinBuildSide(smallLeft, SQLConf.get) === Some(BuildLeft))
+    }
+  }
+
+  test("getNonEquiJoinBuildSide plans a Cartesian product when an inner join can't broadcast") {
+    withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1") {
+      assert(getNonEquiJoinBuildSide(join, SQLConf.get).isEmpty)
+    }
+  }
+
+  test("getNonEquiJoinBuildSide builds the side an outer join prefers, however large") {
+    withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1") {
+      assert(getNonEquiJoinBuildSide(join.copy(joinType = LeftOuter), SQLConf.get) ===
+        Some(BuildRight))
+      assert(getNonEquiJoinBuildSide(join.copy(joinType = RightOuter), SQLConf.get) ===
+        Some(BuildLeft))
+    }
+  }
+
+  test("getNonEquiJoinBuildSide builds a hinted side, even an outer join's preserved one") {
+    withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "10MB") {
+      val hinted = join.copy(joinType = LeftOuter, hint = JoinHint(hintBroadcast, None))
+      assert(getNonEquiJoinBuildSide(hinted, SQLConf.get) === Some(BuildLeft))
+      // Both sides hinted: an inner join builds the smaller one.
+      val bothHinted = join.copy(hint = JoinHint(hintBroadcast, hintBroadcast))
+      assert(getNonEquiJoinBuildSide(bothHinted, SQLConf.get) === Some(BuildRight))
+    }
+  }
+
+  test("getNonEquiJoinBuildSide plans a Cartesian product under a shuffle-replicate hint") {
+    val hintShuffleReplicateNL = Some(HintInfo(Some(SHUFFLE_REPLICATE_NL)))
+    withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "10MB") {
+      val inner = join.copy(hint = JoinHint(hintShuffleReplicateNL, None))
+      assert(getNonEquiJoinBuildSide(inner, SQLConf.get).isEmpty)
+      // A left join can't be a Cartesian product, so the hint doesn't apply.
+      val leftOuter = inner.copy(joinType = LeftOuter)
+      assert(getNonEquiJoinBuildSide(leftOuter, SQLConf.get) === Some(BuildRight))
+    }
+  }
+
+  test("getNonEquiJoinBuildSide builds the side NO_BROADCAST_AND_REPLICATION leaves") {
+    val hintNoBroadcastAndReplication = Some(HintInfo(Some(NO_BROADCAST_AND_REPLICATION)))
+    withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "10MB") {
+      // The hint rules out both broadcasting the right side and a Cartesian product.
+      val hinted = join.copy(hint = JoinHint(None, hintNoBroadcastAndReplication))
+      assert(getNonEquiJoinBuildSide(hinted, SQLConf.get) === Some(BuildLeft))
+    }
+  }
+
+  // Runs `f` with a 1MB static and a 10MB adaptive broadcast threshold, so that `right` (1000
+  // bytes) is small, `left` (20MB) is not, and a side whose runtime size is 5MB is small too.
+  private def withNonEquiJoinThresholds(f: => Unit): Unit = withSQLConf(
+    SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "1MB",
+    SQLConf.ADAPTIVE_AUTO_BROADCASTJOIN_THRESHOLD.key -> "10MB")(f)
+
+  // Returns a line for each join without equi-join keys, given as (scenario, left side, right
+  // side, hint), and each of `joinTypes` whose build side is not `expected(joinType)`.
+  private def nonEquiBuildSideMismatches(
+      scenarios: Seq[(String, LogicalPlan, LogicalPlan, JoinHint)],
+      joinTypes: Seq[JoinType])(
+      expected: JoinType => Option[BuildSide]): Seq[String] = {
+    for {
+      (scenario, leftPlan, rightPlan, hint) <- scenarios
+      joinType <- joinTypes
+      actual = getNonEquiJoinBuildSide(Join(leftPlan, rightPlan, joinType, None, hint), SQLConf.get)
+      if actual != expected(joinType)
+    } yield s"$scenario, $joinType: $actual, expected ${expected(joinType)}"
+  }
+
+  test("SPARK-61505: getNonEquiJoinBuildSide never builds the left side of a LeftSingle join") {
+    case class RuntimeStatsPlan(size: BigInt) extends LeafNode {
+      override def output: Seq[Attribute] = right.output
+      override def computeStats(): Statistics = Statistics(sizeInBytes = size, isRuntime = true)
+    }
+    val otherLeft = left.copy(outputList = Seq($"e".int))
+    val hintNoBroadcastAndReplication = Some(HintInfo(Some(NO_BROADCAST_AND_REPLICATION)))
+    // Joins in which only the left side qualifies for broadcast: it alone has a broadcast hint
+    // or, with no broadcast hint, it alone is small.
+    val scenarios = Seq(
+      ("only the left side is small", right, left, JoinHint.NONE),
+      ("only the left side is small, by its runtime size",
+        RuntimeStatsPlan(5 * 1024 * 1024), left, JoinHint.NONE),
+      ("only the left side is hinted and neither side is small",
+        left, otherLeft, JoinHint(hintBroadcast, None)),
+      ("only the left side is hinted and only the right side is small",
+        left, right, JoinHint(hintBroadcast, None)),
+      ("only the left side is small and the right side has a shuffle hash hint",
+        right, left, JoinHint(None, hintShuffleHash)),
+      ("only the left side is small and the right side is hinted NO_BROADCAST_AND_REPLICATION",
+        right, left, JoinHint(None, hintNoBroadcastAndReplication)))
+    val joinTypes = Seq(Inner, LeftOuter, RightOuter, FullOuter, LeftSemi, LeftAnti,
+      ExistenceJoin($"exists".boolean), LeftSingle)
+    withNonEquiJoinThresholds {
+      // BroadcastNestedLoopJoinExec can't build the left side of a LeftSingle join, so a
+      // LeftSingle join builds its right side even here. The other join types build their left.
+      val mismatches = nonEquiBuildSideMismatches(scenarios, joinTypes) { joinType =>
+        if (joinType == LeftSingle) Some(BuildRight) else Some(BuildLeft)
+      }
+      assert(mismatches.isEmpty, mismatches.mkString("\n"))
+    }
+  }
+
+  test("getNonEquiJoinBuildSide builds the right side of a LeftSingle join that can broadcast " +
+      "it or neither side") {
+    val otherLeft = left.copy(outputList = Seq($"e".int))
+    val otherRight = right.copy(outputList = Seq($"f".int))
+    val hintNoBroadcastAndReplication = Some(HintInfo(Some(NO_BROADCAST_AND_REPLICATION)))
+    val scenarios = Seq(
+      ("only the right side is small", left, right, JoinHint.NONE),
+      ("both sides are small", right, otherRight, JoinHint.NONE),
+      ("neither side is small", left, otherLeft, JoinHint.NONE),
+      ("only the right side is hinted and only the left side is small",
+        right, left, JoinHint(None, hintBroadcast)),
+      ("both sides are hinted and neither side is small",
+        left, otherLeft, JoinHint(hintBroadcast, hintBroadcast)),
+      // A LeftSingle join can't be a Cartesian product, so the hint doesn't apply.
+      ("neither side is small and the left side has a shuffle-replicate hint",
+        left, otherLeft, JoinHint(Some(HintInfo(Some(SHUFFLE_REPLICATE_NL))), None)),
+      ("only the left side is small and it is hinted NO_BROADCAST_AND_REPLICATION",
+        right, left, JoinHint(hintNoBroadcastAndReplication, None)))
+    withNonEquiJoinThresholds {
+      val mismatches = nonEquiBuildSideMismatches(scenarios, Seq(LeftSingle)) { _ =>
+        Some(BuildRight)
+      }
+      assert(mismatches.isEmpty, mismatches.mkString("\n"))
+    }
+  }
+
+  test("NAAJ broadcast threshold is floored by the automatic broadcast threshold") {
+    val betweenThresholdsRight = right.copy(
+      rowCount = 8 * 1024 * 1024,
+      size = Some(8 * 1024 * 1024))
+    val largeRight = right.copy(
+      rowCount = 20 * 1024 * 1024,
+      size = Some(20 * 1024 * 1024))
+    val overDedicatedThresholdRight = right.copy(
+      rowCount = 21 * 1024 * 1024,
+      size = Some(21 * 1024 * 1024))
+
+    withSQLConf(
+      SQLConf.OPTIMIZE_NULL_AWARE_ANTI_JOIN.key -> "true",
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "10MB",
+      SQLConf.NULL_AWARE_ANTI_JOIN_BROADCAST_THRESHOLD.key -> "0") {
+      assert(getBroadcastHashJoinBuildSide(nullAwareAntiJoin(), SQLConf.get) === Some(BuildRight))
+      assert(getBroadcastHashJoinBuildSide(
+        nullAwareAntiJoin().copy(hint = JoinHint(hintBroadcast, None)),
+        SQLConf.get) === Some(BuildRight))
+      assert(getBroadcastHashJoinBuildSide(
+        nullAwareAntiJoin(largeRight).copy(
+          hint = JoinHint(None, hintBroadcast)), SQLConf.get).isEmpty)
+    }
+
+    withSQLConf(
+      SQLConf.OPTIMIZE_NULL_AWARE_ANTI_JOIN.key -> "true",
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "10MB",
+      SQLConf.NULL_AWARE_ANTI_JOIN_BROADCAST_THRESHOLD.key -> "5MB") {
+      assert(getBroadcastHashJoinBuildSide(
+        nullAwareAntiJoin(betweenThresholdsRight), SQLConf.get) === Some(BuildRight))
+    }
+
+    withSQLConf(
+      SQLConf.OPTIMIZE_NULL_AWARE_ANTI_JOIN.key -> "true",
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "10MB",
+      SQLConf.NULL_AWARE_ANTI_JOIN_BROADCAST_THRESHOLD.key -> "20MB") {
+      assert(getBroadcastHashJoinBuildSide(
+        nullAwareAntiJoin(largeRight), SQLConf.get) === Some(BuildRight))
+      assert(getBroadcastHashJoinBuildSide(
+        nullAwareAntiJoin(overDedicatedThresholdRight), SQLConf.get).isEmpty)
+    }
+
+    withSQLConf(
+      SQLConf.OPTIMIZE_NULL_AWARE_ANTI_JOIN.key -> "true",
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+      SQLConf.NULL_AWARE_ANTI_JOIN_BROADCAST_THRESHOLD.key -> "0") {
+      assert(getBroadcastHashJoinBuildSide(nullAwareAntiJoin(), SQLConf.get).isEmpty)
+    }
+  }
+
+  test("NAAJ broadcast threshold preserves the existing controls") {
+    val overLongMaxRight = right.copy(
+      rowCount = BigInt(Long.MaxValue) + 1,
+      size = Some(BigInt(Long.MaxValue) + 1))
+
+    withSQLConf(
+      SQLConf.OPTIMIZE_NULL_AWARE_ANTI_JOIN.key -> "true",
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1") {
+      assert(getBroadcastHashJoinBuildSide(
+        nullAwareAntiJoin(overLongMaxRight), SQLConf.get) === Some(BuildRight))
+    }
+
+    withSQLConf(
+      SQLConf.OPTIMIZE_NULL_AWARE_ANTI_JOIN.key -> "true",
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+      SQLConf.NULL_AWARE_ANTI_JOIN_BROADCAST_THRESHOLD.key -> "10MB") {
+      assert(getBroadcastHashJoinBuildSide(nullAwareAntiJoin(), SQLConf.get) === Some(BuildRight))
+      assert(getBroadcastHashJoinBuildSide(
+        nullAwareAntiJoin(right.copy(size = Some(-1))), SQLConf.get).isEmpty)
+      assert(getBroadcastHashJoinBuildSide(
+        nullAwareAntiJoin(overLongMaxRight), SQLConf.get).isEmpty)
+    }
+
+    withSQLConf(
+      SQLConf.OPTIMIZE_NULL_AWARE_ANTI_JOIN.key -> "false",
+      SQLConf.NULL_AWARE_ANTI_JOIN_BROADCAST_THRESHOLD.key -> "-1") {
+      assert(getBroadcastHashJoinBuildSide(nullAwareAntiJoin(), SQLConf.get).isEmpty)
+    }
+  }
+
+  test("NAAJ broadcast threshold uses the adaptive threshold for runtime statistics") {
+    case class RuntimeStatsPlan(size: BigInt) extends LeafNode {
+      override def output: Seq[Attribute] = right.output
+      override def computeStats(): Statistics = Statistics(sizeInBytes = size, isRuntime = true)
+    }
+    val runtimeRight = RuntimeStatsPlan(5 * 1024 * 1024)
+
+    withSQLConf(
+      SQLConf.OPTIMIZE_NULL_AWARE_ANTI_JOIN.key -> "true",
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "10MB",
+      SQLConf.ADAPTIVE_AUTO_BROADCASTJOIN_THRESHOLD.key -> "1MB",
+      SQLConf.NULL_AWARE_ANTI_JOIN_BROADCAST_THRESHOLD.key -> "0") {
+      assert(getBroadcastHashJoinBuildSide(nullAwareAntiJoin(runtimeRight), SQLConf.get).isEmpty)
+    }
+
+    withSQLConf(
+      SQLConf.OPTIMIZE_NULL_AWARE_ANTI_JOIN.key -> "true",
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "1MB",
+      SQLConf.ADAPTIVE_AUTO_BROADCASTJOIN_THRESHOLD.key -> "10MB",
+      SQLConf.NULL_AWARE_ANTI_JOIN_BROADCAST_THRESHOLD.key -> "0") {
+      assert(getBroadcastHashJoinBuildSide(
+        nullAwareAntiJoin(runtimeRight), SQLConf.get) === Some(BuildRight))
+    }
+
+  }
+}

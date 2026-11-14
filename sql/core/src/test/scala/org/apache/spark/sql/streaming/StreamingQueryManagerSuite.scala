@@ -17,36 +17,290 @@
 
 package org.apache.spark.sql.streaming
 
+import java.io.File
+import java.util.concurrent.CountDownLatch
+
+import scala.collection.mutable.ArrayBuffer
 import scala.concurrent.Future
 import scala.util.Random
 import scala.util.control.NonFatal
 
-import org.scalatest.BeforeAndAfter
-import org.scalatest.concurrent.Eventually._
+import org.apache.hadoop.fs.Path
 import org.scalatest.concurrent.PatienceConfiguration.Timeout
 import org.scalatest.time.Span
 import org.scalatest.time.SpanSugar._
 
 import org.apache.spark.SparkException
-import org.apache.spark.sql.Dataset
-import org.apache.spark.sql.execution.streaming._
+import org.apache.spark.sql.{AnalysisException, Dataset, Encoders}
+import org.apache.spark.sql.catalyst.plans.logical.{Filter, Project}
+import org.apache.spark.sql.execution.datasources.v2.StreamingDataSourceV2ScanRelation
+import org.apache.spark.sql.execution.streaming.checkpointing.{OffsetMap, OffsetSeq, OffsetSeqLog,
+  OffsetSeqMetadata, OffsetSeqMetadataV2}
+import org.apache.spark.sql.execution.streaming.runtime._
+import org.apache.spark.sql.functions.udf
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.streaming.util.BlockingSource
+import org.apache.spark.tags.SlowSQLTest
 import org.apache.spark.util.Utils
 
-class StreamingQueryManagerSuite extends StreamTest with BeforeAndAfter {
+@SlowSQLTest
+class StreamingQueryManagerSuite extends StreamTest {
 
   import AwaitTerminationTester._
   import testImplicits._
 
   override val streamingTimeout = 20.seconds
 
-  before {
+  private def rewriteOffsetLogConf(
+      checkpoint: File)(f: Map[String, String] => Map[String, String]): Unit = {
+    val offsetsPath = new File(checkpoint, "offsets").getCanonicalPath
+    val offsetLog = new OffsetSeqLog(spark, offsetsPath)
+    val (batchId, offsetSeq) = offsetLog.getLatest().getOrElse {
+      fail("Missing offset log entry")
+    }
+    val updatedMetadata = offsetSeq.metadataOpt.map {
+      case m: OffsetSeqMetadata => m.copy(conf = f(m.conf))
+      case m: OffsetSeqMetadataV2 => m.copy(conf = f(m.conf))
+    }
+    val updatedOffsetSeq = offsetSeq match {
+      case o: OffsetSeq =>
+        o.copy(metadataOpt = updatedMetadata.map(_.asInstanceOf[OffsetSeqMetadata]))
+      case o: OffsetMap =>
+        o.copy(metadata = updatedMetadata.map(_.asInstanceOf[OffsetSeqMetadataV2]).get)
+    }
+    val hadoopConf = spark.sessionState.newHadoopConf()
+    val batchFile = new Path(offsetsPath, batchId.toString)
+    assert(batchFile.getFileSystem(hadoopConf).delete(batchFile, false))
+    assert(offsetLog.add(batchId, updatedOffsetSeq))
+  }
+
+  override def beforeEach(): Unit = {
+    super.beforeEach()
     assert(spark.streams.active.isEmpty)
     spark.streams.resetTerminated()
   }
 
-  after {
-    assert(spark.streams.active.isEmpty)
-    spark.streams.resetTerminated()
+  override def afterEach(): Unit = {
+    try {
+      assert(spark.streams.active.isEmpty)
+      spark.streams.resetTerminated()
+    } finally {
+      super.afterEach()
+    }
+  }
+
+  test("streaming EXCEPT compatibility defaults to legacy behavior for old checkpoints") {
+    withTempDir { checkpointDir =>
+      val input = MemoryStream[Int]
+      val result = input.toDS().except(Seq(100).toDS())
+      val checkpointLocation = checkpointDir.getCanonicalPath
+      val output = ArrayBuffer.empty[Int]
+
+      def startQuery(): StreamingQuery = result.writeStream
+        .outputMode("update")
+        .foreachBatch { (batch: Dataset[Int], _: Long) =>
+          output ++= batch.collect()
+          ()
+        }
+        .option("checkpointLocation", checkpointLocation)
+        .start()
+
+      withSQLConf(SQLConf.ALLOW_EXCEPT_ON_STREAMING_DATAFRAME.key -> "true") {
+        val query = startQuery()
+        try {
+          input.addData(1)
+          query.processAllAvailable()
+        } finally {
+          query.stop()
+        }
+      }
+
+      rewriteOffsetLogConf(checkpointDir)(
+        _ - SQLConf.ALLOW_EXCEPT_ON_STREAMING_DATAFRAME.key)
+
+      withSQLConf(SQLConf.ALLOW_EXCEPT_ON_STREAMING_DATAFRAME.key -> "false") {
+        val query = startQuery()
+        try {
+          input.addData(2)
+          query.processAllAvailable()
+        } finally {
+          query.stop()
+        }
+        assert(!spark.conf.get(SQLConf.ALLOW_EXCEPT_ON_STREAMING_DATAFRAME))
+      }
+
+      assert(output.sorted === Seq(1, 2))
+    }
+  }
+
+  test("streaming EXCEPT compatibility restores false from the checkpoint") {
+    withTempDir { checkpointDir =>
+      val input = MemoryStream[Int]
+      val result = input.toDS().except(Seq(100).toDS())
+      val checkpointLocation = checkpointDir.getCanonicalPath
+
+      def startQuery(): StreamingQuery = result.writeStream
+        .outputMode("update")
+        .foreachBatch { (batch: Dataset[Int], _: Long) =>
+          batch.collect()
+          ()
+        }
+        .option("checkpointLocation", checkpointLocation)
+        .start()
+
+      withSQLConf(SQLConf.ALLOW_EXCEPT_ON_STREAMING_DATAFRAME.key -> "true") {
+        val query = startQuery()
+        try {
+          input.addData(1)
+          query.processAllAvailable()
+        } finally {
+          query.stop()
+        }
+      }
+
+      rewriteOffsetLogConf(checkpointDir)(_.updated(
+        SQLConf.ALLOW_EXCEPT_ON_STREAMING_DATAFRAME.key, "false"))
+
+      withSQLConf(SQLConf.ALLOW_EXCEPT_ON_STREAMING_DATAFRAME.key -> "true") {
+        val error = intercept[AnalysisException](startQuery())
+        assert(error.getMessage.contains(
+          "Except on a streaming DataFrame/Dataset on the left is not supported"))
+        assert(spark.conf.get(SQLConf.ALLOW_EXCEPT_ON_STREAMING_DATAFRAME))
+      }
+    }
+  }
+
+  test("SPARK-60632: regex pattern cost estimate version 0 for old checkpoints") {
+    withTempDir { checkpointDir =>
+      val input = MemoryStream[String]
+      // `NOT` caches whether its child is expensive, and both queries share this plan.
+      val result = input.toDF().select($"value", !$"value".rlike("^1") as "p").where($"p")
+
+      def run(data: String): Boolean = {
+        val query = result.writeStream
+          .format("noop")
+          .option("checkpointLocation", checkpointDir.getCanonicalPath)
+          .start()
+        try {
+          input.addData(data)
+          query.processAllAvailable()
+          // Whether the filter stays above the projection.
+          query.asInstanceOf[StreamingQueryWrapper].streamingQuery.lastExecution.optimizedPlan
+            .exists {
+              case Filter(_, _: Project) => true
+              case _ => false
+            }
+        } finally {
+          query.stop()
+        }
+      }
+
+      assert(!run("a"))
+      rewriteOffsetLogConf(checkpointDir)(_ - SQLConf.REGEX_PATTERN_COST_ESTIMATE_VERSION.key)
+      assert(run("b"))
+    }
+  }
+
+  test("streaming EXCEPT compatibility uses the query session checkpoint location") {
+    withTempDir { checkpointRoot =>
+      withTempDir { otherCheckpointRoot =>
+        val querySession = spark.cloneSession()
+        val otherSession = spark.cloneSession()
+        val input = MemoryStream(Encoders.scalaInt, querySession)
+        val static = querySession.createDataset(Seq(100))(Encoders.scalaInt)
+        val result = input.toDS().except(static)
+        val output = ArrayBuffer.empty[Int]
+
+        querySession.conf.set(SQLConf.CHECKPOINT_LOCATION.key, checkpointRoot.getCanonicalPath)
+        otherSession.conf.set(
+          SQLConf.CHECKPOINT_LOCATION.key, otherCheckpointRoot.getCanonicalPath)
+
+        def startQuery(): StreamingQuery = result.writeStream
+          .queryName("streaming-except")
+          .outputMode("update")
+          .foreachBatch { (batch: Dataset[Int], _: Long) =>
+            output ++= batch.collect()
+            ()
+          }
+          .start()
+
+        querySession.conf.set(SQLConf.ALLOW_EXCEPT_ON_STREAMING_DATAFRAME.key, true)
+        val firstQuery = startQuery()
+        try {
+          input.addData(1)
+          firstQuery.processAllAvailable()
+        } finally {
+          firstQuery.stop()
+        }
+
+        querySession.conf.set(SQLConf.ALLOW_EXCEPT_ON_STREAMING_DATAFRAME.key, false)
+        val secondQuery = otherSession.withActive(startQuery())
+        try {
+          input.addData(2)
+          secondQuery.processAllAvailable()
+        } finally {
+          secondQuery.stop()
+        }
+
+        assert(output.sorted === Seq(1, 2))
+        assert(!querySession.conf.get(SQLConf.ALLOW_EXCEPT_ON_STREAMING_DATAFRAME))
+      }
+    }
+  }
+
+  test("streaming EXCEPT reuses the generated checkpoint location during analysis") {
+    withTempDir { checkpointRoot =>
+      val input = MemoryStream[Int]
+      val result = input.toDS().except(Seq(100).toDS())
+
+      withSQLConf(
+          SQLConf.ALLOW_EXCEPT_ON_STREAMING_DATAFRAME.key -> "true",
+          SQLConf.CHECKPOINT_LOCATION.key -> checkpointRoot.getCanonicalPath) {
+        val query = result.writeStream
+          .outputMode("update")
+          .foreachBatch { (batch: Dataset[Int], _: Long) =>
+            batch.collect()
+            ()
+          }
+          .start()
+        try {
+          input.addData(1)
+          query.processAllAvailable()
+        } finally {
+          query.stop()
+        }
+      }
+
+      assert(checkpointRoot.listFiles().count(_.isDirectory) === 1)
+    }
+  }
+
+  test("SPARK-60885: avoidDoubleFilterEval is read from the offset log") {
+    val key = SQLConf.AVOID_DOUBLE_FILTER_EVAL.key
+    val left = MemoryStream[(Int, Int)]
+    val right = MemoryStream[(Int, Int)]
+    val expensive = udf((value: Int) => value)
+    // With the conf on, the filter stays above the join and the left state also keeps the rows
+    // failing it. Turning it off would push the filter under the join, so those rows would join.
+    val df = left.toDF().toDF("key", "leftValue")
+      .join(right.toDF().toDF("key", "rightValue"), "key")
+      .select($"key", expensive($"leftValue").as("result"), $"rightValue")
+      .where($"result" > 0)
+
+    withTempDir { dir =>
+      withSQLConf(key -> "true", SQLConf.SHUFFLE_PARTITIONS.key -> "1") {
+        testStream(df)(
+          StartStream(checkpointLocation = dir.getCanonicalPath),
+          AddData(left, (1, -1), (2, 10)),
+          CheckNewAnswer(),
+          StopStream,
+          StartStream(
+            checkpointLocation = dir.getCanonicalPath,
+            additionalConfs = Map(key -> "false")),
+          AddData(right, (1, 100), (2, 200)),
+          CheckNewAnswer((2, 10, 200)))
+      }
+    }
   }
 
   testQuietly("listing") {
@@ -62,7 +316,7 @@ class StreamingQueryManagerSuite extends StreamTest with BeforeAndAfter {
       assert(spark.streams.get(q1.id).eq(q1))
       assert(spark.streams.get(q2.id).eq(q2))
       assert(spark.streams.get(q3.id).eq(q3))
-      assert(spark.streams.get(-1) === null) // non-existent id
+      assert(spark.streams.get(java.util.UUID.randomUUID()) === null) // non-existent id
       q1.stop()
 
       assert(spark.streams.active.toSet === Set(q2, q3))
@@ -74,13 +328,13 @@ class StreamingQueryManagerSuite extends StreamTest with BeforeAndAfter {
       eventually(Timeout(streamingTimeout)) {
         require(!q2.isActive)
         require(q2.exception.isDefined)
+        assert(spark.streams.get(q2.id) === null)
+        assert(spark.streams.active.toSet === Set(q3))
       }
-      assert(spark.streams.get(q2.id) === null)
-      assert(spark.streams.active.toSet === Set(q3))
     }
   }
 
-  testQuietly("awaitAnyTermination without timeout and resetTerminated") {
+  testRetry("awaitAnyTermination without timeout and resetTerminated") {
     val datasets = Seq.fill(5)(makeDataset._2)
     withQueriesOn(datasets: _*) { queries =>
       require(queries.size === datasets.size)
@@ -90,7 +344,7 @@ class StreamingQueryManagerSuite extends StreamTest with BeforeAndAfter {
       testAwaitAnyTermination(ExpectBlocked)
 
       // Stop a query asynchronously and see if it is reported through awaitAnyTermination
-      val q1 = stopRandomQueryAsync(stopAfter = 100 milliseconds, withError = false)
+      val q1 = stopRandomQueryAsync(stopAfter = 100.milliseconds, withError = false)
       testAwaitAnyTermination(ExpectNotBlocked)
       require(!q1.isActive) // should be inactive by the time the prev awaitAnyTerm returned
 
@@ -103,12 +357,12 @@ class StreamingQueryManagerSuite extends StreamTest with BeforeAndAfter {
 
       // Terminate a query asynchronously with exception and see awaitAnyTermination throws
       // the exception
-      val q2 = stopRandomQueryAsync(100 milliseconds, withError = true)
-      testAwaitAnyTermination(ExpectException[SparkException])
+      val q2 = stopRandomQueryAsync(100.milliseconds, withError = true)
+      testAwaitAnyTermination(ExpectException[SparkException]())
       require(!q2.isActive) // should be inactive by the time the prev awaitAnyTerm returned
 
       // All subsequent calls to awaitAnyTermination should throw the exception
-      testAwaitAnyTermination(ExpectException[SparkException])
+      testAwaitAnyTermination(ExpectException[SparkException]())
 
       // Resetting termination should make awaitAnyTermination() blocking again
       spark.streams.resetTerminated()
@@ -116,13 +370,13 @@ class StreamingQueryManagerSuite extends StreamTest with BeforeAndAfter {
 
       // Terminate multiple queries, one with failure and see whether awaitAnyTermination throws
       // the exception
-      val q3 = stopRandomQueryAsync(10 milliseconds, withError = false)
+      val q3 = stopRandomQueryAsync(10.milliseconds, withError = false)
       testAwaitAnyTermination(ExpectNotBlocked)
       require(!q3.isActive)
-      val q4 = stopRandomQueryAsync(10 milliseconds, withError = true)
+      val q4 = stopRandomQueryAsync(10.milliseconds, withError = true)
       eventually(Timeout(streamingTimeout)) { require(!q4.isActive) }
       // After q4 terminates with exception, awaitAnyTerm should start throwing exception
-      testAwaitAnyTermination(ExpectException[SparkException])
+      testAwaitAnyTermination(ExpectException[SparkException]())
     }
   }
 
@@ -135,93 +389,274 @@ class StreamingQueryManagerSuite extends StreamTest with BeforeAndAfter {
       // awaitAnyTermination should be blocking or non-blocking depending on timeout values
       testAwaitAnyTermination(
         ExpectBlocked,
-        awaitTimeout = 4 seconds,
+        awaitTimeout = 4.seconds,
         expectedReturnedValue = false,
-        testBehaviorFor = 2 seconds)
+        testBehaviorFor = 2.seconds)
 
       testAwaitAnyTermination(
         ExpectNotBlocked,
-        awaitTimeout = 50 milliseconds,
+        awaitTimeout = 50.milliseconds,
         expectedReturnedValue = false,
-        testBehaviorFor = 1 second)
+        testBehaviorFor = 1.second)
 
       // Stop a query asynchronously within timeout and awaitAnyTerm should be unblocked
-      val q1 = stopRandomQueryAsync(stopAfter = 100 milliseconds, withError = false)
+      val q1 = stopRandomQueryAsync(stopAfter = 100.milliseconds, withError = false)
       testAwaitAnyTermination(
         ExpectNotBlocked,
-        awaitTimeout = 2 seconds,
+        awaitTimeout = 2.seconds,
         expectedReturnedValue = true,
-        testBehaviorFor = 4 seconds)
+        testBehaviorFor = 4.seconds)
       require(!q1.isActive) // should be inactive by the time the prev awaitAnyTerm returned
 
       // All subsequent calls to awaitAnyTermination should be non-blocking even if timeout is high
       testAwaitAnyTermination(
-        ExpectNotBlocked, awaitTimeout = 4 seconds, expectedReturnedValue = true)
+        ExpectNotBlocked, awaitTimeout = 4.seconds, expectedReturnedValue = true)
 
       // Resetting termination should make awaitAnyTermination() blocking again
       spark.streams.resetTerminated()
       testAwaitAnyTermination(
         ExpectBlocked,
-        awaitTimeout = 4 seconds,
+        awaitTimeout = 4.seconds,
         expectedReturnedValue = false,
-        testBehaviorFor = 1 second)
+        testBehaviorFor = 1.second)
 
       // Terminate a query asynchronously with exception within timeout, awaitAnyTermination should
       // throws the exception
-      val q2 = stopRandomQueryAsync(100 milliseconds, withError = true)
+      val q2 = stopRandomQueryAsync(100.milliseconds, withError = true)
       testAwaitAnyTermination(
-        ExpectException[SparkException],
-        awaitTimeout = 4 seconds,
-        testBehaviorFor = 6 seconds)
+        ExpectException[SparkException](),
+        awaitTimeout = 4.seconds,
+        testBehaviorFor = 6.seconds)
       require(!q2.isActive) // should be inactive by the time the prev awaitAnyTerm returned
 
       // All subsequent calls to awaitAnyTermination should throw the exception
       testAwaitAnyTermination(
-        ExpectException[SparkException],
-        awaitTimeout = 2 seconds,
-        testBehaviorFor = 4 seconds)
+        ExpectException[SparkException](),
+        awaitTimeout = 2.seconds,
+        testBehaviorFor = 4.seconds)
 
       // Terminate a query asynchronously outside the timeout, awaitAnyTerm should be blocked
       spark.streams.resetTerminated()
-      val q3 = stopRandomQueryAsync(2 seconds, withError = true)
+      val q3 = stopRandomQueryAsync(2.seconds, withError = true)
       testAwaitAnyTermination(
         ExpectNotBlocked,
-        awaitTimeout = 100 milliseconds,
+        awaitTimeout = 100.milliseconds,
         expectedReturnedValue = false,
-        testBehaviorFor = 4 seconds)
+        testBehaviorFor = 4.seconds)
 
       // After that query is stopped, awaitAnyTerm should throw exception
       eventually(Timeout(streamingTimeout)) { require(!q3.isActive) } // wait for query to stop
+      // When `isActive` becomes `false`, `StreamingQueryManager` may not receive the error yet.
+      // Hence, call `stop` to wait until the thread of `q3` exits so that we can ensure
+      // `StreamingQueryManager` has already received the error.
+      q3.stop()
       testAwaitAnyTermination(
-        ExpectException[SparkException],
-        awaitTimeout = 100 milliseconds,
-        testBehaviorFor = 4 seconds)
+        ExpectException[SparkException](),
+        awaitTimeout = 100.milliseconds,
+        testBehaviorFor = 4.seconds)
 
 
       // Terminate multiple queries, one with failure and see whether awaitAnyTermination throws
       // the exception
       spark.streams.resetTerminated()
 
-      val q4 = stopRandomQueryAsync(10 milliseconds, withError = false)
+      val q4 = stopRandomQueryAsync(10.milliseconds, withError = false)
       testAwaitAnyTermination(
-        ExpectNotBlocked, awaitTimeout = 2 seconds, expectedReturnedValue = true)
+        ExpectNotBlocked, awaitTimeout = 2.seconds, expectedReturnedValue = true)
       require(!q4.isActive)
-      val q5 = stopRandomQueryAsync(10 milliseconds, withError = true)
+      val q5 = stopRandomQueryAsync(10.milliseconds, withError = true)
       eventually(Timeout(streamingTimeout)) { require(!q5.isActive) }
+      // When `isActive` becomes `false`, `StreamingQueryManager` may not receive the error yet.
+      // Hence, call `stop` to wait until the thread of `q5` exits so that we can ensure
+      // `StreamingQueryManager` has already received the error.
+      q5.stop()
       // After q5 terminates with exception, awaitAnyTerm should start throwing exception
-      testAwaitAnyTermination(ExpectException[SparkException], awaitTimeout = 2 seconds)
+      testAwaitAnyTermination(ExpectException[SparkException](), awaitTimeout = 2.seconds)
     }
   }
 
+  test("SPARK-18811: Source resolution should not block main thread") {
+    failAfter(streamingTimeout) {
+      BlockingSource.latch = new CountDownLatch(1)
+      withTempDir { tempDir =>
+        // if source resolution was happening on the main thread, it would block the start call,
+        // now it should only be blocking the stream execution thread
+        val sq = spark.readStream
+          .format("org.apache.spark.sql.streaming.util.BlockingSource")
+          .load()
+          .writeStream
+          .format("org.apache.spark.sql.streaming.util.BlockingSource")
+          .option("checkpointLocation", tempDir.toString)
+          .start()
+        eventually(Timeout(streamingTimeout)) {
+          assert(sq.status.message.contains("Initializing sources"))
+        }
+        BlockingSource.latch.countDown()
+        sq.stop()
+      }
+    }
+  }
+
+  testQuietly("can't start a streaming query with the same name in the same session") {
+    val ds1 = makeDataset._2
+    val ds2 = makeDataset._2
+    val queryName = "abc"
+
+    val query1 = ds1.writeStream.format("noop").queryName(queryName).start()
+    try {
+      val e = intercept[IllegalArgumentException] {
+        ds2.writeStream.format("noop").queryName(queryName).start()
+      }
+      assert(e.getMessage.contains("query with that name is already active"))
+    } finally {
+      query1.stop()
+    }
+  }
+
+  testQuietly("can start a streaming query with the same name in a different session") {
+    val session2 = spark.cloneSession()
+
+    val ds1 = MemoryStream(Encoders.INT, spark).toDS()
+    val ds2 = MemoryStream(Encoders.INT, session2).toDS()
+    val queryName = "abc"
+
+    val query1 = ds1.writeStream.format("noop").queryName(queryName).start()
+    val query2 = ds2.writeStream.format("noop").queryName(queryName).start()
+
+    query1.stop()
+    query2.stop()
+  }
+
+  testQuietly("can't start multiple instances of the same streaming query in the same session") {
+    withSQLConf(SQLConf.STREAMING_STOP_ACTIVE_RUN_ON_RESTART.key -> "false") {
+      withTempDir { dir =>
+        val (ms1, ds1) = makeDataset
+        val (ms2, ds2) = makeDataset
+        val chkLocation = new File(dir, "_checkpoint").getCanonicalPath
+        val dataLocation = new File(dir, "data").getCanonicalPath
+
+        val query1 = ds1.writeStream.format("parquet")
+          .option("checkpointLocation", chkLocation).start(dataLocation)
+        ms1.addData(1, 2, 3)
+        try {
+          val e = intercept[IllegalStateException] {
+            ds2.writeStream.format("parquet")
+              .option("checkpointLocation", chkLocation).start(dataLocation)
+          }
+          assert(e.getMessage.contains("same id"))
+        } finally {
+          spark.streams.active.foreach(_.stop())
+        }
+      }
+    }
+  }
+
+  testQuietly("new instance of the same streaming query stops old query in the same session") {
+    failAfter(90 seconds) {
+      withSQLConf(SQLConf.STREAMING_STOP_ACTIVE_RUN_ON_RESTART.key -> "true") {
+        withTempDir { dir =>
+          val (ms1, ds1) = makeDataset
+          val (ms2, ds2) = makeDataset
+          val chkLocation = new File(dir, "_checkpoint").getCanonicalPath
+          val dataLocation = new File(dir, "data").getCanonicalPath
+
+          val query1 = ds1.writeStream.format("parquet")
+            .option("checkpointLocation", chkLocation).start(dataLocation)
+          ms1.addData(1, 2, 3)
+          query1.processAllAvailable() // ensure offset log has been written
+
+          val query2 = ds2.writeStream.format("parquet")
+            .option("checkpointLocation", chkLocation).start(dataLocation)
+          try {
+            ms2.addData(1, 2, 3)
+            query2.processAllAvailable()
+            assert(spark.sharedState.activeStreamingQueries.get(query2.id) ===
+              query2.asInstanceOf[StreamingQueryWrapper].streamingQuery,
+              "The correct streaming query is not being tracked in global state")
+
+            assert(!query1.isActive,
+              "First query should have stopped before starting the second query")
+          } finally {
+            spark.streams.active.foreach(_.stop())
+          }
+        }
+      }
+    }
+  }
+
+  testQuietly(
+    "can't start multiple instances of the same streaming query in the different sessions") {
+    withSQLConf(SQLConf.STREAMING_STOP_ACTIVE_RUN_ON_RESTART.key -> "false") {
+      withTempDir { dir =>
+        val session2 = spark.cloneSession()
+
+        val ms1 = MemoryStream(Encoders.INT, spark)
+        val ds2 = MemoryStream(Encoders.INT, session2).toDS()
+        val chkLocation = new File(dir, "_checkpoint").getCanonicalPath
+        val dataLocation = new File(dir, "data").getCanonicalPath
+
+        val query1 = ms1.toDS().writeStream.format("parquet")
+          .option("checkpointLocation", chkLocation).start(dataLocation)
+        ms1.addData(1, 2, 3)
+        try {
+          val e = intercept[IllegalStateException] {
+            ds2.writeStream.format("parquet")
+              .option("checkpointLocation", chkLocation).start(dataLocation)
+          }
+          assert(e.getMessage.contains("same id"))
+        } finally {
+          spark.streams.active.foreach(_.stop())
+          session2.streams.active.foreach(_.stop())
+        }
+      }
+    }
+  }
+
+  testQuietly(
+    "new instance of the same streaming query stops old query in a different session") {
+    failAfter(90 seconds) {
+      withSQLConf(SQLConf.STREAMING_STOP_ACTIVE_RUN_ON_RESTART.key -> "true") {
+        withTempDir { dir =>
+          val session2 = spark.cloneSession()
+
+          val ms1 = MemoryStream(Encoders.INT, spark)
+          val ds2 = MemoryStream(Encoders.INT, session2).toDS()
+          val chkLocation = new File(dir, "_checkpoint").getCanonicalPath
+          val dataLocation = new File(dir, "data").getCanonicalPath
+
+          val query1 = ms1.toDS().writeStream.format("parquet")
+            .option("checkpointLocation", chkLocation).start(dataLocation)
+          ms1.addData(1, 2, 3)
+          query1.processAllAvailable() // ensure offset log has been written
+
+          val query2 = ds2.writeStream.format("parquet")
+            .option("checkpointLocation", chkLocation).start(dataLocation)
+          try {
+            ms1.addData(1, 2, 3)
+            query2.processAllAvailable()
+            assert(spark.sharedState.activeStreamingQueries.get(query2.id) ===
+              query2.asInstanceOf[StreamingQueryWrapper].streamingQuery,
+              "The correct streaming execution is not being tracked in global state")
+
+            assert(!query1.isActive,
+              "First query should have stopped before starting the second query")
+          } finally {
+            spark.streams.active.foreach(_.stop())
+            session2.streams.active.foreach(_.stop())
+          }
+        }
+      }
+    }
+  }
 
   /** Run a body of code by defining a query on each dataset */
   private def withQueriesOn(datasets: Dataset[_]*)(body: Seq[StreamingQuery] => Unit): Unit = {
     failAfter(streamingTimeout) {
       val queries = withClue("Error starting queries") {
         datasets.zipWithIndex.map { case (ds, i) =>
-          @volatile var query: StreamExecution = null
+          var query: StreamingQuery = null
           try {
-            val df = ds.toDF
+            val df = ds.toDF()
             val metadataRoot =
               Utils.createTempDir(namePrefix = "streaming.checkpoint").getCanonicalPath
             query =
@@ -231,7 +666,6 @@ class StreamingQueryManagerSuite extends StreamTest with BeforeAndAfter {
                 .option("checkpointLocation", metadataRoot)
                 .outputMode("append")
                 .start()
-                .asInstanceOf[StreamExecution]
           } catch {
             case NonFatal(e) =>
               if (query != null) query.stop()
@@ -253,7 +687,7 @@ class StreamingQueryManagerSuite extends StreamTest with BeforeAndAfter {
       expectedBehavior: ExpectedBehavior,
       expectedReturnedValue: Boolean = false,
       awaitTimeout: Span = null,
-      testBehaviorFor: Span = 4 seconds
+      testBehaviorFor: Span = 4.seconds
     ): Unit = {
 
     def awaitTermFunc(): Unit = {
@@ -265,23 +699,23 @@ class StreamingQueryManagerSuite extends StreamTest with BeforeAndAfter {
       }
     }
 
-    AwaitTerminationTester.test(expectedBehavior, awaitTermFunc, testBehaviorFor)
+    AwaitTerminationTester.test(expectedBehavior, () => awaitTermFunc(), testBehaviorFor)
   }
 
   /** Stop a random active query either with `stop()` or with an error */
   private def stopRandomQueryAsync(stopAfter: Span, withError: Boolean): StreamingQuery = {
-
+    // scalastyle:off executioncontextglobal
     import scala.concurrent.ExecutionContext.Implicits.global
-
+    // scalastyle:on executioncontextglobal
     val activeQueries = spark.streams.active
     val queryToStop = activeQueries(Random.nextInt(activeQueries.length))
     Future {
       Thread.sleep(stopAfter.toMillis)
       if (withError) {
         logDebug(s"Terminating query ${queryToStop.name} with error")
-        queryToStop.asInstanceOf[StreamExecution].logicalPlan.collect {
-          case StreamingExecutionRelation(source, _) =>
-            source.asInstanceOf[MemoryStream[Int]].addData(0)
+        queryToStop.asInstanceOf[StreamingQueryWrapper].streamingQuery.logicalPlan.collect {
+          case r: StreamingDataSourceV2ScanRelation =>
+            r.stream.asInstanceOf[MemoryStream[Int]].addData(0)
         }
       } else {
         logDebug(s"Stopping query ${queryToStop.name}")
@@ -293,7 +727,7 @@ class StreamingQueryManagerSuite extends StreamTest with BeforeAndAfter {
 
   private def makeDataset: (MemoryStream[Int], Dataset[Int]) = {
     val inputData = MemoryStream[Int]
-    val mapped = inputData.toDS.map(6 / _)
+    val mapped = inputData.toDS().map(6 / _)
     (inputData, mapped)
   }
 }

@@ -21,6 +21,9 @@ import java.io.IOException;
 import java.io.Reader;
 
 import javax.xml.namespace.QName;
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+import javax.xml.parsers.ParserConfigurationException;
 import javax.xml.xpath.XPath;
 import javax.xml.xpath.XPathConstants;
 import javax.xml.xpath.XPathExpression;
@@ -31,15 +34,23 @@ import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
 import org.xml.sax.InputSource;
 
+import org.apache.spark.SparkIllegalArgumentException;
+
 /**
  * Utility class for all XPath UDFs. Each UDF instance should keep an instance of this class.
  *
  * This is based on Hive's UDFXPathUtil implementation.
  */
 public class UDFXPathUtil {
+  public static final String SAX_FEATURE_PREFIX = "http://xml.org/sax/features/";
+  public static final String EXTERNAL_GENERAL_ENTITIES_FEATURE = "external-general-entities";
+  public static final String EXTERNAL_PARAMETER_ENTITIES_FEATURE = "external-parameter-entities";
+  private DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
+  private DocumentBuilder builder = null;
   private XPath xpath = XPathFactory.newInstance().newXPath();
   private ReusableStringReader reader = new ReusableStringReader();
   private InputSource inputSource = new InputSource(reader);
+
   private XPathExpression expression = null;
   private String oldPath = null;
 
@@ -65,12 +76,29 @@ public class UDFXPathUtil {
       return null;
     }
 
+    if (builder == null){
+      try {
+        initializeDocumentBuilderFactory();
+        builder = dbf.newDocumentBuilder();
+      } catch (ParserConfigurationException e) {
+        throw new RuntimeException(
+          "Error instantiating DocumentBuilder, cannot build xml parser", e);
+      }
+    }
+
     reader.set(xml);
     try {
-      return expression.evaluate(inputSource, qname);
+      return expression.evaluate(builder.parse(inputSource), qname);
     } catch (XPathExpressionException e) {
       throw new RuntimeException("Invalid XML document: " + e.getMessage() + "\n" + xml, e);
+    } catch (Exception e) {
+      throw new RuntimeException("Error loading expression '" + oldPath + "'", e);
     }
+  }
+
+  private void initializeDocumentBuilderFactory() throws ParserConfigurationException {
+    dbf.setFeature(SAX_FEATURE_PREFIX + EXTERNAL_GENERAL_ENTITIES_FEATURE, false);
+    dbf.setFeature(SAX_FEATURE_PREFIX + EXTERNAL_PARAMETER_ENTITIES_FEATURE, false);
   }
 
   public Boolean evalBoolean(String xml, String path) throws XPathExpressionException {
@@ -154,7 +182,7 @@ public class UDFXPathUtil {
         return 0;
       }
       // Bound skip by beginning and end of the source
-      long n = Math.min(length - next, ns);
+      int n = (int) Math.min(length - next, ns);
       n = Math.max(-next, n);
       next += n;
       return n;
@@ -174,7 +202,7 @@ public class UDFXPathUtil {
     @Override
     public void mark(int readAheadLimit) throws IOException {
       if (readAheadLimit < 0) {
-        throw new IllegalArgumentException("Read-ahead limit < 0");
+        throw new SparkIllegalArgumentException("_LEGACY_ERROR_TEMP_3200");
       }
       ensureOpen();
       mark = next;

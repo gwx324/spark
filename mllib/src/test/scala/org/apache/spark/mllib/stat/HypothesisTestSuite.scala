@@ -29,6 +29,7 @@ import org.apache.spark.mllib.regression.LabeledPoint
 import org.apache.spark.mllib.stat.test.ChiSqTest
 import org.apache.spark.mllib.util.MLlibTestSparkContext
 import org.apache.spark.mllib.util.TestingUtils._
+import org.apache.spark.util.ArrayImplicits._
 
 class HypothesisTestSuite extends SparkFunSuite with MLlibTestSparkContext {
 
@@ -140,19 +141,22 @@ class HypothesisTestSuite extends SparkFunSuite with MLlibTestSparkContext {
     val sparseData = Array(
       new LabeledPoint(0.0, Vectors.sparse(numCols, Seq((100, 2.0)))),
       new LabeledPoint(0.1, Vectors.sparse(numCols, Seq((200, 1.0)))))
-    val chi = Statistics.chiSqTest(sc.parallelize(sparseData))
-    assert(chi.size === numCols)
+    val chi = Statistics.chiSqTest(sc.parallelize(sparseData.toImmutableArraySeq))
+    assert(chi.length === numCols)
     assert(chi(1000) != null) // SPARK-3087
 
     // Detect continuous features or labels
+    val tooManyCategories: Int = 100000
+    assert(tooManyCategories > ChiSqTest.maxCategories, "This unit test requires that " +
+      "tooManyCategories be large enough to cause ChiSqTest to throw an exception.")
     val random = new Random(11L)
-    val continuousLabel =
-      Seq.fill(100000)(LabeledPoint(random.nextDouble(), Vectors.dense(random.nextInt(2))))
+    val continuousLabel = Seq.fill(tooManyCategories)(
+      LabeledPoint(random.nextDouble(), Vectors.dense(random.nextInt(2))))
     intercept[SparkException] {
       Statistics.chiSqTest(sc.parallelize(continuousLabel, 2))
     }
-    val continuousFeature =
-      Seq.fill(100000)(LabeledPoint(random.nextInt(2), Vectors.dense(random.nextDouble())))
+    val continuousFeature = Seq.fill(tooManyCategories)(
+      LabeledPoint(random.nextInt(2), Vectors.dense(random.nextDouble())))
     intercept[SparkException] {
       Statistics.chiSqTest(sc.parallelize(continuousFeature, 2))
     }
@@ -172,9 +176,9 @@ class HypothesisTestSuite extends SparkFunSuite with MLlibTestSparkContext {
 
     // Sample data from the distributions and parallelize it
     val n = 100000
-    val sampledNorm = sc.parallelize(stdNormalDist.sample(n), 10)
-    val sampledExp = sc.parallelize(expDist.sample(n), 10)
-    val sampledUnif = sc.parallelize(unifDist.sample(n), 10)
+    val sampledNorm = sc.parallelize(stdNormalDist.sample(n).toImmutableArraySeq, 10)
+    val sampledExp = sc.parallelize(expDist.sample(n).toImmutableArraySeq, 10)
+    val sampledUnif = sc.parallelize(unifDist.sample(n).toImmutableArraySeq, 10)
 
     // Use a apache math commons local KS test to verify calculations
     val ksTest = new KolmogorovSmirnovTest()
@@ -248,7 +252,7 @@ class HypothesisTestSuite extends SparkFunSuite with MLlibTestSparkContext {
         -0.461702683149641, -0.555540910137444, -0.0201353678515895, -0.150382224136063,
         -0.628126755843964, 1.32322085193283, -1.52135057001199, -0.437427868856691,
         0.970577579543399, 0.0282226444247749, -0.0857821886527593, 0.389214404984942
-      )
+      ).toImmutableArraySeq
     )
     val rCompResult = Statistics.kolmogorovSmirnovTest(rData, "norm", 0, 1)
     assert(rCompResult.statistic ~== rKSStat relTol 1e-4)

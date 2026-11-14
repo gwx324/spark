@@ -52,4 +52,48 @@ class RpcAddressSuite extends SparkFunSuite {
     val address = RpcAddress("1.2.3.4", 1234)
     assert(address.toSparkURL == "spark://1.2.3.4:1234")
   }
+
+  test("SPARK-39468: IPv6 hostPort") {
+    val address = RpcAddress("::1", 1234)
+    assert(address.host == "[::1]")
+    assert(address.port == 1234)
+    assert(address.hostPort == "[::1]:1234")
+  }
+
+  test("SPARK-39468: IPv6 fromSparkURL") {
+    val address = RpcAddress.fromSparkURL("spark://[::1]:1234")
+    assert(address.host == "[::1]")
+    assert(address.port == 1234)
+  }
+
+  test("SPARK-39468: IPv6 toSparkURL") {
+    val address = RpcAddress("::1", 1234)
+    assert(address.toSparkURL == "spark://[::1]:1234")
+  }
+
+  test("SPARK-42173: Consistent Sparse Mapping") {
+    val address = RpcAddress("::0:1", 1234)
+    assert(address.toSparkURL == "spark://[::1]:1234")
+  }
+
+  test("SPARK-42173: Consistent Sparse Mapping trailing 0s") {
+    val address = RpcAddress("2600::", 1234)
+    assert(address.toSparkURL == "spark://[2600::]:1234")
+  }
+
+  test("SPARK-58719: Normalize hexadecimal IPv6 addresses") {
+    val expected = RpcAddress("2001:db8::dead:beef", 1234)
+    Seq(
+      "2001:db8::dead:beef",
+      "[2001:db8::dead:beef]",
+      "2001:0DB8:0000::DEAD:BEEF",
+      "[2001:0DB8:0000::DEAD:BEEF]").foreach { host =>
+      val address = RpcAddress(host, 1234)
+      assert(address.host == "[2001:db8::dead:beef]")
+      assert(address.hostPort == "[2001:db8::dead:beef]:1234")
+      assert(address.toSparkURL == "spark://[2001:db8::dead:beef]:1234")
+      assert(address == expected)
+      assert(RpcAddress.fromSparkURL(address.toSparkURL) == address)
+    }
+  }
 }

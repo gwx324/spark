@@ -1,0 +1,462 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.shuffle.sort
+
+import java.lang.{Long => JLong}
+
+import org.mockito.Mockito.when
+import org.scalatestplus.mockito.MockitoSugar
+
+import org.apache.spark._
+import org.apache.spark.executor.{ShuffleWriteMetrics, TaskMetrics}
+import org.apache.spark.internal.config.{MEMORY_FRACTION, MEMORY_OFFHEAP_ENABLED, SHUFFLE_SORT_USE_RADIXSORT}
+import org.apache.spark.internal.config.Tests._
+import org.apache.spark.memory._
+import org.apache.spark.unsafe.{Platform, UnsafeAlignedOffset}
+import org.apache.spark.unsafe.memory.MemoryBlock
+
+class ShuffleExternalSorterSuite extends SparkFunSuite with LocalSparkContext with MockitoSugar {
+
+  test("nested spill should be no-op") {
+    val conf = new SparkConf()
+      .setMaster("local[1]")
+      .setAppName("ShuffleExternalSorterSuite")
+      .set(IS_TESTING, true)
+      .set(TEST_MEMORY, 1600L)
+      .set(MEMORY_FRACTION, 0.9999)
+
+    sc = new SparkContext(conf)
+
+    val memoryManager = UnifiedMemoryManager(conf, 1)
+
+    var shouldAllocate = false
+
+    // Mock `TaskMemoryManager` to allocate free memory when `shouldAllocate` is true.
+    // This will trigger a nested spill and expose issues if we don't handle this case properly.
+    val taskMemoryManager = new TaskMemoryManager(memoryManager, 0) {
+      override def acquireExecutionMemory(required: Long, consumer: MemoryConsumer): Long = {
+        // ExecutionMemoryPool.acquireMemory will wait until there are 400 bytes for a task to use.
+        // So we leave 400 bytes for the task.
+        if (shouldAllocate &&
+          memoryManager.maxHeapMemory - memoryManager.executionMemoryUsed > 400) {
+          val acquireExecutionMemoryMethod =
+            memoryManager.getClass.getMethods.filter(_.getName == "acquireExecutionMemory").head
+          acquireExecutionMemoryMethod
+            .invoke(
+              memoryManager,
+              JLong.valueOf(
+                memoryManager.maxHeapMemory - memoryManager.executionMemoryUsed - 400),
+              JLong.valueOf(1L), // taskAttemptId
+              MemoryMode.ON_HEAP)
+            .asInstanceOf[java.lang.Long]
+        }
+        super.acquireExecutionMemory(required, consumer)
+      }
+    }
+    val taskContext = mock[TaskContext]
+    val taskMetrics = new TaskMetrics
+    when(taskContext.taskMetrics()).thenReturn(taskMetrics)
+    val sorter = new ShuffleExternalSorter(
+      taskMemoryManager,
+      sc.env.blockManager,
+      taskContext,
+      100, // initialSize - This will require ShuffleInMemorySorter to acquire at least 800 bytes
+      1, // numPartitions
+      conf,
+      new ShuffleWriteMetrics)
+    val inMemSorter = {
+      val field = sorter.getClass.getDeclaredField("inMemSorter")
+      field.setAccessible(true)
+      field.get(sorter).asInstanceOf[ShuffleInMemorySorter]
+    }
+    // Allocate memory to make the next "insertRecord" call triggers a spill.
+    val bytes = new Array[Byte](1)
+    while (inMemSorter.hasSpaceForAnotherRecord) {
+      sorter.insertRecord(bytes, Platform.BYTE_ARRAY_OFFSET, 1, 0)
+    }
+
+    // This flag will make the mocked TaskMemoryManager acquire free memory released by spill to
+    // trigger a nested spill.
+    shouldAllocate = true
+
+    // Should throw `SparkOutOfMemoryError` as there is no enough memory: `ShuffleInMemorySorter`
+    // will try to acquire 800 bytes but there are only 400 bytes available.
+    //
+    // Before the fix, a nested spill may use a released page and this causes two tasks access the
+    // same memory page. When a task reads memory written by another task, many types of failures
+    // may happen. Here are some examples we have seen:
+    //
+    // - JVM crash. (This is easy to reproduce in the unit test as we fill newly allocated and
+    //   deallocated memory with 0xa5 and 0x5a bytes which usually points to an invalid memory
+    //   address)
+    // - java.lang.IllegalArgumentException: Comparison method violates its general contract!
+    // - java.lang.NullPointerException
+    //     at org.apache.spark.memory.TaskMemoryManager.getPage(TaskMemoryManager.java:384)
+    // - java.lang.UnsupportedOperationException: Cannot grow BufferHolder by size -536870912
+    //     because the size after growing exceeds size limitation 2147483632
+    checkError(
+      exception = intercept[SparkOutOfMemoryError] {
+        sorter.insertRecord(bytes, Platform.BYTE_ARRAY_OFFSET, 1, 0)
+      },
+      condition = "UNABLE_TO_ACQUIRE_MEMORY",
+      parameters = Map("requestedBytes" -> "800", "receivedBytes" -> "400"))
+  }
+
+  test("cleanupResources should handle lazily reset pointer array") {
+    val conf = new SparkConf()
+      .setMaster("local[1]")
+      .setAppName("ShuffleExternalSorterSuite")
+      .set(IS_TESTING, true)
+      .set(TEST_MEMORY, 10L * 1024 * 1024)
+      .set(MEMORY_FRACTION, 0.9999)
+      .set(MEMORY_OFFHEAP_ENABLED, false)
+
+    sc = new SparkContext(conf)
+    val memoryManager = UnifiedMemoryManager(conf, 1)
+    val taskMemoryManager = new TaskMemoryManager(memoryManager, 0)
+    val taskContext = mock[TaskContext]
+    val taskMetrics = new TaskMetrics
+    when(taskContext.taskMetrics()).thenReturn(taskMetrics)
+    val sorter = new ShuffleExternalSorter(
+      taskMemoryManager,
+      sc.env.blockManager,
+      taskContext,
+      100,
+      1,
+      conf,
+      new ShuffleWriteMetrics)
+    val bytes = new Array[Byte](1)
+    sorter.insertRecord(bytes, Platform.BYTE_ARRAY_OFFSET, 1, 0)
+    sorter.spill()
+
+    val inMemSorterField = sorter.getClass.getDeclaredField("inMemSorter")
+    inMemSorterField.setAccessible(true)
+    val arrayField = classOf[ShuffleInMemorySorter].getDeclaredField("array")
+    arrayField.setAccessible(true)
+    assert(
+      arrayField.get(inMemSorterField.get(sorter)) == null,
+      "spill should leave the pointer array unallocated until the next insert")
+
+    sorter.cleanupResources()
+  }
+
+  test("spill should report all released memory") {
+    val conf = new SparkConf()
+      .setMaster("local[1]")
+      .setAppName("ShuffleExternalSorterSuite")
+      .set(IS_TESTING, true)
+      .set(TEST_MEMORY, 10L * 1024 * 1024)
+      .set(MEMORY_FRACTION, 0.9999)
+
+    sc = new SparkContext(conf)
+    val memoryManager = UnifiedMemoryManager(conf, 1)
+    val taskMemoryManager = new TaskMemoryManager(memoryManager, 0)
+    val taskContext = mock[TaskContext]
+    val taskMetrics = new TaskMetrics
+    when(taskContext.taskMetrics()).thenReturn(taskMetrics)
+    val sorter = new ShuffleExternalSorter(
+      taskMemoryManager,
+      sc.env.blockManager,
+      taskContext,
+      100,
+      1,
+      conf,
+      new ShuffleWriteMetrics)
+
+    sorter.insertRecord(new Array[Byte](1), Platform.BYTE_ARRAY_OFFSET, 1, 0)
+    val usedBeforeSpill = sorter.getUsed
+    val spillSize = sorter.spill(Long.MaxValue, sorter)
+
+    assert(spillSize === usedBeforeSpill - sorter.getUsed)
+    assert(taskMetrics.memoryBytesSpilled === spillSize)
+    sorter.cleanupResources()
+  }
+
+  test("minimum pointer array should grow before the first insert") {
+    val conf = new SparkConf()
+      .setMaster("local[1]")
+      .setAppName("ShuffleExternalSorterSuite")
+      .set(IS_TESTING, true)
+      .set(TEST_MEMORY, 10L * 1024 * 1024)
+      .set(MEMORY_FRACTION, 0.9999)
+
+    sc = new SparkContext(conf)
+    val memoryManager = UnifiedMemoryManager(conf, 1)
+
+    Seq(false, true).foreach { useRadixSort =>
+      conf.set(SHUFFLE_SORT_USE_RADIXSORT, useRadixSort)
+      val taskMemoryManager = new TaskMemoryManager(memoryManager, 0)
+      val taskContext = mock[TaskContext]
+      when(taskContext.taskMetrics()).thenReturn(new TaskMetrics)
+      val sorter = new ShuffleExternalSorter(
+        taskMemoryManager,
+        sc.env.blockManager,
+        taskContext,
+        1,
+        1,
+        conf,
+        new ShuffleWriteMetrics)
+
+      sorter.insertRecord(new Array[Byte](1), Platform.BYTE_ARRAY_OFFSET, 1, 0)
+      assert(sorter.closeAndGetSpills().length === 1)
+      sorter.cleanupResources()
+    }
+  }
+
+  test("successful growth allocation after spill should be reused") {
+    val conf = new SparkConf()
+      .setMaster("local[1]")
+      .setAppName("ShuffleExternalSorterSuite")
+      .set(IS_TESTING, true)
+      .set(TEST_MEMORY, 10L * 1024 * 1024)
+      .set(MEMORY_FRACTION, 0.9999)
+
+    sc = new SparkContext(conf)
+    val memoryManager = UnifiedMemoryManager(conf, 1)
+
+    Seq(false, true).foreach { useRadixSort =>
+      conf.set(SHUFFLE_SORT_USE_RADIXSORT, useRadixSort)
+      val initialSize = 1
+      var spillOnGrowthAllocation = false
+      val taskMemoryManager = new TaskMemoryManager(memoryManager, 0) {
+        override def allocatePage(size: Long, consumer: MemoryConsumer): MemoryBlock = {
+          if (spillOnGrowthAllocation) {
+            spillOnGrowthAllocation = false
+            consumer.spill(size, consumer)
+          }
+          super.allocatePage(size, consumer)
+        }
+      }
+      val taskContext = mock[TaskContext]
+      when(taskContext.taskMetrics()).thenReturn(new TaskMetrics)
+      val sorter = new ShuffleExternalSorter(
+        taskMemoryManager,
+        sc.env.blockManager,
+        taskContext,
+        initialSize,
+        1,
+        conf,
+        new ShuffleWriteMetrics)
+
+      sorter.insertRecord(new Array[Byte](1), Platform.BYTE_ARRAY_OFFSET, 1, 0)
+      spillOnGrowthAllocation = true
+      sorter.insertRecord(new Array[Byte](1), Platform.BYTE_ARRAY_OFFSET, 1, 0)
+
+      val inMemSorterField = sorter.getClass.getDeclaredField("inMemSorter")
+      inMemSorterField.setAccessible(true)
+      val inMemSorter = inMemSorterField.get(sorter).asInstanceOf[ShuffleInMemorySorter]
+      assert(
+        inMemSorter.getMemoryUsage === inMemSorter.getInitialSizeWithUsableCapacity * 2L * 8L)
+      assert(sorter.closeAndGetSpills().length === 2)
+      sorter.cleanupResources()
+    }
+  }
+
+  test("pointer fallback should preserve spill failures") {
+    val conf = new SparkConf()
+      .setMaster("local[1]")
+      .setAppName("ShuffleExternalSorterSuite")
+      .set(IS_TESTING, true)
+      .set(TEST_MEMORY, 10L * 1024 * 1024)
+      .set(MEMORY_FRACTION, 0.9999)
+
+    sc = new SparkContext(conf)
+    val memoryManager = UnifiedMemoryManager(conf, 1)
+    var spillOnGrowthAllocation = false
+    var failNextPageAllocation = false
+    val taskMemoryManager = new TaskMemoryManager(memoryManager, 0) {
+      override def allocatePage(size: Long, consumer: MemoryConsumer): MemoryBlock = {
+        if (spillOnGrowthAllocation) {
+          spillOnGrowthAllocation = false
+          consumer.spill(size, consumer)
+          failNextPageAllocation = true
+        } else if (failNextPageAllocation) {
+          failNextPageAllocation = false
+          val parameters = new java.util.HashMap[String, String]()
+          parameters.put("consumerToSpill", "test")
+          parameters.put("message", "test failure")
+          // scalastyle:off throwerror
+          throw new SparkOutOfMemoryError("SPILL_OUT_OF_MEMORY", parameters)
+          // scalastyle:on throwerror
+        }
+        super.allocatePage(size, consumer)
+      }
+    }
+    val taskContext = mock[TaskContext]
+    when(taskContext.taskMetrics()).thenReturn(new TaskMetrics)
+    val sorter = new ShuffleExternalSorter(
+      taskMemoryManager,
+      sc.env.blockManager,
+      taskContext,
+      1,
+      1,
+      conf,
+      new ShuffleWriteMetrics)
+
+    sorter.insertRecord(new Array[Byte](1), Platform.BYTE_ARRAY_OFFSET, 1, 0)
+    spillOnGrowthAllocation = true
+    val error = intercept[SparkOutOfMemoryError] {
+      sorter.insertRecord(new Array[Byte](1), Platform.BYTE_ARRAY_OFFSET, 1, 0)
+    }
+    assert(error.getCondition === "SPILL_OUT_OF_MEMORY")
+    sorter.cleanupResources()
+  }
+
+  test("pointer growth should preserve spill failures") {
+    val conf = new SparkConf()
+      .setMaster("local[1]")
+      .setAppName("ShuffleExternalSorterSuite")
+      .set(IS_TESTING, true)
+      .set(TEST_MEMORY, 10L * 1024 * 1024)
+      .set(MEMORY_FRACTION, 0.9999)
+
+    sc = new SparkContext(conf)
+    val memoryManager = UnifiedMemoryManager(conf, 1)
+    var failGrowthAfterSpill = false
+    val taskMemoryManager = new TaskMemoryManager(memoryManager, 0) {
+      override def allocatePage(size: Long, consumer: MemoryConsumer): MemoryBlock = {
+        if (failGrowthAfterSpill) {
+          failGrowthAfterSpill = false
+          consumer.spill(size, consumer)
+          val parameters = new java.util.HashMap[String, String]()
+          parameters.put("consumerToSpill", "test")
+          parameters.put("message", "test failure")
+          // scalastyle:off throwerror
+          throw new SparkOutOfMemoryError("SPILL_OUT_OF_MEMORY", parameters)
+          // scalastyle:on throwerror
+        }
+        super.allocatePage(size, consumer)
+      }
+    }
+    val taskContext = mock[TaskContext]
+    when(taskContext.taskMetrics()).thenReturn(new TaskMetrics)
+    val sorter = new ShuffleExternalSorter(
+      taskMemoryManager,
+      sc.env.blockManager,
+      taskContext,
+      1,
+      1,
+      conf,
+      new ShuffleWriteMetrics)
+
+    sorter.insertRecord(new Array[Byte](1), Platform.BYTE_ARRAY_OFFSET, 1, 0)
+    failGrowthAfterSpill = true
+    val error = intercept[SparkOutOfMemoryError] {
+      sorter.insertRecord(new Array[Byte](1), Platform.BYTE_ARRAY_OFFSET, 1, 0)
+    }
+    assert(error.getCondition === "SPILL_OUT_OF_MEMORY")
+    sorter.cleanupResources()
+  }
+
+  test("data page allocation spill should restore the pointer array") {
+    val conf = new SparkConf()
+      .setMaster("local[1]")
+      .setAppName("ShuffleExternalSorterSuite")
+      .set(IS_TESTING, true)
+      .set(TEST_MEMORY, 10L * 1024 * 1024)
+      .set(MEMORY_FRACTION, 0.9999)
+
+    sc = new SparkContext(conf)
+
+    val memoryManager = UnifiedMemoryManager(conf, 1)
+    var spillOnNextPageAllocation = false
+    val taskMemoryManager = new TaskMemoryManager(memoryManager, 0) {
+      override def allocatePage(size: Long, consumer: MemoryConsumer): MemoryBlock = {
+        if (spillOnNextPageAllocation) {
+          spillOnNextPageAllocation = false
+          consumer.spill(size, consumer)
+        }
+        super.allocatePage(size, consumer)
+      }
+    }
+    val taskContext = mock[TaskContext]
+    when(taskContext.taskMetrics()).thenReturn(new TaskMetrics)
+    val sorter = new ShuffleExternalSorter(
+      taskMemoryManager,
+      sc.env.blockManager,
+      taskContext,
+      100,
+      1,
+      conf,
+      new ShuffleWriteMetrics)
+
+    sorter.insertRecord(new Array[Byte](1), Platform.BYTE_ARRAY_OFFSET, 1, 0)
+    spillOnNextPageAllocation = true
+    val bytes =
+      new Array[Byte]((taskMemoryManager.pageSizeBytes() - UnsafeAlignedOffset.getUaoSize).toInt)
+    sorter.insertRecord(bytes, Platform.BYTE_ARRAY_OFFSET, bytes.length, 0)
+
+    assert(sorter.closeAndGetSpills().length === 2)
+    sorter.cleanupResources()
+  }
+
+  test("data page allocation should not starve pointer restoration") {
+    val numCores = 4
+    val conf = new SparkConf(false)
+      .setMaster(s"local[$numCores]")
+      .setAppName("ShuffleExternalSorterSuite")
+      .set(TEST_MEMORY, 512L * 1024 * 1024)
+      .set(MEMORY_FRACTION, 0.01)
+
+    sc = new SparkContext(conf)
+    val memoryManager = UnifiedMemoryManager(conf, numCores)
+    val taskMemoryManager = new TaskMemoryManager(memoryManager, 0)
+    val taskContext = mock[TaskContext]
+    when(taskContext.taskMetrics()).thenReturn(new TaskMetrics)
+    val sorter = new ShuffleExternalSorter(
+      taskMemoryManager,
+      sc.env.blockManager,
+      taskContext,
+      4096,
+      1,
+      conf,
+      new ShuffleWriteMetrics)
+
+    val pageSize = taskMemoryManager.pageSizeBytes()
+    assert(memoryManager.maxHeapMemory / numCores < pageSize)
+    val firstRecord = new Array[Byte]((pageSize - UnsafeAlignedOffset.getUaoSize).toInt)
+    sorter.insertRecord(firstRecord, Platform.BYTE_ARRAY_OFFSET, firstRecord.length, 0)
+
+    val acquireExecutionMemoryMethod =
+      memoryManager.getClass.getMethods.filter(_.getName == "acquireExecutionMemory").head
+    val releaseExecutionMemoryMethod =
+      memoryManager.getClass.getMethods.filter(_.getName == "releaseExecutionMemory").head
+    (1L until numCores.toLong).foreach { taskAttemptId =>
+      val granted = acquireExecutionMemoryMethod.invoke(
+        memoryManager,
+        JLong.valueOf(1L),
+        JLong.valueOf(taskAttemptId),
+        MemoryMode.ON_HEAP).asInstanceOf[JLong]
+      assert(granted === 1L)
+    }
+
+    try {
+      sorter.insertRecord(new Array[Byte](1), Platform.BYTE_ARRAY_OFFSET, 1, 0)
+    } finally {
+      sorter.cleanupResources()
+      (1L until numCores.toLong).foreach { taskAttemptId =>
+        releaseExecutionMemoryMethod.invoke(
+          memoryManager,
+          JLong.valueOf(1L),
+          JLong.valueOf(taskAttemptId),
+          MemoryMode.ON_HEAP)
+      }
+      assert(taskMemoryManager.cleanUpAllAllocatedMemory() === 0L)
+    }
+  }
+}

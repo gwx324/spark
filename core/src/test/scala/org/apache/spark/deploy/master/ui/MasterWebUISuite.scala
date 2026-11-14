@@ -18,25 +18,29 @@
 package org.apache.spark.deploy.master.ui
 
 import java.io.DataOutputStream
-import java.net.{HttpURLConnection, URL}
+import java.net.{HttpURLConnection, URI}
 import java.nio.charset.StandardCharsets
 import java.util.Date
 
 import scala.collection.mutable.HashMap
+import scala.io.Source
 
-import org.mockito.Mockito.{mock, times, verify, when}
-import org.scalatest.BeforeAndAfterAll
+import jakarta.servlet.http.HttpServletResponse.SC_FORBIDDEN
+import org.mockito.Mockito.{mock, never, times, verify, when}
 
 import org.apache.spark.{SecurityManager, SparkConf, SparkFunSuite}
-import org.apache.spark.deploy.DeployMessages.{KillDriverResponse, RequestKillDriver}
+import org.apache.spark.deploy.DeployMessages.{DecommissionWorkersOnHosts, KillDriverResponse, MasterStateResponse, RequestApplicationHold, RequestKillDriver, RequestMasterState}
 import org.apache.spark.deploy.DeployTestUtils._
 import org.apache.spark.deploy.master._
+import org.apache.spark.internal.config.DECOMMISSION_ENABLED
+import org.apache.spark.internal.config.UI.MASTER_UI_DECOMMISSION_ALLOW_MODE
 import org.apache.spark.rpc.{RpcEndpointRef, RpcEnv}
+import org.apache.spark.util.Utils
 
+class MasterWebUISuite extends SparkFunSuite {
+  import MasterWebUISuite._
 
-class MasterWebUISuite extends SparkFunSuite with BeforeAndAfterAll {
-
-  val conf = new SparkConf
+  val conf = new SparkConf().set(DECOMMISSION_ENABLED, true)
   val securityMgr = new SecurityManager(conf)
   val rpcEnv = mock(classOf[RpcEnv])
   val master = mock(classOf[Master])
@@ -47,14 +51,17 @@ class MasterWebUISuite extends SparkFunSuite with BeforeAndAfterAll {
   when(master.self).thenReturn(masterEndpointRef)
   val masterWebUI = new MasterWebUI(master, 0)
 
-  override def beforeAll() {
+  override def beforeAll(): Unit = {
     super.beforeAll()
     masterWebUI.bind()
   }
 
-  override def afterAll() {
-    masterWebUI.stop()
-    super.afterAll()
+  override def afterAll(): Unit = {
+    try {
+      masterWebUI.stop()
+    } finally {
+      super.afterAll()
+    }
   }
 
   test("kill application") {
@@ -65,8 +72,9 @@ class MasterWebUISuite extends SparkFunSuite with BeforeAndAfterAll {
 
     when(master.idToApp).thenReturn(HashMap[String, ApplicationInfo]((activeApp.id, activeApp)))
 
-    val url = s"http://localhost:${masterWebUI.boundPort}/app/kill/"
-    val body = convPostDataToString(Map(("id", activeApp.id), ("terminate", "true")))
+    val url = s"http://${Utils.localHostNameForURI()}:${masterWebUI.boundPort}/app/kill/"
+    val body = convPostDataToString(
+      Map(("id", activeApp.id), ("terminate", "true"), ("csrfToken", masterWebUI.csrfToken)))
     val conn = sendHttpRequest(url, "POST", body)
     conn.getResponseCode
 
@@ -76,8 +84,9 @@ class MasterWebUISuite extends SparkFunSuite with BeforeAndAfterAll {
 
   test("kill driver") {
     val activeDriverId = "driver-0"
-    val url = s"http://localhost:${masterWebUI.boundPort}/driver/kill/"
-    val body = convPostDataToString(Map(("id", activeDriverId), ("terminate", "true")))
+    val url = s"http://${Utils.localHostNameForURI()}:${masterWebUI.boundPort}/driver/kill/"
+    val body = convPostDataToString(
+      Map(("id", activeDriverId), ("terminate", "true"), ("csrfToken", masterWebUI.csrfToken)))
     val conn = sendHttpRequest(url, "POST", body)
     conn.getResponseCode
 
@@ -85,20 +94,170 @@ class MasterWebUISuite extends SparkFunSuite with BeforeAndAfterAll {
     verify(masterEndpointRef, times(1)).ask[KillDriverResponse](RequestKillDriver(activeDriverId))
   }
 
-  private def convPostDataToString(data: Map[String, String]): String = {
+  test("state-changing master UI endpoints reject a request without the CSRF token") {
+    val appDesc = createAppDesc()
+    val activeApp = new ApplicationInfo(
+      new Date().getTime, "app-notoken", appDesc, new Date(), null, Int.MaxValue)
+    when(master.idToApp).thenReturn(HashMap[String, ApplicationInfo]((activeApp.id, activeApp)))
+
+    // Without the token the request is refused before the handler runs, so the master is
+    // never asked to remove the application.
+    Seq("app/kill", "driver/kill", "app/hold", "app/resume").foreach { path =>
+      val url = s"http://${Utils.localHostNameForURI()}:${masterWebUI.boundPort}/$path/"
+      val body = convPostDataToString(Map(("id", activeApp.id), ("terminate", "true")))
+      assert(sendHttpRequest(url, "POST", body).getResponseCode === SC_FORBIDDEN,
+        s"$path accepted a request with no CSRF token")
+    }
+    verify(master, never()).removeApplication(activeApp, ApplicationState.KILLED)
+  }
+
+  test("state-changing master UI endpoints reject a wrong CSRF token") {
+    val url = s"http://${Utils.localHostNameForURI()}:${masterWebUI.boundPort}/app/kill/"
+    val body = convPostDataToString(
+      Map(("id", "app-wrongtoken"), ("terminate", "true"), ("csrfToken", "not-the-token")))
+    assert(sendHttpRequest(url, "POST", body).getResponseCode === SC_FORBIDDEN)
+  }
+
+  test("the master page embeds the CSRF token in the forms it renders") {
+    val app = new ApplicationInfo(
+      new Date().getTime, "app-render", createAppDesc(), new Date(), null, Int.MaxValue)
+    app.holdSupported = true
+    val state = new MasterStateResponse(
+      "host", 8080, None, Array.empty, Array(app), Array.empty,
+      Array.empty, Array.empty, RecoveryState.ALIVE)
+    when(masterEndpointRef.askSync[MasterStateResponse](RequestMasterState)).thenReturn(state)
+    val url = s"http://${Utils.localHostNameForURI()}:${masterWebUI.boundPort}/"
+    val rendered =
+      Source.fromInputStream(sendHttpRequest(url, "GET", "").getInputStream).mkString
+
+    // Both the kill and the hold form carry it, so the browser can drive them.
+    assert(rendered.contains("app/kill/") && rendered.contains("app/hold/"))
+    assert(rendered.split("csrfToken").length - 1 >= 2, "expected a token in each form")
+    assert(rendered.contains(masterWebUI.csrfToken))
+  }
+
+  private def testHoldApplication(action: String, hold: Boolean): Unit = {
+    val appId = s"app-$action"
+    val url = s"http://${Utils.localHostNameForURI()}:${masterWebUI.boundPort}/app/$action/"
+    val conn = sendHttpRequest(url, "POST",
+      convPostDataToString(Map(("id", appId), ("csrfToken", masterWebUI.csrfToken))))
+    conn.getResponseCode
+
+    // Verify that the master was asked to forward the request to the driver of that application
+    verify(masterEndpointRef, times(1)).send(RequestApplicationHold(appId, hold))
+  }
+
+  test("SPARK-59061: hold application") {
+    testHoldApplication("hold", hold = true)
+  }
+
+  test("SPARK-59061: resume application") {
+    testHoldApplication("resume", hold = false)
+  }
+
+  test("SPARK-59061: offer the hold or the resume control, but never both") {
+    val app = new ApplicationInfo(
+      new Date().getTime, "app-hold", createAppDesc(), new Date(), null, Int.MaxValue)
+    val state = new MasterStateResponse(
+      "host", 8080, None, Array.empty, Array(app), Array.empty,
+      Array.empty, Array.empty, RecoveryState.ALIVE)
+    when(masterEndpointRef.askSync[MasterStateResponse](RequestMasterState)).thenReturn(state)
+    val url = s"http://${Utils.localHostNameForURI()}:${masterWebUI.boundPort}/"
+    def render(): String =
+      Source.fromInputStream(sendHttpRequest(url, "GET", "").getInputStream).mkString
+
+    // Nothing is offered until the driver reports the application as holdable.
+    assert(!render().contains("app/hold/") && !render().contains("app/resume/"))
+
+    app.holdSupported = true
+    var result = render()
+    assert(result.contains("app/hold/") && !result.contains("app/resume/"))
+
+    app.held = true
+    result = render()
+    assert(result.contains("app/resume/") && !result.contains("app/hold/"))
+    assert(result.contains("(held)"))
+  }
+
+  test("SPARK-59061: offer no control for an application that disabled holding") {
+    val app = new ApplicationInfo(new Date().getTime, "app-opted-out",
+      createAppDesc().copy(holdEnabled = false), new Date(), null, Int.MaxValue)
+    val state = new MasterStateResponse(
+      "host", 8080, None, Array.empty, Array(app), Array.empty,
+      Array.empty, Array.empty, RecoveryState.ALIVE)
+    when(masterEndpointRef.askSync[MasterStateResponse](RequestMasterState)).thenReturn(state)
+    val url = s"http://${Utils.localHostNameForURI()}:${masterWebUI.boundPort}/"
+
+    // The application can be held (e.g. programmatically) and its status stays visible, but the
+    // Master UI offers no control for it.
+    app.holdSupported = true
+    app.held = true
+    val result =
+      Source.fromInputStream(sendHttpRequest(url, "GET", "").getInputStream).mkString
+    assert(!result.contains("app/hold/") && !result.contains("app/resume/"))
+    assert(result.contains("(held)"))
+  }
+
+  private def testKillWorkers(hostnames: Seq[String]): Unit = {
+    val url = s"http://${Utils.localHostNameForURI()}:${masterWebUI.boundPort}/workers/kill/"
+    val body = convPostDataToString(hostnames.map(("host", _)))
+    val conn = sendHttpRequest(url, "POST", body)
+    // The master is mocked here, so cannot assert on the response code
+    conn.getResponseCode
+    // Verify that master was asked to kill driver with the correct id
+    verify(masterEndpointRef).askSync[Integer](DecommissionWorkersOnHosts(hostnames))
+  }
+
+  test("Kill one host") {
+    testKillWorkers(Seq(s"${Utils.localHostNameForURI()}"))
+  }
+
+  test("Kill multiple hosts") {
+    testKillWorkers(Seq("noSuchHost", "LocalHost"))
+  }
+
+  test("SPARK-57509: /workers/kill responds with 403 Forbidden when the request is not allowed") {
+    val denyConf = new SparkConf()
+      .set(DECOMMISSION_ENABLED, true)
+      .set(MASTER_UI_DECOMMISSION_ALLOW_MODE.key, "DENY")
+    val denyMaster = mock(classOf[Master])
+    when(denyMaster.securityMgr).thenReturn(new SecurityManager(denyConf))
+    when(denyMaster.conf).thenReturn(denyConf)
+    when(denyMaster.rpcEnv).thenReturn(rpcEnv)
+    when(denyMaster.self).thenReturn(masterEndpointRef)
+    val denyWebUI = new MasterWebUI(denyMaster, 0)
+    try {
+      denyWebUI.bind()
+      val url = s"http://${Utils.localHostNameForURI()}:${denyWebUI.boundPort}/workers/kill/"
+      val body = convPostDataToString(Seq(("host", Utils.localHostNameForURI())))
+      assert(sendHttpRequest(url, "POST", body).getResponseCode === SC_FORBIDDEN)
+    } finally {
+      denyWebUI.stop()
+    }
+  }
+}
+
+object MasterWebUISuite {
+  private[ui] def convPostDataToString(data: Seq[(String, String)]): String = {
     (for ((name, value) <- data) yield s"$name=$value").mkString("&")
+  }
+
+  private[ui] def convPostDataToString(data: Map[String, String]): String = {
+    convPostDataToString(data.toSeq)
   }
 
   /**
    * Send an HTTP request to the given URL using the method and the body specified.
    * Return the connection object.
    */
-  private def sendHttpRequest(
+  private[ui] def sendHttpRequest(
       url: String,
       method: String,
-      body: String = ""): HttpURLConnection = {
-    val conn = new URL(url).openConnection().asInstanceOf[HttpURLConnection]
+      body: String = "",
+      headers: Seq[(String, String)] = Nil): HttpURLConnection = {
+    val conn = new URI(url).toURL.openConnection().asInstanceOf[HttpURLConnection]
     conn.setRequestMethod(method)
+    headers.foreach { case (k, v) => conn.setRequestProperty(k, v) }
     if (body.nonEmpty) {
       conn.setDoOutput(true)
       conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")

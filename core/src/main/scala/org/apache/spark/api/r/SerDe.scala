@@ -21,20 +21,28 @@ import java.io.{DataInputStream, DataOutputStream}
 import java.nio.charset.StandardCharsets
 import java.sql.{Date, Time, Timestamp}
 
-import scala.collection.JavaConverters._
-import scala.collection.mutable.WrappedArray
+import scala.collection.mutable
+
+import org.apache.spark.util.collection.Utils
 
 /**
  * Utility functions to serialize, deserialize objects to / from R
  */
 private[spark] object SerDe {
-  type ReadObject = (DataInputStream, Char) => Object
-  type WriteObject = (DataOutputStream, Object) => Boolean
+  type SQLReadObject = (DataInputStream, Char) => Object
+  type SQLWriteObject = (DataOutputStream, Object) => Boolean
 
-  var sqlSerDe: (ReadObject, WriteObject) = _
+  private[this] var sqlReadObject: SQLReadObject = _
+  private[this] var sqlWriteObject: SQLWriteObject = _
 
-  def registerSqlSerDe(sqlSerDe: (ReadObject, WriteObject)): Unit = {
-    this.sqlSerDe = sqlSerDe
+  def setSQLReadObject(value: SQLReadObject): this.type = {
+    sqlReadObject = value
+    this
+  }
+
+  def setSQLWriteObject(value: SQLWriteObject): this.type = {
+    sqlWriteObject = value
+    this
   }
 
   // Type mapping from R to Java
@@ -56,32 +64,33 @@ private[spark] object SerDe {
     dis.readByte().toChar
   }
 
-  def readObject(dis: DataInputStream): Object = {
+  def readObject(dis: DataInputStream, jvmObjectTracker: JVMObjectTracker): Object = {
     val dataType = readObjectType(dis)
-    readTypedObject(dis, dataType)
+    readTypedObject(dis, dataType, jvmObjectTracker)
   }
 
   def readTypedObject(
       dis: DataInputStream,
-      dataType: Char): Object = {
+      dataType: Char,
+      jvmObjectTracker: JVMObjectTracker): Object = {
     dataType match {
       case 'n' => null
-      case 'i' => new java.lang.Integer(readInt(dis))
-      case 'd' => new java.lang.Double(readDouble(dis))
-      case 'b' => new java.lang.Boolean(readBoolean(dis))
+      case 'i' => java.lang.Integer.valueOf(readInt(dis))
+      case 'd' => java.lang.Double.valueOf(readDouble(dis))
+      case 'b' => java.lang.Boolean.valueOf(readBoolean(dis))
       case 'c' => readString(dis)
-      case 'e' => readMap(dis)
+      case 'e' => readMap(dis, jvmObjectTracker)
       case 'r' => readBytes(dis)
-      case 'a' => readArray(dis)
-      case 'l' => readList(dis)
+      case 'a' => readArray(dis, jvmObjectTracker)
+      case 'l' => readList(dis, jvmObjectTracker)
       case 'D' => readDate(dis)
       case 't' => readTime(dis)
-      case 'j' => JVMObjectTracker.getObject(readString(dis))
+      case 'j' => jvmObjectTracker(JVMObjectId(readString(dis)))
       case _ =>
-        if (sqlSerDe == null || sqlSerDe._1 == null) {
+        if (sqlReadObject == null) {
           throw new IllegalArgumentException (s"Invalid type $dataType")
         } else {
-          val obj = (sqlSerDe._1)(dis, dataType)
+          val obj = sqlReadObject(dis, dataType)
           if (obj == null) {
             throw new IllegalArgumentException (s"Invalid type $dataType")
           } else {
@@ -94,7 +103,7 @@ private[spark] object SerDe {
   def readBytes(in: DataInputStream): Array[Byte] = {
     val len = readInt(in)
     val out = new Array[Byte](len)
-    val bytesRead = in.readFully(out)
+    in.readFully(out)
     out
   }
 
@@ -120,20 +129,28 @@ private[spark] object SerDe {
   }
 
   def readBoolean(in: DataInputStream): Boolean = {
-    val intVal = in.readInt()
-    if (intVal == 0) false else true
+    in.readInt() != 0
   }
 
   def readDate(in: DataInputStream): Date = {
-    Date.valueOf(readString(in))
+    val inStr = readString(in)
+    if (inStr == "NA") {
+      null
+    } else {
+      Date.valueOf(inStr)
+    }
   }
 
   def readTime(in: DataInputStream): Timestamp = {
     val seconds = in.readDouble()
-    val sec = Math.floor(seconds).toLong
-    val t = new Timestamp(sec * 1000L)
-    t.setNanos(((seconds - sec) * 1e9).toInt)
-    t
+    if (java.lang.Double.isNaN(seconds)) {
+      null
+    } else {
+      val sec = Math.floor(seconds).toLong
+      val t = new Timestamp(sec * 1000L)
+      t.setNanos(((seconds - sec) * 1e9).toInt)
+      t
+    }
   }
 
   def readBytesArr(in: DataInputStream): Array[Array[Byte]] = {
@@ -162,28 +179,28 @@ private[spark] object SerDe {
   }
 
   // All elements of an array must be of the same type
-  def readArray(dis: DataInputStream): Array[_] = {
+  def readArray(dis: DataInputStream, jvmObjectTracker: JVMObjectTracker): Array[_] = {
     val arrType = readObjectType(dis)
     arrType match {
       case 'i' => readIntArr(dis)
       case 'c' => readStringArr(dis)
       case 'd' => readDoubleArr(dis)
       case 'b' => readBooleanArr(dis)
-      case 'j' => readStringArr(dis).map(x => JVMObjectTracker.getObject(x))
+      case 'j' => readStringArr(dis).map(x => jvmObjectTracker(JVMObjectId(x)))
       case 'r' => readBytesArr(dis)
       case 'a' =>
         val len = readInt(dis)
-        (0 until len).map(_ => readArray(dis)).toArray
+        (0 until len).map(_ => readArray(dis, jvmObjectTracker)).toArray
       case 'l' =>
         val len = readInt(dis)
-        (0 until len).map(_ => readList(dis)).toArray
+        (0 until len).map(_ => readList(dis, jvmObjectTracker)).toArray
       case _ =>
-        if (sqlSerDe == null || sqlSerDe._1 == null) {
+        if (sqlReadObject == null) {
           throw new IllegalArgumentException (s"Invalid array type $arrType")
         } else {
           val len = readInt(dis)
           (0 until len).map { _ =>
-            val obj = (sqlSerDe._1)(dis, arrType)
+            val obj = sqlReadObject(dis, arrType)
             if (obj == null) {
               throw new IllegalArgumentException (s"Invalid array type $arrType")
             } else {
@@ -196,19 +213,21 @@ private[spark] object SerDe {
 
   // Each element of a list can be of different type. They are all represented
   // as Object on JVM side
-  def readList(dis: DataInputStream): Array[Object] = {
+  def readList(dis: DataInputStream, jvmObjectTracker: JVMObjectTracker): Array[Object] = {
     val len = readInt(dis)
-    (0 until len).map(_ => readObject(dis)).toArray
+    (0 until len).map(_ => readObject(dis, jvmObjectTracker)).toArray
   }
 
-  def readMap(in: DataInputStream): java.util.Map[Object, Object] = {
+  def readMap(
+      in: DataInputStream,
+      jvmObjectTracker: JVMObjectTracker): java.util.Map[Object, Object] = {
     val len = readInt(in)
     if (len > 0) {
       // Keys is an array of String
-      val keys = readArray(in).asInstanceOf[Array[Object]]
-      val values = readList(in)
+      val keys = readArray(in, jvmObjectTracker).asInstanceOf[Array[Object]]
+      val values = readList(in, jvmObjectTracker)
 
-      keys.zip(values).toMap.asJava
+      Utils.toJavaMap(keys, values)
     } else {
       new java.util.HashMap[Object, Object]()
     }
@@ -253,7 +272,11 @@ private[spark] object SerDe {
     }
   }
 
-  private def writeKeyValue(dos: DataOutputStream, key: Object, value: Object): Unit = {
+  private def writeKeyValue(
+      dos: DataOutputStream,
+      key: Object,
+      value: Object,
+      jvmObjectTracker: JVMObjectTracker): Unit = {
     if (key == null) {
       throw new IllegalArgumentException("Key in map can't be null.")
     } else if (!key.isInstanceOf[String]) {
@@ -261,22 +284,20 @@ private[spark] object SerDe {
     }
 
     writeString(dos, key.asInstanceOf[String])
-    writeObject(dos, value)
+    writeObject(dos, value, jvmObjectTracker)
   }
 
-  def writeObject(dos: DataOutputStream, obj: Object): Unit = {
+  def writeObject(dos: DataOutputStream, obj: Object, jvmObjectTracker: JVMObjectTracker): Unit = {
     if (obj == null) {
       writeType(dos, "void")
     } else {
       // Convert ArrayType collected from DataFrame to Java array
       // Collected data of ArrayType from a DataFrame is observed to be of
-      // type "scala.collection.mutable.WrappedArray"
-      val value =
-        if (obj.isInstanceOf[WrappedArray[_]]) {
-          obj.asInstanceOf[WrappedArray[_]].toArray
-        } else {
-          obj
-        }
+      // type "scala.collection.mutable.ArraySeq"
+      val value = obj match {
+        case wa: mutable.ArraySeq[_] => wa.array
+        case other => other
+      }
 
       value match {
         case v: java.lang.Character =>
@@ -354,38 +375,40 @@ private[spark] object SerDe {
         case v: Array[Object] =>
           writeType(dos, "list")
           writeInt(dos, v.length)
-          v.foreach(elem => writeObject(dos, elem))
+          v.foreach(elem => writeObject(dos, elem, jvmObjectTracker))
 
         // Handle Properties
         // This must be above the case java.util.Map below.
         // (Properties implements Map<Object,Object> and will be serialized as map otherwise)
         case v: java.util.Properties =>
           writeType(dos, "jobj")
-          writeJObj(dos, value)
+          writeJObj(dos, value, jvmObjectTracker)
 
         // Handle map
         case v: java.util.Map[_, _] =>
           writeType(dos, "map")
           writeInt(dos, v.size)
           val iter = v.entrySet.iterator
-          while(iter.hasNext) {
+          while (iter.hasNext) {
             val entry = iter.next
             val key = entry.getKey
             val value = entry.getValue
 
-            writeKeyValue(dos, key.asInstanceOf[Object], value.asInstanceOf[Object])
+            writeKeyValue(
+              dos, key.asInstanceOf[Object], value.asInstanceOf[Object], jvmObjectTracker)
           }
         case v: scala.collection.Map[_, _] =>
           writeType(dos, "map")
           writeInt(dos, v.size)
-          v.foreach { case (key, value) =>
-            writeKeyValue(dos, key.asInstanceOf[Object], value.asInstanceOf[Object])
+          v.foreach { case (k1, v1) =>
+            writeKeyValue(dos, k1.asInstanceOf[Object], v1.asInstanceOf[Object], jvmObjectTracker)
           }
 
         case _ =>
-          if (sqlSerDe == null || sqlSerDe._2 == null || !(sqlSerDe._2)(dos, value)) {
+          val sqlWriteSucceeded = sqlWriteObject != null && sqlWriteObject(dos, value)
+          if (!sqlWriteSucceeded) {
             writeType(dos, "jobj")
-            writeJObj(dos, value)
+            writeJObj(dos, value, jvmObjectTracker)
           }
       }
     }
@@ -428,9 +451,9 @@ private[spark] object SerDe {
     out.write(value)
   }
 
-  def writeJObj(out: DataOutputStream, value: Object): Unit = {
-    val objId = JVMObjectTracker.put(value)
-    writeString(out, objId)
+  def writeJObj(out: DataOutputStream, value: Object, jvmObjectTracker: JVMObjectTracker): Unit = {
+    val JVMObjectId(id) = jvmObjectTracker.addAndGetId(value)
+    writeString(out, id)
   }
 
   def writeIntArr(out: DataOutputStream, value: Array[Int]): Unit = {

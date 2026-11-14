@@ -19,8 +19,7 @@ package org.apache.spark.ml.tree
 
 import org.apache.spark.ml.linalg.Vector
 import org.apache.spark.mllib.tree.impurity.ImpurityCalculator
-import org.apache.spark.mllib.tree.model.{ImpurityStats,
-  InformationGainStats => OldInformationGainStats, Node => OldNode, Predict => OldPredict}
+import org.apache.spark.mllib.tree.model.{ImpurityStats, InformationGainStats => OldInformationGainStats, Node => OldNode, Predict => OldPredict}
 
 /**
  * Decision tree node interface.
@@ -45,6 +44,9 @@ sealed abstract class Node extends Serializable {
 
   /** Recursive prediction helper method */
   private[ml] def predictImpl(features: Vector): LeafNode
+
+  /** Recursive prediction helper method */
+  private[ml] def predictBinned(binned: Array[Int], splits: Array[Array[Split]]): LeafNode
 
   /**
    * Get the number of nodes in tree below this node, including leaf nodes.
@@ -76,9 +78,34 @@ sealed abstract class Node extends Serializable {
    */
   private[ml] def maxSplitFeatureIndex(): Int
 
-  /** Returns a deep copy of the subtree rooted at this node. */
-  private[tree] def deepCopy(): Node
+  private[ml] def computeStats: NodeStats = {
+    var numDescendants = 0
+    var subtreeDepth = 0
+    var numLeaves = 0
+
+    def visit(node: Node, depth: Int): Unit = {
+      if (depth > 0) {
+        numDescendants += 1
+      }
+      subtreeDepth = math.max(subtreeDepth, depth)
+      node match {
+        case _: LeafNode =>
+          numLeaves += 1
+        case internal: InternalNode =>
+          visit(internal.leftChild, depth + 1)
+          visit(internal.rightChild, depth + 1)
+      }
+    }
+
+    visit(this, 0)
+    NodeStats(subtreeDepth, numDescendants, numLeaves)
+  }
 }
+
+private[ml] case class NodeStats(
+    subtreeDepth: Int,
+    numDescendants: Int,
+    numLeaves: Int)
 
 private[ml] object Node {
 
@@ -86,22 +113,39 @@ private[ml] object Node {
    * Create a new Node from the old Node format, recursively creating child nodes as needed.
    */
   def fromOld(oldNode: OldNode, categoricalFeatures: Map[Int, Int]): Node = {
+    fromOld(oldNode, categoricalFeatures, 0)._1
+  }
+
+  private def fromOld(
+      oldNode: OldNode,
+      categoricalFeatures: Map[Int, Int],
+      nextLeafIndex: Int): (Node, Int) = {
     if (oldNode.isLeaf) {
       // TODO: Once the implementation has been moved to this API, then include sufficient
       //       statistics here.
-      new LeafNode(prediction = oldNode.predict.predict,
-        impurity = oldNode.impurity, impurityStats = null)
+      (new LeafNode(prediction = oldNode.predict.predict,
+        impurity = oldNode.impurity, impurityStats = null, leafIndex = nextLeafIndex),
+        nextLeafIndex + 1)
     } else {
       val gain = if (oldNode.stats.nonEmpty) {
         oldNode.stats.get.gain
       } else {
         0.0
       }
-      new InternalNode(prediction = oldNode.predict.predict, impurity = oldNode.impurity,
-        gain = gain, leftChild = fromOld(oldNode.leftNode.get, categoricalFeatures),
-        rightChild = fromOld(oldNode.rightNode.get, categoricalFeatures),
-        split = Split.fromOld(oldNode.split.get, categoricalFeatures), impurityStats = null)
+      val (leftChild, nextIndex) =
+        fromOld(oldNode.leftNode.get, categoricalFeatures, nextLeafIndex)
+      val (rightChild, endIndex) =
+        fromOld(oldNode.rightNode.get, categoricalFeatures, nextIndex)
+      (new InternalNode(prediction = oldNode.predict.predict, impurity = oldNode.impurity,
+        gain = gain, leftChild = leftChild, rightChild = rightChild,
+        split = Split.fromOld(oldNode.split.get, categoricalFeatures), impurityStats = null),
+        endIndex)
     }
+  }
+
+  // A dummy node used for ml connect only
+  val dummyNode: Node = {
+    new LeafNode(0.0, 0.0, ImpurityCalculator.getCalculator("gini", Array.empty, 0))
   }
 }
 
@@ -113,17 +157,22 @@ private[ml] object Node {
 class LeafNode private[ml] (
     override val prediction: Double,
     override val impurity: Double,
-    override private[ml] val impurityStats: ImpurityCalculator) extends Node {
+    override private[ml] val impurityStats: ImpurityCalculator,
+    private[tree] val leafIndex: Int = -1) extends Node {
 
   override def toString: String =
     s"LeafNode(prediction = $prediction, impurity = $impurity)"
 
   override private[ml] def predictImpl(features: Vector): LeafNode = this
 
+  override private[ml] def predictBinned(
+      binned: Array[Int],
+      splits: Array[Array[Split]]): LeafNode = this
+
   override private[tree] def numDescendants: Int = 0
 
   override private[tree] def subtreeToString(indentFactor: Int = 0): String = {
-    val prefix: String = " " * indentFactor
+    val prefix: String = " ".repeat(indentFactor)
     prefix + s"Predict: $prediction\n"
   }
 
@@ -135,10 +184,6 @@ class LeafNode private[ml] (
   }
 
   override private[ml] def maxSplitFeatureIndex(): Int = -1
-
-  override private[tree] def deepCopy(): Node = {
-    new LeafNode(prediction, impurity, impurityStats)
-  }
 }
 
 /**
@@ -168,11 +213,32 @@ class InternalNode private[ml] (
   }
 
   override private[ml] def predictImpl(features: Vector): LeafNode = {
-    if (split.shouldGoLeft(features)) {
-      leftChild.predictImpl(features)
-    } else {
-      rightChild.predictImpl(features)
+    var node: Node = this
+    while (node.isInstanceOf[InternalNode]) {
+      val n = node.asInstanceOf[InternalNode]
+      if (n.split.shouldGoLeft(features)) {
+        node = n.leftChild
+      } else {
+        node = n.rightChild
+      }
     }
+    node.asInstanceOf[LeafNode]
+  }
+
+  override private[ml] def predictBinned(
+      binned: Array[Int],
+      splits: Array[Array[Split]]): LeafNode = {
+    var node: Node = this
+    while (node.isInstanceOf[InternalNode]) {
+      val n = node.asInstanceOf[InternalNode]
+      val i = n.split.featureIndex
+      if (n.split.shouldGoLeft(binned(i), splits(i))) {
+        node = n.leftChild
+      } else {
+        node = n.rightChild
+      }
+    }
+    node.asInstanceOf[LeafNode]
   }
 
   override private[tree] def numDescendants: Int = {
@@ -180,7 +246,7 @@ class InternalNode private[ml] (
   }
 
   override private[tree] def subtreeToString(indentFactor: Int = 0): String = {
-    val prefix: String = " " * indentFactor
+    val prefix: String = " ".repeat(indentFactor)
     prefix + s"If (${InternalNode.splitToString(split, left = true)})\n" +
       leftChild.subtreeToString(indentFactor + 1) +
       prefix + s"Else (${InternalNode.splitToString(split, left = false)})\n" +
@@ -205,11 +271,6 @@ class InternalNode private[ml] (
   override private[ml] def maxSplitFeatureIndex(): Int = {
     math.max(split.featureIndex,
       math.max(leftChild.maxSplitFeatureIndex(), rightChild.maxSplitFeatureIndex()))
-  }
-
-  override private[tree] def deepCopy(): Node = {
-    new InternalNode(prediction, impurity, gain, leftChild.deepCopy(), rightChild.deepCopy(),
-      split, impurityStats)
   }
 }
 
@@ -266,24 +327,38 @@ private[tree] class LearningNode(
     var isLeaf: Boolean,
     var stats: ImpurityStats) extends Serializable {
 
+  def toNode: Node = toNode(prune = true)
+
   /**
    * Convert this [[LearningNode]] to a regular [[Node]], and recurse on any children.
    */
-  def toNode: Node = {
-    if (leftChild.nonEmpty) {
-      assert(rightChild.nonEmpty && split.nonEmpty && stats != null,
+  def toNode(prune: Boolean = true): Node = {
+    toNode(prune, 0)._1
+  }
+
+  private def toNode(prune: Boolean, nextLeafIndex: Int): (Node, Int) = {
+    if (!leftChild.isEmpty || !rightChild.isEmpty) {
+      assert(leftChild.nonEmpty && rightChild.nonEmpty && split.nonEmpty && stats != null,
         "Unknown error during Decision Tree learning.  Could not convert LearningNode to Node.")
-      new InternalNode(stats.impurityCalculator.predict, stats.impurity, stats.gain,
-        leftChild.get.toNode, rightChild.get.toNode, split.get, stats.impurityCalculator)
+      val (leftNode, nextIndex) = leftChild.get.toNode(prune, nextLeafIndex)
+      val (rightNode, endIndex) = rightChild.get.toNode(prune, nextIndex)
+      (leftNode, rightNode) match {
+        case (l: LeafNode, r: LeafNode) if prune && l.prediction == r.prediction =>
+          (new LeafNode(l.prediction, stats.impurity, stats.impurityCalculator, nextLeafIndex),
+            nextLeafIndex + 1)
+        case (l, r) =>
+          (new InternalNode(stats.impurityCalculator.predict, stats.impurity, stats.gain,
+            l, r, split.get, stats.impurityCalculator), endIndex)
+      }
     } else {
       if (stats.valid) {
-        new LeafNode(stats.impurityCalculator.predict, stats.impurity,
-          stats.impurityCalculator)
+        (new LeafNode(stats.impurityCalculator.predict, stats.impurity,
+          stats.impurityCalculator, nextLeafIndex), nextLeafIndex + 1)
       } else {
         // Here we want to keep same behavior with the old mllib.DecisionTreeModel
-        new LeafNode(stats.impurityCalculator.predict, -1.0, stats.impurityCalculator)
+        (new LeafNode(stats.impurityCalculator.predict, -1.0, stats.impurityCalculator,
+          nextLeafIndex), nextLeafIndex + 1)
       }
-
     }
   }
 
@@ -302,27 +377,27 @@ private[tree] class LearningNode(
    *         [[org.apache.spark.ml.tree.impl.RandomForest.findBestSplits()]].
    */
   def predictImpl(binnedFeatures: Array[Int], splits: Array[Array[Split]]): Int = {
-    if (this.isLeaf || this.split.isEmpty) {
-      this.id
-    } else {
-      val split = this.split.get
+    var node = this
+    while (!node.isLeaf && node.split.nonEmpty) {
+      val split = node.split.get
       val featureIndex = split.featureIndex
       val splitLeft = split.shouldGoLeft(binnedFeatures(featureIndex), splits(featureIndex))
-      if (this.leftChild.isEmpty) {
+      if (node.leftChild.isEmpty) {
         // Not yet split. Return next layer of nodes to train
         if (splitLeft) {
-          LearningNode.leftChildIndex(this.id)
+          return LearningNode.leftChildIndex(node.id)
         } else {
-          LearningNode.rightChildIndex(this.id)
+          return LearningNode.rightChildIndex(node.id)
         }
       } else {
         if (splitLeft) {
-          this.leftChild.get.predictImpl(binnedFeatures, splits)
+          node = node.leftChild.get
         } else {
-          this.rightChild.get.predictImpl(binnedFeatures, splits)
+          node = node.rightChild.get
         }
       }
     }
+    node.id
   }
 
 }
@@ -355,53 +430,12 @@ private[tree] object LearningNode {
   def rightChildIndex(nodeIndex: Int): Int = (nodeIndex << 1) + 1
 
   /**
-   * Get the parent index of the given node, or 0 if it is the root.
-   */
-  def parentIndex(nodeIndex: Int): Int = nodeIndex >> 1
-
-  /**
    * Return the level of a tree which the given node is in.
    */
   def indexToLevel(nodeIndex: Int): Int = if (nodeIndex == 0) {
     throw new IllegalArgumentException(s"0 is not a valid node index.")
   } else {
     java.lang.Integer.numberOfTrailingZeros(java.lang.Integer.highestOneBit(nodeIndex))
-  }
-
-  /**
-   * Returns true if this is a left child.
-   * Note: Returns false for the root.
-   */
-  def isLeftChild(nodeIndex: Int): Boolean = nodeIndex > 1 && nodeIndex % 2 == 0
-
-  /**
-   * Return the maximum number of nodes which can be in the given level of the tree.
-   * @param level  Level of tree (0 = root).
-   */
-  def maxNodesInLevel(level: Int): Int = 1 << level
-
-  /**
-   * Return the index of the first node in the given level.
-   * @param level  Level of tree (0 = root).
-   */
-  def startIndexInLevel(level: Int): Int = 1 << level
-
-  /**
-   * Traces down from a root node to get the node with the given node index.
-   * This assumes the node exists.
-   */
-  def getNode(nodeIndex: Int, rootNode: LearningNode): LearningNode = {
-    var tmpNode: LearningNode = rootNode
-    var levelsToGo = indexToLevel(nodeIndex)
-    while (levelsToGo > 0) {
-      if ((nodeIndex & (1 << levelsToGo - 1)) == 0) {
-        tmpNode = tmpNode.leftChild.get
-      } else {
-        tmpNode = tmpNode.rightChild.get
-      }
-      levelsToGo -= 1
-    }
-    tmpNode
   }
 
 }

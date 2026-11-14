@@ -17,10 +17,13 @@
 
 package org.apache.spark.sql.execution.datasources.parquet
 
+import java.time.ZoneId
+
 import org.apache.parquet.io.api.{GroupConverter, RecordMaterializer}
 import org.apache.parquet.schema.MessageType
 
-import org.apache.spark.sql.catalyst.expressions.UnsafeRow
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.util.RebaseDateTime.RebaseSpec
 import org.apache.spark.sql.types.StructType
 
 /**
@@ -29,15 +32,31 @@ import org.apache.spark.sql.types.StructType
  * @param parquetSchema Parquet schema of the records to be read
  * @param catalystSchema Catalyst schema of the rows to be constructed
  * @param schemaConverter A Parquet-Catalyst schema converter that helps initializing row converters
+ * @param convertTz the optional time zone to convert to int96 data
+ * @param datetimeRebaseSpec the specification of rebasing date/timestamp from Julian to Proleptic
+ *                           Gregorian calendar: mode + optional original time zone
+ * @param int96RebaseSpec the specification of rebasing INT96 timestamp from Julian to Proleptic
+ *                        Gregorian calendar
  */
 private[parquet] class ParquetRecordMaterializer(
-    parquetSchema: MessageType, catalystSchema: StructType, schemaConverter: ParquetSchemaConverter)
-  extends RecordMaterializer[UnsafeRow] {
+    parquetSchema: MessageType,
+    catalystSchema: StructType,
+    schemaConverter: ParquetToSparkSchemaConverter,
+    convertTz: Option[ZoneId],
+    datetimeRebaseSpec: RebaseSpec,
+    int96RebaseSpec: RebaseSpec)
+  extends RecordMaterializer[InternalRow] {
 
-  private val rootConverter =
-    new ParquetRowConverter(schemaConverter, parquetSchema, catalystSchema, NoopUpdater)
+  private val rootConverter = new ParquetRowConverter(
+    schemaConverter,
+    parquetSchema,
+    catalystSchema,
+    convertTz,
+    datetimeRebaseSpec,
+    int96RebaseSpec,
+    NoopUpdater)
 
-  override def getCurrentRecord: UnsafeRow = rootConverter.currentRecord
+  override def getCurrentRecord: InternalRow = rootConverter.currentRecord
 
   override def getRootConverter: GroupConverter = rootConverter
 }

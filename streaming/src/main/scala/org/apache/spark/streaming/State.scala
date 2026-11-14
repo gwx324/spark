@@ -17,8 +17,6 @@
 
 package org.apache.spark.streaming
 
-import scala.language.implicitConversions
-
 import org.apache.spark.annotation.Experimental
 
 /**
@@ -120,12 +118,12 @@ sealed abstract class State[S] {
   def isTimingOut(): Boolean
 
   /**
-   * Get the state as a [[scala.Option]]. It will be `Some(state)` if it exists, otherwise `None`.
+   * Get the state as a `scala.Option`. It will be `Some(state)` if it exists, otherwise `None`.
    */
-  @inline final def getOption(): Option[S] = if (exists) Some(get()) else None
+  @inline final def getOption(): Option[S] = if (exists()) Some(get()) else None
 
   @inline final override def toString(): String = {
-    getOption.map { _.toString }.getOrElse("<state not set>")
+    getOption().map { _.toString }.getOrElse("<state not set>")
   }
 }
 
@@ -178,7 +176,7 @@ private[streaming] class StateImpl[S] extends State[S] {
     removed
   }
 
-  /** Whether the state has been been updated */
+  /** Whether the state has been updated */
   def isUpdated(): Boolean = {
     updated
   }

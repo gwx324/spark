@@ -18,13 +18,22 @@
 package org.apache.spark
 
 import java.io.File
+import java.net.URI
+import java.util.Properties
 
 import scala.reflect.ClassTag
 
-import org.apache.hadoop.fs.Path
+import org.apache.hadoop.fs.{FileAlreadyExistsException, LocalFileSystem, Path, RawLocalFileSystem}
 
+import org.apache.spark.internal.config.CACHE_CHECKPOINT_PREFERRED_LOCS_EXPIRE_TIME
+import org.apache.spark.internal.config.UI._
+import org.apache.spark.io.CompressionCodec
+import org.apache.spark.memory.TaskMemoryManager
 import org.apache.spark.rdd._
+import org.apache.spark.shuffle.FetchFailedException
 import org.apache.spark.storage.{BlockId, StorageLevel, TestBlockId}
+import org.apache.spark.util.ArrayImplicits._
+import org.apache.spark.util.SerializableConfiguration
 import org.apache.spark.util.Utils
 
 trait RDDCheckpointTester { self: SparkFunSuite =>
@@ -112,7 +121,7 @@ trait RDDCheckpointTester { self: SparkFunSuite =>
    * RDDs partitions. So even if the parent RDD is checkpointed and its partitions changed,
    * the generated RDD will remember the partitions and therefore potentially the whole lineage.
    * This function should be called only those RDD whose partitions refer to parent RDD's
-   * partitions (i.e., do not call it on simple RDD like MappedRDD).
+   * partitions (i.e., do not call it on simple RDDs).
    *
    * @param op an operation to run on the RDD
    * @param reliableCheckpoint if true, use reliable checkpoints, otherwise use local checkpoints
@@ -164,10 +173,10 @@ trait RDDCheckpointTester { self: SparkFunSuite =>
    * upon checkpointing. Ignores the checkpointData field, which may grow when we checkpoint.
    */
   private def getSerializedSizes(rdd: RDD[_]): (Int, Int) = {
-    val rddSize = Utils.serialize(rdd).size
-    val rddCpDataSize = Utils.serialize(rdd.checkpointData).size
-    val rddPartitionSize = Utils.serialize(rdd.partitions).size
-    val rddDependenciesSize = Utils.serialize(rdd.dependencies).size
+    val rddSize = Utils.serialize(rdd).length
+    val rddCpDataSize = Utils.serialize(rdd.checkpointData).length
+    val rddPartitionSize = Utils.serialize(rdd.partitions).length
+    val rddDependenciesSize = Utils.serialize(rdd.dependencies).length
 
     // Print detailed size, helps in debugging
     logInfo("Serialized sizes of " + rdd +
@@ -189,7 +198,7 @@ trait RDDCheckpointTester { self: SparkFunSuite =>
   /**
    * Serialize and deserialize an object. This is useful to verify the objects
    * contents after deserialization (e.g., the contents of an RDD split after
-   * it is sent to a slave along with a task)
+   * it is sent to an executor along with a task)
    */
   protected def serializeDeserialize[T](obj: T): T = {
     val bytes = Utils.serialize(obj)
@@ -333,7 +342,7 @@ class CheckpointSuite extends SparkFunSuite with RDDCheckpointTester with LocalS
 
   runTest("ParallelCollectionRDD") { reliableCheckpoint: Boolean =>
     val parCollection = sc.makeRDD(1 to 4, 2)
-    val numPartitions = parCollection.partitions.size
+    val numPartitions = parCollection.partitions.length
     checkpoint(parCollection, reliableCheckpoint)
     assert(parCollection.dependencies === Nil)
     val result = parCollection.collect()
@@ -352,7 +361,7 @@ class CheckpointSuite extends SparkFunSuite with RDDCheckpointTester with LocalS
     val blockManager = SparkEnv.get.blockManager
     blockManager.putSingle(blockId, "test", StorageLevel.MEMORY_ONLY)
     val blockRDD = new BlockRDD[String](sc, Array(blockId))
-    val numPartitions = blockRDD.partitions.size
+    val numPartitions = blockRDD.partitions.length
     checkpoint(blockRDD, reliableCheckpoint)
     val result = blockRDD.collect()
     if (reliableCheckpoint) {
@@ -386,7 +395,7 @@ class CheckpointSuite extends SparkFunSuite with RDDCheckpointTester with LocalS
     // the parent RDD has been checkpointed and parent partitions have been changed.
     // Note that this test is very specific to the current implementation of CartesianRDD.
     val ones = sc.makeRDD(1 to 100, 10).map(x => x)
-    checkpoint(ones, reliableCheckpoint) // checkpoint that MappedRDD
+    checkpoint(ones, reliableCheckpoint)
     val cartesian = new CartesianRDD(sc, ones, ones)
     val splitBeforeCheckpoint =
       serializeDeserialize(cartesian.partitions.head.asInstanceOf[CartesianPartition])
@@ -409,7 +418,7 @@ class CheckpointSuite extends SparkFunSuite with RDDCheckpointTester with LocalS
     // Note that this test is very specific to the current implementation of
     // CoalescedRDDPartitions.
     val ones = sc.makeRDD(1 to 100, 10).map(x => x)
-    checkpoint(ones, reliableCheckpoint) // checkpoint that MappedRDD
+    checkpoint(ones, reliableCheckpoint)
     val coalesced = new CoalescedRDD(ones, 2)
     val splitBeforeCheckpoint =
       serializeDeserialize(coalesced.partitions.head.asInstanceOf[CoalescedRDDPartition])
@@ -470,14 +479,14 @@ class CheckpointSuite extends SparkFunSuite with RDDCheckpointTester with LocalS
       new PartitionerAwareUnionRDD[(Int, Int)](sc, Array(
         generateFatPairRDD(),
         rdd.map(x => (x % 2, 1)).reduceByKey(partitioner, _ + _)
-      ))
+      ).toImmutableArraySeq)
     }, reliableCheckpoint)
 
     testRDDPartitions(rdd => {
       new PartitionerAwareUnionRDD[(Int, Int)](sc, Array(
         generateFatPairRDD(),
         rdd.map(x => (x % 2, 1)).reduceByKey(partitioner, _ + _)
-      ))
+      ).toImmutableArraySeq)
     }, reliableCheckpoint)
 
     // Test that the PartitionerAwareUnionRDD updates parent partitions
@@ -486,7 +495,7 @@ class CheckpointSuite extends SparkFunSuite with RDDCheckpointTester with LocalS
     // implementation of PartitionerAwareUnionRDD.
     val pairRDD = generateFatPairRDD()
     checkpoint(pairRDD, reliableCheckpoint)
-    val unionRDD = new PartitionerAwareUnionRDD(sc, Array(pairRDD))
+    val unionRDD = new PartitionerAwareUnionRDD(sc, Seq(pairRDD))
     val partitionBeforeCheckpoint = serializeDeserialize(
       unionRDD.partitions.head.asInstanceOf[PartitionerAwareUnionRDDPartition])
     pairRDD.count()
@@ -500,17 +509,17 @@ class CheckpointSuite extends SparkFunSuite with RDDCheckpointTester with LocalS
   }
 
   runTest("CheckpointRDD with zero partitions") { reliableCheckpoint: Boolean =>
-    val rdd = new BlockRDD[Int](sc, Array[BlockId]())
-    assert(rdd.partitions.size === 0)
+    val rdd = new BlockRDD[Int](sc, Array.empty[BlockId])
+    assert(rdd.partitions.length === 0)
     assert(rdd.isCheckpointed === false)
     assert(rdd.isCheckpointedAndMaterialized === false)
     checkpoint(rdd, reliableCheckpoint)
     assert(rdd.isCheckpointed === false)
     assert(rdd.isCheckpointedAndMaterialized === false)
     assert(rdd.count() === 0)
-    assert(rdd.isCheckpointed === true)
-    assert(rdd.isCheckpointedAndMaterialized === true)
-    assert(rdd.partitions.size === 0)
+    assert(rdd.isCheckpointed)
+    assert(rdd.isCheckpointedAndMaterialized)
+    assert(rdd.partitions.length === 0)
   }
 
   runTest("checkpointAllMarkedAncestors") { reliableCheckpoint: Boolean =>
@@ -528,7 +537,7 @@ class CheckpointSuite extends SparkFunSuite with RDDCheckpointTester with LocalS
       checkpoint(rdd2, reliableCheckpoint)
       rdd2.count()
       assert(rdd1.isCheckpointed === checkpointAllMarkedAncestors)
-      assert(rdd2.isCheckpointed === true)
+      assert(rdd2.isCheckpointed)
     } finally {
       sc.setLocalProperty(RDD.CHECKPOINT_ALL_MARKED_ANCESTORS, null)
     }
@@ -578,5 +587,237 @@ object CheckpointSuite {
       Seq(first.asInstanceOf[RDD[(K, _)]], second.asInstanceOf[RDD[(K, _)]]),
       part
     ).asInstanceOf[RDD[(K, Array[Iterable[V]])]]
+  }
+}
+
+class CheckpointStorageSuite extends SparkFunSuite with LocalSparkContext {
+
+  test("checkpoint compression") {
+    withTempDir { checkpointDir =>
+      val conf = new SparkConf()
+        .set("spark.checkpoint.compress", "true")
+        .set(UI_ENABLED.key, "false")
+      sc = new SparkContext("local", "test", conf)
+      sc.setCheckpointDir(checkpointDir.toString)
+      val rdd = sc.makeRDD(1 to 20, numSlices = 1)
+      rdd.checkpoint()
+      assert(rdd.collect().toSeq === (1 to 20))
+
+      // Verify that RDD is checkpointed
+      assert(rdd.firstParent.isInstanceOf[ReliableCheckpointRDD[_]])
+
+      val checkpointPath = new Path(rdd.getCheckpointFile.get)
+      val fs = checkpointPath.getFileSystem(sc.hadoopConfiguration)
+      val checkpointFile =
+        fs.listStatus(checkpointPath).map(_.getPath).find(_.getName.startsWith("part-")).get
+
+      // Verify the checkpoint file is compressed, in other words, can be decompressed
+      val compressedInputStream = CompressionCodec.createCodec(conf)
+        .compressedInputStream(fs.open(checkpointFile))
+      try {
+        compressedInputStream.readAllBytes()
+      } finally {
+        compressedInputStream.close()
+      }
+
+      // Verify that the compressed content can be read back
+      assert(rdd.collect().toSeq === (1 to 20))
+    }
+  }
+
+  test("cache checkpoint preferred location") {
+    withTempDir { checkpointDir =>
+      val conf = new SparkConf()
+        .set(CACHE_CHECKPOINT_PREFERRED_LOCS_EXPIRE_TIME.key, "10")
+        .set(UI_ENABLED.key, "false")
+      sc = new SparkContext("local", "test", conf)
+      sc.setCheckpointDir(checkpointDir.toString)
+      val rdd = sc.makeRDD(1 to 20, numSlices = 1)
+      rdd.checkpoint()
+      assert(rdd.collect().toSeq === (1 to 20))
+
+      // Verify that RDD is checkpointed
+      assert(rdd.firstParent.isInstanceOf[ReliableCheckpointRDD[_]])
+      val checkpointedRDD = rdd.firstParent.asInstanceOf[ReliableCheckpointRDD[_]]
+      val partition = checkpointedRDD.partitions(0)
+      assert(!checkpointedRDD.cachedPreferredLocations.asMap.containsKey(partition))
+
+      val preferredLoc = checkpointedRDD.preferredLocations(partition)
+      assert(checkpointedRDD.cachedPreferredLocations.asMap.containsKey(partition))
+      assert(preferredLoc == checkpointedRDD.cachedPreferredLocations.get(partition))
+    }
+  }
+
+  test("SPARK-31484: checkpoint should not fail in retry") {
+    withTempDir { checkpointDir =>
+      val conf = new SparkConf()
+        .set(UI_ENABLED.key, "false")
+      sc = new SparkContext("local[1]", "test", conf)
+      sc.setCheckpointDir(checkpointDir.toString)
+      val rdd = sc.makeRDD(1 to 200, numSlices = 4).repartition(1).mapPartitions { iter =>
+        iter.map { i =>
+          if (i > 100 && TaskContext.get().stageAttemptNumber() == 0) {
+            // throw new SparkException("Make first attempt failed.")
+            // Throw FetchFailedException to explicitly trigger stage resubmission.
+            // A normal exception will only trigger task resubmission in the same stage.
+            throw new FetchFailedException(null, 0, 0L, 0, 0, "Fake")
+          } else {
+            i
+          }
+        }
+      }
+      rdd.checkpoint()
+      assert(rdd.collect().toSeq === (1 to 200))
+      // Verify that RDD is checkpointed
+      assert(rdd.firstParent.isInstanceOf[ReliableCheckpointRDD[_]])
+    }
+  }
+
+  test("SPARK-58750: checkpointing tolerates FileAlreadyExistsException on part file rename") {
+    withTempDir { checkpointDir =>
+      val conf = new SparkConf().set(UI_ENABLED.key, "false")
+      sc = new SparkContext("local", "test", conf)
+      sc.hadoopConfiguration.set(
+        "fs.faee.impl", classOf[FileAlreadyExistsRenameFileSystem].getName)
+      val broadcastedConf = SerializableConfiguration.broadcast(sc, sc.hadoopConfiguration)
+      val outputDir = s"faee://${checkpointDir.getAbsolutePath}"
+
+      def writePartition(taskAttemptId: Long, attemptNumber: Int): Unit = {
+        val ctx = new TaskContextImpl(0, 0, 0, taskAttemptId, attemptNumber, 1,
+          new TaskMemoryManager(sc.env.memoryManager, 0L), new Properties, sc.env.metricsSystem)
+        ReliableCheckpointRDD.writePartitionToCheckpointFile[Int](
+          outputDir, broadcastedConf)(ctx, Iterator(1, 2, 3))
+      }
+
+      writePartition(taskAttemptId = 0L, attemptNumber = 0)
+      // A speculative or retried attempt of the same partition finds the part file already
+      // committed by the first attempt. On filesystems that raise FileAlreadyExistsException
+      // from rename (S3A, ABFS), this must be treated as success rather than fail the task.
+      writePartition(taskAttemptId = 1L, attemptNumber = 1)
+
+      val fs = new Path(outputDir).getFileSystem(sc.hadoopConfiguration)
+      val fileNames = fs.listStatus(new Path(outputDir)).map(_.getPath.getName)
+      assert(fileNames === Array("part-00000"))
+    }
+  }
+
+  test("SPARK-48268: checkpoint directory via configuration") {
+    withTempDir { checkpointDir =>
+      val conf = new SparkConf()
+        .set("spark.checkpoint.dir", checkpointDir.toString)
+        .set(UI_ENABLED.key, "false")
+      sc = new SparkContext("local", "test", conf)
+      val parCollection = sc.makeRDD(1 to 4)
+      val flatMappedRDD = parCollection.flatMap(x => 1 to x)
+      flatMappedRDD.checkpoint()
+      assert(flatMappedRDD.dependencies.head.rdd === parCollection)
+      val result = flatMappedRDD.collect()
+      assert(flatMappedRDD.dependencies.head.rdd != parCollection)
+      assert(flatMappedRDD.collect() === result)
+    }
+  }
+
+  test("checkpoint() without a checkpoint directory") {
+    sc = new SparkContext("local", "test", new SparkConf().set(UI_ENABLED.key, "false"))
+    checkError(
+      exception = intercept[SparkException](sc.makeRDD(1 to 4).checkpoint()),
+      condition = "CHECKPOINT_DIRECTORY_NOT_SET",
+      sqlState = Some("55019"))
+  }
+
+  test("reading a checkpoint directory with a missing partition file") {
+    withTempDir { checkpointDir =>
+      sc = new SparkContext("local", "test", new SparkConf().set(UI_ENABLED.key, "false"))
+      sc.setCheckpointDir(checkpointDir.toString)
+      val rdd = sc.makeRDD(1 to 20, numSlices = 4)
+      rdd.checkpoint()
+      assert(rdd.collect().toSeq === (1 to 20))
+
+      // Drop a middle partition file so the remaining names are no longer part-00000..part-0000N.
+      val checkpointPath = new Path(rdd.getCheckpointFile.get)
+      val fs = checkpointPath.getFileSystem(sc.hadoopConfiguration)
+      assert(fs.delete(new Path(checkpointPath, "part-00001"), false))
+
+      val recovered = sc.checkpointFile[Int](checkpointPath.toString)
+      checkError(
+        exception = intercept[SparkException](recovered.partitions),
+        condition = "INVALID_CHECKPOINT_DIRECTORY",
+        sqlState = Some("58030"),
+        parameters = Map(
+          "path" -> checkpointPath.toString,
+          "expectedFileName" -> "part-00001",
+          "fileName" -> "part-00002"))
+    }
+  }
+
+  test("SPARK-58881: ignore non-numeric part files in a checkpoint directory") {
+    withTempDir { checkpointDir =>
+      sc = new SparkContext("local", "test", new SparkConf().set(UI_ENABLED.key, "false"))
+      sc.setCheckpointDir(checkpointDir.toString)
+      val rdd = sc.makeRDD(1 to 20, numSlices = 4)
+      rdd.checkpoint()
+      assert(rdd.collect().toSeq === (1 to 20))
+
+      val checkpointPath = new Path(rdd.getCheckpointFile.get)
+      val fs = checkpointPath.getFileSystem(sc.hadoopConfiguration)
+      Seq("part-00000.bak", "part-backup", "part-").foreach { fileName =>
+        fs.create(new Path(checkpointPath, fileName)).close()
+      }
+
+      val recovered = sc.checkpointFile[Int](checkpointPath.toString)
+      assert(recovered.getNumPartitions === 4)
+      assert(recovered.collect().toSeq === (1 to 20))
+    }
+  }
+
+  test("checkpoint path that cannot be created") {
+    withTempDir { checkpointDir =>
+      // MkdirsFailingFilesystem refuses to create the per-RDD directory and reports it the way
+      // HDFS and S3A do, by returning false rather than throwing.
+      val conf = new SparkConf()
+        .set("spark.hadoop.fs.file.impl", classOf[MkdirsFailingFilesystem].getName)
+        .set("spark.hadoop.fs.file.impl.disable.cache", "true")
+        .set(UI_ENABLED.key, "false")
+      sc = new SparkContext("local", "test", conf)
+      sc.setCheckpointDir(checkpointDir.toString)
+      val rdd = sc.makeRDD(1 to 4)
+      val rddPath = ReliableRDDCheckpointData.checkpointPath(sc, rdd.id).get
+
+      rdd.checkpoint()
+      checkError(
+        exception = intercept[SparkException](rdd.collect()),
+        condition = "FAILED_CREATE_CHECKPOINT_DIRECTORY",
+        sqlState = Some("58030"),
+        parameters = Map("path" -> rddPath.toString))
+    }
+  }
+}
+
+/**
+ * A filesystem that refuses to create a per-RDD checkpoint directory, returning false from
+ * `mkdirs` instead of throwing. `LocalFileSystem` throws `FileAlreadyExistsException` when the
+ * path is taken, while HDFS and S3A can report the failure through the return value, which is
+ * what `ReliableCheckpointRDD` checks.
+ */
+class MkdirsFailingFilesystem extends LocalFileSystem {
+  override def mkdirs(f: Path): Boolean = {
+    if (f.getName.startsWith("rdd-")) false else super.mkdirs(f)
+  }
+}
+
+/**
+ * A local filesystem mimicking how some Hadoop FileSystem implementations report a rename onto
+ * an existing file: by raising FileAlreadyExistsException (e.g. S3A since HADOOP-16721, ABFS)
+ * rather than returning false as HDFS does.
+ */
+class FileAlreadyExistsRenameFileSystem extends RawLocalFileSystem {
+  override def getUri: URI = URI.create("faee:///")
+
+  override def rename(src: Path, dst: Path): Boolean = {
+    if (exists(dst)) {
+      throw new FileAlreadyExistsException(
+        s"Failed to rename $src to $dst; destination file exists")
+    }
+    super.rename(src, dst)
   }
 }

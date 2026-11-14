@@ -17,6 +17,11 @@
 
 package org.apache.spark.sql.execution.datasources
 
+import org.apache.spark.sql.catalyst.expressions.{Attribute, SpecificInternalRow, UnsafeProjection}
+import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
+import org.apache.spark.sql.types.DataType
+import org.apache.spark.sql.util.SchemaUtils
+
 object BucketingUtils {
   // The file name of bucketed data should have 3 parts:
   //   1. some other information in the head of file name
@@ -30,10 +35,26 @@ object BucketingUtils {
   //   part-r-00000-2dd664f9-d2c4-4ffe-878f-c6c70c1fb0cb_00003.gz.parquet
   private val bucketedFileName = """.*_(\d+)(?:\..*)?$""".r
 
+  // The reserved option name for data source to write Hive-compatible bucketed table
+  val optionForHiveCompatibleBucketWrite = "__hive_compatible_bucketed_table_insertion__"
+
   def getBucketId(fileName: String): Option[Int] = fileName match {
     case bucketedFileName(bucketId) => Some(bucketId.toInt)
     case other => None
   }
+
+  // Given bucketColumn, numBuckets and value, returns the corresponding bucketId
+  def getBucketIdFromValue(bucketColumn: Attribute, numBuckets: Int, value: Any): Int = {
+    val mutableInternalRow = new SpecificInternalRow(Seq(bucketColumn.dataType))
+    mutableInternalRow.update(0, value)
+
+    val bucketIdGenerator = UnsafeProjection.create(
+      HashPartitioning(Seq(bucketColumn), numBuckets).partitionIdExpression :: Nil,
+      bucketColumn :: Nil)
+    bucketIdGenerator(mutableInternalRow).getInt(0)
+  }
+
+  def canBucketOn(dataType: DataType): Boolean = !SchemaUtils.hasNonUTF8BinaryCollation(dataType)
 
   def bucketIdToString(id: Int): String = f"_$id%05d"
 }

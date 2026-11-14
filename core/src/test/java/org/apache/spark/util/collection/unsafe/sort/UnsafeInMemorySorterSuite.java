@@ -20,8 +20,9 @@ package org.apache.spark.util.collection.unsafe.sort;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 
-import org.junit.Assert;
-import org.junit.Test;
+import org.apache.spark.unsafe.array.LongArray;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Test;
 
 import org.apache.spark.HashPartitioner;
 import org.apache.spark.SparkConf;
@@ -30,11 +31,10 @@ import org.apache.spark.memory.TestMemoryManager;
 import org.apache.spark.memory.TaskMemoryManager;
 import org.apache.spark.unsafe.Platform;
 import org.apache.spark.unsafe.memory.MemoryBlock;
+import org.apache.spark.internal.config.package$;
 
-import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.greaterThanOrEqualTo;
-import static org.hamcrest.Matchers.isIn;
-import static org.junit.Assert.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 
 public class UnsafeInMemorySorterSuite {
@@ -50,7 +50,8 @@ public class UnsafeInMemorySorterSuite {
   @Test
   public void testSortingEmptyInput() {
     final TaskMemoryManager memoryManager = new TaskMemoryManager(
-      new TestMemoryManager(new SparkConf().set("spark.memory.offHeap.enabled", "false")), 0);
+      new TestMemoryManager(
+        new SparkConf().set(package$.MODULE$.MEMORY_OFFHEAP_ENABLED(), false)), 0);
     final TestMemoryConsumer consumer = new TestMemoryConsumer(memoryManager);
     final UnsafeInMemorySorter sorter = new UnsafeInMemorySorter(consumer,
       memoryManager,
@@ -59,7 +60,7 @@ public class UnsafeInMemorySorterSuite {
       100,
       shouldUseRadixSort());
     final UnsafeSorterIterator iter = sorter.getSortedIterator();
-    Assert.assertFalse(iter.hasNext());
+    Assertions.assertFalse(iter.hasNext());
   }
 
   @Test
@@ -76,7 +77,8 @@ public class UnsafeInMemorySorterSuite {
       "Mango"
     };
     final TaskMemoryManager memoryManager = new TaskMemoryManager(
-      new TestMemoryManager(new SparkConf().set("spark.memory.offHeap.enabled", "false")), 0);
+      new TestMemoryManager(
+        new SparkConf().set(package$.MODULE$.MEMORY_OFFHEAP_ENABLED(), false)), 0);
     final TestMemoryConsumer consumer = new TestMemoryConsumer(memoryManager);
     final MemoryBlock dataPage = memoryManager.allocatePage(2048, consumer);
     final Object baseObject = dataPage.getBaseObject();
@@ -97,8 +99,10 @@ public class UnsafeInMemorySorterSuite {
       public int compare(
         Object leftBaseObject,
         long leftBaseOffset,
+        int leftBaseLength,
         Object rightBaseObject,
-        long rightBaseOffset) {
+        long rightBaseOffset,
+        int rightBaseLength) {
         return 0;
       }
     };
@@ -126,17 +130,65 @@ public class UnsafeInMemorySorterSuite {
     final UnsafeSorterIterator iter = sorter.getSortedIterator();
     int iterLength = 0;
     long prevPrefix = -1;
-    Arrays.sort(dataToSort);
     while (iter.hasNext()) {
       iter.loadNext();
       final String str =
         getStringFromDataPage(iter.getBaseObject(), iter.getBaseOffset(), iter.getRecordLength());
       final long keyPrefix = iter.getKeyPrefix();
-      assertThat(str, isIn(Arrays.asList(dataToSort)));
-      assertThat(keyPrefix, greaterThanOrEqualTo(prevPrefix));
+      assertTrue(Arrays.asList(dataToSort).contains(str));
+      assertTrue(keyPrefix >= prevPrefix);
       prevPrefix = keyPrefix;
       iterLength++;
     }
     assertEquals(dataToSort.length, iterLength);
   }
+
+  @Test
+  public void testNoOOMDuringReset() {
+    final SparkConf sparkConf = new SparkConf();
+    sparkConf.set(package$.MODULE$.MEMORY_OFFHEAP_ENABLED(), false);
+
+    final TestMemoryManager testMemoryManager =
+            new TestMemoryManager(sparkConf);
+    final TaskMemoryManager memoryManager = new TaskMemoryManager(
+            testMemoryManager, 0);
+    final TestMemoryConsumer consumer = new TestMemoryConsumer(memoryManager);
+
+    // Use integer comparison for comparing prefixes (which are partition ids, in this case)
+    final PrefixComparator prefixComparator = PrefixComparators.LONG;
+    final RecordComparator recordComparator = new RecordComparator() {
+      @Override
+      public int compare(
+              Object leftBaseObject,
+              long leftBaseOffset,
+              int leftBaseLength,
+              Object rightBaseObject,
+              long rightBaseOffset,
+              int rightBaseLength) {
+        return 0;
+      }
+    };
+    UnsafeInMemorySorter sorter = new UnsafeInMemorySorter(consumer, memoryManager,
+            recordComparator, prefixComparator, 100, shouldUseRadixSort());
+
+    // Ensure that the sorter does not OOM while freeing its memory.
+    testMemoryManager.markConsequentOOM(Integer.MAX_VALUE);
+    sorter.freeMemory();
+    testMemoryManager.resetConsequentOOM();
+    Assertions.assertFalse(sorter.hasSpaceForAnotherRecord());
+
+    // Get the sorter in an usable state again by allocating a new pointer array.
+    LongArray array = consumer.allocateArray(1000);
+    sorter.expandPointerArray(array);
+
+    // Ensure that it is safe to call freeMemory() multiple times.
+    testMemoryManager.markConsequentOOM(Integer.MAX_VALUE);
+    sorter.freeMemory();
+    sorter.freeMemory();
+    testMemoryManager.resetConsequentOOM();
+    Assertions.assertFalse(sorter.hasSpaceForAnotherRecord());
+
+    assertEquals(0L, memoryManager.cleanUpAllAllocatedMemory());
+  }
+
 }

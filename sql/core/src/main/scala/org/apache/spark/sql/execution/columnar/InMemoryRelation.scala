@@ -17,98 +17,127 @@
 
 package org.apache.spark.sql.execution.columnar
 
-import scala.collection.JavaConverters._
+import com.esotericsoftware.kryo.{DefaultSerializer, Kryo, Serializer => KryoSerializer}
+import com.esotericsoftware.kryo.io.{Input => KryoInput, Output => KryoOutput}
 
-import org.apache.commons.lang3.StringUtils
-
+import org.apache.spark.{SparkException, TaskContext}
 import org.apache.spark.network.util.JavaUtils
-import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.rdd.{DeterministicLevel, RDD}
+import org.apache.spark.sql.catalyst.{FileSourceOptions, InternalRow}
 import org.apache.spark.sql.catalyst.analysis.MultiInstanceRelation
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.plans.QueryPlan
-import org.apache.spark.sql.catalyst.plans.logical
-import org.apache.spark.sql.catalyst.plans.logical.Statistics
-import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.catalyst.plans.{logical, QueryPlan}
+import org.apache.spark.sql.catalyst.plans.logical.{ColumnStat, LogicalPlan, Statistics}
+import org.apache.spark.sql.catalyst.trees.TreePattern.CURRENT_LIKE
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
+import org.apache.spark.sql.catalyst.util.{truncatedString, CaseInsensitiveMap}
+import org.apache.spark.sql.columnar.{CachedBatch, CachedBatchSerializer, SimpleMetricsCachedBatch, SimpleMetricsCachedBatchSerializer}
+import org.apache.spark.sql.execution._
+import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
+import org.apache.spark.sql.execution.datasources.{FileFormat, FileScanRDD, HadoopFsRelation, LogicalRelation}
+import org.apache.spark.sql.execution.datasources.binaryfile.BinaryFileFormat
+import org.apache.spark.sql.execution.datasources.csv.CSVFileFormat
+import org.apache.spark.sql.execution.datasources.json.JsonFileFormat
+import org.apache.spark.sql.execution.datasources.orc.OrcFileFormat
+import org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
+import org.apache.spark.sql.execution.datasources.text.TextFileFormat
+import org.apache.spark.sql.execution.vectorized.{OffHeapColumnVector, OnHeapColumnVector, WritableColumnVector}
+import org.apache.spark.sql.internal.{SQLConf, StaticSQLConf}
+import org.apache.spark.sql.types._
+import org.apache.spark.sql.util.PartitionKeyedAccumulator
+import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector}
 import org.apache.spark.storage.StorageLevel
-import org.apache.spark.util.CollectionAccumulator
-
-
-object InMemoryRelation {
-  def apply(
-      useCompression: Boolean,
-      batchSize: Int,
-      storageLevel: StorageLevel,
-      child: SparkPlan,
-      tableName: Option[String]): InMemoryRelation =
-    new InMemoryRelation(child.output, useCompression, batchSize, storageLevel, child, tableName)()
-}
-
+import org.apache.spark.util.ArrayImplicits._
+import org.apache.spark.util.Utils
 
 /**
- * CachedBatch is a cached batch of rows.
+ * The default implementation of CachedBatch.
  *
  * @param numRows The total number of rows in this batch
  * @param buffers The buffers for serialized columns
  * @param stats The stat of columns
  */
-private[columnar]
-case class CachedBatch(numRows: Int, buffers: Array[Array[Byte]], stats: InternalRow)
+@DefaultSerializer(classOf[DefaultCachedBatchKryoSerializer])
+case class DefaultCachedBatch(
+     numRows: Int,
+     buffers: Array[Array[Byte]],
+     stats: InternalRow)
+  extends SimpleMetricsCachedBatch
 
-case class InMemoryRelation(
-    output: Seq[Attribute],
-    useCompression: Boolean,
-    batchSize: Int,
-    storageLevel: StorageLevel,
-    @transient child: SparkPlan,
-    tableName: Option[String])(
-    @transient var _cachedColumnBuffers: RDD[CachedBatch] = null,
-    val batchStats: CollectionAccumulator[InternalRow] =
-      child.sqlContext.sparkContext.collectionAccumulator[InternalRow])
-  extends logical.LeafNode with MultiInstanceRelation {
-
-  override protected def innerChildren: Seq[QueryPlan[_]] = Seq(child)
-
-  override def producedAttributes: AttributeSet = outputSet
-
-  @transient val partitionStatistics = new PartitionStatistics(output)
-
-  override lazy val statistics: Statistics = {
-    if (batchStats.value.isEmpty) {
-      // Underlying columnar RDD hasn't been materialized, no useful statistics information
-      // available, return the default statistics.
-      Statistics(sizeInBytes = child.sqlContext.conf.defaultSizeInBytes)
-    } else {
-      // Underlying columnar RDD has been materialized, required information has also been
-      // collected via the `batchStats` accumulator.
-      val sizeOfRow: Expression =
-        BindReferences.bindReference(
-          output.map(a => partitionStatistics.forAttribute(a).sizeInBytes).reduce(Add),
-          partitionStatistics.schema)
-
-      val sizeInBytes =
-        batchStats.value.asScala.map(row => sizeOfRow.eval(row).asInstanceOf[Long]).sum
-      Statistics(sizeInBytes = sizeInBytes)
+class DefaultCachedBatchKryoSerializer extends KryoSerializer[DefaultCachedBatch] {
+  override def write(kryo: Kryo, output: KryoOutput, batch: DefaultCachedBatch): Unit = {
+    output.writeInt(batch.numRows)
+    SparkException.require(batch.buffers != null, "INVALID_KRYO_SERIALIZER_NO_DATA",
+      Map("obj" -> "DefaultCachedBatch.buffers",
+        "serdeOp" -> "serialize",
+        "serdeClass" -> this.getClass.getName))
+    output.writeInt(batch.buffers.length + 1) // +1 to distinguish Kryo.NULL
+    for (i <- batch.buffers.indices) {
+      val buffer = batch.buffers(i)
+        SparkException.require(buffer != null, "INVALID_KRYO_SERIALIZER_NO_DATA",
+          Map("obj" -> s"DefaultCachedBatch.buffers($i)",
+            "serdeOp" -> "serialize",
+            "serdeClass" -> this.getClass.getName))
+      output.writeInt(buffer.length + 1)  // +1 to distinguish Kryo.NULL
+      output.writeBytes(buffer)
     }
+    kryo.writeClassAndObject(output, batch.stats)
   }
 
-  // If the cached column buffers were not passed in, we calculate them in the constructor.
-  // As in Spark, the actual work of caching is lazy.
-  if (_cachedColumnBuffers == null) {
-    buildBuffers()
+  override def read(
+      kryo: Kryo, input: KryoInput, cls: Class[DefaultCachedBatch]): DefaultCachedBatch = {
+    val numRows = input.readInt()
+    val length = input.readInt()
+    SparkException.require(length != Kryo.NULL, "INVALID_KRYO_SERIALIZER_NO_DATA",
+      Map("obj" -> "DefaultCachedBatch.buffers",
+        "serdeOp" -> "deserialize",
+        "serdeClass" -> this.getClass.getName))
+    val buffers = 0.until(length - 1).map { i => // -1 to restore
+      val subLength = input.readInt()
+      SparkException.require(subLength != Kryo.NULL, "INVALID_KRYO_SERIALIZER_NO_DATA",
+          Map("obj" -> s"DefaultCachedBatch.buffers($i)",
+          "serdeOp" -> "deserialize",
+          "serdeClass" -> this.getClass.getName))
+      val innerArray = new Array[Byte](subLength - 1) // -1 to restore
+      input.readBytes(innerArray)
+      innerArray
+    }.toArray
+    val stats = kryo.readClassAndObject(input).asInstanceOf[InternalRow]
+    DefaultCachedBatch(numRows, buffers, stats)
+  }
+}
+
+/**
+ * The default implementation of CachedBatchSerializer.
+ */
+class DefaultCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer {
+  override def supportsColumnarInput(schema: Seq[Attribute]): Boolean = false
+
+  override def convertColumnarBatchToCachedBatch(
+      input: RDD[ColumnarBatch],
+      schema: Seq[Attribute],
+      storageLevel: StorageLevel,
+      conf: SQLConf): RDD[CachedBatch] =
+    throw SparkException.internalError("Columnar input is not supported")
+
+  override def convertInternalRowToCachedBatch(
+      input: RDD[InternalRow],
+      schema: Seq[Attribute],
+      storageLevel: StorageLevel,
+      conf: SQLConf): RDD[CachedBatch] = {
+    val batchSize = conf.columnBatchSize
+    val useCompression = conf.useCompression
+    convertForCacheInternal(input, schema, batchSize, useCompression)
   }
 
-  def recache(): Unit = {
-    _cachedColumnBuffers.unpersist()
-    _cachedColumnBuffers = null
-    buildBuffers()
-  }
-
-  private def buildBuffers(): Unit = {
-    val output = child.output
-    val cached = child.execute().mapPartitionsInternal { rowIterator =>
-      new Iterator[CachedBatch] {
-        def next(): CachedBatch = {
+  def convertForCacheInternal(
+      input: RDD[InternalRow],
+      output: Seq[Attribute],
+      batchSize: Int,
+      useCompression: Boolean): RDD[CachedBatch] = {
+    input.mapPartitionsInternal { rowIterator =>
+      new Iterator[DefaultCachedBatch] {
+        def next(): DefaultCachedBatch = {
           val columnBuilders = output.map { attribute =>
             ColumnBuilder(attribute.dataType, batchSize, attribute.name, useCompression)
           }.toArray
@@ -116,7 +145,7 @@ case class InMemoryRelation(
           var rowCount = 0
           var totalSize = 0L
           while (rowIterator.hasNext && rowCount < batchSize
-            && totalSize < ColumnBuilder.MAX_BATCH_SIZE_IN_BYTE) {
+              && totalSize < ColumnBuilder.MAX_BATCH_SIZE_IN_BYTE) {
             val row = rowIterator.next()
 
             // Added for SPARK-6082. This assertion can be useful for scenarios when something
@@ -126,8 +155,8 @@ case class InMemoryRelation(
             assert(
               row.numFields == columnBuilders.length,
               s"Row column number mismatch, expected ${output.size} columns, " +
-                s"but got ${row.numFields}." +
-                s"\nRow content: $row")
+                  s"but got ${row.numFields}." +
+                  s"\nRow content: $row")
 
             var i = 0
             totalSize = 0
@@ -139,45 +168,585 @@ case class InMemoryRelation(
             rowCount += 1
           }
 
-          val stats = InternalRow.fromSeq(columnBuilders.map(_.columnStats.collectedStatistics)
-            .flatMap(_.values))
-
-          batchStats.add(stats)
-          CachedBatch(rowCount, columnBuilders.map { builder =>
+          val stats = new GenericInternalRow(
+            columnBuilders.flatMap(_.columnStats.collectedStatistics))
+          DefaultCachedBatch(rowCount, columnBuilders.map { builder =>
             JavaUtils.bufferToArray(builder.build())
           }, stats)
         }
 
         def hasNext: Boolean = rowIterator.hasNext
       }
-    }.persist(storageLevel)
+    }
+  }
 
-    cached.setName(
-      tableName.map(n => s"In-memory table $n")
-        .getOrElse(StringUtils.abbreviate(child.toString, 1024)))
-    _cachedColumnBuffers = cached
+  override def supportsColumnarOutput(schema: StructType): Boolean = schema.fields.forall(f =>
+    f.dataType match {
+      // More types can be supported, but this is to match the original implementation that
+      // only supported primitive types "for ease of review"
+      case BooleanType | ByteType | ShortType | IntegerType | LongType |
+           FloatType | DoubleType => true
+      case _ => false
+    })
+
+  override def vectorTypes(attributes: Seq[Attribute], conf: SQLConf): Option[Seq[String]] =
+    Option(Seq.fill(attributes.length)(
+      if (!conf.offHeapColumnVectorEnabled) {
+        classOf[OnHeapColumnVector].getName
+      } else {
+        classOf[OffHeapColumnVector].getName
+      }
+    ))
+
+  override def convertCachedBatchToColumnarBatch(
+      input: RDD[CachedBatch],
+      cacheAttributes: Seq[Attribute],
+      selectedAttributes: Seq[Attribute],
+      conf: SQLConf): RDD[ColumnarBatch] = {
+    val offHeapColumnVectorEnabled = conf.offHeapColumnVectorEnabled
+    val outputSchema = DataTypeUtils.fromAttributes(selectedAttributes)
+    val columnIndices = CachedColumnIndices(cacheAttributes, selectedAttributes)
+
+    def createAndDecompressColumn(cb: CachedBatch): ColumnarBatch = {
+      val cachedColumnarBatch = cb.asInstanceOf[DefaultCachedBatch]
+      val rowCount = cachedColumnarBatch.numRows
+      val taskContext = Option(TaskContext.get())
+      val columnVectors = if (!offHeapColumnVectorEnabled || taskContext.isEmpty) {
+        OnHeapColumnVector.allocateColumns(rowCount, outputSchema)
+      } else {
+        OffHeapColumnVector.allocateColumns(rowCount, outputSchema)
+      }
+      val columnarBatch = new ColumnarBatch(columnVectors.asInstanceOf[Array[ColumnVector]])
+      columnarBatch.setNumRows(rowCount)
+
+      for (i <- selectedAttributes.indices) {
+        ColumnAccessor.decompress(
+          cachedColumnarBatch.buffers(columnIndices(i)),
+          columnarBatch.column(i).asInstanceOf[WritableColumnVector],
+          outputSchema.fields(i).dataType, rowCount)
+      }
+      taskContext.foreach(_.addTaskCompletionListener[Unit](_ => columnarBatch.close()))
+      columnarBatch
+    }
+
+    input.map(createAndDecompressColumn)
+  }
+
+  override def convertCachedBatchToInternalRow(
+      input: RDD[CachedBatch],
+      cacheAttributes: Seq[Attribute],
+      selectedAttributes: Seq[Attribute],
+      conf: SQLConf): RDD[InternalRow] = {
+    // Find the ordinals and data types of the requested columns.
+    val requestedColumnIndices = CachedColumnIndices(cacheAttributes, selectedAttributes)
+
+    val columnTypes = selectedAttributes.map(_.dataType match {
+      case udt: UserDefinedType[_] => udt.sqlType
+      case other => other
+    }).toArray
+
+    input.mapPartitionsInternal { cachedBatchIterator =>
+      val columnarIterator = GenerateColumnAccessor.generate(columnTypes.toImmutableArraySeq)
+      columnarIterator.initialize(cachedBatchIterator.asInstanceOf[Iterator[DefaultCachedBatch]],
+        columnTypes,
+        requestedColumnIndices)
+      columnarIterator
+    }
+  }
+}
+
+private[sql]
+case class CachedRDDBuilder(
+    serializer: CachedBatchSerializer,
+    storageLevel: StorageLevel,
+    @transient cachedPlan: SparkPlan,
+    tableName: Option[String],
+    @transient logicalPlan: LogicalPlan,
+    isCachedLogicalPlanRepeatable: Boolean = false,
+    hasSelectivePredicate: Boolean = false,
+    fileSourceOptions: Seq[Map[String, String]] = Seq.empty) {
+
+  @transient @volatile private var _cachedColumnBuffers: RDD[CachedBatch] = null
+  @volatile private var isCachedRDDRepeatable = false
+  private var hasStrictFileSourceReads = true
+
+  // The cache's materialization bookkeeping: a partition-keyed accumulator storing
+  // (rowCount, sizeInBytes) per partition. AQE creates a separate cache scan stage per reference to
+  // the same cache and each submits its own build job, so the same partition can be computed by
+  // several concurrent jobs (and speculative tasks); Spark has no global cross-executor "compute
+  // this partition once" barrier (only a per-executor write lock). Keying by partition id
+  // (last-write-wins) means those duplicate completions cannot mark the cache loaded before every
+  // partition has been computed -- which otherwise let AQE read rowCount 0 on a non-empty cache and
+  // propagate an empty relation, silently dropping rows -- and also yields exact, de-duplicated row
+  // count / size.
+  private def newPartitionStats(): PartitionKeyedAccumulator[(Long, Long)] = {
+    val acc = new PartitionKeyedAccumulator[(Long, Long)]
+    cachedPlan.session.sparkContext.register(acc)
+    acc
+  }
+
+  // Old tasks can still finish after unpersist; isolating each buffer generation prevents their
+  // late updates from making a rebuilt cache appear complete.
+  private var partitionStats = newPartitionStats()
+
+  // Resolved on first access (cache materialization for anonymous caches). For adaptive plans,
+  // the name reflects the final plan.
+  lazy val cachedName: String = tableName.map(n => s"In-memory table $n").getOrElse {
+    if (cachedPlan.conf.getConf(SQLConf.DATAFRAME_CACHE_PLAN_ID_NAME_ENABLED)) {
+      s"CachedRDD (plan_id=${cachedPlan.id})"
+    } else {
+      Utils.abbreviate(cachedPlan.toString, 1024)
+    }
+  }
+
+  val supportsColumnarInput: Boolean = {
+    cachedPlan.supportsColumnar &&
+      serializer.supportsColumnarInput(cachedPlan.output)
+  }
+
+  def cachedColumnBuffers: RDD[CachedBatch] = synchronized {
+    if (_cachedColumnBuffers == null) {
+      _cachedColumnBuffers = buildBuffers()
+    }
+    _cachedColumnBuffers
+  }
+
+  def clearCache(blocking: Boolean = false): Unit = synchronized {
+    if (_cachedColumnBuffers != null) {
+      _cachedColumnBuffers.unpersist(blocking)
+      _cachedColumnBuffers = null
+      partitionStats = newPartitionStats()
+    }
+    isCachedRDDRepeatable = false
+    // Read strictness is derived independently for each cache generation.
+    hasStrictFileSourceReads = true
+  }
+
+  def isCachedColumnBuffersLoaded: Boolean = synchronized {
+    _cachedColumnBuffers != null &&
+      partitionStats.accumulatedNumPartitions == _cachedColumnBuffers.partitions.length
+  }
+
+  private[sql] def isCachedPlanRepeatable: Boolean =
+    isCachedLogicalPlanRepeatable && isCachedRDDRepeatable
+
+  /** Reads completeness and exact statistics from one cache generation atomically. */
+  private[sql] def loadedMaterializedStats: Option[(Long, Long)] = synchronized {
+    if (_cachedColumnBuffers == null) {
+      None
+    } else {
+      partitionStats.foldValuesIfComplete(
+        _cachedColumnBuffers.partitions.length,
+        (0L, 0L)) {
+        case ((rows, bytes), (partitionRows, partitionBytes)) =>
+          (rows + partitionRows, bytes + partitionBytes)
+      }
+    }
+  }
+
+  private[sql] def materializedMetadata: Option[logical.MaterializedLeafMetadata] = synchronized {
+    loadedMaterializedStats.map { case (rowCount, sizeInBytes) =>
+      logical.MaterializedLeafMetadata(
+        rowCount = rowCount,
+        sizeInBytes = sizeInBytes,
+        isOutputRepeatable = isCachedPlanRepeatable,
+        isDurable = storageLevel.useDisk)
+    }
+  }
+
+  // Reported row count / size for the cache's statistics: exact and de-duplicated, folded over the
+  // distinct materialized partitions. Synchronized so a fold never races a concurrent `clearCache`
+  // reset.
+  private[sql] def materializedRowCount: Long = synchronized {
+    partitionStats.foldValues(0L)((sum, v) => sum + v._1)
+  }
+
+  private[sql] def materializedSizeInBytes: Long = synchronized {
+    partitionStats.foldValues(0L)((sum, v) => sum + v._2)
+  }
+
+  // The id of the accumulator backing this cache's materialization bookkeeping. Exposed only so
+  // `CachedTableSuite`'s accumulator-cleanup test can verify it is cleared after uncache + GC.
+  private[sql] def materializationAccumulatorId: Long = synchronized {
+    partitionStats.id
+  }
+
+  private def buildBuffers(): RDD[CachedBatch] = {
+    def buildInputRDD[T](input: => RDD[T]): RDD[T] = {
+      if (fileSourceOptions.isEmpty) {
+        input
+      } else {
+        // File scans initialize their input RDD lazily. Check both configuration domains while
+        // constructing that RDD so a temporary best-effort setting cannot be mistaken for a
+        // repeatable strict read.
+        val materializationConf = SQLConf.get.clone()
+        val cachedPlanConf = cachedPlan.conf.clone()
+
+        def hasStrictReads(conf: SQLConf): Boolean = SQLConf.withExistingConf(conf) {
+          fileSourceOptions.forall(options => new FileSourceOptions(options).hasStrictFileReads)
+        }
+
+        val (inputRDD, strictPhysicalReads) = SQLConf.withExistingConf(materializationConf) {
+          val result = input
+          val fileScans = cachedPlan.collect { case scan: FileSourceScanExec => scan }
+          val scansAreStrict = fileScans.size == fileSourceOptions.size && fileScans.forall {
+            scan => scan.inputRDD match {
+              case fileRDD: FileScanRDD => fileRDD.hasStrictFileReads
+              case _ => false
+            }
+          }
+          (result, scansAreStrict)
+        }
+        hasStrictFileSourceReads = hasStrictFileSourceReads &&
+          hasStrictReads(materializationConf) && hasStrictReads(cachedPlanConf) &&
+          strictPhysicalReads
+        inputRDD
+      }
+    }
+
+    val cb = try {
+      if (supportsColumnarInput) {
+        serializer.convertColumnarBatchToCachedBatch(
+          buildInputRDD(cachedPlan.executeColumnar()),
+          cachedPlan.output,
+          storageLevel,
+          cachedPlan.conf)
+      } else {
+        serializer.convertInternalRowToCachedBatch(
+          buildInputRDD(cachedPlan.execute()),
+          cachedPlan.output,
+          storageLevel,
+          cachedPlan.conf)
+      }
+    } catch {
+      case e: Throwable if cachedPlan.isInstanceOf[AdaptiveSparkPlanExec] =>
+        // SPARK-49982: during RDD execution, AQE will execute all stages except ResultStage. If any
+        // failure happen, the failure will be cached and the next SQL cache caller will hit the
+        // negative cache. Therefore we need to recache the plan.
+        val session = cachedPlan.session
+        session.sharedState.cacheManager.recacheByPlan(session, logicalPlan)
+        throw e
+    }
+    // Records one successful partition materialization: this partition's (rows, bytes) keyed by its
+    // id. Bound to a local so the task closure below captures only the accumulator, not the
+    // enclosing CachedRDDBuilder (whose cachedPlan is not serializable).
+    val accumulator = partitionStats
+    val cached = cb.mapPartitionsWithIndexInternal { (partitionId, it) =>
+      val taskContext = TaskContext.get()
+      // This task computes exactly one partition. Tally its totals so the completion listener
+      // records them once, keyed by partition id (covering empty-output partitions, which produce
+      // no batches).
+      var localRows = 0L
+      var localBytes = 0L
+      var fullyConsumed = false
+      taskContext.addTaskCompletionListener[Unit] { context =>
+        if (fullyConsumed && !context.isFailed() && !context.isInterrupted()) {
+          accumulator.add((partitionId, (localRows, localBytes)))
+        }
+      }
+      new Iterator[CachedBatch] {
+        override def hasNext: Boolean = {
+          val more = it.hasNext
+          if (!more) fullyConsumed = true
+          more
+        }
+        override def next(): CachedBatch = {
+          val batch = it.next()
+          localBytes += batch.sizeInBytes
+          localRows += batch.numRows
+          batch
+        }
+      }
+    }.persist(storageLevel)
+    cached.setName(cachedName)
+    isCachedRDDRepeatable = hasStrictFileSourceReads &&
+      cached.outputDeterministicLevel != DeterministicLevel.INDETERMINATE &&
+      InMemoryRelation.hasRepeatablePhysicalPlan(cachedPlan)
+    cached
+  }
+}
+
+object InMemoryRelation extends PredicateHelper {
+
+  private val trustedFileFormatClasses: Set[Class[_ <: FileFormat]] = Set(
+    classOf[BinaryFileFormat],
+    classOf[CSVFileFormat],
+    classOf[JsonFileFormat],
+    classOf[OrcFileFormat],
+    classOf[ParquetFileFormat],
+    classOf[TextFileFormat])
+
+  private val trustedExternalFileFormatNames = Set(
+    "org.apache.spark.sql.avro.AvroFileFormat",
+    "org.apache.spark.sql.hive.orc.OrcFileFormat")
+
+  private val catalystExpressionPackage = "org.apache.spark.sql.catalyst.expressions."
+
+  private def hasSafeExpressions(plan: QueryPlan[_]): Boolean = {
+    // Treat the Catalyst namespace as the trust boundary for Expression.deterministic's
+    // repeatability contract. Expressions outside it fail closed; reject AesEncrypt and
+    // opaque/user-defined expressions explicitly.
+    plan.expressions.forall { expression =>
+      !expression.exists {
+        case _: AesEncrypt | _: NonSQLExpression | _: UserDefinedExpression => true
+        case value => !value.deterministic || value.containsPattern(CURRENT_LIKE) ||
+          !value.getClass.getName.startsWith(catalystExpressionPackage)
+      }
+    }
+  }
+
+  private def hasRepeatableLogicalPlan(
+      analyzedPlan: LogicalPlan,
+      plan: LogicalPlan,
+      onOptimizedNode: LogicalPlan => Unit): Boolean = {
+    // Runtime-replaceable expressions such as AES encryption can become deterministic-looking
+    // StaticInvoke nodes during optimization despite using a fresh random initialization vector.
+    // Inspect the original analyzed expressions before trusting the optimized execution shape.
+    var repeatable = analyzedPlan.deterministic
+    if (repeatable) {
+      analyzedPlan.foreachWithSubqueries { node =>
+        if (repeatable && !hasSafeExpressions(node)) {
+          repeatable = false
+        }
+      }
+    }
+    if (repeatable) {
+      repeatable = plan.deterministic
+    }
+    plan.foreachWithSubqueries { node =>
+      onOptimizedNode(node)
+      if (repeatable) {
+        repeatable = hasSafeExpressions(node) && (node match {
+          case _: logical.Project | _: logical.Filter | _: logical.SubqueryAlias |
+               _: logical.Range | _: logical.LocalRelation => true
+          case relation: LogicalRelation => relation.relation match {
+            case fileRelation: HadoopFsRelation =>
+              val fileFormatClass = fileRelation.fileFormat.getClass
+              trustedFileFormatClasses.contains(fileFormatClass) ||
+                trustedExternalFileFormatNames.contains(fileFormatClass.getName)
+            case _ => false
+          }
+          case _ => false
+        })
+      }
+    }
+    repeatable
+  }
+
+  private[columnar] def hasRepeatablePhysicalPlan(plan: SparkPlan): Boolean = {
+    !plan.exists { node =>
+      val supported = node match {
+        case _: ColumnarToRowExec | _: FileSourceScanExec | _: FilterExec |
+             _: InputAdapter | _: LocalTableScanExec | _: ProjectExec |
+             _: RangeExec | _: WholeStageCodegenExec => true
+        case _ => false
+      }
+      !supported || node.subqueries.nonEmpty || !hasSafeExpressions(node)
+    }
+  }
+
+  private def newCacheBuilder(
+      serializer: CachedBatchSerializer,
+      storageLevel: StorageLevel,
+      cachedPlan: SparkPlan,
+      tableName: Option[String],
+      logicalPlan: LogicalPlan,
+      analyzedPlan: LogicalPlan,
+      optimizedPlan: LogicalPlan): CachedRDDBuilder = {
+    val relevantOptions = Seq(
+      FileSourceOptions.IGNORE_MISSING_FILES,
+      FileSourceOptions.IGNORE_CORRUPT_FILES)
+    val fileSourceOptions = Seq.newBuilder[Map[String, String]]
+    var hasSelectivePredicate = false
+    val repeatable = hasRepeatableLogicalPlan(analyzedPlan, optimizedPlan, {
+      case logical.Filter(condition, _) =>
+        if (!hasSelectivePredicate && condition.deterministic && isLikelySelective(condition)) {
+          hasSelectivePredicate = true
+        }
+      case relation: LogicalRelation if relation.relation.isInstanceOf[HadoopFsRelation] =>
+        val options = CaseInsensitiveMap(relation.relation.asInstanceOf[HadoopFsRelation].options)
+        fileSourceOptions += relevantOptions.flatMap { key =>
+          options.get(key).map(key -> _)
+        }.toMap
+      case _ =>
+    })
+    CachedRDDBuilder(
+      serializer,
+      storageLevel,
+      cachedPlan,
+      tableName,
+      logicalPlan,
+      isCachedLogicalPlanRepeatable = repeatable,
+      hasSelectivePredicate = hasSelectivePredicate,
+      fileSourceOptions = fileSourceOptions.result())
+  }
+
+  private[this] var ser: Option[CachedBatchSerializer] = None
+  private[this] def getSerializer(sqlConf: SQLConf): CachedBatchSerializer = synchronized {
+    if (ser.isEmpty) {
+      val serName = sqlConf.getConf(StaticSQLConf.SPARK_CACHE_SERIALIZER)
+      val serClass = Utils.classForName(serName)
+      val instance = serClass.getConstructor().newInstance().asInstanceOf[CachedBatchSerializer]
+      ser = Some(instance)
+    }
+    ser.get
+  }
+
+  /* Visible for testing */
+  private[sql] def clearSerializer(): Unit = synchronized { ser = None }
+
+  def apply(
+      storageLevel: StorageLevel,
+      qe: QueryExecution,
+      tableName: Option[String]): InMemoryRelation = {
+    val optimizedPlan = qe.optimizedPlan
+    val serializer = getSerializer(optimizedPlan.conf)
+    val child = if (serializer.supportsColumnarInput(optimizedPlan.output)) {
+      serializer.convertToColumnarPlanIfPossible(qe.executedPlan)
+    } else {
+      qe.executedPlan
+    }
+    val cacheBuilder = newCacheBuilder(
+      serializer, storageLevel, child, tableName, qe.logical, qe.analyzed, optimizedPlan)
+    val relation = new InMemoryRelation(child.output, cacheBuilder, optimizedPlan.outputOrdering)
+    relation.statsOfPlanToCache = optimizedPlan.stats
+    relation
+  }
+
+  /**
+   * This API is intended only to be used for testing.
+   */
+  def apply(
+      serializer: CachedBatchSerializer,
+      storageLevel: StorageLevel,
+      child: SparkPlan,
+      tableName: Option[String],
+      optimizedPlan: LogicalPlan): InMemoryRelation = {
+    val cacheBuilder = newCacheBuilder(
+      serializer, storageLevel, child, tableName, optimizedPlan, optimizedPlan, optimizedPlan)
+    val relation = new InMemoryRelation(child.output, cacheBuilder, optimizedPlan.outputOrdering)
+    relation.statsOfPlanToCache = optimizedPlan.stats
+    relation
+  }
+
+  def apply(cacheBuilder: CachedRDDBuilder, qe: QueryExecution): InMemoryRelation = {
+    val optimizedPlan = qe.optimizedPlan
+    val serializer = cacheBuilder.serializer
+    val newCachedPlan = if (serializer.supportsColumnarInput(optimizedPlan.output)) {
+      serializer.convertToColumnarPlanIfPossible(qe.executedPlan)
+    } else {
+      qe.executedPlan
+    }
+    val newBuilder = newCacheBuilder(
+      serializer,
+      cacheBuilder.storageLevel,
+      newCachedPlan,
+      cacheBuilder.tableName,
+      qe.logical,
+      qe.analyzed,
+      optimizedPlan)
+    val relation = new InMemoryRelation(
+      newBuilder.cachedPlan.output, newBuilder, optimizedPlan.outputOrdering)
+    relation.statsOfPlanToCache = optimizedPlan.stats
+    relation
+  }
+
+  def apply(
+      output: Seq[Attribute],
+      cacheBuilder: CachedRDDBuilder,
+      outputOrdering: Seq[SortOrder],
+      statsOfPlanToCache: Statistics): InMemoryRelation = {
+    val relation = InMemoryRelation(output, cacheBuilder, outputOrdering)
+    relation.statsOfPlanToCache = statsOfPlanToCache
+    relation
+  }
+}
+
+case class InMemoryRelation(
+    output: Seq[Attribute],
+    @transient cacheBuilder: CachedRDDBuilder,
+    override val outputOrdering: Seq[SortOrder])
+  extends logical.MaterializedLeafNode with MultiInstanceRelation {
+
+  @volatile var statsOfPlanToCache: Statistics = null
+
+  override def innerChildren: Seq[SparkPlan] = Seq(cachedPlan)
+
+  override def doCanonicalize(): logical.LogicalPlan =
+    withOutput(output.map(QueryPlan.normalizeExpressions(_, output)))
+
+  @transient val partitionStatistics = new PartitionStatistics(output)
+
+  def cachedPlan: SparkPlan = cacheBuilder.cachedPlan
+
+  override def mayHaveUsableMaterializedStats: Boolean =
+    cacheBuilder.storageLevel.useDisk && cacheBuilder.isCachedPlanRepeatable
+
+  override def materializedMetadata: Option[logical.MaterializedLeafMetadata] =
+    cacheBuilder.materializedMetadata
+
+  override def isOutputRepeatable: Boolean =
+    cacheBuilder.isCachedPlanRepeatable && materializedMetadata.exists(_.isOutputRepeatable)
+
+  override def hasSelectivePredicate: Boolean = cacheBuilder.hasSelectivePredicate
+
+  private[sql] def updateStats(
+      rowCount: Long,
+      newColStats: Map[Attribute, ColumnStat]): Unit = this.synchronized {
+    val newStats = statsOfPlanToCache.copy(
+      rowCount = Some(rowCount),
+      attributeStats = AttributeMap(statsOfPlanToCache.attributeStats ++ newColStats)
+    )
+    statsOfPlanToCache = newStats
+  }
+
+  override def computeStats(): Statistics = {
+    cacheBuilder.loadedMaterializedStats.map { case (rowCount, sizeInBytes) =>
+      statsOfPlanToCache.copy(sizeInBytes = sizeInBytes, rowCount = Some(rowCount))
+    }.getOrElse {
+      // Underlying columnar RDD hasn't been materialized, use the stats from the plan to cache.
+      statsOfPlanToCache
+    }
   }
 
   def withOutput(newOutput: Seq[Attribute]): InMemoryRelation = {
-    InMemoryRelation(
-      newOutput, useCompression, batchSize, storageLevel, child, tableName)(
-        _cachedColumnBuffers, batchStats)
+    val map = AttributeMap(output.zip(newOutput))
+    val newOutputOrdering = outputOrdering
+      .map(_.transform { case a: Attribute => map(a) })
+      .asInstanceOf[Seq[SortOrder]]
+    // `attributeStats` is keyed by attribute, so it has to be re-keyed onto `newOutput` as well,
+    // otherwise every column stat lookup misses for the new relation and the estimates silently
+    // fall back to the un-filtered defaults. `statsOfPlanToCache` is a `var` that starts as null.
+    val newStatsOfPlanToCache = if (statsOfPlanToCache == null) {
+      null
+    } else {
+      LogicalRDD.rewriteStatistics(statsOfPlanToCache, map)
+    }
+    InMemoryRelation(newOutput, cacheBuilder, newOutputOrdering, newStatsOfPlanToCache)
   }
 
-  override def newInstance(): this.type = {
-    new InMemoryRelation(
-      output.map(_.newInstance()),
-      useCompression,
-      batchSize,
-      storageLevel,
-      child,
-      tableName)(
-        _cachedColumnBuffers,
-        batchStats).asInstanceOf[this.type]
+  // Goes through `withOutput` so that `outputOrdering` is re-mapped onto the fresh exprIds.
+  // Returning a relation whose `outputOrdering` still references the old attributes would break
+  // canonicalization, which re-maps the ordering through the relation's own `output`.
+  override def newInstance(): this.type =
+    withOutput(output.map(_.newInstance())).asInstanceOf[this.type]
+
+  // override `clone` since the default implementation won't carry over mutable states.
+  override def clone(): LogicalPlan = {
+    val cloned = this.copy()
+    cloned.statsOfPlanToCache = this.statsOfPlanToCache
+    cloned
   }
 
-  def cachedColumnBuffers: RDD[CachedBatch] = _cachedColumnBuffers
+  override def makeCopy(newArgs: Array[AnyRef]): LogicalPlan = {
+    val copied = super.makeCopy(newArgs).asInstanceOf[InMemoryRelation]
+    copied.statsOfPlanToCache = this.statsOfPlanToCache
+    copied
+  }
 
-  override protected def otherCopyArgs: Seq[AnyRef] =
-    Seq(_cachedColumnBuffers, batchStats)
+  override def simpleString(maxFields: Int): String =
+    s"InMemoryRelation [${truncatedString(output, ", ", maxFields)}], ${cacheBuilder.storageLevel}"
+
+  override def stringArgs: Iterator[Any] =
+    Iterator(output, cacheBuilder.storageLevel, outputOrdering)
 }

@@ -17,14 +17,15 @@
 
 package org.apache.spark.ml.feature
 
-import edu.emory.mathcs.jtransforms.dct._
+import org.jtransforms.dct._
 
 import org.apache.spark.annotation.Since
 import org.apache.spark.ml.UnaryTransformer
-import org.apache.spark.ml.linalg.{Vector, Vectors, VectorUDT}
+import org.apache.spark.ml.attribute.AttributeGroup
+import org.apache.spark.ml.linalg.{SQLDataTypes, Vector, Vectors, VectorUDT}
 import org.apache.spark.ml.param.BooleanParam
 import org.apache.spark.ml.util._
-import org.apache.spark.sql.types.DataType
+import org.apache.spark.sql.types._
 
 /**
  * A feature transformer that takes the 1D discrete cosine transform of a real vector. No zero
@@ -32,7 +33,8 @@ import org.apache.spark.sql.types.DataType
  * It returns a real vector of the same length representing the DCT. The return vector is scaled
  * such that the transform matrix is unitary (aka scaled DCT-II).
  *
- * More information on [[https://en.wikipedia.org/wiki/Discrete_cosine_transform#DCT-II Wikipedia]].
+ * More information on <a href="https://en.wikipedia.org/wiki/Discrete_cosine_transform#DCT-II">
+ * DCT-II in Discrete cosine transform (Wikipedia)</a>.
  */
 @Since("1.5.0")
 class DCT @Since("1.5.0") (@Since("1.5.0") override val uid: String)
@@ -60,18 +62,51 @@ class DCT @Since("1.5.0") (@Since("1.5.0") override val uid: String)
 
   setDefault(inverse -> false)
 
-  override protected def createTransformFunc: Vector => Vector = { vec =>
-    val result = vec.toArray
-    val jTransformer = new DoubleDCT_1D(result.length)
-    if ($(inverse)) jTransformer.inverse(result, true) else jTransformer.forward(result, true)
-    Vectors.dense(result)
+  override protected def createTransformFunc: Vector => Vector = {
+    $(inverse) match {
+      case true =>
+        (vec: Vector) => {
+          val result = vec.toArray
+          val jTransformer = new DoubleDCT_1D(result.length)
+          jTransformer.inverse(result, true)
+          Vectors.dense(result)
+        }
+      case false =>
+        (vec: Vector) => {
+          val result = vec.toArray
+          val jTransformer = new DoubleDCT_1D(result.length)
+          jTransformer.forward(result, true)
+          Vectors.dense(result)
+        }
+    }
   }
 
   override protected def validateInputType(inputType: DataType): Unit = {
-    require(inputType.isInstanceOf[VectorUDT], s"Input type must be VectorUDT but got $inputType.")
+    require(inputType.isInstanceOf[VectorUDT],
+      s"Input type must be ${SQLDataTypes.VectorType.catalogString} " +
+        s"but got ${inputType.catalogString}.")
   }
 
-  override protected def outputDataType: DataType = new VectorUDT
+  override protected def outputDataType: DataType = SQLDataTypes.VectorType
+
+  override def transformSchema(schema: StructType): StructType = {
+    var outputSchema = super.transformSchema(schema)
+    if ($(inputCol).nonEmpty && $(outputCol).nonEmpty) {
+      val size = AttributeGroup.fromStructField(
+        SchemaUtils.getSchemaField(schema, $(inputCol))
+      ).size
+      if (size >= 0) {
+        outputSchema = SchemaUtils.updateAttributeGroupSize(outputSchema,
+          $(outputCol), size)
+      }
+    }
+    outputSchema
+  }
+
+  @Since("3.0.0")
+  override def toString: String = {
+    s"DCT: uid=$uid, inverse=$inverse"
+  }
 }
 
 @Since("1.6.0")

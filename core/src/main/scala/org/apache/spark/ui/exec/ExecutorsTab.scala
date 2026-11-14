@@ -11,130 +11,80 @@
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
+ * See the License for the specific language governing permissions and
  * limitations under the License.
  */
 
 package org.apache.spark.ui.exec
 
-import scala.collection.mutable.HashMap
+import scala.xml.{Node, Unparsed}
 
-import org.apache.spark.{ExceptionFailure, Resubmitted, SparkConf, SparkContext}
-import org.apache.spark.annotation.DeveloperApi
-import org.apache.spark.scheduler._
-import org.apache.spark.storage.{StorageStatus, StorageStatusListener}
-import org.apache.spark.ui.{SparkUI, SparkUITab}
-import org.apache.spark.ui.jobs.UIData.ExecutorUIData
+import jakarta.servlet.http.HttpServletRequest
+
+import org.apache.spark.internal.config.UI._
+import org.apache.spark.ui.{CspNonce, SparkUI, SparkUITab, UIUtils, WebUIPage}
 
 private[ui] class ExecutorsTab(parent: SparkUI) extends SparkUITab(parent, "executors") {
-  val listener = parent.executorsListener
-  val sc = parent.sc
-  val threadDumpEnabled =
-    sc.isDefined && parent.conf.getBoolean("spark.ui.threadDumpsEnabled", true)
 
-  attachPage(new ExecutorsPage(this, threadDumpEnabled))
-  if (threadDumpEnabled) {
-    attachPage(new ExecutorThreadDumpPage(this))
+  init()
+
+  private def init(): Unit = {
+    val threadDumpEnabled =
+      parent.sc.isDefined && parent.conf.get(UI_THREAD_DUMPS_ENABLED)
+    val heapHistogramEnabled =
+      parent.sc.isDefined && parent.conf.get(UI_HEAP_HISTOGRAM_ENABLED)
+
+    attachPage(new ExecutorsPage(this, threadDumpEnabled, heapHistogramEnabled))
+    if (threadDumpEnabled) {
+      attachPage(new ExecutorThreadDumpPage(this, parent.sc))
+    }
+    if (heapHistogramEnabled) {
+      attachPage(new ExecutorHeapHistogramPage(this, parent.sc))
+    }
   }
+
 }
 
-/**
- * :: DeveloperApi ::
- * A SparkListener that prepares information to be displayed on the ExecutorsTab
- */
-@DeveloperApi
-class ExecutorsListener(storageStatusListener: StorageStatusListener, conf: SparkConf)
-    extends SparkListener {
-  val executorToTotalCores = HashMap[String, Int]()
-  val executorToTasksMax = HashMap[String, Int]()
-  val executorToTasksActive = HashMap[String, Int]()
-  val executorToTasksComplete = HashMap[String, Int]()
-  val executorToTasksFailed = HashMap[String, Int]()
-  val executorToDuration = HashMap[String, Long]()
-  val executorToJvmGCTime = HashMap[String, Long]()
-  val executorToInputBytes = HashMap[String, Long]()
-  val executorToInputRecords = HashMap[String, Long]()
-  val executorToOutputBytes = HashMap[String, Long]()
-  val executorToOutputRecords = HashMap[String, Long]()
-  val executorToShuffleRead = HashMap[String, Long]()
-  val executorToShuffleWrite = HashMap[String, Long]()
-  val executorToLogUrls = HashMap[String, Map[String, String]]()
-  val executorIdToData = HashMap[String, ExecutorUIData]()
+private[ui] class ExecutorsPage(
+    parent: SparkUITab,
+    threadDumpEnabled: Boolean,
+    heapHistogramEnabled: Boolean)
+  extends WebUIPage("") {
 
-  def activeStorageStatusList: Seq[StorageStatus] = storageStatusListener.storageStatusList
-
-  def deadStorageStatusList: Seq[StorageStatus] = storageStatusListener.deadStorageStatusList
-
-  override def onExecutorAdded(executorAdded: SparkListenerExecutorAdded): Unit = synchronized {
-    val eid = executorAdded.executorId
-    executorToLogUrls(eid) = executorAdded.executorInfo.logUrlMap
-    executorToTotalCores(eid) = executorAdded.executorInfo.totalCores
-    executorToTasksMax(eid) = executorToTotalCores(eid) / conf.getInt("spark.task.cpus", 1)
-    executorIdToData(eid) = new ExecutorUIData(executorAdded.time)
-  }
-
-  override def onExecutorRemoved(
-      executorRemoved: SparkListenerExecutorRemoved): Unit = synchronized {
-    val eid = executorRemoved.executorId
-    val uiData = executorIdToData(eid)
-    uiData.finishTime = Some(executorRemoved.time)
-    uiData.finishReason = Some(executorRemoved.reason)
-  }
-
-  override def onApplicationStart(applicationStart: SparkListenerApplicationStart): Unit = {
-    applicationStart.driverLogs.foreach { logs =>
-      val storageStatus = activeStorageStatusList.find { s =>
-        s.blockManagerId.executorId == SparkContext.LEGACY_DRIVER_IDENTIFIER ||
-        s.blockManagerId.executorId == SparkContext.DRIVER_IDENTIFIER
-      }
-      storageStatus.foreach { s => executorToLogUrls(s.blockManagerId.executorId) = logs.toMap }
-    }
-  }
-
-  override def onTaskStart(taskStart: SparkListenerTaskStart): Unit = synchronized {
-    val eid = taskStart.taskInfo.executorId
-    executorToTasksActive(eid) = executorToTasksActive.getOrElse(eid, 0) + 1
-  }
-
-  override def onTaskEnd(taskEnd: SparkListenerTaskEnd): Unit = synchronized {
-    val info = taskEnd.taskInfo
-    if (info != null) {
-      val eid = info.executorId
-      taskEnd.reason match {
-        case Resubmitted =>
-          // Note: For resubmitted tasks, we continue to use the metrics that belong to the
-          // first attempt of this task. This may not be 100% accurate because the first attempt
-          // could have failed half-way through. The correct fix would be to keep track of the
-          // metrics added by each attempt, but this is much more complicated.
-          return
-        case e: ExceptionFailure =>
-          executorToTasksFailed(eid) = executorToTasksFailed.getOrElse(eid, 0) + 1
-        case _ =>
-          executorToTasksComplete(eid) = executorToTasksComplete.getOrElse(eid, 0) + 1
+  def render(request: HttpServletRequest): Seq[Node] = {
+    val imported = UIUtils.formatImportJavaScript(
+      request,
+      "/static/executorspage.js",
+      "setThreadDumpEnabled",
+      "setHeapHistogramEnabled")
+    val js =
+      s"""
+         |$imported
+         |
+         |setThreadDumpEnabled($threadDumpEnabled);
+         |setHeapHistogramEnabled($heapHistogramEnabled)
+         |""".stripMargin
+    val content =
+      {
+        <div id="active-executors"></div> ++
+        <div class="offcanvas offcanvas-end" tabindex="-1" id="executor-detail-offcanvas"
+             aria-labelledby="executor-detail-offcanvas-label"
+             style="width: 60vw; max-width: 900px;">
+          <div class="offcanvas-resize-handle" id="offcanvas-resize-handle"></div>
+          <div class="offcanvas-header">
+            <h5 class="offcanvas-title" id="executor-detail-offcanvas-label"></h5>
+            <button type="button" class="btn-close" data-bs-dismiss="offcanvas"
+                    aria-label="Close"></button>
+          </div>
+          <div class="offcanvas-body" id="executor-detail-offcanvas-body">
+          </div>
+        </div> ++
+        <script type="module" src={UIUtils.prependBaseUri(request, "/static/utils.js")}></script> ++
+        <script type="module"
+                src={UIUtils.prependBaseUri(request, "/static/executorspage.js")}></script> ++
+        <script type="module" nonce={CspNonce.get}>{Unparsed(js)}</script>
       }
 
-      executorToTasksActive(eid) = executorToTasksActive.getOrElse(eid, 1) - 1
-      executorToDuration(eid) = executorToDuration.getOrElse(eid, 0L) + info.duration
-
-      // Update shuffle read/write
-      val metrics = taskEnd.taskMetrics
-      if (metrics != null) {
-        executorToInputBytes(eid) =
-          executorToInputBytes.getOrElse(eid, 0L) + metrics.inputMetrics.bytesRead
-        executorToInputRecords(eid) =
-          executorToInputRecords.getOrElse(eid, 0L) + metrics.inputMetrics.recordsRead
-        executorToOutputBytes(eid) =
-          executorToOutputBytes.getOrElse(eid, 0L) + metrics.outputMetrics.bytesWritten
-        executorToOutputRecords(eid) =
-          executorToOutputRecords.getOrElse(eid, 0L) + metrics.outputMetrics.recordsWritten
-
-        executorToShuffleRead(eid) =
-          executorToShuffleRead.getOrElse(eid, 0L) + metrics.shuffleReadMetrics.remoteBytesRead
-        executorToShuffleWrite(eid) =
-          executorToShuffleWrite.getOrElse(eid, 0L) + metrics.shuffleWriteMetrics.bytesWritten
-        executorToJvmGCTime(eid) = executorToJvmGCTime.getOrElse(eid, 0L) + metrics.jvmGCTime
-      }
-    }
+    UIUtils.headerSparkPage(request, "Executors", content, parent, useDataTables = true)
   }
-
 }

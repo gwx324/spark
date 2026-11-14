@@ -17,10 +17,28 @@
 
 package org.apache.spark.sql.execution.python
 
-import org.apache.spark.api.python.PythonFunction
-import org.apache.spark.sql.catalyst.expressions.Expression
-import org.apache.spark.sql.Column
-import org.apache.spark.sql.types.DataType
+import java.io.{DataInputStream, DataOutputStream}
+import java.util.{List => JList}
+
+import scala.collection.mutable.ArrayBuffer
+import scala.jdk.CollectionConverters._
+
+import net.razorvine.pickle.Pickler
+
+import org.apache.spark.api.python.{PythonEvalType, PythonFunction, PythonWorkerUtils, SpecialLengths}
+import org.apache.spark.sql.{Column, TableArg}
+import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
+import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, Descending, Expression, FunctionTableSubqueryArgumentExpression, NamedArgumentExpression, NullsFirst, NullsLast, PythonAggregate, PythonUDAF, PythonUDF, PythonUDTF, PythonUDTFAnalyzeResult, PythonUDTFSelectedExpression, SortOrder, TranspiledPythonUDF, TranspiledUDFParameter, UnresolvedPolymorphicPythonUDTF, UnresolvedTableArgPlanId}
+import org.apache.spark.sql.catalyst.parser.ParserInterface
+import org.apache.spark.sql.catalyst.plans.logical.{Generate, LogicalPlan, NamedParametersSupport, OneRowRelation}
+import org.apache.spark.sql.catalyst.util.CharVarcharUtils
+import org.apache.spark.sql.classic.{DataFrame, Dataset, SparkSession}
+import org.apache.spark.sql.classic.ClassicConversions._
+import org.apache.spark.sql.classic.ColumnConversions
+import org.apache.spark.sql.classic.ExpressionUtils.expression
+import org.apache.spark.sql.errors.QueryCompilationErrors
+import org.apache.spark.sql.internal.{SQLConf, TableValuedFunctionArgument}
+import org.apache.spark.sql.types.{DataType, StructType}
 
 /**
  * A user-defined Python function. This is used by the Python API.
@@ -28,15 +46,410 @@ import org.apache.spark.sql.types.DataType
 case class UserDefinedPythonFunction(
     name: String,
     func: PythonFunction,
-    dataType: DataType) {
+    dataType: DataType,
+    pythonEvalType: Int,
+    udfDeterministic: Boolean,
+    // TODO: Add support for transpilation with Spark Connect and remove the default value.
+    transpiled: JList[Column] = Nil.asJava,
+    // Per-option input-type categories ("numeric"/"string" per public param),
+    // parallel to `transpiled` (same length). The analyzer rule
+    // ResolveTranspiledPythonUDFOptions later keeps only the options whose
+    // categories match the bound argument types; when none match, the call
+    // falls back to the plain Python UDF. `builder` requires the two lists to
+    // be parallel and skips transpilation otherwise.
+    transpiledInputTypes: JList[JList[String]] = Nil.asJava,
+    // Schema of the intermediate aggregation buffer, set only for the incremental Python
+    // aggregator eval types (see [[PythonAggregate]]); `null` otherwise. Nullable rather than
+    // `Option` so it can be passed positionally from Python over Py4J.
+    bufferType: DataType = null) {
 
-  def builder(e: Seq[Expression]): PythonUDF = {
-    PythonUDF(name, func, dataType, e)
+  def builder(e: Seq[Expression]): Expression = {
+    if (CharVarcharUtils.hasCharVarcharIncludingUDT(dataType)) {
+      throw QueryCompilationErrors.charVarcharNotSupportedInPython(
+        "Python UDF return types", dataType.catalogString)
+    }
+    if (bufferType != null && CharVarcharUtils.hasCharVarcharIncludingUDT(bufferType)) {
+      throw QueryCompilationErrors.charVarcharNotSupportedInPython(
+        "Python UDAF buffer schemas", bufferType.catalogString)
+    }
+    if (pythonEvalType == PythonEvalType.SQL_BATCHED_UDF
+        || pythonEvalType ==PythonEvalType.SQL_ARROW_BATCHED_UDF
+        || pythonEvalType == PythonEvalType.SQL_SCALAR_PANDAS_UDF
+        || pythonEvalType == PythonEvalType.SQL_GROUPED_AGG_PANDAS_UDF
+        || pythonEvalType == PythonEvalType.SQL_GROUPED_AGG_PANDAS_ITER_UDF
+        || pythonEvalType == PythonEvalType.SQL_SCALAR_ARROW_UDF
+        || pythonEvalType == PythonEvalType.SQL_GROUPED_AGG_ARROW_UDF
+        || pythonEvalType == PythonEvalType.SQL_GROUPED_AGG_ARROW_ITER_UDF
+        || pythonEvalType == PythonEvalType.SQL_GROUPED_AGG_ARROW_INCREMENTAL_FINAL_UDF) {
+      /*
+       * Check if the named arguments:
+       * - don't have duplicated names
+       * - don't contain positional arguments after named arguments
+       */
+      NamedParametersSupport.splitAndCheckNamedArguments(e, name, SQLConf.get.resolver)
+    } else if (e.exists(_.isInstanceOf[NamedArgumentExpression])) {
+      throw QueryCompilationErrors.namedArgumentsNotSupported(name)
+    }
+    val transpiledExprs: List[Expression] = transpiled.asScala.map(
+      column => ColumnConversions.expression(column)).toList
+    val optionInputTypes: List[List[String]] =
+      transpiledInputTypes.asScala.map(_.asScala.toList).toList
+
+
+    val udfExpr = if (pythonEvalType == PythonEvalType.SQL_GROUPED_AGG_PANDAS_UDF
+      || pythonEvalType == PythonEvalType.SQL_GROUPED_AGG_PANDAS_ITER_UDF
+      || pythonEvalType == PythonEvalType.SQL_GROUPED_AGG_ARROW_UDF
+      || pythonEvalType == PythonEvalType.SQL_GROUPED_AGG_ARROW_ITER_UDF) {
+      PythonUDAF(name, func, dataType, e, udfDeterministic, pythonEvalType)
+    } else if (pythonEvalType == PythonEvalType.SQL_GROUPED_AGG_ARROW_INCREMENTAL_FINAL_UDF) {
+      // The incremental Python aggregator. `bufferType` (the intermediate buffer schema) must have
+      // been supplied as a struct when the UDF was created. The single expression carries the
+      // aggregator for both the PARTIAL and FINAL stages; the physical operator picks the per-stage
+      // eval type. `udaf()` enforces this up front, but a malformed Connect proto (eval type set,
+      // `buffer_type` missing or non-struct) or a direct `UserDefinedFunction(f, evalType=...)` can
+      // reach here without it, so return a classed error rather than a bare require /
+      // ClassCastException.
+      val bufferStruct = bufferType match {
+        case s: StructType => s
+        case _ =>
+          throw QueryCompilationErrors.invalidIncrementalPythonAggregatorBufferError(
+            name, bufferType)
+      }
+      PythonAggregate(name, func, dataType, e, udfDeterministic, bufferStruct)
+    } else {
+      PythonUDF(name, func, dataType, e, pythonEvalType, udfDeterministic)
+    }
+    // The ``_udf_param_N`` substitution below is positional, so a UDF
+    // call site that supplied named arguments (e.g. SQL ``name => val``
+    // or pyspark ``udf(b=col)``) would splice ``NamedArgumentExpression``
+    // wrappers into the rewritten Catalyst tree and confuse downstream
+    // function resolution (``isnotnull`` etc. reject named parameters).
+    // The Python ``__call__`` shim resolves kwargs to positional before
+    // they reach this builder; SQL named arguments don't go through that
+    // shim, so we conservatively skip transpilation here when any child
+    // is a ``NamedArgumentExpression`` and let the regular Python UDF
+    // path execute.
+    val transpiledExprsForUse =
+      if (e.exists(_.isInstanceOf[NamedArgumentExpression])) Nil else transpiledExprs
+    val optionInputTypesForUse =
+      if (e.exists(_.isInstanceOf[NamedArgumentExpression])) Nil else optionInputTypes
+    // If we have possible transpiled expressions insert the node carrying every
+    // option plus its declared input-type categories. We can't pick here: this
+    // builder runs at call-construction time, before the argument columns are
+    // bound, so their types aren't known yet. ResolveTranspiledPythonUDFOptions
+    // prunes the options to those matching the resolved input types (once known,
+    // and before CheckAnalysis), and ConvertToCatalyst picks the survivor.
+    // Only build the node when every option carries its parallel input-type
+    // categories. ResolveTranspiledPythonUDFOptions prunes type-incompatible
+    // options using those categories, but only when they are present (its guard
+    // is `optionInputCategories.nonEmpty`); an empty or mismatched categories
+    // list would leave a type-invalid option to fail CheckAnalysis instead of
+    // falling back. If the two lists don't line up, skip transpilation.
+    // A call-site arity mismatch (user passed more or fewer args than the UDF's
+    // parameters) must fall back to the plain Python UDF so the standard runtime
+    // TypeError surfaces. Each option's category list has exactly one entry per
+    // public parameter, so a length mismatch against the bound children detects
+    // both directions: too few args would otherwise trip the placeholder bounds
+    // check below as a misleading "internal error", and too many args on a
+    // zero/fewer-param UDF would otherwise silently succeed where Python raises.
+    if (transpiledExprsForUse.nonEmpty &&
+        optionInputTypesForUse.length == transpiledExprsForUse.length &&
+        optionInputTypesForUse.forall(_.length == e.length)) {
+      // Turn the transpiler's `_udf_param_N` placeholders into references to the bound arguments.
+      // References, not copies, so the argument stays in `udfExpr`'s children and ConvertToCatalyst
+      // can compute it once in a Project below the operator (SPARK-58626). We run before the
+      // arguments are bound so the reference has no type yet; ResolveTranspiledPythonUDFOptions
+      // fills that in, which is also what gets the option body coerced.
+      //
+      // Options ONLY, never `udfExpr` itself. Somebody's column really can be called
+      // `_udf_param_0`, and if they pass it in we must not rewrite it.
+      // Only the arity is needed, so the arguments are not in scope here at all -- there is nothing
+      // to read one off the wrong node with.
+      def resolveUDFParams(expression: Expression): Expression = {
+        expression match {
+          case UnresolvedAttribute(nameParts)
+              if nameParts.length == 1 && nameParts.head.startsWith("_udf_param_") =>
+            val suffix = nameParts.head.stripPrefix("_udf_param_")
+            val index = suffix.toIntOption.getOrElse {
+              throw QueryCompilationErrors.invalidUDFParameterPlaceholder(nameParts.head)
+            }
+            if (index >= 0 && index < e.length) {
+              TranspiledUDFParameter(index)
+            } else {
+              throw QueryCompilationErrors.invalidUDFParameterPlaceholderIndex(index, e.length)
+            }
+          case _ =>
+            expression.mapChildren(resolveUDFParams)
+        }
+      }
+      val resolvedOptions = transpiledExprsForUse.map(resolveUDFParams)
+      TranspiledPythonUDF(name, udfExpr, resolvedOptions, optionInputTypesForUse)
+    } else {
+      udfExpr
+    }
   }
+
+  def builderWithColumns(e: Seq[Column]): Expression = builder(e.map(expression))
 
   /** Returns a [[Column]] that will evaluate to calling this UDF with the given input. */
   def apply(exprs: Column*): Column = {
-    val udf = builder(exprs.map(_.expr))
-    Column(udf)
+    fromUDFExpr(builder(exprs.map(expression)))
+  }
+
+  /**
+   * Returns a [[Column]] that will evaluate the UDF expression with the given input.
+   */
+  def fromUDFExpr(expr: Expression): Column = {
+    Column(expr match {
+      case TranspiledPythonUDF(name, udaf: PythonUDAF, transpiled, inputCategories) =>
+        TranspiledPythonUDF(name, udaf.toAggregateExpression(), transpiled, inputCategories)
+      case udaf: PythonUDAF => udaf.toAggregateExpression()
+      case agg: PythonAggregate => agg.toAggregateExpression()
+      case _ => expr
+    })
+  }
+}
+
+/**
+ * A user-defined Python table function. This is used by the Python API.
+ */
+case class UserDefinedPythonTableFunction(
+    name: String,
+    func: PythonFunction,
+    returnType: Option[StructType],
+    pythonEvalType: Int,
+    udfDeterministic: Boolean) {
+
+  def this(
+      name: String,
+      func: PythonFunction,
+      returnType: StructType,
+      pythonEvalType: Int,
+      udfDeterministic: Boolean) = {
+    this(name, func, Some(returnType), pythonEvalType, udfDeterministic)
+  }
+
+  def this(
+      name: String,
+      func: PythonFunction,
+      pythonEvalType: Int,
+      udfDeterministic: Boolean) = {
+    this(name, func, None, pythonEvalType, udfDeterministic)
+  }
+
+  def builder(exprs: Seq[Expression], parser: => ParserInterface): LogicalPlan = {
+    /*
+     * Check if the named arguments:
+     * - don't have duplicated names
+     * - don't contain positional arguments after named arguments
+     */
+    NamedParametersSupport.splitAndCheckNamedArguments(exprs, name, SQLConf.get.resolver)
+
+    returnType.foreach { rt =>
+      if (CharVarcharUtils.hasCharVarcharIncludingUDT(rt)) {
+        throw QueryCompilationErrors.charVarcharNotSupportedInPython(
+          "Python UDTF return types", rt.catalogString)
+      }
+    }
+
+    // Check which argument is a table argument here since it will be replaced with
+    // `UnresolvedAttribute` to construct lateral join.
+    val tableArgs = exprs.map {
+      case _: FunctionTableSubqueryArgumentExpression => true
+      case _: UnresolvedTableArgPlanId => true
+      case NamedArgumentExpression(_, _: FunctionTableSubqueryArgumentExpression) => true
+      case NamedArgumentExpression(_, _: UnresolvedTableArgPlanId) => true
+      case _ => false
+    }
+
+    val udtf = returnType match {
+      case Some(rt) =>
+        PythonUDTF(
+          name = name,
+          func = func,
+          elementSchema = rt,
+          pickledAnalyzeResult = None,
+          children = exprs,
+          evalType = pythonEvalType,
+          udfDeterministic = udfDeterministic,
+          tableArguments = Some(tableArgs))
+      case _ =>
+        val runAnalyzeInPython = (func: PythonFunction, exprs: Seq[Expression]) => {
+          val runner =
+            new UserDefinedPythonTableFunctionAnalyzeRunner(name, func, exprs, tableArgs, parser)
+          runner.runInPython()
+        }
+        UnresolvedPolymorphicPythonUDTF(
+          name = name,
+          func = func,
+          children = exprs,
+          evalType = pythonEvalType,
+          udfDeterministic = udfDeterministic,
+          resolveElementMetadata = runAnalyzeInPython,
+          tableArguments = Some(tableArgs))
+    }
+    Generate(
+      udtf,
+      unrequiredChildIndex = Nil,
+      outer = false,
+      qualifier = None,
+      generatorOutput = Nil,
+      child = OneRowRelation()
+    )
+  }
+
+  /** Returns a [[DataFrame]] that will evaluate to calling this UDTF with the given input. */
+  def apply(session: SparkSession, exprs: TableValuedFunctionArgument*): DataFrame = {
+    val parser = session.sessionState.sqlParser
+    val expressions = exprs.map {
+      case col: Column => session.expression(col)
+      case tableArg: TableArg => tableArg.expression
+      case other => throw new IllegalArgumentException(
+        s"Unsupported argument type: ${other.getClass.getName}"
+      )
+    }
+    val udtf = builder(expressions, parser)
+    Dataset.ofRows(session, udtf)
+  }
+}
+
+/**
+ * Runs the Python UDTF's `analyze` static method.
+ *
+ * When the Python UDTF is defined without a static return type,
+ * the analyzer will call this while resolving table-valued functions.
+ *
+ * This expects the Python UDTF to have `analyze` static method that take arguments:
+ *
+ * - The number and order of arguments are the same as the UDTF inputs
+ * - Each argument is an `AnalyzeArgument`, containing:
+ *   - dataType: DataType
+ *   - value: Any: if the argument is foldable; otherwise None
+ *   - isTable: bool: True if the argument is TABLE
+ *
+ * and that return an `AnalyzeResult`.
+ *
+ * It serializes/deserializes the data types via JSON,
+ * and the values for the case the argument is foldable are pickled.
+ *
+ * `AnalysisException` with the error class "TABLE_VALUED_FUNCTION_FAILED_TO_ANALYZE_IN_PYTHON"
+ * will be thrown when an exception is raised in Python.
+ */
+class UserDefinedPythonTableFunctionAnalyzeRunner(
+    name: String,
+    func: PythonFunction,
+    exprs: Seq[Expression],
+    tableArgs: Seq[Boolean],
+    parser: ParserInterface)
+  extends PythonPlannerRunner[PythonUDTFAnalyzeResult](func) {
+
+  override val workerModule = "pyspark.sql.worker.analyze_udtf"
+
+  override protected def writeToPython(dataOut: DataOutputStream, pickler: Pickler): Unit = {
+    // Send Python UDTF
+    PythonWorkerUtils.writeUTF(name, dataOut)
+    PythonWorkerUtils.writePythonFunction(func, dataOut)
+
+    // Send arguments
+    dataOut.writeInt(exprs.length)
+    exprs.zip(tableArgs).foreach { case (expr, isTable) =>
+      PythonWorkerUtils.writeUTF(expr.dataType.json, dataOut)
+      val (key, value) = expr match {
+        case NamedArgumentExpression(k, v) => (Some(k), v)
+        case _ => (None, expr)
+      }
+      if (value.foldable) {
+        dataOut.writeBoolean(true)
+        val obj = pickler.dumps(EvaluatePython.toJava(
+          value.eval(), value.dataType, SQLConf.get.pysparkBinaryAsBytes))
+        PythonWorkerUtils.writeBytes(obj, dataOut)
+      } else {
+        dataOut.writeBoolean(false)
+      }
+      dataOut.writeBoolean(isTable)
+      // If the expr is NamedArgumentExpression, send its name.
+      key match {
+        case Some(key) =>
+          dataOut.writeBoolean(true)
+          PythonWorkerUtils.writeUTF(key, dataOut)
+        case _ =>
+          dataOut.writeBoolean(false)
+      }
+    }
+  }
+
+  override protected def receiveFromPython(dataIn: DataInputStream): PythonUDTFAnalyzeResult = {
+    // Receive the schema or an exception raised in Python worker.
+    val length = dataIn.readInt()
+    if (length == SpecialLengths.PYTHON_EXCEPTION_THROWN) {
+      val msg = PythonWorkerUtils.readUTF(dataIn)
+        // Remove the leading traceback stack trace from the error message string, if any, since it
+        // usually only includes the "analyze_udtf.py" filename and a line number.
+        .split("PySparkValueError:").last.strip()
+      throw QueryCompilationErrors.tableValuedFunctionFailedToAnalyseInPythonError(msg)
+    }
+
+    val schema = DataType.fromJson(
+      PythonWorkerUtils.readUTF(length, dataIn)).asInstanceOf[StructType]
+    if (CharVarcharUtils.hasCharVarcharIncludingUDT(schema)) {
+      throw QueryCompilationErrors.charVarcharNotSupportedInPython(
+        "Python UDTF return types", schema.catalogString)
+    }
+
+    // Receive the pickled AnalyzeResult buffer, if any.
+    val pickledAnalyzeResult: Array[Byte] = PythonWorkerUtils.readBytes(dataIn)
+
+    // Receive whether the "with single partition" property is requested.
+    val withSinglePartition = dataIn.readInt() == 1
+    // Receive the list of requested partitioning expressions, if any.
+    val partitionByExpressions = ArrayBuffer.empty[Expression]
+    val numPartitionByExpressions = dataIn.readInt()
+    for (_ <- 0 until numPartitionByExpressions) {
+      val expressionSql: String = PythonWorkerUtils.readUTF(dataIn)
+      val parsed: Expression = parser.parseExpression(expressionSql)
+      partitionByExpressions.append(parsed)
+    }
+    // Receive the list of requested ordering expressions, if any.
+    val orderBy = ArrayBuffer.empty[SortOrder]
+    val numOrderByItems = dataIn.readInt()
+    for (_ <- 0 until numOrderByItems) {
+      val expressionSql: String = PythonWorkerUtils.readUTF(dataIn)
+      val parsed: Expression = parser.parseExpression(expressionSql)
+      // Perform a basic check that the requested ordering column string does not include an alias,
+      // since it is possible to accidentally try to specify a sort order like ASC or DESC or NULLS
+      // FIRST/LAST in this manner leading to confusing results.
+      parsed match {
+        case a: Alias =>
+          throw QueryCompilationErrors
+            .invalidSortOrderInUDTFOrderingColumnFromAnalyzeMethodHasAlias(aliasName = a.name)
+        case _ =>
+      }
+      val direction = if (dataIn.readInt() == 1) Ascending else Descending
+      val overrideNullsFirst = dataIn.readInt()
+      overrideNullsFirst match {
+        case 0 => orderBy.append(SortOrder(parsed, direction))
+        case 1 => orderBy.append(SortOrder(parsed, direction, NullsFirst, Seq.empty))
+        case 2 => orderBy.append(SortOrder(parsed, direction, NullsLast, Seq.empty))
+      }
+    }
+    // Receive the list of requested input columns to select, if specified.
+    val numSelectedInputExpressions = dataIn.readInt()
+    val selectedInputExpressions = ArrayBuffer.empty[PythonUDTFSelectedExpression]
+    for (_ <- 0 until numSelectedInputExpressions) {
+      val expressionSql: String = PythonWorkerUtils.readUTF(dataIn)
+      val parsed: Expression = parser.parseExpression(expressionSql)
+      val alias: String = PythonWorkerUtils.readUTF(dataIn)
+      selectedInputExpressions.append(
+        PythonUDTFSelectedExpression(
+          parsed,
+          if (alias.nonEmpty) Some(alias) else None))
+    }
+    PythonUDTFAnalyzeResult(
+      schema = schema,
+      withSinglePartition = withSinglePartition,
+      partitionByExpressions = partitionByExpressions.toSeq,
+      orderByExpressions = orderBy.toSeq,
+      selectedInputExpressions = selectedInputExpressions.toSeq,
+      pickledAnalyzeResult = pickledAnalyzeResult)
   }
 }

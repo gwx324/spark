@@ -15,11 +15,10 @@
 # limitations under the License.
 #
 
-from __future__ import print_function
-
 # $example on$
 from pyspark.ml.classification import MultilayerPerceptronClassifier
 from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+
 # $example off$
 from pyspark.sql import SparkSession
 

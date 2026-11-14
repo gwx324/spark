@@ -20,11 +20,12 @@ package org.apache.spark.sql.execution.columnar.compression
 import java.nio.{ByteBuffer, ByteOrder}
 
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.MutableRow
+import org.apache.spark.sql.catalyst.types.PhysicalDataType
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.execution.columnar.{ColumnType, NativeColumnType}
-import org.apache.spark.sql.types.AtomicType
+import org.apache.spark.sql.execution.vectorized.WritableColumnVector
 
-private[columnar] trait Encoder[T <: AtomicType] {
+private[columnar] trait Encoder[T <: PhysicalDataType] {
   def gatherCompressibilityStats(row: InternalRow, ordinal: Int): Unit = {}
 
   def compressedSize: Int
@@ -38,10 +39,12 @@ private[columnar] trait Encoder[T <: AtomicType] {
   def compress(from: ByteBuffer, to: ByteBuffer): ByteBuffer
 }
 
-private[columnar] trait Decoder[T <: AtomicType] {
-  def next(row: MutableRow, ordinal: Int): Unit
+private[columnar] trait Decoder[T <: PhysicalDataType] {
+  def next(row: InternalRow, ordinal: Int): Unit
 
   def hasNext: Boolean
+
+  def decompress(columnVector: WritableColumnVector, capacity: Int): Unit
 }
 
 private[columnar] trait CompressionScheme {
@@ -49,9 +52,11 @@ private[columnar] trait CompressionScheme {
 
   def supports(columnType: ColumnType[_]): Boolean
 
-  def encoder[T <: AtomicType](columnType: NativeColumnType[T]): Encoder[T]
+  def encoder[T <: PhysicalDataType](columnType: NativeColumnType[T]): Encoder[T]
 
-  def decoder[T <: AtomicType](buffer: ByteBuffer, columnType: NativeColumnType[T]): Decoder[T]
+  def decoder[T <: PhysicalDataType](
+    buffer: ByteBuffer,
+    columnType: NativeColumnType[T]): Decoder[T]
 }
 
 private[columnar] trait WithCompressionSchemes {
@@ -69,8 +74,8 @@ private[columnar] object CompressionScheme {
   private val typeIdToScheme = all.map(scheme => scheme.typeId -> scheme).toMap
 
   def apply(typeId: Int): CompressionScheme = {
-    typeIdToScheme.getOrElse(typeId, throw new UnsupportedOperationException(
-      s"Unrecognized compression scheme type ID: $typeId"))
+    typeIdToScheme.getOrElse(typeId,
+      throw QueryExecutionErrors.unrecognizedCompressionSchemaTypeIDError(typeId))
   }
 
   def columnHeaderSize(columnBuffer: ByteBuffer): Int = {
@@ -78,5 +83,11 @@ private[columnar] object CompressionScheme {
     val nullCount = header.getInt()
     // null count + null positions
     4 + 4 * nullCount
+  }
+
+  def createNullsBuffer(buffer: ByteBuffer): ByteBuffer = {
+    val nullsBuffer = buffer.duplicate().order(ByteOrder.nativeOrder())
+    nullsBuffer.rewind()
+    nullsBuffer
   }
 }

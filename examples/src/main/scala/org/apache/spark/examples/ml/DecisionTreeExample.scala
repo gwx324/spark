@@ -18,8 +18,9 @@
 // scalastyle:off println
 package org.apache.spark.examples.ml
 
+import java.util.Locale
+
 import scala.collection.mutable
-import scala.language.reflectiveCalls
 
 import scopt.OptionParser
 
@@ -64,7 +65,7 @@ object DecisionTreeExample {
       checkpointDir: Option[String] = None,
       checkpointInterval: Int = 10) extends AbstractParams[Params]
 
-  def main(args: Array[String]) {
+  def main(args: Array[String]): Unit = {
     val defaultParams = Params()
 
     val parser = new OptionParser[Params]("DecisionTreeExample") {
@@ -165,7 +166,7 @@ object DecisionTreeExample {
       algo: String,
       fracTest: Double): (DataFrame, DataFrame) = {
     val spark = SparkSession
-      .builder
+      .builder()
       .getOrCreate()
 
     // Load training data
@@ -198,12 +199,12 @@ object DecisionTreeExample {
 
   def run(params: Params): Unit = {
     val spark = SparkSession
-      .builder
+      .builder()
       .appName(s"DecisionTreeExample with $params")
       .getOrCreate()
 
     params.checkpointDir.foreach(spark.sparkContext.setCheckpointDir)
-    val algo = params.algo.toLowerCase
+    val algo = params.algo.toLowerCase(Locale.ROOT)
 
     println(s"DecisionTreeExample with parameters:\n$params")
 
@@ -250,7 +251,7 @@ object DecisionTreeExample {
           .setMinInfoGain(params.minInfoGain)
           .setCacheNodeIds(params.cacheNodeIds)
           .setCheckpointInterval(params.checkpointInterval)
-      case _ => throw new IllegalArgumentException("Algo ${params.algo} not supported.")
+      case _ => throw new IllegalArgumentException(s"Algo ${params.algo} not supported.")
     }
     stages += dt
     val pipeline = new Pipeline().setStages(stages.toArray)
@@ -277,7 +278,7 @@ object DecisionTreeExample {
         } else {
           println(treeModel) // Print model summary.
         }
-      case _ => throw new IllegalArgumentException("Algo ${params.algo} not supported.")
+      case _ => throw new IllegalArgumentException(s"Algo ${params.algo} not supported.")
     }
 
     // Evaluate model on training, test data.
@@ -293,7 +294,7 @@ object DecisionTreeExample {
         println("Test data results:")
         evaluateRegressionModel(pipelineModel, test, labelColName)
       case _ =>
-        throw new IllegalArgumentException("Algo ${params.algo} not supported.")
+        throw new IllegalArgumentException(s"Algo ${params.algo} not supported.")
     }
 
     spark.stop()

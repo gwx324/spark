@@ -28,6 +28,7 @@ import org.apache.spark.ml.clustering.{KMeans, KMeansModel}
 import org.apache.spark.ml.feature.RFormula
 import org.apache.spark.ml.util._
 import org.apache.spark.sql.{DataFrame, Dataset}
+import org.apache.spark.util.ArrayImplicits._
 
 private[r] class KMeansWrapper private (
     val pipeline: PipelineModel,
@@ -42,6 +43,8 @@ private[r] class KMeansWrapper private (
   lazy val k: Int = kMeansModel.getK
 
   lazy val cluster: DataFrame = kMeansModel.summary.cluster
+
+  lazy val clusterSize: Int = kMeansModel.clusterCenters.length
 
   def fitted(method: String): DataFrame = {
     if (method == "centers") {
@@ -68,12 +71,16 @@ private[r] object KMeansWrapper extends MLReadable[KMeansWrapper] {
       formula: String,
       k: Int,
       maxIter: Int,
-      initMode: String): KMeansWrapper = {
+      initMode: String,
+      seed: String,
+      initSteps: Int,
+      tol: Double): KMeansWrapper = {
 
-    val rFormulaModel = new RFormula()
+    val rFormula = new RFormula()
       .setFormula(formula)
       .setFeaturesCol("features")
-      .fit(data)
+    RWrapperUtils.checkDataColumns(rFormula, data)
+    val rFormulaModel = rFormula.fit(data)
 
     // get feature names from output schema
     val schema = rFormulaModel.transform(data).schema
@@ -85,6 +92,11 @@ private[r] object KMeansWrapper extends MLReadable[KMeansWrapper] {
       .setK(k)
       .setMaxIter(maxIter)
       .setInitMode(initMode)
+      .setFeaturesCol(rFormula.getFeaturesCol)
+      .setInitSteps(initSteps)
+      .setTol(tol)
+
+    if (seed != null && seed.length > 0) kMeans.setSeed(seed.toInt)
 
     val pipeline = new Pipeline()
       .setStages(Array(rFormulaModel, kMeans))
@@ -107,11 +119,13 @@ private[r] object KMeansWrapper extends MLReadable[KMeansWrapper] {
       val pipelinePath = new Path(path, "pipeline").toString
 
       val rMetadata = ("class" -> instance.getClass.getName) ~
-        ("features" -> instance.features.toSeq) ~
-        ("size" -> instance.size.toSeq)
+        ("features" -> instance.features.toImmutableArraySeq) ~
+        ("size" -> instance.size.toImmutableArraySeq)
       val rMetadataJson: String = compact(render(rMetadata))
 
-      sc.parallelize(Seq(rMetadataJson), 1).saveAsTextFile(rMetadataPath)
+      // Note that we should write single file. If there are more than one row
+      // it produces more partitions.
+      sparkSession.createDataFrame(Seq(Tuple1(rMetadataJson))).write.text(rMetadataPath)
       instance.pipeline.save(pipelinePath)
     }
   }
@@ -124,7 +138,8 @@ private[r] object KMeansWrapper extends MLReadable[KMeansWrapper] {
       val pipelinePath = new Path(path, "pipeline").toString
       val pipeline = PipelineModel.load(pipelinePath)
 
-      val rMetadataStr = sc.textFile(rMetadataPath, 1).first()
+      val rMetadataStr = sparkSession.read.text(rMetadataPath)
+        .first().getString(0)
       val rMetadata = parse(rMetadataStr)
       val features = (rMetadata \ "features").extract[Array[String]]
       val size = (rMetadata \ "size").extract[Array[Long]]

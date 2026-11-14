@@ -17,19 +17,15 @@
 
 """
 Isotonic Regression Example.
-"""
-from __future__ import print_function
 
-# $example on$
-from pyspark.ml.regression import IsotonicRegression
-# $example off$
-from pyspark.sql import SparkSession
-
-"""
-An example demonstrating isotonic regression.
 Run with:
   bin/spark-submit examples/src/main/python/ml/isotonic_regression_example.py
 """
+# $example on$
+from pyspark.ml.regression import IsotonicRegression
+
+# $example off$
+from pyspark.sql import SparkSession
 
 if __name__ == "__main__":
     spark = SparkSession\

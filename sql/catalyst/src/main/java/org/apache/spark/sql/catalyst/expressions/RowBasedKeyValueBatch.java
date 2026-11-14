@@ -16,16 +16,18 @@
  */
 package org.apache.spark.sql.catalyst.expressions;
 
+import java.io.Closeable;
 import java.io.IOException;
 
+import org.apache.spark.internal.SparkLogger;
+import org.apache.spark.internal.SparkLoggerFactory;
+import org.apache.spark.internal.LogKeys;
+import org.apache.spark.internal.MDC;
 import org.apache.spark.memory.MemoryConsumer;
+import org.apache.spark.memory.SparkOutOfMemoryError;
 import org.apache.spark.memory.TaskMemoryManager;
 import org.apache.spark.sql.types.*;
 import org.apache.spark.unsafe.memory.MemoryBlock;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 
 /**
  * RowBasedKeyValueBatch stores key value pairs in contiguous memory region.
@@ -37,19 +39,19 @@ import org.slf4j.LoggerFactory;
  * We use `FixedLengthRowBasedKeyValueBatch` if all fields in the key and the value are fixed-length
  * data types. Otherwise we use `VariableLengthRowBasedKeyValueBatch`.
  *
- * RowBasedKeyValueBatch is backed by a single page / MemoryBlock (defaults to 64MB). If the page
- * is full, the aggregate logic should fallback to a second level, larger hash map. We intentionally
- * use the single-page design because it simplifies memory address encoding & decoding for each
- * key-value pair. Because the maximum capacity for RowBasedKeyValueBatch is only 2^16, it is
- * unlikely we need a second page anyway. Filling the page requires an average size for key value
- * pairs to be larger than 1024 bytes.
+ * RowBasedKeyValueBatch is backed by a single page / MemoryBlock (ranges from 1 to 64MB depending
+ * on the system configuration). If the page is full, the aggregate logic should fallback to a
+ * second level, larger hash map. We intentionally use the single-page design because it simplifies
+ * memory address encoding & decoding for each key-value pair. Because the maximum capacity for
+ * RowBasedKeyValueBatch is only 2^16, it is unlikely we need a second page anyway. Filling the
+ * page requires an average size for key value pairs to be larger than 1024 bytes.
  *
  */
-public abstract class RowBasedKeyValueBatch extends MemoryConsumer {
-  protected final Logger logger = LoggerFactory.getLogger(RowBasedKeyValueBatch.class);
+public abstract class RowBasedKeyValueBatch extends MemoryConsumer implements Closeable {
+  protected static final SparkLogger logger =
+    SparkLoggerFactory.getLogger(RowBasedKeyValueBatch.class);
 
   private static final int DEFAULT_CAPACITY = 1 << 16;
-  private static final long DEFAULT_PAGE_SIZE = 64 * 1024 * 1024;
 
   protected final StructType keySchema;
   protected final StructType valueSchema;
@@ -78,13 +80,11 @@ public abstract class RowBasedKeyValueBatch extends MemoryConsumer {
     boolean allFixedLength = true;
     // checking if there is any variable length fields
     // there is probably a more succinct impl of this
-    for (String name : keySchema.fieldNames()) {
-      allFixedLength = allFixedLength
-              && UnsafeRow.isFixedLength(keySchema.apply(name).dataType());
+    for (StructField field : keySchema.fields()) {
+      allFixedLength = allFixedLength && UnsafeRow.isFixedLength(field.dataType());
     }
-    for (String name : valueSchema.fieldNames()) {
-      allFixedLength = allFixedLength
-              && UnsafeRow.isFixedLength(valueSchema.apply(name).dataType());
+    for (StructField field : valueSchema.fields()) {
+      allFixedLength = allFixedLength && UnsafeRow.isFixedLength(field.dataType());
     }
 
     if (allFixedLength) {
@@ -96,7 +96,7 @@ public abstract class RowBasedKeyValueBatch extends MemoryConsumer {
 
   protected RowBasedKeyValueBatch(StructType keySchema, StructType valueSchema, int maxRows,
                                 TaskMemoryManager manager) {
-    super(manager, manager.pageSizeBytes(), manager.getTungstenMemoryMode());
+    super(manager, manager.getTungstenMemoryMode());
 
     this.keySchema = keySchema;
     this.valueSchema = valueSchema;
@@ -105,7 +105,7 @@ public abstract class RowBasedKeyValueBatch extends MemoryConsumer {
     this.keyRow = new UnsafeRow(keySchema.length());
     this.valueRow = new UnsafeRow(valueSchema.length());
 
-    if (!acquirePage(DEFAULT_PAGE_SIZE)) {
+    if (!acquirePage(manager.pageSizeBytes())) {
       page = null;
       recordStartOffset = 0;
     } else {
@@ -116,6 +116,7 @@ public abstract class RowBasedKeyValueBatch extends MemoryConsumer {
 
   public final int numRows() { return numRows; }
 
+  @Override
   public final void close() {
     if (page != null) {
       freePage(page);
@@ -126,8 +127,9 @@ public abstract class RowBasedKeyValueBatch extends MemoryConsumer {
   private boolean acquirePage(long requiredSize) {
     try {
       page = allocatePage(requiredSize);
-    } catch (OutOfMemoryError e) {
-      logger.warn("Failed to allocate page ({} bytes).", requiredSize);
+    } catch (SparkOutOfMemoryError e) {
+      logger.warn("Failed to allocate page ({} bytes).",
+        MDC.of(LogKeys.PAGE_SIZE, requiredSize));
       return false;
     }
     base = page.getBaseObject();
@@ -170,8 +172,9 @@ public abstract class RowBasedKeyValueBatch extends MemoryConsumer {
    * space for new consumers. For RowBasedKeyValueBatch, we do not actually spill and return 0.
    * We should not throw OutOfMemory exception here because other associated consumers might spill
    */
+  @Override
   public final long spill(long size, MemoryConsumer trigger) throws IOException {
-    logger.warn("Calling spill() on RowBasedKeyValueBatch. Will not spill but return 0.");
+    logger.debug("Calling spill() on RowBasedKeyValueBatch. Will not spill but return 0.");
     return 0;
   }
 

@@ -18,7 +18,8 @@
 package org.apache.spark.sql.execution.aggregate
 
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, DeclarativeAggregate}
-import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, ExprCode}
+import org.apache.spark.sql.catalyst.expressions.codegen._
+import org.apache.spark.sql.catalyst.expressions.codegen.Block._
 import org.apache.spark.sql.types._
 
 /**
@@ -41,28 +42,29 @@ abstract class HashMapGenerator(
   val groupingKeys = groupingKeySchema.map(k => Buffer(k.dataType, ctx.freshName("key")))
   val bufferValues = bufferSchema.map(k => Buffer(k.dataType, ctx.freshName("value")))
   val groupingKeySignature =
-    groupingKeys.map(key => s"${ctx.javaType(key.dataType)} ${key.name}").mkString(", ")
+    groupingKeys.map(key => s"${CodeGenerator.javaType(key.dataType)} ${key.name}").mkString(", ")
   val buffVars: Seq[ExprCode] = {
     val functions = aggregateExpressions.map(_.aggregateFunction.asInstanceOf[DeclarativeAggregate])
     val initExpr = functions.flatMap(f => f.initialValues)
     initExpr.map { e =>
-      val isNull = ctx.freshName("bufIsNull")
-      val value = ctx.freshName("bufValue")
-      ctx.addMutableState("boolean", isNull, "")
-      ctx.addMutableState(ctx.javaType(e.dataType), value, "")
+      val isNull = ctx.addMutableState(CodeGenerator.JAVA_BOOLEAN, "bufIsNull")
+      val value = ctx.addMutableState(CodeGenerator.javaType(e.dataType), "bufValue")
       val ev = e.genCode(ctx)
       val initVars =
-        s"""
+        code"""
            | $isNull = ${ev.isNull};
            | $value = ${ev.value};
        """.stripMargin
-      ExprCode(ev.code + initVars, isNull, value)
+      ExprCode(
+        ev.code + initVars,
+        JavaCode.isNullGlobal(isNull),
+        JavaCode.global(value, e.dataType))
     }
   }
 
   def generate(): String = {
     s"""
-       |public class $generatedClassName {
+       |public class $generatedClassName implements java.lang.AutoCloseable {
        |${initializeAggregateHashMap()}
        |
        |${generateFindOrInsert()}
@@ -127,7 +129,7 @@ abstract class HashMapGenerator(
   protected def generateRowIterator(): String
 
   protected final def generateClose(): String = {
-    s"""
+    """
        |public void close() {
        |  batch.close();
        |}
@@ -156,8 +158,10 @@ abstract class HashMapGenerator(
 
     dataType match {
       case BooleanType => hashInt(s"$input ? 1 : 0")
-      case ByteType | ShortType | IntegerType | DateType => hashInt(input)
-      case LongType | TimestampType => hashLong(input)
+      case ByteType | ShortType | IntegerType | DateType | _: YearMonthIntervalType =>
+        hashInt(input)
+      case LongType | TimestampType | TimestampNTZType | _: DayTimeIntervalType | _: TimeType =>
+        hashLong(input)
       case FloatType => hashInt(s"Float.floatToIntBits($input)")
       case DoubleType => hashLong(s"Double.doubleToLongBits($input)")
       case d: DecimalType =>
@@ -170,7 +174,12 @@ abstract class HashMapGenerator(
             ${hashBytes(bytes)}
           """
         }
-      case StringType => hashBytes(s"$input.getBytes()")
+      case st: StringType if st.supportsBinaryEquality =>
+        hashBytes(s"$input.getBytes()")
+      case st: StringType if !st.supportsBinaryEquality =>
+        hashLong(s"CollationFactory.fetchCollation(${st.collationId})" +
+          s".hashFunction.applyAsLong($input)")
+      case CalendarIntervalType => hashInt(s"$input.hashCode()")
     }
   }
 }

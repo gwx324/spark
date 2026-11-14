@@ -15,10 +15,9 @@
 # limitations under the License.
 #
 
-from __future__ import print_function
-
 # $example on$
 from pyspark.ml.feature import Word2Vec
+
 # $example off$
 from pyspark.sql import SparkSession
 

@@ -1,0 +1,335 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.catalyst.plans.logical
+
+import org.apache.spark.sql.catalyst.analysis.{MultiInstanceRelation, UnresolvedSubqueryColumnAliases}
+import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.plans._
+import org.apache.spark.sql.catalyst.trees.TreePattern._
+import org.apache.spark.sql.catalyst.util._
+import org.apache.spark.sql.internal.SQLConf
+
+/**
+ * The logical node for CTE recursion, that contains a initial (anchor) and a recursion describing
+ * term, that contains an [[UnionLoopRef]] node in its recursive child.
+ * The node is very similar to [[Union]] because the initial and "generated" children are union-ed
+ * and it is also similar to a loop because the recursion continues until the last generated child
+ * is not empty. Union in a recursive CTE gets resolved into UnionLoop.
+ *
+ * @param id The id of the loop, inherited from [[CTERelationDef]] within which the Union lived.
+ * @param anchor The plan of the initial element of the loop.
+ * @param recursion The plan that describes the recursion with an [[UnionLoopRef]] node.
+ * @param outputAttrIds The ids of UnionLoop's output attributes.
+ * @param limit An optional limit that can be pushed down to the node to stop the loop earlier.
+ * @param maxDepth Maximal number of iterations before we report an error.
+ */
+case class UnionLoop(
+    id: Long,
+    anchor: LogicalPlan,
+    recursion: LogicalPlan,
+    outputAttrIds: Seq[ExprId],
+    limit: Option[Int] = None,
+    maxDepth: Option[Int] = None) extends UnionBase {
+  override def children: Seq[LogicalPlan] = Seq(anchor, recursion)
+
+  override protected def withNewChildrenInternal(newChildren: IndexedSeq[LogicalPlan]): UnionLoop =
+    copy(anchor = newChildren(0), recursion = newChildren(1))
+
+  override protected def computeOutput(): Seq[Attribute] =
+    Union.mergeChildOutputs(children.map(_.output)).zip(outputAttrIds).map { case (x, id) =>
+      x.withExprId(id)
+    }
+
+  override def argString(maxFields: Int): String = {
+    id.toString + limit.map(", " + _.toString).getOrElse("") +
+      maxDepth.map(", " + _.toString).getOrElse("")
+  }
+
+  override lazy val resolved: Boolean = {
+    // allChildrenCompatible needs to be evaluated after childrenResolved
+    childrenResolved && allChildrenCompatible
+  }
+}
+
+/**
+ * The recursive reference in the recursive child of an [[UnionLoop]] node. CTERelationRef in a
+ * recursive CTE gets resolved into UnionLoopRef.
+ *
+ * @param loopId The id of the loop, inherited from [[CTERelationRef]] which got resolved into this
+ *               UnionLoopRef.
+ * @param output The output attributes of this recursive reference.
+ * @param accumulated If false the reference stands for the result of the previous iteration.
+ *                    If it is true then it stands for the union of all previous iteration
+ *                    results.
+ */
+case class UnionLoopRef(
+    loopId: Long,
+    override val output: Seq[Attribute],
+    accumulated: Boolean) extends LeafNode with MultiInstanceRelation {
+  override def newInstance(): LogicalPlan = copy(output = output.map(_.newInstance()))
+
+  override def computeStats(): Statistics = Statistics(SQLConf.get.defaultSizeInBytes)
+
+  override def verboseStringWithOperatorId(): String = {
+    s"""
+       |$formattedNodeName
+       |Loop id: $loopId
+       |${QueryPlan.generateFieldString("Output", output)}
+       |Accumulated: $accumulated
+       |""".stripMargin
+  }
+}
+
+/**
+ * A wrapper for CTE definition plan with a unique ID.
+ * @param child The CTE definition query plan.
+ * @param id    The unique ID for this CTE definition.
+ * @param originalPlanWithPredicates The base plan of the last predicate pushdown and the
+ *                                   predicates that have been pushed down into `child`. The
+ *                                   base plan (the definition's child at the time of the last
+ *                                   pushdown, with the filter that pushdown inserted removed)
+ *                                   is recorded but not read back: the rule rebuilds from the
+ *                                   definition's current child and only consults the
+ *                                   predicates, both to detect newly appeared predicates and
+ *                                   to locate the previous pushdown for removal. This is a
+ *                                   temporary field used by optimization rules for CTE
+ *                                   predicate pushdown to help ensure rule idempotency.
+ * @param underSubquery If true, it means we don't need to add a shuffle for this CTE relation as
+ *                      subquery reuse will be applied to reuse CTE relation output.
+ * @param maxDepth The maximal depth of a recursion in a recursive CTE.
+ * @param materialized The user-specified materialization option: `Some(true)` for `MATERIALIZED`,
+ *                     `Some(false)` for `NOT MATERIALIZED`, `None` if unspecified. It overrides
+ *                     the default decision of [[InlineCTE]] on whether to inline this CTE.
+ * @param forceSkipInline If true, this CTE relation will never be inlined by [[InlineCTE]],
+ *                        regardless of determinism or reference count. This lets a producer
+ *                        force the CTE to be materialized instead of duplicated, e.g. when the
+ *                        CTE wraps a non-deterministic source that must be evaluated exactly once.
+ */
+case class CTERelationDef(
+    child: LogicalPlan,
+    id: Long = CTERelationDef.newId,
+    originalPlanWithPredicates: Option[(LogicalPlan, Seq[Expression])] = None,
+    underSubquery: Boolean = false,
+    maxDepth: Option[Int] = None,
+    materialized: Option[Boolean] = None,
+    forceSkipInline: Boolean = false) extends UnaryNode {
+
+  final override val nodePatterns: Seq[TreePattern] = Seq(CTE)
+
+  // Keep the default string representation stable when `forceSkipInline` is not set, so that
+  // existing plan comparisons and golden files are unaffected by the field. The materialization
+  // option is printed as its keyword, and omitted when unspecified.
+  override def stringArgs: Iterator[Any] = {
+    val option = materialized.map(m => if (m) "MATERIALIZED" else "NOT MATERIALIZED")
+    Iterator(child, id, originalPlanWithPredicates, underSubquery, maxDepth, option) ++
+      (if (forceSkipInline) Iterator(forceSkipInline) else Iterator.empty)
+  }
+
+  override def maxRows: Option[Long] = if (conf.getConf(SQLConf.CTE_RELATION_DEF_MAX_ROWS)) {
+    child.maxRows
+  } else {
+    None
+  }
+
+  override protected def withNewChildInternal(newChild: LogicalPlan): LogicalPlan =
+    copy(child = newChild)
+
+  override def output: Seq[Attribute] = if (resolved) child.output else Nil
+
+  lazy val hasSelfReferenceAsCTERef: Boolean = child.collectFirstWithSubqueries {
+    case CTERelationRef(this.id, _, _, _, _, true, _, _) => true
+  }.getOrElse(false)
+  lazy val hasSelfReferenceInAnchor: Boolean = {
+    val unionNode: Option[Union] = child match {
+      case SubqueryAlias(_, union: Union) =>
+        Some(union)
+      case SubqueryAlias(_, UnresolvedSubqueryColumnAliases(_, union: Union)) =>
+        Some(union)
+      case SubqueryAlias(_, WithCTE(union: Union, _)) =>
+        Some(union)
+      case SubqueryAlias(_, UnresolvedSubqueryColumnAliases(_, WithCTE(union: Union, _))) =>
+        Some(union)
+      case _ => None
+    }
+    if (unionNode.isDefined) {
+      unionNode.get.children.head.collectFirstWithSubqueries {
+        case CTERelationRef(this.id, _, _, _, _, true, _, _) => true
+      }.getOrElse(false)
+    } else {
+      false
+    }
+  }
+  lazy val hasSelfReferenceInSubCTE: Boolean = {
+    val withCTENode: Option[WithCTE] = child match {
+      case SubqueryAlias(_, withCTE @ WithCTE(_, _)) =>
+        Some(withCTE)
+      case SubqueryAlias(_, UnresolvedSubqueryColumnAliases(_, withCTE @ WithCTE(_, _))) =>
+        Some(withCTE)
+      case _ => None
+    }
+    if (withCTENode.isDefined) {
+      withCTENode.exists(_.cteDefs.exists(_.collectFirstWithSubqueries {
+        case CTERelationRef(this.id, _, _, _, _, true, _, _) => true
+      }.isDefined))
+    } else {
+      false
+    }
+  }
+  lazy val hasSelfReferenceAsUnionLoopRef: Boolean = child.collectFirstWithSubqueries {
+    case UnionLoopRef(this.id, _, _) => true
+  }.getOrElse(false)
+}
+
+object CTERelationDef {
+  private[sql] val curId = new java.util.concurrent.atomic.AtomicLong()
+  def newId: Long = curId.getAndIncrement()
+}
+
+/**
+ * Represents the relation of a CTE reference.
+ * @param cteId                The ID of the corresponding CTE definition.
+ * @param _resolved            Whether this reference is resolved.
+ * @param output               The output attributes of this CTE reference, which can be different
+ *                             from the output of its corresponding CTE definition after attribute
+ *                             de-duplication.
+ * @param statsOpt             The optional statistics inferred from the corresponding CTE
+ *                             definition.
+ * @param recursive            If this is a recursive reference.
+ * @param isUnlimitedRecursion If the node is a (non-recursive) reference to a recursive CTE that
+ *                             should be executed without a limit to the number of rows it returns.
+ */
+case class CTERelationRef(
+    cteId: Long,
+    _resolved: Boolean,
+    override val output: Seq[Attribute],
+    override val isStreaming: Boolean,
+    statsOpt: Option[Statistics] = None,
+    recursive: Boolean = false,
+    override val maxRows: Option[Long] = None,
+    isUnlimitedRecursion: Boolean = false) extends LeafNode with MultiInstanceRelation {
+
+  final override val nodePatterns: Seq[TreePattern] = Seq(CTE)
+
+  override lazy val resolved: Boolean = _resolved
+
+  override def stringArgs: Iterator[Any] = {
+    // We omit the false value of isUnlimitedRecursion in golden files.
+    if (isUnlimitedRecursion) super.stringArgs else super.stringArgs.toArray.init.iterator
+  }
+
+  override def newInstance(): LogicalPlan = {
+    // CTERelationRef inherits the output attributes from a query, which may contain duplicated
+    // attributes, for queries like `SELECT a, a FROM t`. It's important to keep the duplicated
+    // attributes to have the same id in the new instance, as column resolution allows more than one
+    // matching attributes if their ids are the same.
+    // For example, `Project('a, CTERelationRef(a#1, a#1))` can be resolved properly as the matching
+    // attributes `a` have the same id, but `Project('a, CTERelationRef(a#2, a#3))` can't be
+    // resolved.
+    val oldAttrToNewAttr = AttributeMap(output.zip(output.map(_.newInstance())))
+    if (conf.getConf(SQLConf.LEGACY_CTE_DUPLICATE_ATTRIBUTE_NAMES)) {
+      copy(output = output.map(attr => oldAttrToNewAttr(attr)))
+    } else {
+      copy(output = output.map(attr => attr.withExprId(oldAttrToNewAttr(attr).exprId)))
+    }
+  }
+
+  def withNewStats(statsOpt: Option[Statistics]): CTERelationRef = copy(statsOpt = statsOpt)
+
+  override def computeStats(): Statistics = statsOpt.getOrElse(Statistics(conf.defaultSizeInBytes))
+}
+
+/**
+ * The resolved version of [[UnresolvedWith]] with CTE referrences linked to CTE definitions
+ * through unique IDs instead of relation aliases.
+ *
+ * @param plan    The query plan.
+ * @param cteDefs The CTE definitions.
+ */
+case class WithCTE(plan: LogicalPlan, cteDefs: Seq[CTERelationDef]) extends LogicalPlan {
+
+  final override val nodePatterns: Seq[TreePattern] = Seq(CTE)
+
+  override def output: Seq[Attribute] = plan.output
+
+  override def children: Seq[LogicalPlan] = cteDefs :+ plan
+
+  override protected def withNewChildrenInternal(
+      newChildren: IndexedSeq[LogicalPlan]): LogicalPlan = {
+    copy(plan = newChildren.last, cteDefs = newChildren.init.asInstanceOf[Seq[CTERelationDef]])
+  }
+
+  def withNewPlan(newPlan: LogicalPlan): WithCTE = {
+    withNewChildren(children.init :+ newPlan).asInstanceOf[WithCTE]
+  }
+
+  override def maxRows: Option[Long] = plan.maxRows
+
+  override def maxRowsPerPartition: Option[Long] = plan.maxRowsPerPartition
+}
+
+/**
+ * The logical node which is able to place the `WithCTE` node on its children.
+ */
+trait CTEInChildren extends LogicalPlan {
+  def withCTEDefs(cteDefs: Seq[CTERelationDef]): LogicalPlan = {
+    withNewChildren(children.map(WithCTE(_, cteDefs)))
+  }
+}
+
+/**
+ * A named common table expression (CTE) as defined in a WITH clause, before analysis.
+ *
+ * @param name The name of the CTE.
+ * @param plan The CTE definition query plan, aliased by `name`.
+ * @param maxDepth The optional `MAX RECURSION LEVEL` of a recursive CTE.
+ * @param materialized The materialization option: `Some(true)` for `MATERIALIZED`,
+ *                     `Some(false)` for `NOT MATERIALIZED`, `None` if unspecified.
+ */
+case class UnresolvedCTERelation(
+    name: String,
+    plan: SubqueryAlias,
+    maxDepth: Option[Int] = None,
+    materialized: Option[Boolean] = None)
+
+/**
+ * A container for holding named common table expressions (CTEs) and a query plan.
+ * This operator will be removed during analysis and the relations will be substituted into child.
+ *
+ * @param child The final query of this CTE.
+ * @param cteRelations The CTE definitions that this CTE defined. Each CTE can see the base tables
+ *                     and the previously defined CTEs only.
+ * @param allowRecursion A boolean flag if recursion is allowed.
+ */
+case class UnresolvedWith(
+    child: LogicalPlan,
+    cteRelations: Seq[UnresolvedCTERelation],
+    allowRecursion: Boolean = false) extends UnaryNode {
+  final override val nodePatterns: Seq[TreePattern] = Seq(UNRESOLVED_WITH)
+
+  override def output: Seq[Attribute] = child.output
+
+  override def simpleString(maxFields: Int): String = {
+    val cteAliases = truncatedString(cteRelations.map(_.name), "[", ", ", "]", maxFields)
+    s"CTE $cteAliases"
+  }
+
+  override def innerChildren: Seq[LogicalPlan] = cteRelations.map(_.plan)
+
+  override protected def withNewChildInternal(newChild: LogicalPlan): UnresolvedWith =
+    copy(child = newChild)
+}

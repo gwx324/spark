@@ -1,0 +1,253 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.spark.sql.avro
+
+import org.apache.avro.SchemaBuilder
+
+import org.apache.spark.sql.avro.AvroUtils.AvroMatchedField
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.test.SharedSparkSession
+import org.apache.spark.sql.types.{ArrayType, IntegerType, StringType, StructField, StructType}
+
+class AvroSchemaHelperSuite extends SharedSparkSession {
+
+  test("Catalyst type carried in the avro property parses normally") {
+    // An INT Avro field carrying a nested Catalyst type in the spark.sql.catalyst.type property.
+    val deepType = "array<" * 8 + "int" + ">" * 8
+    val avroSchema = SchemaBuilder.builder().intType()
+    avroSchema.addProp("spark.sql.catalyst.type", deepType)
+    assert(SchemaConverters.toSqlType(avroSchema).dataType.isInstanceOf[ArrayType])
+  }
+
+  // A type string deep enough to overflow the recursive-descent parser on the small-stack thread
+  // used by the overflow tests below. A backquoted identifier may itself contain '>', so a
+  // character scan of the type string cannot bound the real nesting -- only parsing it can.
+  private def deeplyNestedType(depth: Int): String =
+    "struct<`>`:" * depth + "int" + ">" * depth
+
+  // Runs `f` on a thread with a small (256 KiB) stack so the recursive-descent parser overflows
+  // deterministically, and returns whatever it threw (or null if nothing did).
+  private def runOnSmallStack(f: => Unit): Throwable = {
+    @volatile var thrown: Throwable = null
+    val runnable = new Runnable {
+      override def run(): Unit = {
+        try f catch { case t: Throwable => thrown = t }
+      }
+    }
+    val t = new Thread(null, runnable, "avro-deep-catalyst-type", 256 * 1024)
+    t.start()
+    t.join()
+    thrown
+  }
+
+  test("a pathologically nested Catalyst type fails as a schema error, not StackOverflowError") {
+    val avroSchema = SchemaBuilder.builder().intType()
+    avroSchema.addProp("spark.sql.catalyst.type", deeplyNestedType(1000))
+    val thrown = runOnSmallStack(SchemaConverters.toSqlType(avroSchema))
+    assert(thrown.isInstanceOf[IncompatibleSchemaException],
+      s"expected IncompatibleSchemaException but got: $thrown")
+    // The message names the property the deep type came from.
+    assert(thrown.getMessage.contains("spark.sql.catalyst.type"))
+  }
+
+  test("SPARK-59311: a pathologically nested map-key type names the map-key property on overflow") {
+    // The overflow while parsing the map-key type must be reported against
+    // spark.sql.catalyst.mapKey.type, not the generic spark.sql.catalyst.type property.
+    val mapSchema = SchemaBuilder.builder().map().values(SchemaBuilder.builder().intType())
+    mapSchema.addProp("spark.sql.catalyst.mapKey.type", deeplyNestedType(1000))
+    val thrown = runOnSmallStack(SchemaConverters.toSqlType(mapSchema))
+    assert(thrown.isInstanceOf[IncompatibleSchemaException],
+      s"expected IncompatibleSchemaException but got: $thrown")
+    assert(thrown.getMessage.contains("spark.sql.catalyst.mapKey.type"),
+      s"expected the map-key property name in: ${thrown.getMessage}")
+  }
+
+  test("ensure schema is a record") {
+    val avroSchema = SchemaBuilder.builder().intType()
+
+    val msg = intercept[IncompatibleSchemaException] {
+      new AvroUtils.AvroSchemaHelper(avroSchema, StructType(Seq()), Seq(""), Seq(""), false)
+    }.getMessage
+    assert(msg.contains("Attempting to treat int as a RECORD"))
+  }
+
+  test("handle mixed case field names") {
+    val catalystSchema = StructType(
+      StructField("a", IntegerType) ::
+      StructField("b", IntegerType) ::
+      StructField("A", IntegerType) ::
+      Nil
+    )
+
+    val avroSchema = SchemaConverters.toAvroType(catalystSchema)
+    val helper =
+      new AvroUtils.AvroSchemaHelper(avroSchema, StructType(Seq()), Seq(""), Seq(""), false)
+    withSQLConf(SQLConf.CASE_SENSITIVE.key -> "true") {
+      assert(helper.getFieldByName("A").get.name() == "A")
+      assert(helper.getFieldByName("a").get.name() == "a")
+      assert(helper.getFieldByName("b").get.name() == "b")
+      assert(helper.getFieldByName("B").isEmpty)
+    }
+
+    withSQLConf(SQLConf.CASE_SENSITIVE.key -> "false") {
+      Seq("a", "A").foreach { fieldName =>
+        withClue(s"looking for field name: $fieldName") {
+          val msg = intercept[IncompatibleSchemaException] {
+            helper.getFieldByName(fieldName)
+          }.getMessage
+          assert(msg.contains(s"Searching for '$fieldName' in Avro schema"))
+        }
+      }
+
+      assert(helper.getFieldByName("b").get.name() == "b")
+      assert(helper.getFieldByName("B").get.name() == "b")
+    }
+  }
+
+  test("change field match strategy based on positionalFieldMatch value") {
+    val catalystSchema = new StructType().add("foo", IntegerType).add("bar", StringType)
+    val avroSchema = SchemaConverters.toAvroType(catalystSchema)
+
+    val posHelper =
+      new AvroUtils.AvroSchemaHelper(avroSchema, catalystSchema, Seq(""), Seq(""), true)
+    val nameHelper =
+      new AvroUtils.AvroSchemaHelper(avroSchema, catalystSchema, Seq(""), Seq(""), false)
+
+    for (name <- Seq("foo", "bar"); fieldPos <- Seq(0, 1)) {
+      assert(posHelper.getAvroField(name, fieldPos) === Some(avroSchema.getFields.get(fieldPos)))
+      assert(nameHelper.getAvroField(name, fieldPos) === Some(avroSchema.getField(name)))
+    }
+    assert(posHelper.getAvroField("foo", 5).isEmpty)
+    assert(nameHelper.getAvroField("foo", 5).isDefined)
+
+    assert(posHelper.getAvroField("nonexist", 1).isDefined)
+    assert(nameHelper.getAvroField("nonexist", 1).isEmpty)
+  }
+
+  test("SPARK-59108: positional field match resolves against the data schema positions") {
+    val dataSchema = new StructType()
+      .add("a", IntegerType).add("b", IntegerType).add("c", IntegerType)
+    val avroSchema = SchemaConverters.toAvroType(dataSchema)
+    val projection = new StructType().add("c", IntegerType).add("a", IntegerType)
+
+    val helper = new AvroUtils.AvroSchemaHelper(
+      avroSchema, projection, Seq(""), Seq(""), true, Array(2, 0))
+    assert(helper.getAvroField("c", 0) === Some(avroSchema.getFields.get(2)))
+    assert(helper.getAvroField("a", 1) === Some(avroSchema.getFields.get(0)))
+    assert(helper.matchedFields.map(_.avroField.name()) === Seq("c", "a"))
+
+    // With no positions a field's own position is used, which is what an unprojected match needs.
+    val unprojected =
+      new AvroUtils.AvroSchemaHelper(avroSchema, projection, Seq(""), Seq(""), true)
+    assert(unprojected.getAvroField("c", 0) === Some(avroSchema.getFields.get(0)))
+
+    // The shape both read paths produce is an ascending subsequence of the data schema.
+    val ascending = new StructType().add("a", IntegerType).add("c", IntegerType)
+    val ascendingHelper = new AvroUtils.AvroSchemaHelper(
+      avroSchema, ascending, Seq(""), Seq(""), true, Array(0, 2))
+    assert(ascendingHelper.getAvroField("a", 0) === Some(avroSchema.getFields.get(0)))
+    assert(ascendingHelper.getAvroField("c", 1) === Some(avroSchema.getFields.get(2)))
+    assert(ascendingHelper.matchedFields.map(_.avroField.name()) === Seq("a", "c"))
+
+    val msg = intercept[IllegalArgumentException] {
+      new AvroUtils.AvroSchemaHelper(avroSchema, projection, Seq(""), Seq(""), true, Array(2))
+    }.getMessage
+    assert(msg.contains("Got 1 data schema positions for 2 Catalyst fields"))
+
+    // A missing field is reported by the position that was looked for, not by the position the
+    // field happens to have in the projection.
+    val twoFieldAvro = SchemaConverters.toAvroType(
+      new StructType().add("a", IntegerType).add("b", IntegerType))
+    val pastTheEnd = new AvroUtils.AvroSchemaHelper(
+      twoFieldAvro, new StructType().add("c", IntegerType, nullable = false),
+      Seq(""), Seq(""), true, Array(2))
+    val missing = intercept[IncompatibleSchemaException] {
+      pastTheEnd.validateNoExtraCatalystFields(ignoreNullable = false)
+    }.getMessage
+    assert(missing.contains("Cannot find field at position 2"))
+  }
+
+  test("properly match fields between Avro and Catalyst schemas") {
+    val catalystSchema = StructType(
+      Seq("catalyst1", "catalyst2", "shared1", "shared2").map(StructField(_, IntegerType))
+    )
+    val avroSchema = SchemaBuilder.record("toplevel").fields()
+      .requiredInt("shared1")
+      .requiredInt("shared2")
+      .requiredInt("avro1")
+      .requiredInt("avro2")
+      .endRecord()
+
+    val helper = new AvroUtils.AvroSchemaHelper(avroSchema, catalystSchema, Seq(""), Seq(""), false)
+    assert(helper.matchedFields === Seq(
+      AvroMatchedField(catalystSchema("shared1"), 2, avroSchema.getField("shared1")),
+      AvroMatchedField(catalystSchema("shared2"), 3, avroSchema.getField("shared2"))
+    ))
+    assertThrows[IncompatibleSchemaException] {
+      helper.validateNoExtraRequiredAvroFields()
+    }
+    helper.validateNoExtraCatalystFields(ignoreNullable = true)
+    assertThrows[IncompatibleSchemaException] {
+      helper.validateNoExtraCatalystFields(ignoreNullable = false)
+    }
+  }
+
+  test("respect nullability settings for validateNoExtraSqlFields") {
+    val avroSchema = SchemaBuilder.record("record").fields().requiredInt("bar").endRecord()
+
+    val catalystNonnull = new StructType().add("foo", IntegerType, nullable = false)
+    val helperNonnull =
+      new AvroUtils.AvroSchemaHelper(avroSchema, catalystNonnull, Seq(""), Seq(""), false)
+    assertThrows[IncompatibleSchemaException] {
+      helperNonnull.validateNoExtraCatalystFields(ignoreNullable = true)
+    }
+    assertThrows[IncompatibleSchemaException] {
+      helperNonnull.validateNoExtraCatalystFields(ignoreNullable = false)
+    }
+
+    val catalystNullable = new StructType().add("foo", IntegerType)
+    val helperNullable =
+      new AvroUtils.AvroSchemaHelper(avroSchema, catalystNullable, Seq(""), Seq(""), false)
+    helperNullable.validateNoExtraCatalystFields(ignoreNullable = true)
+    assertThrows[IncompatibleSchemaException] {
+      helperNullable.validateNoExtraCatalystFields(ignoreNullable = false)
+    }
+  }
+
+  test("SPARK-34378: validateNoExtraRequiredAvroFields detects required and ignores nullable") {
+    val avroSchema = SchemaBuilder.record("record").fields()
+      .requiredInt("foo")
+      .nullableInt("bar", 1)
+      .optionalInt("baz")
+      .endRecord()
+
+    val catalystFull =
+      new StructType().add("foo", IntegerType).add("bar", IntegerType).add("baz", IntegerType)
+
+    def testValidation(catalystFieldToRemove: String): Unit = {
+      val filteredSchema = StructType(catalystFull.filterNot(_.name == catalystFieldToRemove))
+      new AvroUtils.AvroSchemaHelper(avroSchema, filteredSchema, Seq(""), Seq(""), false)
+        .validateNoExtraRequiredAvroFields()
+    }
+
+    assertThrows[IncompatibleSchemaException] {
+      testValidation("foo")
+    }
+    testValidation("bar")
+    testValidation("baz")
+  }
+}

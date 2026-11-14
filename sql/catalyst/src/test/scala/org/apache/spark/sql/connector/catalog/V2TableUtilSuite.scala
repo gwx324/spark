@@ -1,0 +1,1093 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.connector.catalog
+
+import java.util
+
+import org.apache.spark.SparkFunSuite
+import org.apache.spark.sql.AnalysisException
+import org.apache.spark.sql.catalyst.expressions.{AttributeReference, MetadataAttribute}
+import org.apache.spark.sql.catalyst.plans.SQLHelper
+import org.apache.spark.sql.connector.catalog.TableCapability.BATCH_READ
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.internal.connector.ColumnImpl
+import org.apache.spark.sql.types._
+import org.apache.spark.sql.util.CaseInsensitiveStringMap
+import org.apache.spark.sql.util.SchemaValidationMode.{ALLOW_NEW_FIELDS, ALLOW_NEW_TOP_LEVEL_FIELDS, PROHIBIT_CHANGES}
+import org.apache.spark.sql.util.SchemaValidationMode
+import org.apache.spark.util.ArrayImplicits.SparkArrayOps
+
+class V2TableUtilSuite extends SparkFunSuite with SQLHelper {
+
+  test("validateCapturedColumns - no changes") {
+    val cols = Array(
+      col("id", LongType, nullable = false),
+      col("name", StringType, nullable = true))
+    val table = TestTableWithMetadataSupport("test", cols)
+
+    val errors = validateCapturedColumns(table, cols)
+    assert(errors.isEmpty, "No changes should produce no errors")
+  }
+
+  test("validateCapturedColumns - column type changed") {
+    val originCols = Array(
+      col("id", LongType, nullable = true), // original type
+      col("name", StringType, nullable = true))
+    val currentCols = Array(
+      col("id", StringType, nullable = true), // changed from LongType
+      col("name", StringType, nullable = true))
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val errors = validateCapturedColumns(table, originCols)
+    assert(errors.size == 1)
+    assert(errors.head.contains("`id` type has changed from BIGINT to STRING"))
+  }
+
+  test("validateCapturedColumns - column nullability changed to not null") {
+    val originCols = Array(
+      col("id", LongType, nullable = true), // originally nullable
+      col("name", StringType, nullable = true))
+    val currentCols = Array(
+      col("id", LongType, nullable = false), // now NOT NULL
+      col("name", StringType, nullable = true))
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val errors = validateCapturedColumns(table, originCols)
+    assert(errors.size == 1)
+    assert(errors.head == "`id` is no longer nullable")
+  }
+
+  test("validateCapturedColumns - column nullability changed to nullable") {
+    val originCols = Array(
+      col("id", LongType, nullable = false), // originally NOT NULL
+      col("name", StringType, nullable = true))
+    val currentCols = Array(
+      col("id", LongType, nullable = true), // now nullable
+      col("name", StringType, nullable = true))
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val errors = validateCapturedColumns(table, originCols)
+    assert(errors.size == 1)
+    assert(errors.head == "`id` is nullable now")
+  }
+
+  test("validateCapturedColumns - column removed") {
+    val originCols = Array(
+      col("id", LongType, nullable = true), // originally present
+      col("name", StringType, nullable = true))
+    val currentCols = Array(
+      col("name", StringType, nullable = true))
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val errors = validateCapturedColumns(table, originCols)
+    assert(errors.size == 1)
+    assert(errors.head == "`id` BIGINT has been removed")
+  }
+
+  test("validateCapturedColumns - column added") {
+    val originCols = Array(
+      col("id", LongType, nullable = true),
+      col("name", StringType, nullable = true))
+    val currentCols = Array(
+      col("id", LongType, nullable = true),
+      col("name", StringType, nullable = true),
+      col("age", IntegerType, nullable = true)) // new column
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val errors = validateCapturedColumns(table, originCols)
+    assert(errors.size == 1)
+    assert(errors.head == "`age` INT has been added")
+  }
+
+  test("validateCapturedColumns - multiple columns removed and added") {
+    val originCols = Array(
+      col("id", LongType, nullable = true),
+      col("name", StringType, nullable = true),    // originally present
+      col("address", StringType, nullable = true))  // originally present
+    val currentCols = Array(
+      col("id", LongType, nullable = true),
+      col("email", StringType, nullable = true), // new column
+      col("age", IntegerType, nullable = true))   // new column
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val errors = validateCapturedColumns(table, originCols)
+    assert(errors.size == 4) // 2 removed + 2 added
+    assert(errors.count(_.contains("removed")) == 2)
+    assert(errors.count(_.contains("has been added")) == 2)
+  }
+
+  test("validateCapturedColumns - case insensitive column names") {
+    val originCols = Array(
+      col("id", LongType, nullable = true), // lowercase
+      col("name", StringType, nullable = true))
+    val currentCols = Array(
+      col("ID", LongType, nullable = true), // uppercase
+      col("NAME", StringType, nullable = true))
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val errors = validateCapturedColumns(table, originCols)
+    assert(errors.isEmpty, "Case insensitive comparison should match")
+  }
+
+  test("validateCapturedColumns - duplicate columns with different case") {
+    val originCols = Array(
+      col("id", LongType, nullable = true),
+      col("name", StringType, nullable = true))
+    val currentCols = Array(
+      col("id", LongType, nullable = true),
+      col("ID", StringType, nullable = true), // duplicate with different case
+      col("name", StringType, nullable = true))
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val e = intercept[AnalysisException] { validateCapturedColumns(table, originCols) }
+    assert(e.message.contains("Choose another name or rename the existing column"))
+  }
+
+  test("validateCapturedColumns - complex types") {
+    val structType = StructType(Seq(
+      StructField("street", StringType),
+      StructField("city", StringType)))
+    val originCols = Array(
+      col("id", LongType, nullable = true),
+      col("address", structType, nullable = true))
+    val currentCols = Array(
+      col("id", LongType, nullable = true),
+      col("address", structType, nullable = true))
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val errors = validateCapturedColumns(table, originCols)
+    assert(errors.isEmpty)
+  }
+
+  test("validateCapturedColumns - complex type changed") {
+    val originStructType = StructType(Seq(
+      StructField("street", StringType),
+      StructField("city", StringType))) // originally StringType
+    val originCols = Array(
+      col("id", LongType, nullable = true),
+      col("address", originStructType, nullable = true))
+    val currentStructType = StructType(Seq(
+      StructField("street", StringType),
+      StructField("city", IntegerType))) // changed type
+    val currentCols = Array(
+      col("id", LongType, nullable = true),
+      col("address", currentStructType, nullable = true))
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val errors = V2TableUtil.validateCapturedColumns(
+      table,
+      originCols.toSeq,
+      mode = PROHIBIT_CHANGES,
+      checkIds = true)
+    assert(errors.size == 1)
+    assert(errors.head.contains("`address`.`city` type has changed from STRING to INT"))
+  }
+
+  test("validateCapturedMetadataColumns - no changes") {
+    val originMetaCols = Seq(
+      metaCol("_partition", StringType, nullable = false),
+      metaCol("index", IntegerType, nullable = false))
+    val currentMetaCols = Array(
+      metaCol("_partition", StringType, nullable = false),
+      metaCol("index", IntegerType, nullable = false))
+    val table = TestTableWithMetadataSupport("test", Array.empty, currentMetaCols)
+
+    val errors = V2TableUtil.validateCapturedMetadataColumns(
+      table,
+      originMetaCols,
+      mode = PROHIBIT_CHANGES,
+      checkIds = true)
+    assert(errors.isEmpty, "No changes should produce no errors")
+  }
+
+  test("validateCapturedMetadataColumns - type changed") {
+    val originMetaCols = Seq(
+      metaCol("index", IntegerType, nullable = false)) // originally IntegerType
+    val currentMetaCols = Array(
+      metaCol("index", StringType, nullable = false)) // changed to StringType
+    val table = TestTableWithMetadataSupport("test", Array.empty, currentMetaCols)
+
+    val errors = V2TableUtil.validateCapturedMetadataColumns(
+      table,
+      originMetaCols,
+      mode = PROHIBIT_CHANGES,
+      checkIds = true)
+    assert(errors.size == 1)
+    assert(errors.head == "`index` type has changed from INT to STRING")
+  }
+
+  test("validateCapturedMetadataColumns - nullability changed to nullable") {
+    val originMetaCols = Seq(
+      metaCol("index", IntegerType, nullable = false)) // originally NOT NULL
+    val currentMetaCols = Array(
+      metaCol("index", IntegerType, nullable = true)) // now nullable
+    val table = TestTableWithMetadataSupport("test", Array.empty, currentMetaCols)
+
+    val errors = V2TableUtil.validateCapturedMetadataColumns(
+      table,
+      originMetaCols,
+      mode = PROHIBIT_CHANGES,
+      checkIds = true)
+    assert(errors.size == 1)
+    assert(errors.head == "`index` is nullable now")
+  }
+
+  test("validateCapturedMetadataColumns - nullability changed to not null") {
+    val originMetaCols = Seq(metaCol("index", IntegerType, nullable = true)) // originally nullable
+    val currentMetaCols = Array(metaCol("index", IntegerType, nullable = false)) // now NOT NULL
+    val table = TestTableWithMetadataSupport("test", Array.empty, currentMetaCols)
+
+    val errors = V2TableUtil.validateCapturedMetadataColumns(
+      table,
+      originMetaCols,
+      mode = PROHIBIT_CHANGES,
+      checkIds = true)
+    assert(errors.size == 1)
+    assert(errors.head == "`index` is no longer nullable")
+  }
+
+  test("validateCapturedMetadataColumns - column removed") {
+    val originMetaCols = Seq(metaCol("index", IntegerType, nullable = true)) // originally present
+    val currentMetaCols = Array.empty[MetadataColumn] // no metadata columns
+    val table = TestTableWithMetadataSupport("test", Array.empty, currentMetaCols)
+
+    val errors = V2TableUtil.validateCapturedMetadataColumns(
+      table,
+      originMetaCols,
+      mode = PROHIBIT_CHANGES,
+      checkIds = true)
+    assert(errors.size == 1)
+    assert(errors.head == "`index` INT has been removed")
+  }
+
+  test("validateCapturedMetadataColumns - table doesn't support metadata") {
+    // table that doesn't implement SupportsMetadataColumns
+    val table = TestTable("test", Array(col("id", LongType, nullable = true)))
+    val originMetaCols = Seq(metaCol("index", IntegerType, nullable = false))
+
+    val errors = V2TableUtil.validateCapturedMetadataColumns(
+      table,
+      originMetaCols,
+      mode = PROHIBIT_CHANGES,
+      checkIds = true)
+    assert(errors.size == 1)
+    assert(errors.head == "`index` INT NOT NULL has been removed")
+  }
+
+  test("validateCapturedMetadataColumns - multiple errors") {
+    val originMetaCols = Seq(
+      metaCol("_partition", StringType, nullable = false),
+      metaCol("index", IntegerType, nullable = false)) // originally present
+    val currentMetaCols = Array(
+      metaCol("_partition", IntegerType, nullable = false)) // type changed from StringType
+    val table = TestTableWithMetadataSupport("test", Array.empty, currentMetaCols)
+
+    val errors = V2TableUtil.validateCapturedMetadataColumns(
+      table,
+      originMetaCols,
+      mode = PROHIBIT_CHANGES,
+      checkIds = true)
+    assert(errors.size == 2)
+    assert(errors.exists(e => e.contains("_partition") && e.contains("type has changed")))
+    assert(errors.exists(e => e.contains("index") && e.contains("removed")))
+  }
+
+  test("validateCapturedMetadataColumns - case insensitive names") {
+    val originMetaCols = Seq(metaCol("index", IntegerType, nullable = true)) // lowercase
+    val currentMetaCols = Array(metaCol("INDEX", IntegerType, nullable = true)) // uppercase
+    val table = TestTableWithMetadataSupport("test", Array.empty, currentMetaCols)
+
+    val errors = V2TableUtil.validateCapturedMetadataColumns(
+      table,
+      originMetaCols,
+      mode = PROHIBIT_CHANGES,
+      checkIds = true)
+    assert(errors.isEmpty, "Case insensitive comparison should match")
+  }
+
+  test("validateCapturedMetadataColumns - duplicate metadata columns with different case") {
+    val originMetaCols = Seq(
+      metaCol("_partition", StringType, nullable = false),
+      metaCol("index", IntegerType, nullable = false))
+    val currentMetaCols = Array(
+      metaCol("_partition", StringType, nullable = false),
+      metaCol("index", IntegerType, nullable = false),
+      metaCol("INDEX", StringType, nullable = false)) // duplicate with different case
+    val table = TestTableWithMetadataSupport("test", Array.empty, currentMetaCols)
+
+    val e = intercept[AnalysisException] {
+      V2TableUtil.validateCapturedMetadataColumns(
+      table,
+      originMetaCols,
+      mode = PROHIBIT_CHANGES,
+      checkIds = true)
+    }
+    assert(e.message.contains("Choose another name or rename the existing column"))
+  }
+
+  test("validateCapturedMetadataColumns - empty metadata columns") {
+    val originMetaCols = Seq.empty[MetadataColumn]
+    val currentMetaCols = Array.empty[MetadataColumn]
+    val table = TestTableWithMetadataSupport("test", Array.empty, currentMetaCols)
+
+    val errors = V2TableUtil.validateCapturedMetadataColumns(
+      table,
+      originMetaCols,
+      mode = PROHIBIT_CHANGES,
+      checkIds = true)
+    assert(errors.isEmpty, "No metadata columns should produce no errors")
+  }
+
+  test("validateCapturedMetadataColumns - complex metadata type") {
+    val structType = StructType(Seq(
+      StructField("bucket", IntegerType),
+      StructField("partition", IntegerType)))
+    val originMetaCols = Seq(metaCol("_partition", structType, nullable = false))
+    val currentMetaCols = Array(metaCol("_partition", structType, nullable = false))
+    val table = TestTableWithMetadataSupport("test", Array.empty, currentMetaCols)
+
+    val errors = V2TableUtil.validateCapturedMetadataColumns(
+      table,
+      originMetaCols,
+      mode = PROHIBIT_CHANGES,
+      checkIds = true)
+    assert(errors.isEmpty)
+  }
+
+  test("validateCapturedMetadataColumns - complex metadata type changed") {
+    val originStructType = StructType(Seq(
+      StructField("bucket", IntegerType), // originally IntegerType
+      StructField("partition", IntegerType)))
+    val originMetaCols = Seq(metaCol("_partition", originStructType, nullable = false))
+    val currentStructType = StructType(Seq(
+      StructField("bucket", StringType), // changed type
+      StructField("partition", IntegerType)))
+    val currentMetaCols = Array(metaCol("_partition", currentStructType, nullable = false))
+    val table = TestTableWithMetadataSupport("test", Array.empty, currentMetaCols)
+
+    val errors = V2TableUtil.validateCapturedMetadataColumns(
+      table,
+      originMetaCols,
+      mode = PROHIBIT_CHANGES,
+      checkIds = true)
+    assert(errors.size == 1)
+    assert(errors.head.contains("`_partition`.`bucket` type has changed from INT to STRING"))
+  }
+
+  test("validateCapturedMetadataColumns - with DataSourceV2Relation") {
+    val dataCols = Array(
+      col("id", LongType, nullable = true),
+      col("name", StringType, nullable = true))
+    val originMetaCols = Array(
+      metaCol("_partition", StringType, nullable = false),
+      metaCol("index", IntegerType, nullable = false))
+    val originTable = TestTableWithMetadataSupport("test", dataCols, originMetaCols)
+
+    val dataAttrs = dataCols.map(c => AttributeReference(c.name, c.dataType, c.nullable)())
+    val metadataAttrs = originMetaCols.map(c => MetadataAttribute(c.name, c.dataType, c.isNullable))
+    val attrs = dataAttrs ++ metadataAttrs
+
+    val relation = DataSourceV2Relation(
+      originTable,
+      attrs.toImmutableArraySeq,
+      None,
+      None,
+      CaseInsensitiveStringMap.empty())
+
+    val currentMetaCols = Array(
+      metaCol("_partition", IntegerType, nullable = false), // type changed
+      metaCol("index", IntegerType, nullable = false))
+    val currentTable = TestTableWithMetadataSupport("test", dataCols, currentMetaCols)
+
+    val errors = V2TableUtil.validateCapturedMetadataColumns(
+      currentTable,
+      relation,
+      mode = PROHIBIT_CHANGES,
+      checkIds = true)
+    assert(errors.size == 1)
+    assert(errors.head.contains("`_partition` type has changed"))
+  }
+
+  test("validateCapturedMetadataColumns - with DataSourceV2Relation no metadata attrs") {
+    val dataCols = Array(
+      col("id", LongType, nullable = true),
+      col("name", StringType, nullable = true))
+    val originTable = TestTable("test", dataCols)
+
+    val dataAttrs = dataCols.map(c => AttributeReference(c.name, c.dataType, c.nullable)())
+
+    val relation = DataSourceV2Relation(
+      originTable,
+      dataAttrs.toImmutableArraySeq,
+      None,
+      None,
+      CaseInsensitiveStringMap.empty())
+
+    val currentTable = TestTable("test", dataCols)
+
+    val errors = V2TableUtil.validateCapturedMetadataColumns(
+      currentTable,
+      relation,
+      mode = PROHIBIT_CHANGES,
+      checkIds = true)
+    assert(errors.isEmpty)
+  }
+
+  test("validateCapturedMetadataColumns - renamed captured metadata column type changed") {
+    val dataCols = Array(col("index", LongType, nullable = true))
+    val originMetaCols = Array(metaCol("index", IntegerType, nullable = false))
+    val originTable = TestTableWithRenamableMetadata("test", dataCols, originMetaCols)
+    val dataAttrs = dataCols.map(c => AttributeReference(c.name, c.dataType, c.nullable)())
+    val relation = DataSourceV2Relation(
+      originTable,
+      dataAttrs.toImmutableArraySeq,
+      None,
+      None,
+      CaseInsensitiveStringMap.empty()).withMetadataColumns()
+    assert(relation.output.map(_.name) == Seq("index", "_index"))
+    val currentTable = TestTableWithRenamableMetadata(
+      "test",
+      dataCols,
+      Array(metaCol("index", StringType, nullable = false)))
+
+    val errors = V2TableUtil.validateCapturedMetadataColumns(
+      currentTable,
+      relation,
+      mode = PROHIBIT_CHANGES,
+      checkIds = true)
+    assert(errors == Seq("`index` type has changed from INT to STRING"))
+  }
+
+  test("validateCapturedMetadataColumns - unchanged renamed captured metadata column") {
+    val dataCols = Array(col("index", LongType, nullable = true))
+    val originMetaCols = Array(metaCol("index", IntegerType, nullable = false))
+    val originTable = TestTableWithRenamableMetadata("test", dataCols, originMetaCols)
+    val attrs = Seq(
+      AttributeReference("index", LongType, nullable = true)(),
+      MetadataAttribute("index", IntegerType, nullable = false).withName("_index"))
+    val relation = DataSourceV2Relation(
+      originTable,
+      attrs,
+      None,
+      None,
+      CaseInsensitiveStringMap.empty())
+    val currentTable = TestTableWithRenamableMetadata("test", dataCols, originMetaCols)
+
+    val errors = V2TableUtil.validateCapturedMetadataColumns(
+      currentTable,
+      relation,
+      mode = PROHIBIT_CHANGES,
+      checkIds = true)
+    assert(errors.isEmpty, "renaming a captured metadata column must remain valid")
+  }
+
+  test("validateCapturedMetadataColumns - metadata column hidden by a data column is rejected") {
+    val originMetaCols = Seq(metaCol("index", IntegerType, nullable = false))
+    // The connector still reports the `index` metadata column, but a data column has taken its
+    // name. Because the connector suppresses rather than renames the conflict, the metadata column
+    // is no longer reachable, so a captured reference to it is broken.
+    val currentDataCols = Array(col("index", IntegerType, nullable = true))
+    val currentMetaCols = Array(metaCol("index", IntegerType, nullable = false))
+    val table = TestTableWithMetadataSupport("test", currentDataCols, currentMetaCols)
+
+    val errors = V2TableUtil.validateCapturedMetadataColumns(
+      table,
+      originMetaCols,
+      mode = ALLOW_NEW_FIELDS,
+      checkIds = false)
+    assert(errors.size == 1)
+    assert(errors.head == "`index` metadata column is hidden by a data column with the same name")
+  }
+
+  test("validateCapturedMetadataColumns - metadata column hidden by a data column is rejected " +
+      "under PROHIBIT_CHANGES") {
+    // The check is independent of the validation mode: it fires whenever a data column hides a
+    // still-reported metadata column, regardless of whether new fields are otherwise allowed.
+    val originMetaCols = Seq(metaCol("index", IntegerType, nullable = false))
+    val currentDataCols = Array(col("index", IntegerType, nullable = true))
+    val currentMetaCols = Array(metaCol("index", IntegerType, nullable = false))
+    val table = TestTableWithMetadataSupport("test", currentDataCols, currentMetaCols)
+
+    val errors = V2TableUtil.validateCapturedMetadataColumns(
+      table,
+      originMetaCols,
+      mode = PROHIBIT_CHANGES,
+      checkIds = true)
+    assert(errors.size == 1)
+    assert(errors.head == "`index` metadata column is hidden by a data column with the same name")
+  }
+
+  test("validateCapturedMetadataColumns - hidden metadata column detection is case insensitive") {
+    val originMetaCols = Seq(metaCol("index", IntegerType, nullable = false))
+    // The data column differs only in case from the metadata column, which still conflicts.
+    val currentDataCols = Array(col("INDEX", IntegerType, nullable = true))
+    val currentMetaCols = Array(metaCol("index", IntegerType, nullable = false))
+    val table = TestTableWithMetadataSupport("test", currentDataCols, currentMetaCols)
+
+    val errors = V2TableUtil.validateCapturedMetadataColumns(
+      table,
+      originMetaCols,
+      mode = ALLOW_NEW_FIELDS,
+      checkIds = false)
+    assert(errors.size == 1)
+    assert(errors.head == "`index` metadata column is hidden by a data column with the same name")
+  }
+
+  test("validateCapturedMetadataColumns - hidden metadata column detection uses SQL resolver " +
+      "for Unicode identifiers") {
+    val originMetaCols = Seq(metaCol("index", IntegerType, nullable = false))
+    // These names are equal under the case-insensitive SQL resolver, but differ after root-locale
+    // lowercasing because the capital I with dot expands to an i followed by a combining dot.
+    val unicodeName = new String(Character.toChars(0x130)) + "ndex"
+    val currentDataCols = Array(col(unicodeName, IntegerType, nullable = true))
+    val currentMetaCols = Array(metaCol("index", IntegerType, nullable = false))
+    val table = TestTableWithMetadataSupport("test", currentDataCols, currentMetaCols)
+
+    val errors = V2TableUtil.validateCapturedMetadataColumns(
+      table,
+      originMetaCols,
+      mode = ALLOW_NEW_FIELDS,
+      checkIds = false)
+    assert(errors.size == 1)
+    assert(errors.head == "`index` metadata column is hidden by a data column with the same name")
+  }
+
+  test("validateCapturedMetadataColumns - hidden metadata column detection is case sensitive " +
+      "under case-sensitive analysis") {
+    val originMetaCols = Seq(metaCol("index", IntegerType, nullable = false))
+    // Under case-sensitive analysis the data column does not take the metadata column's name, so
+    // the metadata column is still reachable and must not be reported as hidden. This has to match
+    // `metadataOutputWithOutConflicts`, which resolves the same names through `conf.resolver`.
+    val currentDataCols = Array(col("INDEX", IntegerType, nullable = true))
+    val currentMetaCols = Array(metaCol("index", IntegerType, nullable = false))
+    val table = TestTableWithMetadataSupport("test", currentDataCols, currentMetaCols)
+
+    withSQLConf(SQLConf.CASE_SENSITIVE.key -> "true") {
+      val errors = V2TableUtil.validateCapturedMetadataColumns(
+        table,
+        originMetaCols,
+        mode = ALLOW_NEW_FIELDS,
+        checkIds = false)
+      assert(errors.isEmpty, "a differently cased data column does not hide the metadata column")
+    }
+  }
+
+  test("validateCapturedMetadataColumns - data column matching a renamable metadata column is ok") {
+    val originMetaCols = Seq(metaCol("index", IntegerType, nullable = false))
+    val currentDataCols = Array(col("index", IntegerType, nullable = true))
+    val currentMetaCols = Array(metaCol("index", IntegerType, nullable = false))
+    // The connector renames a conflicting metadata column, so it stays reachable (as `_index`) and
+    // the data column does not hide it. This must keep working.
+    val table = TestTableWithRenamableMetadata("test", currentDataCols, currentMetaCols)
+
+    val errors = V2TableUtil.validateCapturedMetadataColumns(
+      table,
+      originMetaCols,
+      mode = ALLOW_NEW_FIELDS,
+      checkIds = false)
+    assert(errors.isEmpty, "a renamable metadata column is not hidden by a same-named data column")
+  }
+
+  test("validateCapturedMetadataColumns - dropped metadata column is reported as removed, " +
+      "not hidden") {
+    val originMetaCols = Seq(metaCol("index", IntegerType, nullable = false))
+    // The connector no longer reports the metadata column and a data column now carries its name.
+    // The removal, not the shadowing, is the accurate diagnosis, so only one error is expected.
+    val currentDataCols = Array(col("index", IntegerType, nullable = true))
+    val table = TestTableWithMetadataSupport("test", currentDataCols, Array.empty)
+
+    val errors = V2TableUtil.validateCapturedMetadataColumns(
+      table,
+      originMetaCols,
+      mode = PROHIBIT_CHANGES,
+      checkIds = true)
+    assert(errors.size == 1)
+    assert(errors.head == "`index` INT NOT NULL has been removed")
+  }
+
+  test("extractMetadataColumns - doesn't access table metadata unless needed") {
+    val dataCols = Array(
+      col("id", LongType, nullable = true),
+      col("name", StringType, nullable = true))
+
+    val throwingTable = TestTableThatThrowsOnMetadataAccess("test", dataCols)
+
+    val dataAttrs = dataCols.map(c => AttributeReference(c.name, c.dataType, c.nullable)())
+    val relation = DataSourceV2Relation(
+      throwingTable,
+      dataAttrs.toImmutableArraySeq,
+      None,
+      None,
+      CaseInsensitiveStringMap.empty())
+
+    val extractedMetaColumns = V2TableUtil.extractMetadataColumns(relation)
+    assert(extractedMetaColumns.isEmpty)
+  }
+
+  test("validateCapturedColumns - array element type changed") {
+    val originCols = Array(
+      col("id", LongType, nullable = true),
+      col("data", ArrayType(IntegerType, containsNull = true), nullable = true))
+    val currentCols = Array(
+      col("id", LongType, nullable = true),
+      col("data", ArrayType(LongType, containsNull = true), nullable = true))
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val errors = validateCapturedColumns(table, originCols)
+    assert(errors.size == 1)
+    assert(errors.head == "`data`.`element` type has changed from INT to BIGINT")
+  }
+
+  test("validateCapturedColumns - array containsNull changed to false") {
+    val originCols = Array(
+      col("id", LongType, nullable = true),
+      col("data", ArrayType(IntegerType, containsNull = true), nullable = true))
+    val currentCols = Array(
+      col("id", LongType, nullable = true),
+      col("data", ArrayType(IntegerType, containsNull = false), nullable = true))
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val errors = validateCapturedColumns(table, originCols)
+    assert(errors.size == 1)
+    assert(errors.head == "`data`.`element` is no longer nullable")
+  }
+
+  test("validateCapturedColumns - array containsNull changed to true") {
+    val originCols = Array(
+      col("id", LongType, nullable = true),
+      col("data", ArrayType(IntegerType, containsNull = false), nullable = true))
+    val currentCols = Array(
+      col("id", LongType, nullable = true),
+      col("data", ArrayType(IntegerType, containsNull = true), nullable = true))
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val errors = validateCapturedColumns(table, originCols)
+    assert(errors.size == 1)
+    assert(errors.head == "`data`.`element` is nullable now")
+  }
+
+  test("validateCapturedColumns - map key type changed") {
+    val originCols = Array(
+      col("id", LongType, nullable = true),
+      col("data", MapType(IntegerType, StringType, valueContainsNull = true), nullable = true))
+    val currentCols = Array(
+      col("id", LongType, nullable = true),
+      col("data", MapType(LongType, StringType, valueContainsNull = true), nullable = true))
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val errors = validateCapturedColumns(table, originCols)
+    assert(errors.size == 1)
+    assert(errors.head == "`data`.`key` type has changed from INT to BIGINT")
+  }
+
+  test("validateCapturedColumns - map value type changed") {
+    val originCols = Array(
+      col("id", LongType, nullable = true),
+      col("data", MapType(StringType, IntegerType, valueContainsNull = true), nullable = true))
+    val currentCols = Array(
+      col("id", LongType, nullable = true),
+      col("data", MapType(StringType, LongType, valueContainsNull = true), nullable = true))
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val errors = validateCapturedColumns(table, originCols)
+    assert(errors.size == 1)
+    assert(errors.head == "`data`.`value` type has changed from INT to BIGINT")
+  }
+
+  test("validateCapturedColumns - map valueContainsNull changed to false") {
+    val originCols = Array(
+      col("id", LongType, nullable = true),
+      col("data", MapType(StringType, IntegerType, valueContainsNull = true), nullable = true))
+    val currentCols = Array(
+      col("id", LongType, nullable = true),
+      col("data", MapType(StringType, IntegerType, valueContainsNull = false), nullable = true))
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val errors = validateCapturedColumns(table, originCols)
+    assert(errors.size == 1)
+    assert(errors.head == "`data`.`value` is no longer nullable")
+  }
+
+  test("validateCapturedColumns - map valueContainsNull changed to true") {
+    val originCols = Array(
+      col("id", LongType, nullable = true),
+      col("data", MapType(StringType, IntegerType, valueContainsNull = false), nullable = true))
+    val currentCols = Array(
+      col("id", LongType, nullable = true),
+      col("data", MapType(StringType, IntegerType, valueContainsNull = true), nullable = true))
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val errors = validateCapturedColumns(table, originCols)
+    assert(errors.size == 1)
+    assert(errors.head == "`data`.`value` is nullable now")
+  }
+
+  test("validateCapturedColumns - nested array in struct element type changed") {
+    val originStructType = StructType(Seq(
+      StructField("name", StringType),
+      StructField("scores", ArrayType(IntegerType, containsNull = true))))
+    val originCols = Array(
+      col("id", LongType, nullable = true),
+      col("person", originStructType, nullable = true))
+    val currentStructType = StructType(Seq(
+      StructField("name", StringType),
+      StructField("scores", ArrayType(LongType, containsNull = true))))
+    val currentCols = Array(
+      col("id", LongType, nullable = true),
+      col("person", currentStructType, nullable = true))
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val errors = validateCapturedColumns(table, originCols)
+    assert(errors.size == 1)
+    assert(errors.head == "`person`.`scores`.`element` type has changed from INT to BIGINT")
+  }
+
+  test("validateCapturedColumns - nested map in struct value type changed") {
+    val originStructType = StructType(Seq(
+      StructField("name", StringType),
+      StructField("attrs", MapType(StringType, IntegerType, valueContainsNull = true))))
+    val originCols = Array(
+      col("id", LongType, nullable = true),
+      col("person", originStructType, nullable = true))
+    val currentStructType = StructType(Seq(
+      StructField("name", StringType),
+      StructField("attrs", MapType(StringType, LongType, valueContainsNull = true))))
+    val currentCols = Array(
+      col("id", LongType, nullable = true),
+      col("person", currentStructType, nullable = true))
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val errors = validateCapturedColumns(table, originCols)
+    assert(errors.size == 1)
+    assert(errors.head == "`person`.`attrs`.`value` type has changed from INT to BIGINT")
+  }
+
+  // ---------------------------------------------------------------------------
+  // Field ID change error messages
+  // ---------------------------------------------------------------------------
+
+  test("validateCapturedColumns - top-level column ID changed") {
+    val originCols = Array(
+      colWithId("id", LongType, nullable = false, id = "1"),
+      colWithId("name", StringType, nullable = true, id = "2"))
+    val currentCols = Array(
+      colWithId("id", LongType, nullable = false, id = "99"),  // ID changed
+      colWithId("name", StringType, nullable = true, id = "2"))
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val errors = validateCapturedColumns(table, originCols)
+    assert(errors.size == 1)
+    assert(errors.head == "`id` field ID has changed from 1 to 99")
+  }
+
+  test("validateCapturedColumns - nested struct field ID changed") {
+    val originStruct = StructType(Seq(
+      StructField("name", StringType).withId("10"),
+      StructField("age", IntegerType).withId("11")))
+    val originCols = Array(col("person", originStruct, nullable = true))
+
+    val currentStruct = StructType(Seq(
+      StructField("name", StringType).withId("10"),
+      StructField("age", IntegerType).withId("99")))  // age ID changed
+    val currentCols = Array(col("person", currentStruct, nullable = true))
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val errors = validateCapturedColumns(table, originCols)
+    assert(errors.size == 1)
+    assert(errors.head == "`person`.`age` field ID has changed from 11 to 99")
+  }
+
+  test("validateCapturedColumns - doubly-nested struct field ID changed") {
+    val originInner = StructType(Seq(StructField("age", IntegerType).withId("11")))
+    val originOuter = StructType(Seq(StructField("info", originInner).withId("10")))
+    val originCols = Array(col("person", originOuter, nullable = true))
+
+    val currentInner = StructType(Seq(StructField("age", IntegerType).withId("99")))  // changed
+    val currentOuter = StructType(Seq(StructField("info", currentInner).withId("10")))
+    val currentCols = Array(col("person", currentOuter, nullable = true))
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val errors = validateCapturedColumns(table, originCols)
+    assert(errors.size == 1)
+    assert(errors.head == "`person`.`info`.`age` field ID has changed from 11 to 99")
+  }
+
+  test("validateCapturedColumns - multiple nested struct field IDs changed") {
+    val originStruct = StructType(Seq(
+      StructField("name", StringType).withId("10"),
+      StructField("age", IntegerType).withId("11"),
+      StructField("score", DoubleType).withId("12")))
+    val originCols = Array(col("person", originStruct, nullable = true))
+
+    val currentStruct = StructType(Seq(
+      StructField("name", StringType).withId("10"),
+      StructField("age", IntegerType).withId("98"),    // changed
+      StructField("score", DoubleType).withId("99")))  // changed
+    val currentCols = Array(col("person", currentStruct, nullable = true))
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val errors = validateCapturedColumns(table, originCols)
+    assert(errors.size == 2)
+    assert(errors.exists(_ == "`person`.`age` field ID has changed from 11 to 98"))
+    assert(errors.exists(_ == "`person`.`score` field ID has changed from 12 to 99"))
+  }
+
+  test("validateCapturedColumns - nested field ID changed in array element struct") {
+    val originElem = StructType(Seq(
+      StructField("name", StringType).withId("10"),
+      StructField("price", IntegerType).withId("11")))
+    val originCols = Array(col("items", ArrayType(originElem), nullable = true))
+
+    val currentElem = StructType(Seq(
+      StructField("name", StringType).withId("10"),
+      StructField("price", IntegerType).withId("99")))  // price ID changed
+    val currentCols = Array(col("items", ArrayType(currentElem), nullable = true))
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val errors = validateCapturedColumns(table, originCols)
+    assert(errors.size == 1)
+    assert(errors.head == "`items`.`element`.`price` field ID has changed from 11 to 99")
+  }
+
+  test("validateCapturedColumns - nested field ID changed in map value struct") {
+    val originValue = StructType(Seq(
+      StructField("count", IntegerType).withId("10"),
+      StructField("label", StringType).withId("11")))
+    val originCols = Array(col("props", MapType(StringType, originValue), nullable = true))
+
+    val currentValue = StructType(Seq(
+      StructField("count", IntegerType).withId("10"),
+      StructField("label", StringType).withId("99")))  // label ID changed
+    val currentCols = Array(col("props", MapType(StringType, currentValue), nullable = true))
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val errors = validateCapturedColumns(table, originCols)
+    assert(errors.size == 1)
+    assert(errors.head == "`props`.`value`.`label` field ID has changed from 11 to 99")
+  }
+
+  test("validateCapturedColumns - field ID unchanged produces no error") {
+    val struct = StructType(Seq(
+      StructField("name", StringType).withId("10"),
+      StructField("age", IntegerType).withId("11")))
+    val cols = Array(col("person", struct, nullable = true))
+    val table = TestTableWithMetadataSupport("test", cols)
+
+    val errors = validateCapturedColumns(table, cols)
+    assert(errors.isEmpty)
+  }
+
+  test("validateCapturedColumns - reordered nested fields produce no error") {
+    val originStruct = StructType(Seq(
+      StructField("name", StringType).withId("10"),
+      StructField("age", IntegerType).withId("11")))
+    val currentStruct = StructType(Seq(
+      StructField("age", IntegerType).withId("11"),  // reordered
+      StructField("name", StringType).withId("10")))
+    val originCols = Array(col("person", originStruct, nullable = true))
+    val table = TestTableWithMetadataSupport("test",
+      Array(col("person", currentStruct, nullable = true)))
+
+    val errors = validateCapturedColumns(table, originCols)
+    assert(errors.isEmpty, "reordering nested fields should not produce errors")
+  }
+
+  test("validateCapturedColumns - field ID check disabled") {
+    val originStruct = StructType(Seq(StructField("age", IntegerType).withId("11")))
+    val originCols = Array(col("person", originStruct, nullable = true))
+
+    val currentStruct = StructType(Seq(StructField("age", IntegerType).withId("99")))
+    val currentCols = Array(col("person", currentStruct, nullable = true))
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val errors = V2TableUtil.validateCapturedColumns(
+      table,
+      originCols.toImmutableArraySeq,
+      mode = PROHIBIT_CHANGES,
+      checkIds = false)
+    assert(errors.isEmpty, "Disabled field ID check should not report ID changes")
+  }
+
+  test("validateCapturedColumns - ALLOW_NEW_TOP_LEVEL_FIELDS allows top-level additions") {
+    val originCols = Array(
+      col("id", LongType, nullable = false),
+      col("name", StringType, nullable = true))
+    val currentCols = Array(
+      col("id", LongType, nullable = false),
+      col("name", StringType, nullable = true),
+      col("age", IntegerType, nullable = true))
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val errors = validateCapturedColumns(table, originCols, ALLOW_NEW_TOP_LEVEL_FIELDS)
+    assert(errors.isEmpty)
+  }
+
+  test("validateCapturedColumns - ALLOW_NEW_TOP_LEVEL_FIELDS prohibits nested additions") {
+    val originAddress = StructType(Seq(
+      StructField("street", StringType),
+      StructField("city", StringType)))
+    val originCols = Array(
+      col("id", LongType, nullable = false),
+      col("address", originAddress, nullable = true))
+    val currentAddress = StructType(Seq(
+      StructField("street", StringType),
+      StructField("city", StringType),
+      StructField("zipCode", StringType)))
+    val currentCols = Array(
+      col("id", LongType, nullable = false),
+      col("address", currentAddress, nullable = true))
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val errors = validateCapturedColumns(table, originCols, ALLOW_NEW_TOP_LEVEL_FIELDS)
+    assert(errors.size == 1)
+    assert(errors.head.contains("`address`.`zipCode` STRING has been added"))
+  }
+
+  test("validateCapturedColumns - ALLOW_NEW_TOP_LEVEL_FIELDS fails new nested fields in array") {
+    val originItem = StructType(Seq(
+      StructField("itemId", LongType),
+      StructField("itemName", StringType)))
+    val originCols = Array(
+      col("id", LongType, nullable = false),
+      col("items", ArrayType(originItem), nullable = true))
+    val currentItem = StructType(Seq(
+      StructField("itemId", LongType),
+      StructField("itemName", StringType),
+      StructField("price", IntegerType)))
+    val currentCols = Array(
+      col("id", LongType, nullable = false),
+      col("items", ArrayType(currentItem), nullable = true))
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val errors = V2TableUtil.validateCapturedColumns(
+      table,
+      originCols.toImmutableArraySeq,
+      mode = ALLOW_NEW_TOP_LEVEL_FIELDS,
+      checkIds = true)
+    assert(errors.size == 1)
+    assert(errors.head.contains("`items`.`element`.`price` INT has been added"))
+  }
+
+  test("validateCapturedColumns - ALLOW_NEW_TOP_LEVEL_FIELDS prohibits nested map additions") {
+    val originValue = StructType(Seq(
+      StructField("count", IntegerType),
+      StructField("status", StringType)))
+    val originCols = Array(
+      col("id", LongType, nullable = false),
+      col("metadata", MapType(StringType, originValue), nullable = true))
+    val currentValue = StructType(Seq(
+      StructField("count", IntegerType),
+      StructField("status", StringType),
+      StructField("timestamp", LongType)))
+    val currentCols = Array(
+      col("id", LongType, nullable = false),
+      col("metadata", MapType(StringType, currentValue), nullable = true))
+    val table = TestTableWithMetadataSupport("test", currentCols)
+
+    val errors = validateCapturedColumns(table, originCols, ALLOW_NEW_TOP_LEVEL_FIELDS)
+    assert(errors.size == 1)
+    assert(errors.head.contains("`metadata`.`value`.`timestamp` BIGINT has been added"))
+  }
+
+  // simple table without metadata column support
+  private case class TestTable(
+      override val name: String,
+      override val columns: Array[Column])
+      extends Table {
+    override def capabilities: util.Set[TableCapability] = util.Set.of(BATCH_READ)
+  }
+
+  // simple table implementation with metadata column support
+  private case class TestTableWithMetadataSupport(
+      override val name: String,
+      override val columns: Array[Column],
+      override val metadataColumns: Array[MetadataColumn] = Array.empty)
+      extends Table with SupportsMetadataColumns {
+    override def capabilities: util.Set[TableCapability] = util.Set.of(BATCH_READ)
+  }
+
+  // table that renames metadata columns conflicting with data columns instead of suppressing them
+  private case class TestTableWithRenamableMetadata(
+      override val name: String,
+      override val columns: Array[Column],
+      override val metadataColumns: Array[MetadataColumn] = Array.empty)
+      extends Table with SupportsMetadataColumns {
+    override def capabilities: util.Set[TableCapability] = util.Set.of(BATCH_READ)
+    override def canRenameConflictingMetadataColumns: Boolean = true
+  }
+
+  // table that throws when metadataColumns is accessed
+  private case class TestTableThatThrowsOnMetadataAccess(
+      override val name: String,
+      override val columns: Array[Column])
+      extends Table with SupportsMetadataColumns {
+    override def capabilities: util.Set[TableCapability] = util.Set.of(BATCH_READ)
+    override lazy val metadataColumns: Array[MetadataColumn] = {
+      throw new RuntimeException("metadataColumns should not be accessed")
+    }
+  }
+
+  private case class TestMetadataColumn(
+      override val name: String,
+      override val dataType: DataType,
+      override val isNullable: Boolean)
+      extends MetadataColumn {
+    override def comment: String = s"Test metadata column $name"
+    override def metadataInJSON: String = "{}"
+  }
+
+  private def validateCapturedColumns(
+      table: Table,
+      originCols: Array[Column],
+      mode: SchemaValidationMode = PROHIBIT_CHANGES): Seq[String] = {
+    V2TableUtil.validateCapturedColumns(
+      table,
+      originCols.toImmutableArraySeq,
+      mode,
+      checkIds = true)
+  }
+
+  private def col(name: String, dataType: DataType, nullable: Boolean): Column = {
+    Column.create(name, dataType, nullable)
+  }
+
+  private def colWithId(
+      name: String,
+      dataType: DataType,
+      nullable: Boolean,
+      id: String): Column = {
+    ColumnImpl(
+      name = name,
+      dataType = dataType,
+      nullable = nullable,
+      comment = null,
+      defaultValue = null,
+      columnGenerationExpression = null,
+      identityColumnSpec = null,
+      metadataInJSON = null,
+      id = id)
+  }
+
+  private def metaCol(
+      name: String,
+      dataType: DataType,
+      nullable: Boolean): MetadataColumn = {
+    TestMetadataColumn(name, dataType, nullable)
+  }
+}

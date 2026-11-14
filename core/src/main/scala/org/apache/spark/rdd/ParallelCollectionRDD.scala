@@ -19,7 +19,6 @@ package org.apache.spark.rdd
 
 import java.io._
 
-import scala.Serializable
 import scala.collection.Map
 import scala.collection.immutable.NumericRange
 import scala.collection.mutable.ArrayBuffer
@@ -27,6 +26,7 @@ import scala.reflect.ClassTag
 
 import org.apache.spark._
 import org.apache.spark.serializer.JavaSerializer
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.Utils
 
 private[spark] class ParallelCollectionPartition[T: ClassTag](
@@ -116,7 +116,7 @@ private object ParallelCollectionRDD {
    */
   def slice[T: ClassTag](seq: Seq[T], numSlices: Int): Seq[Seq[T]] = {
     if (numSlices < 1) {
-      throw new IllegalArgumentException("Positive number of slices required")
+      throw new IllegalArgumentException("Positive number of partitions required")
     }
     // Sequences need to be sliced at the same set of index positions for operations
     // like RDD.zip() to behave as expected
@@ -133,12 +133,11 @@ private object ParallelCollectionRDD {
           // If the range is inclusive, use inclusive range for the last slice
           if (r.isInclusive && index == numSlices - 1) {
             new Range.Inclusive(r.start + start * r.step, r.end, r.step)
-          }
-          else {
-            new Range(r.start + start * r.step, r.start + end * r.step, r.step)
+          } else {
+            new Range.Inclusive(r.start + start * r.step, r.start + (end - 1) * r.step, r.step)
           }
         }.toSeq.asInstanceOf[Seq[Seq[T]]]
-      case nr: NumericRange[_] =>
+      case nr: NumericRange[T] =>
         // For ranges of Long, Double, BigInteger, etc
         val slices = new ArrayBuffer[Seq[T]](numSlices)
         var r = nr
@@ -147,11 +146,11 @@ private object ParallelCollectionRDD {
           slices += r.take(sliceSize).asInstanceOf[Seq[T]]
           r = r.drop(sliceSize)
         }
-        slices
+        slices.toSeq
       case _ =>
         val array = seq.toArray // To prevent O(n^2) operations for List etc
         positions(array.length, numSlices).map { case (start, end) =>
-            array.slice(start, end).toSeq
+            array.slice(start, end).toImmutableArraySeq
         }.toSeq
     }
   }

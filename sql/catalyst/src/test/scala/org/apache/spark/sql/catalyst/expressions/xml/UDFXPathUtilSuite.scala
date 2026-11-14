@@ -17,6 +17,8 @@
 
 package org.apache.spark.sql.catalyst.expressions.xml
 
+import java.nio.charset.StandardCharsets
+import java.nio.file.Files
 import javax.xml.xpath.XPathConstants.STRING
 
 import org.w3c.dom.Node
@@ -57,7 +59,7 @@ class UDFXPathUtilSuite extends SparkFunSuite {
   test("boolean eval") {
     var ret =
       util.evalBoolean("<a><b>true</b><b>false</b><b>b3</b><c>c1</c><c>c2</c></a>", "a/b[1]/text()")
-    assert(ret == true)
+    assert(ret)
 
     ret = util.evalBoolean("<a><b>true</b><b>false</b><b>b3</b><c>c1</c><c>c2</c></a>", "a/b[4]")
     assert(ret == false)
@@ -75,6 +77,26 @@ class UDFXPathUtilSuite extends SparkFunSuite {
     ret = util.evalString(
       "<a><b>true</b><b k=\"foo\">FALSE</b><b>b3</b><c>c1</c><c>c2</c></a>", "a/b[2]/@k")
     assert(ret == "foo")
+  }
+
+  test("embedFailure") {
+    import java.io.File
+    val secretValue = String.valueOf(Math.random)
+    val tempFile = File.createTempFile("verifyembed", ".tmp")
+    tempFile.deleteOnExit()
+    val fname = tempFile.getAbsolutePath
+
+    Files.writeString(tempFile.toPath(), secretValue, StandardCharsets.UTF_8)
+
+    val xml =
+      s"""<?xml version="1.0" encoding="utf-8"?>
+        |<!DOCTYPE test [
+        |    <!ENTITY embed SYSTEM "$fname">
+        |]>
+        |<foo>&embed;</foo>
+      """.stripMargin
+    val evaled = new UDFXPathUtil().evalString(xml, "/foo")
+    assert(evaled.isEmpty)
   }
 
   test("number eval") {
@@ -95,6 +117,6 @@ class UDFXPathUtilSuite extends SparkFunSuite {
   test("node list eval") {
     val ret = util.evalNodeList("<a><b>true</b><b>false</b><b>b3</b><c>c1</c><c>-77</c></a>", "a/*")
     assert(ret != null && ret.isInstanceOf[NodeList])
-    assert(ret.asInstanceOf[NodeList].getLength == 5)
+    assert(ret.getLength == 5)
   }
 }

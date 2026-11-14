@@ -23,6 +23,8 @@ import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 
 import org.apache.spark.deploy.ApplicationDescription
+import org.apache.spark.resource.{ResourceInformation, ResourceProfile, ResourceUtils}
+import org.apache.spark.resource.ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID
 import org.apache.spark.rpc.RpcEndpointRef
 import org.apache.spark.util.Utils
 
@@ -42,10 +44,15 @@ private[spark] class ApplicationInfo(
   @transient var endTime: Long = _
   @transient var appSource: ApplicationSource = _
 
-  // A cap on the number of executors this application can have at any given time.
-  // By default, this is infinite. Only after the first allocation request is issued by the
-  // application will this be set to a finite value. This is used for dynamic allocation.
-  @transient private[master] var executorLimit: Int = _
+  // Hold state reported by the driver. Transient, because it belongs to the running driver and
+  // not to the recovered application: a new Master learns it again when the driver re-registers.
+  @transient var holdSupported: Boolean = _
+  @transient var held: Boolean = _
+
+  @transient private var executorsPerResourceProfileId: mutable.HashMap[Int, mutable.Set[Int]] = _
+  @transient private var targetNumExecutorsPerResourceProfileId: mutable.HashMap[Int, Int] = _
+  @transient private var rpIdToResourceProfile: mutable.HashMap[Int, ResourceProfile] = _
+  @transient private var rpIdToResourceDesc: mutable.HashMap[Int, ExecutorResourceDescription] = _
 
   @transient private var nextExecutorId: Int = _
 
@@ -56,15 +63,78 @@ private[spark] class ApplicationInfo(
     init()
   }
 
-  private def init() {
+  private def init(): Unit = {
     state = ApplicationState.WAITING
     executors = new mutable.HashMap[Int, ExecutorDesc]
     coresGranted = 0
     endTime = -1L
+    holdSupported = false
+    held = false
     appSource = new ApplicationSource(this)
     nextExecutorId = 0
     removedExecutors = new ArrayBuffer[ExecutorDesc]
-    executorLimit = desc.initialExecutorLimit.getOrElse(Integer.MAX_VALUE)
+    val initialExecutorLimit = desc.initialExecutorLimit.getOrElse(Integer.MAX_VALUE)
+
+    rpIdToResourceProfile = new mutable.HashMap[Int, ResourceProfile]()
+    rpIdToResourceProfile(DEFAULT_RESOURCE_PROFILE_ID) = desc.defaultProfile
+    rpIdToResourceDesc = new mutable.HashMap[Int, ExecutorResourceDescription]()
+    createResourceDescForResourceProfile(desc.defaultProfile)
+
+    targetNumExecutorsPerResourceProfileId = new mutable.HashMap[Int, Int]()
+    targetNumExecutorsPerResourceProfileId(DEFAULT_RESOURCE_PROFILE_ID) = initialExecutorLimit
+
+    executorsPerResourceProfileId = new mutable.HashMap[Int, mutable.Set[Int]]()
+  }
+
+  private[deploy] def getOrUpdateExecutorsForRPId(rpId: Int): mutable.Set[Int] = {
+    executorsPerResourceProfileId.getOrElseUpdate(rpId, mutable.HashSet[Int]())
+  }
+
+  private[deploy] def getTargetExecutorNumForRPId(rpId: Int): Int = {
+    targetNumExecutorsPerResourceProfileId.getOrElse(rpId, 0)
+  }
+
+  private[deploy] def getRequestedRPIds(): Seq[Int] = {
+    rpIdToResourceProfile.keys.toSeq.sorted
+  }
+
+  private def createResourceDescForResourceProfile(resourceProfile: ResourceProfile): Unit = {
+    if (!rpIdToResourceDesc.contains(resourceProfile.id)) {
+      val defaultMemoryMbPerExecutor = desc.memoryPerExecutorMB
+      val defaultCoresPerExecutor = desc.coresPerExecutor
+      val coresPerExecutor = resourceProfile.getExecutorCores
+        .orElse(defaultCoresPerExecutor)
+      val memoryMbPerExecutor = resourceProfile.getExecutorMemory
+        .map(_.toInt)
+        .getOrElse(defaultMemoryMbPerExecutor)
+      val customResources = ResourceUtils.executorResourceRequestToRequirement(
+        resourceProfile.getCustomExecutorResources().values.toSeq.sortBy(_.resourceName))
+
+      rpIdToResourceDesc(resourceProfile.id) =
+        ExecutorResourceDescription(coresPerExecutor, memoryMbPerExecutor, customResources)
+    }
+  }
+
+  // Get resources required for schedule.
+  private[deploy] def getResourceDescriptionForRpId(rpId: Int): ExecutorResourceDescription = {
+    rpIdToResourceDesc(rpId)
+  }
+
+  private[deploy] def requestExecutors(
+      resourceProfileToTotalExecs: Map[ResourceProfile, Int]): Unit = {
+    resourceProfileToTotalExecs.foreach { case (rp, num) =>
+      createResourceDescForResourceProfile(rp)
+
+      if (!rpIdToResourceProfile.contains(rp.id)) {
+        rpIdToResourceProfile(rp.id) = rp
+      }
+
+      targetNumExecutorsPerResourceProfileId(rp.id) = num
+    }
+  }
+
+  private[deploy] def getResourceProfileById(rpId: Int): ResourceProfile = {
+    rpIdToResourceProfile(rpId)
   }
 
   private def newExecutorId(useID: Option[Int] = None): Int = {
@@ -82,17 +152,23 @@ private[spark] class ApplicationInfo(
   private[master] def addExecutor(
       worker: WorkerInfo,
       cores: Int,
+      memoryMb: Int,
+      resources: Map[String, ResourceInformation],
+      rpId: Int,
       useID: Option[Int] = None): ExecutorDesc = {
-    val exec = new ExecutorDesc(newExecutorId(useID), this, worker, cores, desc.memoryPerExecutorMB)
+    val exec = new ExecutorDesc(
+      newExecutorId(useID), this, worker, cores, memoryMb, resources, rpId)
     executors(exec.id) = exec
+    getOrUpdateExecutorsForRPId(rpId).add(exec.id)
     coresGranted += cores
     exec
   }
 
-  private[master] def removeExecutor(exec: ExecutorDesc) {
+  private[master] def removeExecutor(exec: ExecutorDesc): Unit = {
     if (executors.contains(exec.id)) {
       removedExecutors += executors(exec.id)
       executors -= exec.id
+      executorsPerResourceProfileId(exec.rpId) -= exec.id
       coresGranted -= exec.cores
     }
   }
@@ -112,7 +188,7 @@ private[spark] class ApplicationInfo(
 
   private[master] def resetRetryCount() = _retryCount = 0
 
-  private[master] def markFinished(endState: ApplicationState.Value) {
+  private[master] def markFinished(endState: ApplicationState.Value): Unit = {
     state = endState
     endTime = System.currentTimeMillis()
   }
@@ -122,10 +198,45 @@ private[spark] class ApplicationInfo(
   }
 
   /**
-   * Return the limit on the number of executors this application can have.
-   * For testing only.
+   * Return the total limit on the number of executors for all resource profiles.
    */
-  private[deploy] def getExecutorLimit: Int = executorLimit
+  private[deploy] def getExecutorLimit: Int = {
+    targetNumExecutorsPerResourceProfileId.values.sum
+  }
+
+  /**
+   * Whether the application is held right now, per the last report from its running driver. An
+   * application that did not report the hold as supported is not considered held -- its driver
+   * UI offers no control to change it -- and neither is a finished application, whose driver is
+   * gone, so the last reported hold is stale.
+   */
+  private[deploy] def isHeld: Boolean = held && holdSupported && !isFinished
+
+  /**
+   * The number of executors that have not exited yet while the application is held. They are
+   * still draining their running tasks; the hold is complete once this reaches zero. Counting
+   * `executors` relies on `DECOMMISSIONED` not being a finished `ExecutorState`: the Master
+   * keeps a decommissioning executor in the map until it actually exits, which is what makes
+   * this count agree with the driver's own `draining` from its `/holdstatus` endpoint.
+   */
+  private[deploy] def numDrainingExecutors: Int = if (isHeld) executors.size else 0
+
+  /**
+   * The application state, annotated with the hold reported by its driver, for example
+   * `RUNNING (held, draining 2 executors)`.
+   */
+  private[deploy] def stateText: String = {
+    if (!isHeld) {
+      state.toString
+    } else {
+      val draining = numDrainingExecutors
+      if (draining == 0) {
+        s"$state (held)"
+      } else {
+        s"$state (held, draining $draining executor${if (draining > 1) "s" else ""})"
+      }
+    }
+  }
 
   def duration: Long = {
     if (endTime != -1) {

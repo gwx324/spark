@@ -20,6 +20,7 @@ package org.apache.spark.mllib.clustering
 import scala.util.Random
 
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.LogKeys.{NUM_ITERATIONS, POINT_OF_CENTER}
 import org.apache.spark.mllib.linalg.BLAS.{axpy, scal}
 import org.apache.spark.mllib.linalg.Vectors
 
@@ -46,7 +47,7 @@ private[mllib] object LocalKMeans extends Logging {
 
     // Initialize centers by sampling using the k-means++ procedure.
     centers(0) = pickWeighted(rand, points, weights).toDense
-    val costArray = points.map(KMeans.fastSquaredDistance(_, centers(0)))
+    val costArray = points.map(EuclideanDistanceMeasure.fastSquaredDistance(_, centers(0)))
 
     for (i <- 1 until k) {
       val sum = costArray.zip(weights).map(p => p._1 * p._2).sum
@@ -58,8 +59,8 @@ private[mllib] object LocalKMeans extends Logging {
         j += 1
       }
       if (j == 0) {
-        logWarning("kMeansPlusPlus initialization ran out of distinct points for centers." +
-          s" Using duplicate point for center k = $i.")
+        logWarning(log"kMeansPlusPlus initialization ran out of distinct points for centers." +
+          log" Using duplicate point for center k = ${MDC(POINT_OF_CENTER, i)}.")
         centers(i) = points(0).toDense
       } else {
         centers(i) = points(j - 1).toDense
@@ -67,10 +68,14 @@ private[mllib] object LocalKMeans extends Logging {
 
       // update costArray
       for (p <- points.indices) {
-        costArray(p) = math.min(KMeans.fastSquaredDistance(points(p), centers(i)), costArray(p))
+        costArray(p) = math.min(
+          EuclideanDistanceMeasure.fastSquaredDistance(points(p), centers(i)),
+          costArray(p))
       }
 
     }
+
+    val distanceMeasureInstance = EuclideanDistanceMeasure
 
     // Run up to maxIterations iterations of Lloyd's algorithm
     val oldClosest = Array.fill(points.length)(-1)
@@ -78,12 +83,12 @@ private[mllib] object LocalKMeans extends Logging {
     var moved = true
     while (moved && iteration < maxIterations) {
       moved = false
-      val counts = Array.fill(k)(0.0)
+      val counts = Array.ofDim[Double](k)
       val sums = Array.fill(k)(Vectors.zeros(dimensions))
       var i = 0
       while (i < points.length) {
         val p = points(i)
-        val index = KMeans.findClosest(centers, p)._1
+        val index = distanceMeasureInstance.findClosest(centers, p)._1
         axpy(weights(i), p.vector, sums(index))
         counts(index) += weights(i)
         if (index != oldClosest(i)) {
@@ -108,9 +113,10 @@ private[mllib] object LocalKMeans extends Logging {
     }
 
     if (iteration == maxIterations) {
-      logInfo(s"Local KMeans++ reached the max number of iterations: $maxIterations.")
+      logInfo(log"Local KMeans++ reached the max number of " +
+        log"iterations: ${MDC(NUM_ITERATIONS, maxIterations)}.")
     } else {
-      logInfo(s"Local KMeans++ converged in $iteration iterations.")
+      logInfo(log"Local KMeans++ converged in ${MDC(NUM_ITERATIONS, iteration)} iterations.")
     }
 
     centers

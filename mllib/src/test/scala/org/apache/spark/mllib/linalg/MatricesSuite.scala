@@ -20,16 +20,43 @@ package org.apache.spark.mllib.linalg
 import java.util.Random
 
 import scala.collection.mutable.{Map => MutableMap}
+import scala.reflect.ClassTag
 
 import breeze.linalg.{CSCMatrix, Matrix => BM}
 import org.mockito.Mockito.when
-import org.scalatest.mock.MockitoSugar._
+import org.scalatestplus.mockito.MockitoSugar._
 
-import org.apache.spark.SparkFunSuite
+import org.apache.spark.{SparkConf, SparkFunSuite}
+import org.apache.spark.internal.config.Kryo._
 import org.apache.spark.ml.{linalg => newlinalg}
 import org.apache.spark.mllib.util.TestingUtils._
+import org.apache.spark.serializer.KryoSerializer
 
 class MatricesSuite extends SparkFunSuite {
+  test("kryo class register") {
+    val conf = new SparkConf(false)
+    conf.set(KRYO_REGISTRATION_REQUIRED, true)
+
+    val ser = new KryoSerializer(conf).newInstance()
+
+    def check[T: ClassTag](t: T): Unit = {
+      assert(ser.deserialize[T](ser.serialize(t)) === t)
+    }
+
+    val m = 3
+    val n = 2
+    val denseValues = Array(0.0, 1.0, 2.0, 3.0, 4.0, 5.0)
+    val denseMat = Matrices.dense(m, n, denseValues).asInstanceOf[DenseMatrix]
+
+    val sparseValues = Array(1.0, 2.0, 4.0, 5.0)
+    val colPtrs = Array(0, 2, 4)
+    val rowIndices = Array(1, 2, 1, 2)
+    val sparseMat =
+      Matrices.sparse(m, n, colPtrs, rowIndices, sparseValues).asInstanceOf[SparseMatrix]
+    check(denseMat)
+    check(sparseMat)
+  }
+
   test("dense matrix construction") {
     val m = 3
     val n = 2
@@ -124,6 +151,43 @@ class MatricesSuite extends SparkFunSuite {
     assert(!sparseMat.toArray.eq(sparseCopy.toArray))
   }
 
+  test("SPARK-60296: DenseMatrix.hashCode is consistent with equals") {
+    val dm = new DenseMatrix(3, 2, Array(1.0, -0.0, 2.0, 0.0, 3.0, 0.0))
+    assert(dm.hashCode === dm.hashCode)
+    assert(dm.copy === dm)
+    assert(dm.copy.hashCode === dm.hashCode)
+
+    // The same matrix with the values stored in row major.
+    val dmt = new DenseMatrix(3, 2, Array(1.0, 0.0, -0.0, 3.0, 2.0, 0.0), isTransposed = true)
+    val dmtColMajor = new DenseMatrix(3, 2, dmt.toArray)
+    assert(dmt === dmtColMajor)
+    assert(dmt.hashCode === dmtColMajor.hashCode)
+
+    // The same matrix with an explicit 0.0 and an explicit -0.0.
+    val sm = new SparseMatrix(3, 2, Array(0, 3, 5), Array(0, 1, 2, 0, 1),
+      Array(1.0, 0.0, 2.0, -0.0, 3.0))
+    Seq(dm, dmt).foreach { m =>
+      assert(m === sm)
+      assert(m.hashCode === sm.hashCode)
+      assert(m.transpose === sm.transpose)
+      assert(m.transpose.hashCode === sm.transpose.hashCode)
+    }
+  }
+
+  test("SPARK-60491: Matrix.hashCode depends on the shape and the positions of the entries") {
+    val values = Array(1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
+    val matrices = Seq(new DenseMatrix(2, 3, values), new DenseMatrix(3, 2, values),
+      new DenseMatrix(3, 2, Array(1.0, 0.0, 2.0, 0.0, 3.0, 0.0)),
+      new DenseMatrix(3, 2, Array(1.0, 2.0, 0.0, 3.0, 0.0, 0.0)))
+    assert(matrices.map(_.hashCode).distinct.length === matrices.length)
+    matrices.foreach { m =>
+      assert(m.toSparse === m)
+      assert(m.toSparse.hashCode === m.hashCode)
+      assert(m.toSparse.transpose === m.transpose)
+      assert(m.toSparse.transpose.hashCode === m.transpose.hashCode)
+    }
+  }
+
   test("matrix indexing and updating") {
     val m = 3
     val n = 2
@@ -204,8 +268,8 @@ class MatricesSuite extends SparkFunSuite {
       new DenseMatrix(4, 3, Array(0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 3.0))
     val sA = new SparseMatrix(4, 3, Array(0, 1, 3, 4), Array(1, 0, 2, 3), Array(1.0, 2.0, 1.0, 3.0))
 
-    val dAT = dA.transpose.asInstanceOf[DenseMatrix]
-    val sAT = sA.transpose.asInstanceOf[SparseMatrix]
+    val dAT = dA.transpose
+    val sAT = sA.transpose
     val dATexpected =
       new DenseMatrix(3, 4, Array(0.0, 2.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 3.0))
     val sATexpected =
@@ -219,10 +283,32 @@ class MatricesSuite extends SparkFunSuite {
     assert(sA(2, 1) === sAT(1, 2))
 
     assert(!dA.toArray.eq(dAT.toArray), "has to have a new array")
-    assert(dA.values.eq(dAT.transpose.asInstanceOf[DenseMatrix].values), "should not copy array")
+    assert(dA.values.eq(dAT.transpose.values), "should not copy array")
 
     assert(dAT.toSparse.asBreeze === sATexpected.asBreeze)
     assert(sAT.toDense.asBreeze === dATexpected.asBreeze)
+  }
+
+  test("SPARK-60300: copy preserves isTransposed") {
+    val denseMatrices = Seq(
+      new DenseMatrix(2, 2, Array(1.0, 2.0, 3.0, 4.0)).transpose,
+      new DenseMatrix(2, 3, Array(1.0, 2.0, 3.0, 4.0, 5.0, 6.0)).transpose)
+    denseMatrices.foreach { m =>
+      val copy = m.copy
+      assert(copy === m)
+      assert(copy.isTransposed === m.isTransposed)
+      assert(!copy.values.eq(m.values), "has to have a new array")
+    }
+
+    val sparseMatrices = Seq(
+      new SparseMatrix(2, 2, Array(0, 2, 3), Array(0, 1, 1), Array(1.0, 2.0, 3.0)).transpose,
+      new SparseMatrix(2, 3, Array(0, 1, 2, 3), Array(0, 1, 0), Array(1.0, 2.0, 3.0)).transpose)
+    sparseMatrices.foreach { m =>
+      val copy = m.copy
+      assert(copy === m)
+      assert(copy.isTransposed === m.isTransposed)
+      assert(!copy.values.eq(m.values), "has to have a new array")
+    }
   }
 
   test("foreachActive") {
@@ -241,22 +327,22 @@ class MatricesSuite extends SparkFunSuite {
       dnMap.put((i, j), value)
     }
     assert(dnMap.size === 6)
-    assert(dnMap(0, 0) === 1.0)
-    assert(dnMap(1, 0) === 2.0)
-    assert(dnMap(2, 0) === 0.0)
-    assert(dnMap(0, 1) === 0.0)
-    assert(dnMap(1, 1) === 4.0)
-    assert(dnMap(2, 1) === 5.0)
+    assert(dnMap((0, 0)) === 1.0)
+    assert(dnMap((1, 0)) === 2.0)
+    assert(dnMap((2, 0)) === 0.0)
+    assert(dnMap((0, 1)) === 0.0)
+    assert(dnMap((1, 1)) === 4.0)
+    assert(dnMap((2, 1)) === 5.0)
 
     val spMap = MutableMap[(Int, Int), Double]()
     sp.foreachActive { (i, j, value) =>
       spMap.put((i, j), value)
     }
     assert(spMap.size === 4)
-    assert(spMap(0, 0) === 1.0)
-    assert(spMap(1, 0) === 2.0)
-    assert(spMap(1, 1) === 4.0)
-    assert(spMap(2, 1) === 5.0)
+    assert(spMap((0, 0)) === 1.0)
+    assert(spMap((1, 0)) === 2.0)
+    assert(spMap((1, 1)) === 4.0)
+    assert(spMap((2, 1)) === 5.0)
   }
 
   test("horzcat, vertcat, eye, speye") {
@@ -289,7 +375,7 @@ class MatricesSuite extends SparkFunSuite {
     val spHorz2 = Matrices.horzcat(Array(spMat1, deMat2))
     val spHorz3 = Matrices.horzcat(Array(deMat1, spMat2))
     val deHorz1 = Matrices.horzcat(Array(deMat1, deMat2))
-    val deHorz2 = Matrices.horzcat(Array[Matrix]())
+    val deHorz2 = Matrices.horzcat(Array.empty[Matrix])
 
     assert(deHorz1.numRows === 3)
     assert(spHorz2.numRows === 3)
@@ -343,7 +429,7 @@ class MatricesSuite extends SparkFunSuite {
     val deVert1 = Matrices.vertcat(Array(deMat1, deMat3))
     val spVert2 = Matrices.vertcat(Array(spMat1, deMat3))
     val spVert3 = Matrices.vertcat(Array(deMat1, spMat3))
-    val deVert2 = Matrices.vertcat(Array[Matrix]())
+    val deVert2 = Matrices.vertcat(Array.empty[Matrix])
 
     assert(deVert1.numRows === 5)
     assert(spVert2.numRows === 5)
@@ -485,11 +571,11 @@ class MatricesSuite extends SparkFunSuite {
     mat.toString(0, 0)
     mat.toString(Int.MinValue, Int.MinValue)
     mat.toString(Int.MaxValue, Int.MaxValue)
-    var lines = mat.toString(6, 50).lines.toArray
-    assert(lines.size == 5 && lines.forall(_.size <= 50))
+    var lines = mat.toString(6, 50).split('\n')
+    assert(lines.length == 5 && lines.forall(_.length <= 50))
 
-    lines = mat.toString(5, 100).lines.toArray
-    assert(lines.size == 5 && lines.forall(_.size <= 100))
+    lines = mat.toString(5, 100).split('\n')
+    assert(lines.length == 5 && lines.forall(_.length <= 100))
   }
 
   test("numNonzeros and numActives") {
@@ -511,6 +597,26 @@ class MatricesSuite extends SparkFunSuite {
       Array(1.0, 2, 2, 4), 3, 3, Array(0, 0, 2, 4), Array(1, 2, 1, 2))
     val sum = bm1 + bm2
     Matrices.fromBreeze(sum)
+  }
+
+  test("Test FromBreeze when Breeze.CSCMatrix.rowIndices has trailing zeros. - SPARK-20687") {
+    // (2, 0, 0)
+    // (2, 0, 0)
+    val mat1Brz = Matrices.sparse(2, 3, Array(0, 2, 2, 2), Array(0, 1), Array(2, 2)).asBreeze
+    // (2, 1E-15, 1E-15)
+    // (2, 1E-15, 1E-15)
+    val mat2Brz = Matrices.sparse(2, 3,
+      Array(0, 2, 4, 6),
+      Array(0, 0, 0, 1, 1, 1),
+      Array(2, 1E-15, 1E-15, 2, 1E-15, 1E-15)).asBreeze
+    val t1Brz = mat1Brz - mat2Brz
+    val t2Brz = mat2Brz - mat1Brz
+    // The following operations raise exceptions on un-patch Matrices.fromBreeze
+    val t1 = Matrices.fromBreeze(t1Brz)
+    val t2 = Matrices.fromBreeze(t2Brz)
+    // t1 == t1Brz && t2 == t2Brz
+    assert((t1.asBreeze - t1Brz).iterator.map((x) => math.abs(x._2)).sum < 1E-15)
+    assert((t2.asBreeze - t2Brz).iterator.map((x) => math.abs(x._2)).sum < 1E-15)
   }
 
   test("row/col iterator") {

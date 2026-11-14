@@ -1,0 +1,1706 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.spark.sql.connect.client
+
+import java.nio.charset.StandardCharsets.UTF_8
+import java.util.{Base64, UUID}
+import java.util.concurrent.{CountDownLatch, Executor, TimeUnit}
+
+import scala.collection.mutable
+import scala.concurrent.duration.FiniteDuration
+import scala.jdk.CollectionConverters._
+
+import com.google.protobuf.{Any => PAny, StringValue}
+import io.grpc.{CallCredentials, CallOptions, Channel, ClientCall, ClientInterceptor, Metadata, MethodDescriptor, Server, ServerCall, ServerCallHandler, ServerInterceptor, Status, StatusRuntimeException}
+import io.grpc.netty.NettyServerBuilder
+import io.grpc.stub.StreamObserver
+import org.scalatest.concurrent.Eventually
+import org.scalatest.concurrent.Futures.timeout
+import org.scalatest.time.SpanSugar._
+
+import org.apache.spark.{SparkException, SparkThrowable}
+import org.apache.spark.connect.proto
+import org.apache.spark.connect.proto.{AddArtifactsRequest, AddArtifactsResponse, AnalyzePlanRequest, AnalyzePlanResponse, ArtifactStatusesRequest, ArtifactStatusesResponse, ExecutePlanRequest, ExecutePlanResponse, Relation, SparkConnectServiceGrpc, SQL}
+import org.apache.spark.sql.connect.SparkSession
+import org.apache.spark.sql.connect.common.config.ConnectCommon
+import org.apache.spark.sql.connect.test.ConnectFunSuite
+
+class SparkConnectClientSuite extends ConnectFunSuite {
+
+  private var client: SparkConnectClient = _
+  private var service: DummySparkConnectService = _
+  private var server: Server = _
+
+  private def startDummyServer(
+      port: Int,
+      interceptors: Seq[ServerInterceptor] = Seq(),
+      dummyService: DummySparkConnectService = new DummySparkConnectService): Unit = {
+    service = dummyService
+    val serverBuilder = NettyServerBuilder
+      .forPort(port)
+      .addService(service)
+    interceptors.foreach(serverBuilder.intercept)
+    server = serverBuilder.build()
+    server.start()
+  }
+
+  override def beforeEach(): Unit = {
+    super.beforeEach()
+    client = null
+    server = null
+    service = null
+  }
+
+  override def afterEach(): Unit = {
+    if (server != null) {
+      server.shutdownNow()
+      assert(server.awaitTermination(5, TimeUnit.SECONDS), "server failed to shutdown")
+    }
+
+    if (client != null) {
+      client.shutdown()
+    }
+  }
+
+  test("SPARK-51391: Use 'user.name' by default") {
+    client = SparkConnectClient.builder().build()
+    assert(client.userId == System.getProperty("user.name"))
+  }
+
+  Seq(false, true).foreach { reattachable =>
+    test(s"client generates an operation ID for ExecutePlan requests ($reattachable)") {
+      val operationIdHeaders = mutable.Map.empty[String, Option[String]]
+      val interceptor = new ServerInterceptor {
+        override def interceptCall[ReqT, RespT](
+            call: ServerCall[ReqT, RespT],
+            headers: Metadata,
+            next: ServerCallHandler[ReqT, RespT]): ServerCall.Listener[ReqT] = {
+          val key = Metadata.Key.of(
+            SparkConnectClient.OPERATION_ID_HEADER,
+            Metadata.ASCII_STRING_MARSHALLER)
+          operationIdHeaders.synchronized {
+            operationIdHeaders(call.getMethodDescriptor.getBareMethodName) =
+              Option(headers.get(key))
+          }
+          next.startCall(call, headers)
+        }
+      }
+      val dummyService = if (reattachable) {
+        new DummySparkConnectService {
+          override def executePlan(
+              request: ExecutePlanRequest,
+              responseObserver: StreamObserver[ExecutePlanResponse]): Unit = {
+            responseObserver.onNext(
+              ExecutePlanResponse
+                .newBuilder()
+                .setSessionId(request.getSessionId)
+                .setOperationId(request.getOperationId)
+                .setResponseId("initial-response")
+                .build())
+            responseObserver.onCompleted()
+          }
+
+          override def reattachExecute(
+              request: proto.ReattachExecuteRequest,
+              responseObserver: StreamObserver[ExecutePlanResponse]): Unit = {
+            responseObserver.onNext(
+              ExecutePlanResponse
+                .newBuilder()
+                .setSessionId(request.getSessionId)
+                .setOperationId(request.getOperationId)
+                .setResponseId("result-complete")
+                .setResultComplete(proto.ExecutePlanResponse.ResultComplete.newBuilder().build())
+                .build())
+            responseObserver.onCompleted()
+          }
+        }
+      } else {
+        new DummySparkConnectService
+      }
+      startDummyServer(0, Seq(interceptor), dummyService)
+      val builder = SparkConnectClient
+        .builder()
+        .connectionString(s"sc://localhost:${server.getPort}")
+        .option(SparkConnectClient.OPERATION_ID_HEADER, "ignored")
+      if (reattachable) builder.enableReattachableExecute()
+      else builder.disableReattachableExecute()
+      client = builder.build()
+
+      val responses = client.execute(buildPlan("select 1")).toSeq
+      val operationId = responses.head.getOperationId
+
+      UUID.fromString(operationId)
+      assert(responses.forall(_.getOperationId == operationId))
+      assert(operationIdHeaders.synchronized {
+        operationIdHeaders("ExecutePlan").contains(operationId)
+      })
+      if (reattachable) {
+        assert(operationIdHeaders.synchronized {
+          operationIdHeaders("ReattachExecute").contains(operationId)
+        })
+        Eventually.eventually(timeout(5.seconds)) {
+          assert(operationIdHeaders.synchronized {
+            operationIdHeaders("ReleaseExecute").contains(operationId)
+          })
+        }
+      }
+    }
+  }
+
+  test("ExecutePlan exceptions expose the client-generated operation ID") {
+    val failingService = new DummySparkConnectService {
+      override def executePlan(
+          request: ExecutePlanRequest,
+          responseObserver: StreamObserver[ExecutePlanResponse]): Unit = {
+        responseObserver.onError(Status.INTERNAL.withDescription("expected").asRuntimeException())
+      }
+    }
+    server = NettyServerBuilder.forPort(0).addService(failingService).build().start()
+    service = failingService
+    client = SparkConnectClient
+      .builder()
+      .connectionString(s"sc://localhost:${server.getPort}")
+      .disableReattachableExecute()
+      .retryPolicy(RetryPolicy(maxRetries = Some(0), canRetry = _ => false, name = "NoRetry"))
+      .build()
+
+    val error = intercept[SparkException] {
+      client.execute(buildPlan("select 1")).foreach(_ => ())
+    }
+    val operationId = SparkConnectClient.getOperationId(error)
+    assert(operationId.isDefined)
+    UUID.fromString(operationId.get)
+  }
+
+  test("Placeholder test: Create SparkConnectClient") {
+    client = SparkConnectClient.builder().userId("abc123").build()
+    assert(client.userId == "abc123")
+  }
+
+  // Starts the server at a random port and connects the client built for that port to it.
+  private def testClientConnection(clientBuilder: Int => SparkConnectClient): Unit = {
+    startDummyServer(0)
+    client = clientBuilder(server.getPort)
+    val request = AnalyzePlanRequest
+      .newBuilder()
+      .setSessionId("abc123")
+      .build()
+
+    val response = client.analyze(request)
+    assert(response.getSessionId === "abc123")
+  }
+
+  private def withEnvs(pairs: (String, String)*)(f: => Unit): Unit = {
+    val readonlyEnv = System.getenv()
+    val field = readonlyEnv.getClass.getDeclaredField("m")
+    field.setAccessible(true)
+    val modifiableEnv = field.get(readonlyEnv).asInstanceOf[java.util.Map[String, String]]
+    try {
+      for ((k, v) <- pairs) {
+        assert(!modifiableEnv.containsKey(k))
+        modifiableEnv.put(k, v)
+      }
+      f
+    } finally {
+      for ((k, _) <- pairs) {
+        modifiableEnv.remove(k)
+      }
+    }
+  }
+
+  test("Test connection") {
+    testClientConnection { testPort => SparkConnectClient.builder().port(testPort).build() }
+  }
+
+  test("Test connection string") {
+    testClientConnection { testPort =>
+      SparkConnectClient.builder().connectionString(s"sc://localhost:$testPort").build()
+    }
+  }
+
+  test("Test encryption") {
+    startDummyServer(0)
+    client = SparkConnectClient
+      .builder()
+      .connectionString(s"sc://localhost:${server.getPort}/;use_ssl=true")
+      .retryPolicy(RetryPolicy(maxRetries = Some(0), canRetry = _ => false, name = "TestPolicy"))
+      .build()
+
+    val request = AnalyzePlanRequest.newBuilder().setSessionId("abc123").build()
+
+    // Failed the ssl handshake as the dummy server does not have any server credentials installed.
+    assertThrows[SparkException] {
+      client.analyze(request)
+    }
+  }
+
+  test("SparkSession create with SPARK_REMOTE") {
+    startDummyServer(0)
+
+    withEnvs("SPARK_REMOTE" -> s"sc://localhost:${server.getPort}") {
+      val session = SparkSession.builder().create()
+      val df = session.range(10)
+      df.analyze // Trigger RPC
+      assert(df.plan === service.getAndClearLatestInputPlan())
+
+      val session2 = SparkSession.builder().create()
+      assert(session != session2)
+    }
+  }
+
+  test("SparkSession getOrCreate with SPARK_REMOTE") {
+    startDummyServer(0)
+
+    withEnvs("SPARK_REMOTE" -> s"sc://localhost:${server.getPort}") {
+      val session = SparkSession.builder().getOrCreate()
+
+      val df = session.range(10)
+      df.analyze // Trigger RPC
+      assert(df.plan === service.getAndClearLatestInputPlan())
+
+      val session2 = SparkSession.builder().getOrCreate()
+      assert(session === session2)
+    }
+  }
+
+  test("Builder.remote takes precedence over SPARK_REMOTE") {
+    startDummyServer(0)
+    val incorrectUrl = s"sc://localhost:${server.getPort + 1}"
+
+    withEnvs("SPARK_REMOTE" -> incorrectUrl) {
+      val session =
+        SparkSession.builder().remote(s"sc://localhost:${server.getPort}").getOrCreate()
+
+      val df = session.range(10)
+      df.analyze // Trigger RPC
+      assert(df.plan === service.getAndClearLatestInputPlan())
+    }
+  }
+
+  test("SparkSession initialisation with connection string") {
+    startDummyServer(0)
+    client = SparkConnectClient
+      .builder()
+      .connectionString(s"sc://localhost:${server.getPort}")
+      .build()
+    // Disable plan compression to make sure there is only one RPC request in client.analyze,
+    // so the interceptor can capture the initial header.
+    client.setPlanCompressionOptions(None)
+
+    val session = SparkSession.builder().client(client).create()
+    val df = session.range(10)
+    df.analyze // Trigger RPC
+    assert(df.plan === service.getAndClearLatestInputPlan())
+  }
+
+  test("Custom Interceptor") {
+    startDummyServer(0)
+    client = SparkConnectClient
+      .builder()
+      .connectionString(s"sc://localhost:${server.getPort}")
+      .interceptor(new ClientInterceptor {
+        override def interceptCall[ReqT, RespT](
+            methodDescriptor: MethodDescriptor[ReqT, RespT],
+            callOptions: CallOptions,
+            channel: Channel): ClientCall[ReqT, RespT] = {
+          throw new RuntimeException("Blocked")
+        }
+      })
+      .build()
+
+    val session = SparkSession.builder().client(client).create()
+
+    assertThrows[RuntimeException] {
+      session.range(10).count()
+    }
+  }
+
+  test("error framework parameters") {
+    val errors = GrpcExceptionConverter.errorFactory
+    for ((name, constructor) <- errors if name.startsWith("org.apache.spark")) {
+      withClue(name) {
+        val testParams = GrpcExceptionConverter.ErrorParams(
+          message = "",
+          cause = None,
+          errorClass = Some("DUPLICATE_KEY"),
+          messageParameters = Map("keyColumn" -> "`abc`"),
+          queryContext = Array.empty,
+          sqlState = None)
+        val error = constructor(testParams).asInstanceOf[Throwable with SparkThrowable]
+        assert(error.getMessage.contains(testParams.message))
+        assert(error.getCause == null)
+        assert(error.getCondition == testParams.errorClass.get)
+        assert(error.getMessageParameters.asScala == testParams.messageParameters)
+        assert(error.getQueryContext.isEmpty)
+        assert(error.getSqlState == "23505")
+      }
+    }
+
+    for ((name, constructor) <- errors if !name.startsWith("org.apache.spark")) {
+      withClue(name) {
+        val testParams = GrpcExceptionConverter.ErrorParams(
+          message = "Found duplicate keys `abc`",
+          cause = None,
+          errorClass = None,
+          messageParameters = Map.empty,
+          queryContext = Array.empty,
+          sqlState = None)
+        val error = constructor(testParams)
+        assert(error.getMessage.contains(testParams.message))
+        assert(error.getCause == null)
+      }
+    }
+  }
+
+  test("Legacy error class is set as default") {
+    Seq(
+      ("org.apache.spark.sql.AnalysisException", "_LEGACY_ERROR_TEMP_3100"),
+      ("java.lang.NumberFormatException", "_LEGACY_ERROR_TEMP_3104"),
+      ("java.lang.IllegalArgumentException", "_LEGACY_ERROR_TEMP_3105"),
+      ("java.lang.ArithmeticException", "_LEGACY_ERROR_TEMP_3106"),
+      ("java.lang.UnsupportedOperationException", "_LEGACY_ERROR_TEMP_3107"),
+      ("java.lang.ArrayIndexOutOfBoundsException", "_LEGACY_ERROR_TEMP_3108"),
+      ("java.time.DateTimeException", "_LEGACY_ERROR_TEMP_3109")).foreach {
+      case (className, legacyErrorClass) =>
+        val baseParams = GrpcExceptionConverter.ErrorParams(
+          message = "Test error message",
+          cause = None,
+          errorClass = None,
+          messageParameters = Map.empty,
+          queryContext = Array.empty,
+          sqlState = None)
+
+        val error = GrpcExceptionConverter
+          .errorFactory(className)(baseParams)
+          .asInstanceOf[SparkThrowable]
+        assert(error.asInstanceOf[Exception].getMessage.contains("Test error message"))
+        assert(error.getCondition == legacyErrorClass)
+        assert(error.getSqlState == "XXKCM")
+    }
+  }
+
+  private case class TestPackURI(
+      connectionString: String,
+      isCorrect: Boolean,
+      extraChecks: SparkConnectClient => Unit = _ => {})
+
+  private val URIs = Seq[TestPackURI](
+    TestPackURI("sc://host", isCorrect = true),
+    TestPackURI(
+      "sc://localhost/",
+      isCorrect = true,
+      client => {
+        assert(client.configuration.host == "localhost")
+        assert(client.configuration.port == ConnectCommon.CONNECT_GRPC_BINDING_PORT)
+      }),
+    TestPackURI(
+      "sc://localhost:1234/",
+      isCorrect = true,
+      client => {
+        assert(client.configuration.host == "localhost")
+        assert(client.configuration.port == 1234)
+        assert(client.sessionId != null)
+        // Must be able to parse the UUID
+        assert(UUID.fromString(client.sessionId) != null)
+      }),
+    TestPackURI(
+      "sc://localhost/;",
+      isCorrect = true,
+      client => {
+        assert(client.configuration.host == "localhost")
+        assert(client.configuration.port == ConnectCommon.CONNECT_GRPC_BINDING_PORT)
+      }),
+    TestPackURI("sc://host:123", isCorrect = true),
+    TestPackURI(
+      "sc://host:123/;user_id=a94",
+      isCorrect = true,
+      client => assert(client.userId == "a94")),
+    TestPackURI(
+      "sc://host:123/;user_agent=a945",
+      isCorrect = true,
+      client => assert(client.userAgent.contains("a945"))),
+    TestPackURI("scc://host:12", isCorrect = false),
+    TestPackURI("http://host", isCorrect = false),
+    TestPackURI("sc:/host:1234/path", isCorrect = false),
+    TestPackURI("sc://host/path", isCorrect = false),
+    TestPackURI("sc://host/;parm1;param2", isCorrect = false),
+    TestPackURI("sc://host:123;user_id=a94", isCorrect = false),
+    TestPackURI("sc:///user_id=123", isCorrect = false),
+    TestPackURI("sc://host:-4", isCorrect = false),
+    TestPackURI("sc://:123/", isCorrect = false),
+    TestPackURI("sc://host:123/;use_ssl=true", isCorrect = true),
+    TestPackURI("sc://host:123/;token=mySecretToken", isCorrect = true),
+    TestPackURI("sc://host:123/;token=", isCorrect = false),
+    TestPackURI("sc://host:123/;session_id=", isCorrect = false),
+    TestPackURI("sc://host:123/;session_id=abcdefgh", isCorrect = false),
+    TestPackURI(s"sc://host:123/;session_id=${UUID.randomUUID().toString}", isCorrect = true),
+    TestPackURI("sc://host:123/;use_ssl=true;token=mySecretToken", isCorrect = true),
+    TestPackURI("sc://host:123/;token=mySecretToken;use_ssl=true", isCorrect = true),
+    TestPackURI("sc://host:123/;use_ssl=false;token=mySecretToken", isCorrect = true),
+    TestPackURI("sc://host:123/;token=mySecretToken;use_ssl=false", isCorrect = true),
+    TestPackURI("sc://host:123/;param1=value1;param2=value2", isCorrect = true),
+    TestPackURI(
+      "sc://SPARK-45486",
+      isCorrect = true,
+      client => {
+        assert(client.userAgent.contains("spark/"))
+        assert(client.userAgent.contains("scala/"))
+        assert(client.userAgent.contains("jvm/"))
+        assert(client.userAgent.contains("os/"))
+      }),
+    TestPackURI(
+      "sc://SPARK-47694:123/;grpc_max_message_size=1860",
+      isCorrect = true,
+      client => {
+        assert(client.configuration.grpcMaxMessageSize == 1860)
+      }),
+    TestPackURI("sc://SPARK-47694:123/;grpc_max_message_size=abc", isCorrect = false))
+
+  private def checkTestPack(testPack: TestPackURI): Unit = {
+    val client = SparkConnectClient.builder().connectionString(testPack.connectionString).build()
+    testPack.extraChecks(client)
+  }
+
+  URIs.foreach { testPack =>
+    test(s"Check URI: ${testPack.connectionString}, isCorrect: ${testPack.isCorrect}") {
+      if (!testPack.isCorrect) {
+        assertThrows[IllegalArgumentException](checkTestPack(testPack))
+      } else {
+        checkTestPack(testPack)
+      }
+    }
+  }
+
+  test("ArtifactManager retries errors") {
+    var attempt = 0
+
+    startDummyServer(0)
+    client = SparkConnectClient
+      .builder()
+      .connectionString(s"sc://localhost:${server.getPort}")
+      .interceptor(new ClientInterceptor {
+        override def interceptCall[ReqT, RespT](
+            methodDescriptor: MethodDescriptor[ReqT, RespT],
+            callOptions: CallOptions,
+            channel: Channel): ClientCall[ReqT, RespT] = {
+          attempt += 1;
+          if (attempt <= 3) {
+            throw Status.UNAVAILABLE.withDescription("").asRuntimeException()
+          }
+
+          channel.newCall(methodDescriptor, callOptions)
+        }
+      })
+      .build()
+
+    val session = SparkSession.builder().client(client).create()
+    val tmpFile = java.io.File.createTempFile("smallClassFile", ".class")
+    tmpFile.deleteOnExit()
+    java.nio.file.Files.write(tmpFile.toPath, "dummy".getBytes)
+    session.addArtifact(tmpFile.getAbsolutePath)
+  }
+
+  private def buildPlan(query: String): proto.Plan = {
+    proto.Plan
+      .newBuilder()
+      .setRoot(Relation.newBuilder().setSql(SQL.newBuilder().setQuery(query)).build())
+      .build()
+  }
+
+  test("SPARK-45871: Client execute iterator.toSeq consumes the reattachable iterator") {
+    startDummyServer(0)
+    client = SparkConnectClient
+      .builder()
+      .connectionString(s"sc://localhost:${server.getPort}")
+      .enableReattachableExecute()
+      .build()
+
+    val plan = buildPlan("select * from range(10000000)")
+    val iter = client.execute(plan)
+    val reattachableIter =
+      ExecutePlanResponseReattachableIterator.fromIterator(iter)
+    iter.toSeq
+    // In several places in SparkSession, we depend on `.toSeq` to consume and close the iterator.
+    // If this assertion fails, we need to double check the correctness of that.
+    // In scala 2.12 `s.c.TraversableOnce#toSeq` builds an `immutable.Stream`,
+    // which is a tail lazy structure and this would fail.
+    // In scala 2.13 `s.c.IterableOnceOps#toSeq` builds an `immutable.Seq` which is not
+    // lazy and will consume and close the iterator.
+    assert(reattachableIter.resultComplete)
+  }
+
+  test("SPARK-45871: Client execute iterator.foreach consumes the reattachable iterator") {
+    startDummyServer(0)
+    client = SparkConnectClient
+      .builder()
+      .connectionString(s"sc://localhost:${server.getPort}")
+      .enableReattachableExecute()
+      .build()
+
+    val plan = buildPlan("select * from range(10000000)")
+    val iter = client.execute(plan)
+    val reattachableIter =
+      ExecutePlanResponseReattachableIterator.fromIterator(iter)
+    iter.foreach(_ => ())
+    assert(reattachableIter.resultComplete)
+  }
+
+  test("SPARK-48056: Client execute gets INVALID_HANDLE.SESSION_NOT_FOUND and proceeds") {
+    startDummyServer(0)
+    client = SparkConnectClient
+      .builder()
+      .connectionString(s"sc://localhost:${server.getPort}")
+      .enableReattachableExecute()
+      .build()
+    service.errorToThrowOnExecute = Some(
+      new StatusRuntimeException(
+        Status.INTERNAL.withDescription("INVALID_HANDLE.SESSION_NOT_FOUND")))
+
+    val plan = buildPlan("select * from range(1)")
+    val iter = client.execute(plan)
+    val reattachableIter =
+      ExecutePlanResponseReattachableIterator.fromIterator(iter)
+    reattachableIter.foreach(_ => ())
+    assert(reattachableIter.resultComplete)
+  }
+
+  private val INVALID_HOST = "host.invalid"
+
+  private def createUnresolvableHostChannel = {
+    SparkConnectClient.Configuration(host = INVALID_HOST).createChannel()
+  }
+
+  private def assertContainsUnavailable(t: Throwable) = {
+    assert(t.getMessage.contains("UNAVAILABLE: Unable to resolve host " + INVALID_HOST))
+  }
+
+  test("GRPC stub unary call throws error immediately") {
+    // Spark Connect error retry handling depends on the error being returned from the unary
+    // call immediately.
+    val channel = createUnresolvableHostChannel
+    val stub = proto.SparkConnectServiceGrpc.newBlockingStub(channel)
+    // The request is invalid, but it shouldn't even reach the server.
+    val request = proto.AnalyzePlanRequest.newBuilder().build()
+
+    // calling unary call immediately throws connection exception
+    val ex = intercept[StatusRuntimeException] {
+      stub.analyzePlan(request)
+    }
+    assertContainsUnavailable(ex)
+  }
+
+  test("GRPC stub server streaming call throws error on first next() / hasNext()") {
+    // Spark Connect error retry handling depends on the error being returned from the response
+    // iterator and not immediately upon iterator creation.
+    val channel = createUnresolvableHostChannel
+    val stub = proto.SparkConnectServiceGrpc.newBlockingStub(channel)
+    // The request is invalid, but it shouldn't even reach the server.
+    val request = proto.ExecutePlanRequest.newBuilder().build()
+
+    // creating the iterator doesn't throw exception
+    val iter = stub.executePlan(request)
+    // error is thrown only when the iterator is open.
+    val ex = intercept[StatusRuntimeException] {
+      iter.hasNext()
+    }
+    assertContainsUnavailable(ex)
+  }
+
+  test("GRPC stub client streaming call throws error on first client request sent") {
+    // Spark Connect error retry handling depends on the error being returned from the response
+    // iterator and not immediately upon iterator creation or request being sent.
+    val channel = createUnresolvableHostChannel
+    val stub = proto.SparkConnectServiceGrpc.newStub(channel)
+
+    var onNextResponse: Option[proto.AddArtifactsResponse] = None
+    var onErrorThrowable: Option[Throwable] = None
+    var onCompletedCalled: Boolean = false
+
+    val responseObserver = new StreamObserver[proto.AddArtifactsResponse] {
+      override def onNext(value: proto.AddArtifactsResponse): Unit = {
+        onNextResponse = Some(value)
+      }
+
+      override def onError(t: Throwable): Unit = {
+        onErrorThrowable = Some(t)
+      }
+
+      override def onCompleted(): Unit = {
+        onCompletedCalled = false
+      }
+    }
+
+    // calling client streaming call doesn't throw exception
+    val observer = stub.addArtifacts(responseObserver)
+
+    // but exception will get returned on the responseObserver.
+    Eventually.eventually(timeout(30.seconds)) {
+      assert(onNextResponse == None)
+      assert(onErrorThrowable.isDefined)
+      assertContainsUnavailable(onErrorThrowable.get)
+      assert(onCompletedCalled == false)
+    }
+
+    // despite that, requests can be sent to the request observer without error being thrown.
+    observer.onNext(proto.AddArtifactsRequest.newBuilder().build())
+    observer.onCompleted()
+  }
+
+  test("getOperationStatuses returns operation statuses for requested IDs") {
+    startDummyServer(0)
+    client = SparkConnectClient
+      .builder()
+      .connectionString(s"sc://localhost:${server.getPort}")
+      .build()
+
+    val response =
+      client.getOperationStatuses(Seq("default-op-1", "unknown-op"))
+    val statuses = response.getOperationStatusesList.asScala.toSeq
+    assert(statuses.size == 2)
+    assert(statuses.map(_.getOperationId).toSet == Set("default-op-1", "unknown-op"))
+
+    val statusMap = statuses.map(s => s.getOperationId -> s.getState).toMap
+    assert(
+      statusMap("default-op-1") ==
+        proto.GetStatusResponse.OperationStatus.OperationState.OPERATION_STATE_SUCCEEDED)
+    assert(
+      statusMap("unknown-op") ==
+        proto.GetStatusResponse.OperationStatus.OperationState.OPERATION_STATE_UNKNOWN)
+  }
+
+  test("getOperationStatuses with no IDs returns all operations from server") {
+    startDummyServer(0)
+    client = SparkConnectClient
+      .builder()
+      .connectionString(s"sc://localhost:${server.getPort}")
+      .build()
+
+    val response = client.getOperationStatuses()
+    val statuses = response.getOperationStatusesList.asScala.toSeq
+    assert(statuses.size == 2)
+    assert(statuses.map(_.getOperationId).toSet == Set("default-op-1", "default-op-2"))
+
+    val statusMap = statuses.map(s => s.getOperationId -> s.getState).toMap
+    assert(
+      statusMap("default-op-1") ==
+        proto.GetStatusResponse.OperationStatus.OperationState.OPERATION_STATE_SUCCEEDED)
+    assert(
+      statusMap("default-op-2") ==
+        proto.GetStatusResponse.OperationStatus.OperationState.OPERATION_STATE_RUNNING)
+  }
+
+  test("getOperationStatuses sends extensions and returns them per operation") {
+    startDummyServer(0)
+    client = SparkConnectClient
+      .builder()
+      .connectionString(s"sc://localhost:${server.getPort}")
+      .build()
+
+    val extension = PAny.pack(StringValue.of("custom_extension"))
+
+    val response = client.getOperationStatuses(
+      operationIds = Seq("default-op-1", "default-op-2"),
+      operationExtensions = Seq(extension))
+
+    // Verify operation statuses are returned
+    val statuses = response.getOperationStatusesList.asScala.toSeq
+    assert(statuses.size == 2)
+
+    val statusMap = statuses.map(s => s.getOperationId -> s).toMap
+    assert(
+      statusMap("default-op-1").getState ==
+        proto.GetStatusResponse.OperationStatus.OperationState.OPERATION_STATE_SUCCEEDED)
+    assert(
+      statusMap("default-op-2").getState ==
+        proto.GetStatusResponse.OperationStatus.OperationState.OPERATION_STATE_RUNNING)
+
+    // Verify that extensions are echoed back per operation
+    statuses.foreach { status =>
+      val opExtensions = status.getExtensionsList.asScala.toSeq
+      assert(opExtensions.size == 1)
+      assert(opExtensions.head.is(classOf[StringValue]))
+      assert(
+        opExtensions.head
+          .unpack(classOf[StringValue])
+          .getValue == "custom_extension")
+    }
+  }
+
+  test("getOperationStatuses sends request-level extensions and echoes them in the response") {
+    startDummyServer(0)
+    client = SparkConnectClient
+      .builder()
+      .connectionString(s"sc://localhost:${server.getPort}")
+      .build()
+
+    val reqExtension = PAny.pack(StringValue.of("request_extension"))
+
+    val response = client.getOperationStatuses(
+      operationIds = Seq("default-op-1"),
+      requestExtensions = Seq(reqExtension))
+
+    // Verify the operation status is returned
+    val statuses = response.getOperationStatusesList.asScala.toSeq
+    assert(statuses.size == 1)
+    assert(statuses.head.getOperationId == "default-op-1")
+
+    // Verify request-level extensions were echoed back in the response
+    val responseExtensions = response.getExtensionsList.asScala.toSeq
+    assert(responseExtensions.size == 1)
+    assert(responseExtensions.head.is(classOf[StringValue]))
+    assert(
+      responseExtensions.head
+        .unpack(classOf[StringValue])
+        .getValue == "request_extension")
+  }
+
+  test("client can set a custom operation id for ExecutePlan requests") {
+    startDummyServer(0)
+    client = SparkConnectClient
+      .builder()
+      .connectionString(s"sc://localhost:${server.getPort}")
+      .enableReattachableExecute()
+      .build()
+    // Disable plan compression to make sure there is only one RPC request in client.analyze,
+    // so the interceptor can capture the initial header.
+    client.setPlanCompressionOptions(None)
+
+    val plan = buildPlan("select * from range(10000000)")
+    val dummyUUID = "10a4c38e-7e87-40ee-9d6f-60ff0751e63b"
+    val iter = client.execute(plan, operationId = Some(dummyUUID))
+    val reattachableIter =
+      ExecutePlanResponseReattachableIterator.fromIterator(iter)
+    assert(reattachableIter.operationId == dummyUUID)
+    while (reattachableIter.hasNext) {
+      val resp = reattachableIter.next()
+      assert(resp.getOperationId == dummyUUID)
+    }
+  }
+
+  test("Plan compression works correctly for execution") {
+    startDummyServer(0)
+    client = SparkConnectClient
+      .builder()
+      .connectionString(s"sc://localhost:${server.getPort}")
+      .enableReattachableExecute()
+      .build()
+    // Set plan compression options for testing
+    client.setPlanCompressionOptions(Some(PlanCompressionOptions(1000, "ZSTD")))
+
+    // Small plan should not be compressed
+    val plan = buildPlan("select * from range(10)")
+    val iter = client.execute(plan)
+    val reattachableIter =
+      ExecutePlanResponseReattachableIterator.fromIterator(iter)
+    while (reattachableIter.hasNext) {
+      reattachableIter.next()
+    }
+    assert(service.getAndClearLatestInputPlan().hasRoot)
+
+    // Large plan should be compressed
+    val plan2 = buildPlan(s"select ${"Apache Spark" * 10000} as value")
+    val iter2 = client.execute(plan2)
+    val reattachableIter2 =
+      ExecutePlanResponseReattachableIterator.fromIterator(iter2)
+    while (reattachableIter2.hasNext) {
+      reattachableIter2.next()
+    }
+    assert(service.getAndClearLatestInputPlan().hasCompressedOperation)
+  }
+
+  test("Plan compression works correctly for analysis") {
+    startDummyServer(0)
+    client = SparkConnectClient
+      .builder()
+      .connectionString(s"sc://localhost:${server.getPort}")
+      .enableReattachableExecute()
+      .build()
+    // Set plan compression options for testing
+    client.setPlanCompressionOptions(Some(PlanCompressionOptions(1000, "ZSTD")))
+
+    // Small plan should not be compressed
+    val plan = buildPlan("select * from range(10)")
+    client.analyze(proto.AnalyzePlanRequest.AnalyzeCase.SCHEMA, Some(plan))
+    assert(service.getAndClearLatestInputPlan().hasRoot)
+
+    // Large plan should be compressed
+    val plan2 = buildPlan(s"select ${"Apache Spark" * 10000} as value")
+    client.analyze(proto.AnalyzePlanRequest.AnalyzeCase.SCHEMA, Some(plan2))
+    assert(service.getAndClearLatestInputPlan().hasCompressedOperation)
+  }
+
+  test("Plan compression will be disabled if the configs are not defined on the server") {
+    startDummyServer(0)
+    client = SparkConnectClient
+      .builder()
+      .connectionString(s"sc://localhost:${server.getPort}")
+      .enableReattachableExecute()
+      .build()
+
+    service.setErrorToThrowOnConfig(
+      "spark.connect.session.planCompression.defaultAlgorithm",
+      new StatusRuntimeException(Status.INTERNAL.withDescription("SQL_CONF_NOT_FOUND")))
+
+    // Execute a few queries to make sure the client fetches the configs only once.
+    (1 to 3).foreach { _ =>
+      val plan = buildPlan(s"select ${"Apache Spark" * 10000} as value")
+      val iter = client.execute(plan)
+      val reattachableIter =
+        ExecutePlanResponseReattachableIterator.fromIterator(iter)
+      while (reattachableIter.hasNext) {
+        reattachableIter.next()
+      }
+      assert(service.getAndClearLatestInputPlan().hasRoot)
+    }
+    // The plan compression options should be empty.
+    assert(client.getPlanCompressionOptions.isEmpty)
+    // The client should try to fetch the config only once.
+    assert(service.getAndClearLatestConfigRequests().size == 1)
+  }
+
+  test("SPARK-55243: Binary headers use the correct marshaller") {
+    class HeadersInterceptor extends ServerInterceptor {
+      var headers: Option[Metadata] = None
+
+      override def interceptCall[ReqT, RespT](
+          call: ServerCall[ReqT, RespT],
+          headers: Metadata,
+          next: ServerCallHandler[ReqT, RespT]): ServerCall.Listener[ReqT] = {
+        this.headers = Some(headers)
+        next.startCall(call, headers)
+      }
+    }
+
+    def buildClientWithHeader(key: String, value: String): SparkConnectClient = {
+      SparkConnectClient
+        .builder()
+        .connectionString(s"sc://localhost:${server.getPort}")
+        .option(key, value)
+        .build()
+    }
+
+    val headerInterceptor = new HeadersInterceptor()
+    startDummyServer(0, Seq(headerInterceptor))
+
+    val keyName = "test-bin"
+    val key = Metadata.Key.of(keyName, Metadata.BINARY_BYTE_MARSHALLER)
+    val binaryData = "test-binary-data"
+    val base64EncodedValue = Base64.getEncoder.encodeToString(binaryData.getBytes(UTF_8))
+
+    val plan = buildPlan("select * from range(10)")
+
+    // Successfully set and use base64-encoded -bin key.
+    client = buildClientWithHeader(keyName, base64EncodedValue)
+    client.execute(plan)
+
+    Eventually.eventually(timeout(5.seconds)) {
+      assert(headerInterceptor.headers.exists(_.containsKey(key)))
+      val bytes = headerInterceptor.headers.get.get(key)
+      assert(new String(bytes, UTF_8) == binaryData)
+    }
+
+    // Non base64-encoded -bin header throws IllegalArgumentException at construction time.
+    assertThrows[IllegalArgumentException] {
+      buildClientWithHeader(keyName, binaryData)
+    }
+
+    // Non -bin headers keep using the ASCII marshaller.
+    val asciiKeyName = "test"
+    val asciiKey = Metadata.Key.of(asciiKeyName, Metadata.ASCII_STRING_MARSHALLER)
+
+    headerInterceptor.headers = None // Reset captured headers.
+
+    client = buildClientWithHeader(asciiKeyName, base64EncodedValue)
+    client.execute(plan)
+
+    Eventually.eventually(timeout(5.seconds)) {
+      assert(headerInterceptor.headers.exists(_.containsKey(asciiKey)))
+      val value = headerInterceptor.headers.get.get(asciiKey)
+      assert(value == base64EncodedValue)
+      // No BINARY_BYTE_MARSHALLER header.
+      assert(!headerInterceptor.headers.exists(_.containsKey(key)))
+    }
+  }
+
+  test("one-shot RPC deadlines fire on slow server") {
+    val latch = new CountDownLatch(1)
+    val slowService = new DummySparkConnectService {
+      override def analyzePlan(
+          request: AnalyzePlanRequest,
+          responseObserver: StreamObserver[AnalyzePlanResponse]): Unit = {
+        latch.await(250, TimeUnit.MILLISECONDS)
+        super.analyzePlan(request, responseObserver)
+      }
+      override def config(
+          request: proto.ConfigRequest,
+          responseObserver: StreamObserver[proto.ConfigResponse]): Unit = {
+        latch.await(250, TimeUnit.MILLISECONDS)
+        super.config(request, responseObserver)
+      }
+      override def interrupt(
+          request: proto.InterruptRequest,
+          responseObserver: StreamObserver[proto.InterruptResponse]): Unit = {
+        latch.await(250, TimeUnit.MILLISECONDS)
+        super.interrupt(request, responseObserver)
+      }
+      override def releaseSession(
+          request: proto.ReleaseSessionRequest,
+          responseObserver: StreamObserver[proto.ReleaseSessionResponse]): Unit = {
+        latch.await(250, TimeUnit.MILLISECONDS)
+        responseObserver.onNext(
+          proto.ReleaseSessionResponse
+            .newBuilder()
+            .setSessionId(request.getSessionId)
+            .build())
+        responseObserver.onCompleted()
+      }
+    }
+    server = NettyServerBuilder.forPort(0).addService(slowService).build().start()
+    service = slowService
+    val d = FiniteDuration(50, TimeUnit.MILLISECONDS)
+    client = SparkConnectClient
+      .builder()
+      .connectionString(s"sc://localhost:${server.getPort}")
+      .rpcDeadlines(
+        RpcDeadlines(
+          analyzePlan = Some(d),
+          config = Some(d),
+          interrupt = Some(d),
+          releaseSession = Some(d)))
+      .retryPolicy(RetryPolicy(maxRetries = Some(0), canRetry = _ => false, name = "NoRetry"))
+      .build()
+
+    def expectDeadlineExceeded(thunk: => Any): Unit = {
+      val ex = intercept[SparkException] { thunk }
+      assert(ex.getCause.isInstanceOf[StatusRuntimeException])
+      assert(
+        ex.getCause.asInstanceOf[StatusRuntimeException].getStatus.getCode ==
+          Status.Code.DEADLINE_EXCEEDED)
+    }
+
+    try {
+      expectDeadlineExceeded(
+        client.analyze(proto.AnalyzePlanRequest.newBuilder().setSessionId("abc123").build()))
+      val configOp = proto.ConfigRequest.Operation
+        .newBuilder()
+        .setGetOption(
+          proto.ConfigRequest.GetOption.newBuilder().addKeys("spark.sql.shuffle.partitions"))
+        .build()
+      expectDeadlineExceeded(client.config(configOp))
+      expectDeadlineExceeded(client.interruptAll())
+      expectDeadlineExceeded(client.releaseSession())
+    } finally {
+      latch.countDown()
+    }
+  }
+
+  test("transport errors preserve the original gRPC status exception as the cause") {
+    val failingService = new DummySparkConnectService {
+      override def analyzePlan(
+          request: AnalyzePlanRequest,
+          responseObserver: StreamObserver[AnalyzePlanResponse]): Unit = {
+        responseObserver.onError(
+          Status.UNAVAILABLE.withDescription("injected failure").asRuntimeException())
+      }
+    }
+    server = NettyServerBuilder.forPort(0).addService(failingService).build().start()
+    service = failingService
+    client = SparkConnectClient
+      .builder()
+      .connectionString(s"sc://localhost:${server.getPort}")
+      .retryPolicy(RetryPolicy(maxRetries = Some(0), canRetry = _ => false, name = "NoRetry"))
+      .build()
+
+    val ex = intercept[SparkException] {
+      client.analyze(proto.AnalyzePlanRequest.newBuilder().setSessionId("abc123").build())
+    }
+    // The original StatusRuntimeException must survive as the cause so that callers
+    // can programmatically inspect the gRPC status code instead of parsing the message.
+    assert(ex.getCause.isInstanceOf[StatusRuntimeException])
+    assert(
+      ex.getCause.asInstanceOf[StatusRuntimeException].getStatus.getCode ==
+        Status.Code.UNAVAILABLE)
+  }
+
+  test(
+    "SPARK-58094: gRPC keepalive surfaces a bounded failure on a silently dropped " +
+      "connection instead of hanging forever") {
+    val requestReceived = new CountDownLatch(1)
+    val serverLatch = new CountDownLatch(1)
+    val slowService = new DummySparkConnectService {
+      override def analyzePlan(
+          request: AnalyzePlanRequest,
+          responseObserver: StreamObserver[AnalyzePlanResponse]): Unit = {
+        requestReceived.countDown()
+        // Blocks far longer than the test's keepalive settings, standing in for a query that
+        // is still genuinely running server-side while the client's connection goes dark.
+        serverLatch.await(30, TimeUnit.SECONDS)
+        super.analyzePlan(request, responseObserver)
+      }
+    }
+    val keepAliveMs = 300L
+    server = NettyServerBuilder
+      .forPort(0)
+      .addService(slowService)
+      // The server must permit client PINGs at least as frequently as the client's own
+      // keepAliveTime, or it will tear down the connection as "too_many_pings" even when
+      // healthy. In production (SparkConnectService.scala) this floor is a fixed constant
+      // decoupled from any per-connection setting; here it's simply set to match the test
+      // client's cadence.
+      .permitKeepAliveTime(keepAliveMs, TimeUnit.MILLISECONDS)
+      .permitKeepAliveWithoutCalls(true)
+      .build()
+      .start()
+    service = slowService
+    val relay = new FreezableTcpRelay(server.getPort)
+    try {
+      client = SparkConnectClient
+        .builder()
+        .connectionString(s"sc://localhost:${relay.port}")
+        .grpcKeepAliveEnabled(true)
+        .grpcKeepAliveTimeMs(keepAliveMs)
+        .grpcKeepAliveTimeoutMs(keepAliveMs)
+        .retryPolicy(RetryPolicy(maxRetries = Some(0), canRetry = _ => false, name = "NoRetry"))
+        .build()
+
+      val resultPromise = scala.concurrent.Promise[Unit]()
+      val callThread = new Thread(() => {
+        try {
+          client.analyze(proto.AnalyzePlanRequest.newBuilder().setSessionId("abc123").build())
+          resultPromise.success(())
+        } catch {
+          case t: Throwable => resultPromise.failure(t)
+        }
+      })
+      callThread.setDaemon(true)
+      callThread.start()
+
+      assert(requestReceived.await(10, TimeUnit.SECONDS), "server never received the request")
+      // Freeze the relay without closing either socket, simulating a NAT gateway/load balancer
+      // silently dropping an idle connection mapping (no TCP RST/FIN to either endpoint).
+      relay.freeze()
+
+      // Bounded by Await's timeout: without the keepalive fix this never completes and the
+      // test would fail with a TimeoutException instead of surfacing UNAVAILABLE.
+      // scalastyle:off awaitresult
+      val ex = intercept[SparkException] {
+        scala.concurrent.Await.result(resultPromise.future, FiniteDuration(15, TimeUnit.SECONDS))
+      }
+      // scalastyle:on awaitresult
+      // The status code/description of a keepalive-triggered UNAVAILABLE is part of the
+      // message (see GrpcExceptionConverter.toThrowable).
+      assert(ex.getMessage.contains("UNAVAILABLE"))
+      assert(ex.getMessage.contains("Keepalive failed"))
+    } finally {
+      serverLatch.countDown()
+      relay.close()
+    }
+  }
+
+  test("SPARK-58094: keepalive does not disrupt a healthy long-lived connection") {
+    val keepAliveMs = 300L
+    server = NettyServerBuilder
+      .forPort(0)
+      .addService(new DummySparkConnectService)
+      .permitKeepAliveTime(keepAliveMs, TimeUnit.MILLISECONDS)
+      .permitKeepAliveWithoutCalls(true)
+      .build()
+      .start()
+    client = SparkConnectClient
+      .builder()
+      .connectionString(s"sc://localhost:${server.getPort}")
+      .grpcKeepAliveEnabled(true)
+      .grpcKeepAliveTimeMs(keepAliveMs)
+      .grpcKeepAliveTimeoutMs(keepAliveMs)
+      .build()
+
+    // Several calls spaced out well beyond the keepalive interval: if permitKeepAliveTime were
+    // mistuned (e.g. left at the gRPC default of 5 minutes while the client pings every 300ms),
+    // the server would tear the connection down as "too_many_pings" and these would fail.
+    for (i <- 1 to 3) {
+      val response =
+        client.analyze(proto.AnalyzePlanRequest.newBuilder().setSessionId(s"abc$i").build())
+      assert(response.getSessionId === s"abc$i")
+      Thread.sleep(keepAliveMs * 2)
+    }
+  }
+
+  test("analyzePlan with short deadline fires, then succeeds after disabling deadlines") {
+    val latch = new CountDownLatch(1)
+    val slowService = new DummySparkConnectService {
+      override def analyzePlan(
+          request: AnalyzePlanRequest,
+          responseObserver: StreamObserver[AnalyzePlanResponse]): Unit = {
+        latch.await(250, TimeUnit.MILLISECONDS)
+        super.analyzePlan(request, responseObserver)
+      }
+    }
+    server = NettyServerBuilder.forPort(0).addService(slowService).build().start()
+    service = slowService
+    val noRetry = RetryPolicy(maxRetries = Some(0), canRetry = _ => false, name = "NoRetry")
+
+    client = SparkConnectClient
+      .builder()
+      .connectionString(s"sc://localhost:${server.getPort}")
+      .rpcDeadlines(RpcDeadlines(analyzePlan = Some(FiniteDuration(50, TimeUnit.MILLISECONDS))))
+      .retryPolicy(noRetry)
+      .build()
+    try {
+      val ex = intercept[SparkException] {
+        client.analyze(proto.AnalyzePlanRequest.newBuilder().setSessionId("abc123").build())
+      }
+      assert(
+        ex.getCause.asInstanceOf[StatusRuntimeException].getStatus.getCode ==
+          Status.Code.DEADLINE_EXCEEDED)
+      client.shutdown()
+    } finally {
+      latch.countDown()
+    }
+
+    client = SparkConnectClient
+      .builder()
+      .connectionString(s"sc://localhost:${server.getPort}")
+      .rpcDeadlines(RpcDeadlines.disabled)
+      .retryPolicy(noRetry)
+      .build()
+    client.analyze(proto.AnalyzePlanRequest.newBuilder().setSessionId("abc123").build())
+  }
+
+  test("reattachable execute recovers from mid-stream deadline via ReattachExecute") {
+    val executeLatch = new CountDownLatch(1)
+    @volatile var reattachCalled = false
+    val midStreamService = new DummySparkConnectService {
+      override def executePlan(
+          request: ExecutePlanRequest,
+          responseObserver: StreamObserver[ExecutePlanResponse]): Unit = {
+        val sessionId = request.getSessionId
+        val operationId =
+          if (request.hasOperationId) request.getOperationId
+          else UUID.randomUUID().toString
+        val serverSideSessionId = "srv-deadline-test"
+        responseObserver.onNext(
+          ExecutePlanResponse
+            .newBuilder()
+            .setSessionId(sessionId)
+            .setServerSideSessionId(serverSideSessionId)
+            .setOperationId(operationId)
+            .setResponseId("r1")
+            .build())
+        executeLatch.await(250, TimeUnit.MILLISECONDS)
+        responseObserver.onCompleted()
+      }
+
+      override def reattachExecute(
+          request: proto.ReattachExecuteRequest,
+          responseObserver: StreamObserver[ExecutePlanResponse]): Unit = {
+        reattachCalled = true
+        val sessionId = request.getSessionId
+        val operationId = request.getOperationId
+        val serverSideSessionId = "srv-deadline-test"
+        responseObserver.onNext(
+          ExecutePlanResponse
+            .newBuilder()
+            .setSessionId(sessionId)
+            .setServerSideSessionId(serverSideSessionId)
+            .setOperationId(operationId)
+            .setResponseId("r2")
+            .build())
+        responseObserver.onNext(
+          ExecutePlanResponse
+            .newBuilder()
+            .setSessionId(sessionId)
+            .setServerSideSessionId(serverSideSessionId)
+            .setOperationId(operationId)
+            .setResponseId("r3")
+            .setResultComplete(proto.ExecutePlanResponse.ResultComplete.newBuilder().build())
+            .build())
+        responseObserver.onCompleted()
+      }
+    }
+    server = NettyServerBuilder.forPort(0).addService(midStreamService).build().start()
+    service = midStreamService
+    client = SparkConnectClient
+      .builder()
+      .connectionString(s"sc://localhost:${server.getPort}")
+      .rpcDeadlines(
+        RpcDeadlines(reattachableExecutePlan = Some(FiniteDuration(50, TimeUnit.MILLISECONDS))))
+      .enableReattachableExecute()
+      .build()
+
+    try {
+      val iter = client.execute(buildPlan("select 1"))
+      val reattachableIter = ExecutePlanResponseReattachableIterator.fromIterator(iter)
+      iter.foreach(_ => ())
+
+      assert(reattachableIter.resultComplete, "iterator should complete after reattach")
+      assert(reattachCalled, "ReattachExecute should have been called")
+    } finally {
+      executeLatch.countDown()
+    }
+  }
+
+  test(
+    "SPARK-58162: maxRetryExceptionElapsedTime set via Builder bounds the " +
+      "RetryException retry loop end-to-end") {
+    // Every attempt (the initial ExecutePlan and every subsequent ReattachExecute) never
+    // responds at all, so the client's reattach deadline fires every time -- DEADLINE_EXCEEDED
+    // -> RetryException, on every attempt, forever -- unless the elapsed-time bound kicks in.
+    // The point of this test is that the bound is configured only through the real
+    // Builder -> Configuration -> SparkConnectStubState -> GrpcRetryHandler wiring (unlike
+    // SparkConnectClientRetriesSuite, which constructs GrpcRetryHandler directly), so it guards
+    // against a regression that silently drops the maxRetryExceptionElapsedTime passthrough in
+    // SparkConnectStubState.
+    val stallingService = new DummySparkConnectService {
+      override def executePlan(
+          request: ExecutePlanRequest,
+          responseObserver: StreamObserver[ExecutePlanResponse]): Unit = {}
+
+      override def reattachExecute(
+          request: proto.ReattachExecuteRequest,
+          responseObserver: StreamObserver[ExecutePlanResponse]): Unit = {}
+    }
+    server = NettyServerBuilder.forPort(0).addService(stallingService).build().start()
+    service = stallingService
+    client = SparkConnectClient
+      .builder()
+      .connectionString(s"sc://localhost:${server.getPort}")
+      .rpcDeadlines(
+        RpcDeadlines(
+          reattachableExecutePlan = Some(FiniteDuration(50, TimeUnit.MILLISECONDS)),
+          reattachExecute = Some(FiniteDuration(50, TimeUnit.MILLISECONDS))))
+      .maxRetryExceptionElapsedTime(FiniteDuration(200, TimeUnit.MILLISECONDS))
+      .enableReattachableExecute()
+      .build()
+
+    val ex = intercept[SparkException] {
+      val iter = client.execute(buildPlan("select 1"))
+      iter.foreach(_ => ())
+    }
+    assert(
+      ex.getCause.asInstanceOf[StatusRuntimeException].getStatus.getCode ==
+        Status.Code.DEADLINE_EXCEEDED)
+  }
+
+  test("non-reattachable executePlan has no client-side deadline") {
+    val latch = new CountDownLatch(1)
+    val slowService = new DummySparkConnectService {
+      override def executePlan(
+          request: ExecutePlanRequest,
+          responseObserver: StreamObserver[ExecutePlanResponse]): Unit = {
+        latch.await(250, TimeUnit.MILLISECONDS)
+        super.executePlan(request, responseObserver)
+      }
+    }
+    server = NettyServerBuilder.forPort(0).addService(slowService).build().start()
+    service = slowService
+    client = SparkConnectClient
+      .builder()
+      .connectionString(s"sc://localhost:${server.getPort}")
+      .disableReattachableExecute()
+      .rpcDeadlines(
+        RpcDeadlines(reattachableExecutePlan = Some(FiniteDuration(50, TimeUnit.MILLISECONDS))))
+      .retryPolicy(RetryPolicy(maxRetries = Some(0), canRetry = _ => false, name = "NoRetry"))
+      .build()
+    try {
+      val iter = client.execute(buildPlan("select 1"))
+      iter.foreach(_ => ())
+    } finally {
+      latch.countDown()
+    }
+  }
+
+  test("SPARK-56538: RpcDeadlines.disabled has no configured deadlines in toString") {
+    assert(RpcDeadlines.disabled.toString === "RpcDeadlines(all disabled)")
+  }
+
+  test("SPARK-57336: access token is sent in the standard Authorization header") {
+    val token = "test-token-12345"
+    val creds = new SparkConnectClient.AccessTokenCallCredentials(token)
+
+    var captured: Option[Metadata] = None
+    var failure: Option[Status] = None
+    val applier = new CallCredentials.MetadataApplier {
+      override def apply(headers: Metadata): Unit = captured = Some(headers)
+      override def fail(status: Status): Unit = failure = Some(status)
+    }
+    val sameThreadExecutor = new Executor {
+      override def execute(command: Runnable): Unit = command.run()
+    }
+
+    creds.applyRequestMetadata(null, sameThreadExecutor, applier)
+
+    val authorizationKey = Metadata.Key.of("Authorization", Metadata.ASCII_STRING_MARSHALLER)
+    assert(failure.isEmpty, s"unexpected failure: ${failure.orNull}")
+    assert(captured.isDefined)
+    assert(captured.get.get(authorizationKey) === s"Bearer $token")
+  }
+}
+
+/**
+ * A minimal bidirectional TCP relay that can be "frozen" mid-connection without closing either
+ * side's socket -- simulating a NAT gateway/load balancer/corporate proxy that silently drops an
+ * idle connection's mapping (no TCP RST/FIN sent to either endpoint). While frozen, no bytes are
+ * read from or written to either socket, so gRPC/HTTP2 keepalive PING frames also stop flowing,
+ * exactly as they would over a genuinely dead network path.
+ */
+private class FreezableTcpRelay(targetPort: Int) {
+  private val listener = new java.net.ServerSocket(0)
+  @volatile private var frozen = false
+  private val sockets = mutable.ListBuffer[java.net.Socket]()
+
+  private val acceptThread = new Thread(() => {
+    try {
+      while (true) {
+        val clientSocket = listener.accept()
+        val serverSocket = new java.net.Socket("127.0.0.1", targetPort)
+        sockets.synchronized {
+          sockets += clientSocket
+          sockets += serverSocket
+        }
+        pump(clientSocket, serverSocket)
+        pump(serverSocket, clientSocket)
+      }
+    } catch {
+      case _: java.io.IOException => // listener closed, relay shutting down
+    }
+  })
+  acceptThread.setDaemon(true)
+  acceptThread.start()
+
+  def port: Int = listener.getLocalPort
+
+  // Once frozen, bytes read from either socket are dropped rather than forwarded: no data
+  // (including keepalive PING/PONG frames) reaches the other side, but neither socket is
+  // closed -- the same observable behavior as a middlebox silently black-holing the connection.
+  def freeze(): Unit = frozen = true
+
+  private def pump(src: java.net.Socket, dst: java.net.Socket): Unit = {
+    val t = new Thread(() => {
+      try {
+        val in = src.getInputStream
+        val out = dst.getOutputStream
+        val buf = new Array[Byte](8192)
+        var n = 0
+        while ({ n = in.read(buf); n != -1 }) {
+          if (!frozen) {
+            out.write(buf, 0, n)
+            out.flush()
+          }
+        }
+      } catch {
+        case _: java.io.IOException => // socket closed, nothing left to pump
+      }
+    })
+    t.setDaemon(true)
+    t.start()
+  }
+
+  def close(): Unit = {
+    listener.close()
+    sockets.synchronized(sockets.foreach { s =>
+      try {
+        s.close()
+      } catch {
+        case _: java.io.IOException =>
+      }
+    })
+  }
+}
+
+class DummySparkConnectService() extends SparkConnectServiceGrpc.SparkConnectServiceImplBase {
+
+  private var inputPlan: proto.Plan = _
+  private val inputArtifactRequests: mutable.ListBuffer[AddArtifactsRequest] =
+    mutable.ListBuffer.empty
+  private val inputConfigRequests = mutable.ListBuffer.empty[proto.ConfigRequest]
+  private val sparkConfigs = mutable.Map.empty[String, String]
+
+  var errorToThrowOnExecute: Option[Throwable] = None
+  var errorToThrowOnAnalyze: Option[Throwable] = None
+  var serverCapabilities: Seq[String] = Nil
+
+  private var errorToThrowOnConfig: Map[String, Throwable] = Map.empty
+
+  private[sql] def setErrorToThrowOnConfig(key: String, error: Throwable): Unit = synchronized {
+    errorToThrowOnConfig = errorToThrowOnConfig + (key -> error)
+  }
+
+  private[sql] def setSparkConfig(key: String, value: String): Unit = synchronized {
+    sparkConfigs.put(key, value)
+  }
+
+  private[sql] def getAndClearLatestInputPlan(): proto.Plan = synchronized {
+    val plan = inputPlan
+    inputPlan = null
+    plan
+  }
+
+  private[sql] def getAndClearLatestAddArtifactRequests(): Seq[AddArtifactsRequest] =
+    synchronized {
+      val requests = inputArtifactRequests.toSeq
+      inputArtifactRequests.clear()
+      requests
+    }
+
+  private[sql] def getAndClearLatestConfigRequests(): Seq[proto.ConfigRequest] =
+    synchronized {
+      val requests = inputConfigRequests.clone().toSeq
+      inputConfigRequests.clear()
+      requests
+    }
+
+  override def executePlan(
+      request: ExecutePlanRequest,
+      responseObserver: StreamObserver[ExecutePlanResponse]): Unit = {
+    synchronized {
+      if (errorToThrowOnExecute.isDefined) {
+        val error = errorToThrowOnExecute.get
+        errorToThrowOnExecute = None
+        responseObserver.onError(error)
+        return
+      }
+    }
+
+    // Reply with a dummy response using the same client ID
+    val requestSessionId = request.getSessionId
+    val operationId = if (request.hasOperationId) {
+      request.getOperationId
+    } else {
+      UUID.randomUUID().toString
+    }
+    synchronized {
+      inputPlan = request.getPlan
+    }
+    val response = ExecutePlanResponse
+      .newBuilder()
+      .setSessionId(requestSessionId)
+      .setOperationId(operationId)
+      .build()
+    responseObserver.onNext(response)
+    // Reattachable execute must end with ResultComplete
+    if (request.getRequestOptionsList.asScala.exists { option =>
+        option.hasReattachOptions && option.getReattachOptions.getReattachable
+      }) {
+      val resultComplete = ExecutePlanResponse
+        .newBuilder()
+        .setSessionId(requestSessionId)
+        .setOperationId(operationId)
+        .setResultComplete(proto.ExecutePlanResponse.ResultComplete.newBuilder().build())
+        .build()
+      responseObserver.onNext(resultComplete)
+    }
+    responseObserver.onCompleted()
+  }
+
+  override def analyzePlan(
+      request: AnalyzePlanRequest,
+      responseObserver: StreamObserver[AnalyzePlanResponse]): Unit = {
+    errorToThrowOnAnalyze.foreach { error =>
+      errorToThrowOnAnalyze = None
+      responseObserver.onError(error)
+      return
+    }
+    // Reply with a dummy response using the same client ID
+    val requestSessionId = request.getSessionId
+    synchronized {
+      request.getAnalyzeCase match {
+        case proto.AnalyzePlanRequest.AnalyzeCase.SCHEMA =>
+          inputPlan = request.getSchema.getPlan
+        case proto.AnalyzePlanRequest.AnalyzeCase.EXPLAIN =>
+          inputPlan = request.getExplain.getPlan
+        case proto.AnalyzePlanRequest.AnalyzeCase.TREE_STRING =>
+          inputPlan = request.getTreeString.getPlan
+        case proto.AnalyzePlanRequest.AnalyzeCase.IS_LOCAL =>
+          inputPlan = request.getIsLocal.getPlan
+        case proto.AnalyzePlanRequest.AnalyzeCase.IS_STREAMING =>
+          inputPlan = request.getIsStreaming.getPlan
+        case proto.AnalyzePlanRequest.AnalyzeCase.INPUT_FILES =>
+          inputPlan = request.getInputFiles.getPlan
+        case _ => inputPlan = null
+      }
+    }
+    val responseBuilder = AnalyzePlanResponse
+      .newBuilder()
+      .setSessionId(requestSessionId)
+    if (request.hasSparkVersion) {
+      responseBuilder.setSparkVersion(
+        proto.AnalyzePlanResponse.SparkVersion
+          .newBuilder()
+          .setVersion("test-version")
+          .addAllCapabilities(serverCapabilities.asJava))
+    }
+    responseObserver.onNext(responseBuilder.build())
+    responseObserver.onCompleted()
+  }
+
+  override def addArtifacts(responseObserver: StreamObserver[AddArtifactsResponse])
+      : StreamObserver[AddArtifactsRequest] = new StreamObserver[AddArtifactsRequest] {
+    override def onNext(v: AddArtifactsRequest): Unit =
+      synchronized(inputArtifactRequests.append(v))
+
+    override def onError(throwable: Throwable): Unit = responseObserver.onError(throwable)
+
+    override def onCompleted(): Unit = {
+      responseObserver.onNext(proto.AddArtifactsResponse.newBuilder().build())
+      responseObserver.onCompleted()
+    }
+  }
+
+  override def artifactStatus(
+      request: ArtifactStatusesRequest,
+      responseObserver: StreamObserver[ArtifactStatusesResponse]): Unit = {
+    val builder = proto.ArtifactStatusesResponse.newBuilder()
+    request.getNamesList().iterator().asScala.foreach { name =>
+      val status = proto.ArtifactStatusesResponse.ArtifactStatus.newBuilder()
+      val exists = if (name.startsWith("cache/")) {
+        synchronized {
+          inputArtifactRequests.exists { artifactReq =>
+            if (artifactReq.hasBatch) {
+              val batch = artifactReq.getBatch
+              batch.getArtifactsList.asScala.exists { singleArtifact =>
+                singleArtifact.getName == name
+              }
+            } else false
+          }
+        }
+      } else false
+      builder.putStatuses(name, status.setExists(exists).build())
+    }
+    responseObserver.onNext(builder.build())
+    responseObserver.onCompleted()
+  }
+
+  override def config(
+      request: proto.ConfigRequest,
+      responseObserver: StreamObserver[proto.ConfigResponse]): Unit = {
+    inputConfigRequests.synchronized {
+      inputConfigRequests.append(request)
+    }
+    require(
+      request.getOperation.hasGetOption,
+      "Only GetOption is supported. Other operations " +
+        "can be implemented by following the same procedure below.")
+
+    val responseBuilder = proto.ConfigResponse.newBuilder().setSessionId(request.getSessionId)
+    request.getOperation.getGetOption.getKeysList.asScala.iterator.foreach { key =>
+      if (errorToThrowOnConfig.contains(key)) {
+        val error = errorToThrowOnConfig(key)
+        responseObserver.onError(error)
+        return
+      }
+
+      val kvBuilder = proto.KeyValue.newBuilder()
+      synchronized {
+        sparkConfigs.get(key).foreach { value =>
+          kvBuilder.setKey(key)
+          kvBuilder.setValue(value)
+        }
+      }
+      responseBuilder.addPairs(kvBuilder.build())
+    }
+    responseObserver.onNext(responseBuilder.build())
+    responseObserver.onCompleted()
+  }
+
+  override def interrupt(
+      request: proto.InterruptRequest,
+      responseObserver: StreamObserver[proto.InterruptResponse]): Unit = {
+    val response = proto.InterruptResponse.newBuilder().setSessionId(request.getSessionId).build()
+    responseObserver.onNext(response)
+    responseObserver.onCompleted()
+  }
+
+  override def reattachExecute(
+      request: proto.ReattachExecuteRequest,
+      responseObserver: StreamObserver[proto.ExecutePlanResponse]): Unit = {
+    // Reply with a dummy response using the same client ID
+    val requestSessionId = request.getSessionId
+    val response = ExecutePlanResponse
+      .newBuilder()
+      .setSessionId(requestSessionId)
+      .build()
+    responseObserver.onNext(response)
+    responseObserver.onCompleted()
+  }
+
+  override def releaseExecute(
+      request: proto.ReleaseExecuteRequest,
+      responseObserver: StreamObserver[proto.ReleaseExecuteResponse]): Unit = {
+    val response = proto.ReleaseExecuteResponse
+      .newBuilder()
+      .setSessionId(request.getSessionId)
+      .setOperationId(request.getOperationId)
+      .build()
+    responseObserver.onNext(response)
+    responseObserver.onCompleted()
+  }
+
+  // Default operations stored in the mock session
+  private val defaultOperationStatuses = Map(
+    "default-op-1" ->
+      proto.GetStatusResponse.OperationStatus.OperationState.OPERATION_STATE_SUCCEEDED,
+    "default-op-2" ->
+      proto.GetStatusResponse.OperationStatus.OperationState.OPERATION_STATE_RUNNING)
+
+  override def getStatus(
+      request: proto.GetStatusRequest,
+      responseObserver: StreamObserver[proto.GetStatusResponse]): Unit = {
+    val responseBuilder = proto.GetStatusResponse
+      .newBuilder()
+      .setSessionId(request.getSessionId)
+      .setServerSideSessionId(UUID.randomUUID().toString)
+
+    if (request.hasOperationStatus) {
+      val opStatusRequest = request.getOperationStatus
+      val requestedIds = opStatusRequest.getOperationIdsList.asScala.toSeq
+      // Collect operation-status-level extensions from the request to echo back
+      val opStatusExtensions = opStatusRequest.getExtensionsList.asScala
+
+      if (requestedIds.isEmpty) {
+        // No specific IDs requested - return all default operations
+        defaultOperationStatuses.foreach { case (opId, state) =>
+          val statusBuilder = proto.GetStatusResponse.OperationStatus
+            .newBuilder()
+            .setOperationId(opId)
+            .setState(state)
+          opStatusExtensions.foreach(statusBuilder.addExtensions)
+          responseBuilder.addOperationStatuses(statusBuilder.build())
+        }
+      } else {
+        // Return status for each requested operation ID
+        // Unknown operations return OPERATION_STATE_UNKNOWN
+        requestedIds.foreach { opId =>
+          val state = defaultOperationStatuses.getOrElse(
+            opId,
+            proto.GetStatusResponse.OperationStatus.OperationState.OPERATION_STATE_UNKNOWN)
+          val statusBuilder = proto.GetStatusResponse.OperationStatus
+            .newBuilder()
+            .setOperationId(opId)
+            .setState(state)
+          opStatusExtensions.foreach(statusBuilder.addExtensions)
+          responseBuilder.addOperationStatuses(statusBuilder.build())
+        }
+      }
+    }
+
+    // Echo request-level extensions back in the response
+    request.getExtensionsList.asScala.foreach(responseBuilder.addExtensions)
+
+    responseObserver.onNext(responseBuilder.build())
+    responseObserver.onCompleted()
+  }
+}

@@ -30,7 +30,7 @@ import org.apache.spark.sql.SparkSession
 object DecisionTreeRegressionExample {
   def main(args: Array[String]): Unit = {
     val spark = SparkSession
-      .builder
+      .builder()
       .appName("DecisionTreeRegressionExample")
       .getOrCreate()
 
@@ -73,10 +73,10 @@ object DecisionTreeRegressionExample {
       .setPredictionCol("prediction")
       .setMetricName("rmse")
     val rmse = evaluator.evaluate(predictions)
-    println("Root Mean Squared Error (RMSE) on test data = " + rmse)
+    println(s"Root Mean Squared Error (RMSE) on test data = $rmse")
 
     val treeModel = model.stages(1).asInstanceOf[DecisionTreeRegressionModel]
-    println("Learned regression tree model:\n" + treeModel.toDebugString)
+    println(s"Learned regression tree model:\n ${treeModel.toDebugString}")
     // $example off$
 
     spark.stop()

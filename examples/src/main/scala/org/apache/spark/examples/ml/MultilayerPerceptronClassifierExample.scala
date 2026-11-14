@@ -31,7 +31,7 @@ object MultilayerPerceptronClassifierExample {
 
   def main(args: Array[String]): Unit = {
     val spark = SparkSession
-      .builder
+      .builder()
       .appName("MultilayerPerceptronClassifierExample")
       .getOrCreate()
 
@@ -66,7 +66,7 @@ object MultilayerPerceptronClassifierExample {
     val evaluator = new MulticlassClassificationEvaluator()
       .setMetricName("accuracy")
 
-    println("Test set accuracy = " + evaluator.evaluate(predictionAndLabels))
+    println(s"Test set accuracy = ${evaluator.evaluate(predictionAndLabels)}")
     // $example off$
 
     spark.stop()

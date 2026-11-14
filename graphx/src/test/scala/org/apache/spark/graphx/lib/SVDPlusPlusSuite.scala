@@ -40,4 +40,28 @@ class SVDPlusPlusSuite extends SparkFunSuite with LocalSparkContext {
     }
   }
 
+  test("Test SVD++ with no edges") {
+    withSpark { sc =>
+      val edges = sc.emptyRDD[Edge[Double]]
+      val conf = new SVDPlusPlus.Conf(10, 2, 0.0, 5.0, 0.007, 0.007, 0.005, 0.015) // 2 iterations
+      val (graph, _) = SVDPlusPlus.run(edges, conf)
+      assert(graph.vertices.count() == 0)
+      assert(graph.edges.count() == 0)
+    }
+  }
+
+  test("SPARK-58177: training-phase message combiner sums both vectors element-wise") {
+    val g1 = (Array(1.0, 2.0), Array(10.0, 20.0), 100.0)
+    val g2 = (Array(3.0, 4.0), Array(30.0, 40.0), 200.0)
+    val (out1, out2, out3) = SVDPlusPlus.combineTrainMessages(g1, g2)
+    // Each component is the element-wise sum of the two messages.
+    assert(out1.toSeq === Seq(4.0, 6.0))
+    assert(out2.toSeq === Seq(40.0, 60.0))
+    assert(out3 === 300.0)
+    // Inputs are cloned, not mutated.
+    assert(g1._1.toSeq === Seq(1.0, 2.0))
+    assert(g1._2.toSeq === Seq(10.0, 20.0))
+    assert(g2._1.toSeq === Seq(3.0, 4.0))
+    assert(g2._2.toSeq === Seq(30.0, 40.0))
+  }
 }

@@ -17,39 +17,86 @@
 
 package org.apache.spark.sql.execution.datasources.jdbc
 
-import java.util.Properties
+import org.apache.spark.sql.{DataFrame, SaveMode, SQLContext}
+import org.apache.spark.sql.errors.QueryCompilationErrors
+import org.apache.spark.sql.execution.datasources.jdbc.JdbcUtils._
+import org.apache.spark.sql.execution.metric.SQLMetrics
+import org.apache.spark.sql.jdbc.JdbcDialects
+import org.apache.spark.sql.sources.{BaseRelation, CreatableRelationProvider, DataSourceRegister, RelationProvider}
 
-import org.apache.spark.sql.SQLContext
-import org.apache.spark.sql.sources.{BaseRelation, DataSourceRegister, RelationProvider}
-
-class JdbcRelationProvider extends RelationProvider with DataSourceRegister {
+class JdbcRelationProvider extends CreatableRelationProvider
+  with RelationProvider with DataSourceRegister {
 
   override def shortName(): String = "jdbc"
 
-  /** Returns a new base relation with the given parameters. */
   override def createRelation(
       sqlContext: SQLContext,
       parameters: Map[String, String]): BaseRelation = {
     val jdbcOptions = new JDBCOptions(parameters)
-    if (jdbcOptions.partitionColumn != null
-      && (jdbcOptions.lowerBound == null
-        || jdbcOptions.upperBound == null
-        || jdbcOptions.numPartitions == null)) {
-      sys.error("Partitioning incompletely specified")
+    val sparkSession = sqlContext.sparkSession
+    val resolver = sparkSession.sessionState.conf.resolver
+    val timeZoneId = sparkSession.sessionState.conf.sessionLocalTimeZone
+    val remoteSchemaFetchMetric = JdbcUtils.createSchemaFetchMetric(sparkSession.sparkContext)
+    val (schema, databaseMetadata) = SQLMetrics.withTimingNs(remoteSchemaFetchMetric) {
+      JDBCRelation.getSchemaAndDatabaseMetadata(resolver, jdbcOptions)
+    }
+    val parts = JDBCRelation.columnPartition(schema, resolver, timeZoneId, jdbcOptions)
+    JDBCRelation(
+      schema,
+      parts,
+      jdbcOptions,
+      Map(JDBCRelation.schemaFetchKey -> remoteSchemaFetchMetric)
+    )(sparkSession, Some(databaseMetadata))
+  }
+
+  override def createRelation(
+      sqlContext: SQLContext,
+      mode: SaveMode,
+      parameters: Map[String, String],
+      df: DataFrame): BaseRelation = {
+    val options = new JdbcOptionsInWrite(parameters)
+    val isCaseSensitive = sqlContext.sparkSession.sessionState.conf.caseSensitiveAnalysis
+    val dialect = JdbcDialects.get(options.url)
+    val conn = dialect.createConnectionFactory(options)(-1)
+    val (shouldSave, tableSchema) = try {
+      val tableExists = JdbcUtils.tableExists(conn, options)
+      if (tableExists) {
+        mode match {
+          case SaveMode.Overwrite =>
+            if (options.isTruncate && isCascadingTruncateTable(options.url) == Some(false)) {
+              // In this case, we should truncate table and then load.
+              truncateTable(conn, options)
+              (true, JdbcUtils.getSchemaOption(conn, options))
+            } else {
+              // Otherwise, do not truncate the table, instead drop and recreate it
+              dropTable(conn, options.table, options)
+              createTable(conn, options.table, df.schema, isCaseSensitive, options)
+              (true, Some(df.schema))
+            }
+
+          case SaveMode.Append =>
+            (true, JdbcUtils.getSchemaOption(conn, options))
+
+          case SaveMode.ErrorIfExists =>
+            throw QueryCompilationErrors.tableOrViewAlreadyExistsError(options.table)
+
+          case SaveMode.Ignore =>
+            // With `SaveMode.Ignore` mode, if table already exists, the save operation is expected
+            // to not save the contents of the DataFrame and to not change the existing data.
+            // Therefore, it is okay to do nothing here and then just return the relation below.
+            (false, None)
+        }
+      } else {
+        createTable(conn, options.table, df.schema, isCaseSensitive, options)
+        (true, Some(df.schema))
+      }
+    } finally {
+      conn.close()
+    }
+    if (shouldSave) {
+      saveTable(df, tableSchema, isCaseSensitive, options)
     }
 
-    val partitionInfo = if (jdbcOptions.partitionColumn == null) {
-      null
-    } else {
-      JDBCPartitioningInfo(
-        jdbcOptions.partitionColumn,
-        jdbcOptions.lowerBound.toLong,
-        jdbcOptions.upperBound.toLong,
-        jdbcOptions.numPartitions.toInt)
-    }
-    val parts = JDBCRelation.columnPartition(partitionInfo)
-    val properties = new Properties() // Additional properties that we will pass to getConnection
-    parameters.foreach(kv => properties.setProperty(kv._1, kv._2))
-    JDBCRelation(jdbcOptions.url, jdbcOptions.table, parts, properties)(sqlContext.sparkSession)
+    createRelation(sqlContext, parameters)
   }
 }

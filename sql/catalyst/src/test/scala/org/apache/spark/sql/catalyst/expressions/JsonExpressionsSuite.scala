@@ -17,9 +17,23 @@
 
 package org.apache.spark.sql.catalyst.expressions
 
-import org.apache.spark.SparkFunSuite
+import java.text.{DecimalFormat, DecimalFormatSymbols, SimpleDateFormat}
+import java.time.{LocalDateTime, ZoneOffset}
+import java.util.{Calendar, Locale, TimeZone}
+
+import org.scalatest.exceptions.TestFailedException
+
+import org.apache.spark.{SparkException, SparkFunSuite, SparkRuntimeException}
+import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.unsafe.types.UTF8String
+import org.apache.spark.sql.catalyst.analysis.TypeCheckResult.DataTypeMismatch
+import org.apache.spark.sql.catalyst.expressions.Cast._
+import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeProjection
+import org.apache.spark.sql.catalyst.util._
+import org.apache.spark.sql.catalyst.util.DateTimeTestUtils.{PST, UTC, UTC_OPT}
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.types._
+import org.apache.spark.unsafe.types.{CalendarInterval, UTF8String}
 
 class JsonExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
   val json =
@@ -35,10 +49,42 @@ class JsonExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
       |"fb:testid":"1234"}
       |""".stripMargin
 
+  /* invalid json with leading nulls would trigger java.io.CharConversionException
+   in Jackson's JsonFactory.createParser(byte[]) due to RFC-4627 encoding detection */
+  val badJson = "\u0000\u0000\u0000A\u0001AAA"
+
+  test("get_json_object escaping") {
+    GenerateUnsafeProjection.generate(GetJsonObject(Literal("\"quote"), Literal("\"quote")) :: Nil)
+  }
+
   test("$.store.bicycle") {
     checkEvaluation(
       GetJsonObject(Literal(json), Literal("$.store.bicycle")),
       """{"price":19.95,"color":"red"}""")
+  }
+
+  test("$['store'].bicycle") {
+    checkEvaluation(
+      GetJsonObject(Literal(json), Literal("$['store'].bicycle")),
+      """{"price":19.95,"color":"red"}""")
+  }
+
+  test("$.store['bicycle']") {
+    checkEvaluation(
+      GetJsonObject(Literal(json), Literal("$.store['bicycle']")),
+      """{"price":19.95,"color":"red"}""")
+  }
+
+  test("$['store']['bicycle']") {
+    checkEvaluation(
+      GetJsonObject(Literal(json), Literal("$['store']['bicycle']")),
+      """{"price":19.95,"color":"red"}""")
+  }
+
+  test("$['key with spaces']") {
+    checkEvaluation(GetJsonObject(
+      Literal("""{ "key with spaces": "it works" }"""), Literal("$['key with spaces']")),
+      "it works")
   }
 
   test("$.store.book") {
@@ -196,10 +242,24 @@ class JsonExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
       null)
   }
 
+  test("SPARK-16548: character conversion") {
+    checkEvaluation(
+      GetJsonObject(Literal(badJson), Literal("$.a")),
+      null
+    )
+  }
+
   test("non foldable literal") {
     checkEvaluation(
       GetJsonObject(NonFoldableLiteral(json), NonFoldableLiteral("$.fb:testid")),
       "1234")
+  }
+
+  test("some big value") {
+    val value = "x".repeat(3000)
+    checkEvaluation(
+      GetJsonObject(NonFoldableLiteral((s"""{"big": "$value"}""")),
+      NonFoldableLiteral("$.big")), value)
   }
 
   val jsonTupleQuery = Literal("f1") ::
@@ -210,7 +270,13 @@ class JsonExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     Nil
 
   private def checkJsonTuple(jt: JsonTuple, expected: InternalRow): Unit = {
-    assert(jt.eval(null).toSeq.head === expected)
+    assert(jt.eval(null).iterator.to(Seq).head === expected)
+  }
+
+  test("json_tuple escaping") {
+    checkJsonTuple(
+      JsonTuple(Literal("\"quote") ::  Literal("\"quote") :: Nil),
+      InternalRow.fromSeq(Seq(null).map(UTF8String.fromString)))
   }
 
   test("json_tuple - hive key 1") {
@@ -279,42 +345,809 @@ class JsonExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
   test("json_tuple - hive key 4 - null json") {
     checkJsonTuple(
       JsonTuple(Literal(null) :: jsonTupleQuery),
-      InternalRow.fromSeq(Seq(null, null, null, null, null)))
+      InternalRow(null, null, null, null, null))
   }
 
   test("json_tuple - hive key 5 - null and empty fields") {
     checkJsonTuple(
       JsonTuple(Literal("""{"f1": "", "f5": null}""") :: jsonTupleQuery),
-      InternalRow.fromSeq(Seq(UTF8String.fromString(""), null, null, null, null)))
+      InternalRow(UTF8String.fromString(""), null, null, null, null))
   }
 
   test("json_tuple - hive key 6 - invalid json (array)") {
     checkJsonTuple(
       JsonTuple(Literal("[invalid JSON string]") :: jsonTupleQuery),
-      InternalRow.fromSeq(Seq(null, null, null, null, null)))
+      InternalRow(null, null, null, null, null))
   }
 
   test("json_tuple - invalid json (object start only)") {
     checkJsonTuple(
       JsonTuple(Literal("{") :: jsonTupleQuery),
-      InternalRow.fromSeq(Seq(null, null, null, null, null)))
+      InternalRow(null, null, null, null, null))
   }
 
   test("json_tuple - invalid json (no object end)") {
     checkJsonTuple(
       JsonTuple(Literal("""{"foo": "bar"""") :: jsonTupleQuery),
-      InternalRow.fromSeq(Seq(null, null, null, null, null)))
+      InternalRow(null, null, null, null, null))
   }
 
   test("json_tuple - invalid json (invalid json)") {
     checkJsonTuple(
       JsonTuple(Literal("\\") :: jsonTupleQuery),
-      InternalRow.fromSeq(Seq(null, null, null, null, null)))
+      InternalRow(null, null, null, null, null))
+  }
+
+  test("SPARK-16548: json_tuple - invalid json with leading nulls") {
+    checkJsonTuple(
+      JsonTuple(Literal(badJson) :: jsonTupleQuery),
+      InternalRow(null, null, null, null, null))
   }
 
   test("json_tuple - preserve newlines") {
     checkJsonTuple(
       JsonTuple(Literal("{\"a\":\"b\nc\"}") :: Literal("a") :: Nil),
-      InternalRow.fromSeq(Seq(UTF8String.fromString("b\nc"))))
+      InternalRow(UTF8String.fromString("b\nc")))
+  }
+
+  test("SPARK-21677: json_tuple throws NullPointException when column is null as string type") {
+    checkJsonTuple(
+      JsonTuple(Literal("""{"f1": 1, "f2": 2}""") ::
+        NonFoldableLiteral("f1") ::
+        NonFoldableLiteral("cast(NULL AS STRING)") ::
+        NonFoldableLiteral("f2") ::
+        Nil),
+      InternalRow(UTF8String.fromString("1"), null, UTF8String.fromString("2")))
+  }
+
+  test("SPARK-21804: json_tuple returns null values within repeated columns except the first one") {
+    checkJsonTuple(
+      JsonTuple(Literal("""{"f1": 1, "f2": 2}""") ::
+        NonFoldableLiteral("f1") ::
+        NonFoldableLiteral("cast(NULL AS STRING)") ::
+        NonFoldableLiteral("f1") ::
+        Nil),
+      InternalRow(UTF8String.fromString("1"), null, UTF8String.fromString("1")))
+  }
+
+  test("json_tuple - all arguments must be strings") {
+    assert(JsonTuple(Seq(Literal(888), Literal(999))).checkInputDataTypes() ==
+      DataTypeMismatch(
+        errorSubClass = "NON_STRING_TYPE",
+        messageParameters = Map("funcName" -> "`json_tuple`")
+      )
+    )
+  }
+
+  test("from_json escaping") {
+    val schema = StructType(StructField("\"quote", IntegerType) :: Nil)
+    GenerateUnsafeProjection.generate(
+      JsonToStructs(schema, Map.empty, Literal("\"quote"), UTC_OPT) :: Nil)
+  }
+
+  test("from_json") {
+    val jsonData = """{"a": 1}"""
+    val schema = StructType(StructField("a", IntegerType) :: Nil)
+    checkEvaluation(
+      JsonToStructs(schema, Map.empty, Literal(jsonData), UTC_OPT),
+      InternalRow(1)
+    )
+  }
+
+  test("from_json - invalid data") {
+    val jsonData = """{"a" 1}"""
+    val schema = StructType(StructField("a", IntegerType) :: Nil)
+    checkEvaluation(
+      JsonToStructs(schema, Map.empty, Literal(jsonData), UTC_OPT),
+      InternalRow(null)
+    )
+
+    val exception = intercept[TestFailedException] {
+      checkEvaluation(
+        JsonToStructs(schema, Map("mode" -> FailFastMode.name), Literal(jsonData), UTC_OPT),
+        InternalRow(null)
+      )
+    }.getCause
+    checkError(
+      exception = exception.asInstanceOf[SparkException],
+      condition = "MALFORMED_RECORD_IN_PARSING.WITHOUT_SUGGESTION",
+      parameters = Map("badRecord" -> "[null]", "failFastMode" -> "FAILFAST")
+    )
+  }
+
+  test("from_json - input=array, schema=array, output=array") {
+    val input = """[{"a": 1}, {"a": 2}]"""
+    val schema = ArrayType(StructType(StructField("a", IntegerType) :: Nil))
+    val output = InternalRow(1) :: InternalRow(2) :: Nil
+    checkEvaluation(JsonToStructs(schema, Map.empty, Literal(input), UTC_OPT), output)
+  }
+
+  test("from_json - input=object, schema=array, output=array of single row") {
+    val input = """{"a": 1}"""
+    val schema = ArrayType(StructType(StructField("a", IntegerType) :: Nil))
+    val output = InternalRow(1) :: Nil
+    checkEvaluation(JsonToStructs(schema, Map.empty, Literal(input), UTC_OPT), output)
+  }
+
+  test("from_json - input=empty array, schema=array, output=empty array") {
+    val input = "[ ]"
+    val schema = ArrayType(StructType(StructField("a", IntegerType) :: Nil))
+    val output = Nil
+    checkEvaluation(JsonToStructs(schema, Map.empty, Literal(input), UTC_OPT), output)
+  }
+
+  test("from_json - input=empty object, schema=array, output=array of single row with null") {
+    val input = "{ }"
+    val schema = ArrayType(StructType(StructField("a", IntegerType) :: Nil))
+    val output = InternalRow(null) :: Nil
+    checkEvaluation(JsonToStructs(schema, Map.empty, Literal(input), UTC_OPT), output)
+  }
+
+  test("from_json - input=array of single object, schema=struct, output=single row") {
+    val input = """[{"a": 1}]"""
+    val schema = StructType(StructField("a", IntegerType) :: Nil)
+    val output = InternalRow(null)
+    checkEvaluation(JsonToStructs(schema, Map.empty, Literal(input), UTC_OPT), output)
+  }
+
+  test("from_json - input=array, schema=struct, output=single row") {
+    val input = """[{"a": 1}, {"a": 2}]"""
+    val corrupted = "corrupted"
+    val schema = new StructType().add("a", IntegerType).add(corrupted, StringType)
+    val output = InternalRow(null, UTF8String.fromString(input))
+    val options = Map("columnNameOfCorruptRecord" -> corrupted)
+    checkEvaluation(JsonToStructs(schema, options, Literal(input), UTC_OPT), output)
+  }
+
+  test("from_json - input=empty array, schema=struct, output=single row with null") {
+    val input = """[]"""
+    val schema = StructType(StructField("a", IntegerType) :: Nil)
+    val output = InternalRow(null)
+    checkEvaluation(JsonToStructs(schema, Map.empty, Literal(input), UTC_OPT), output)
+  }
+
+  test("from_json - input=empty object, schema=struct, output=single row with null") {
+    val input = """{  }"""
+    val schema = StructType(StructField("a", IntegerType) :: Nil)
+    val output = InternalRow(null)
+    checkEvaluation(JsonToStructs(schema, Map.empty, Literal(input), UTC_OPT), output)
+  }
+
+  test("from_json null input column") {
+    val schema = StructType(StructField("a", IntegerType) :: Nil)
+    checkEvaluation(
+      JsonToStructs(schema, Map.empty, Literal.create(null, StringType), UTC_OPT),
+      null
+    )
+  }
+
+  test("SPARK-20549: from_json bad UTF-8") {
+    val schema = StructType(StructField("a", IntegerType) :: Nil)
+    checkEvaluation(
+      JsonToStructs(schema, Map.empty, Literal(badJson), UTC_OPT),
+      InternalRow(null))
+  }
+
+  test("from_json with timestamp") {
+    val schema = StructType(StructField("t", TimestampType) :: Nil)
+
+    val jsonData1 = """{"t": "2016-01-01T00:00:00.123Z"}"""
+    var c = Calendar.getInstance(TimeZone.getTimeZone(UTC))
+    c.set(2016, 0, 1, 0, 0, 0)
+    c.set(Calendar.MILLISECOND, 123)
+    checkEvaluation(
+      JsonToStructs(schema, Map.empty, Literal(jsonData1), UTC_OPT),
+      InternalRow(c.getTimeInMillis * 1000L)
+    )
+    // The result doesn't change because the json string includes timezone string ("Z" here),
+    // which means the string represents the timestamp string in the timezone regardless of
+    // the timeZoneId parameter.
+    checkEvaluation(
+      JsonToStructs(schema, Map.empty, Literal(jsonData1), Option(PST.getId)),
+      InternalRow(c.getTimeInMillis * 1000L)
+    )
+
+    val jsonData2 = """{"t": "2016-01-01T00:00:00"}"""
+    for (zid <- DateTimeTestUtils.outstandingZoneIds) {
+      c = Calendar.getInstance(TimeZone.getTimeZone(zid))
+      c.set(2016, 0, 1, 0, 0, 0)
+      c.set(Calendar.MILLISECOND, 0)
+      checkEvaluation(
+        JsonToStructs(
+          schema,
+          Map("timestampFormat" -> "yyyy-MM-dd'T'HH:mm:ss"),
+          Literal(jsonData2),
+          Option(zid.getId)),
+        InternalRow(c.getTimeInMillis * 1000L)
+      )
+      checkEvaluation(
+        JsonToStructs(
+          schema,
+          Map("timestampFormat" -> "yyyy-MM-dd'T'HH:mm:ss",
+            DateTimeUtils.TIMEZONE_OPTION -> zid.getId),
+          Literal(jsonData2),
+          UTC_OPT),
+        InternalRow(c.getTimeInMillis * 1000L)
+      )
+    }
+  }
+
+  test("SPARK-57456: from_json with nanos timestamp") {
+    val jsonData = """{"t": "2016-01-01T00:00:00.123456789"}"""
+    // No timestamp format option: the default formatter parses the full sub-second fraction and
+    // truncates the sub-precision digits toward zero to the declared precision.
+    withSQLConf(SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "true") {
+      TimestampNanosTestUtils.foreachNanosPrecision { p =>
+        val nano = TimestampNanosTestUtils.nanoOfSecTruncator(p)(123456789)
+        val ldt = LocalDateTime.of(2016, 1, 1, 0, 0, 0, nano)
+        checkEvaluation(
+          JsonToStructs(
+            StructType(StructField("t", TimestampNTZNanosType(p)) :: Nil),
+            Map.empty[String, String],
+            Literal(jsonData),
+            UTC_OPT),
+          InternalRow(TimestampNanosTestUtils.localDateTimeToNanosVal(ldt)))
+        // LTZ: the string has no zone, so it is interpreted in the given time zone (UTC here).
+        checkEvaluation(
+          JsonToStructs(
+            StructType(StructField("t", TimestampLTZNanosType(p)) :: Nil),
+            Map.empty[String, String],
+            Literal(jsonData),
+            UTC_OPT),
+          InternalRow(TimestampNanosTestUtils.instantToNanosVal(ldt.toInstant(ZoneOffset.UTC))))
+      }
+    }
+  }
+
+  test("SPARK-19543: from_json empty input column") {
+    val schema = StructType(StructField("a", IntegerType) :: Nil)
+    checkEvaluation(
+      JsonToStructs(schema, Map.empty, Literal.create(" ", StringType), UTC_OPT),
+      null
+    )
+  }
+
+  test("to_json escaping") {
+    val schema = StructType(StructField("\"quote", IntegerType) :: Nil)
+    val struct = Literal.create(create_row(1), schema)
+    GenerateUnsafeProjection.generate(
+      StructsToJson(Map.empty, struct, UTC_OPT).replacement :: Nil)
+  }
+
+  test("to_json - struct") {
+    val schema = StructType(StructField("a", IntegerType) :: Nil)
+    val struct = Literal.create(create_row(1), schema)
+    checkEvaluation(
+      StructsToJson(Map.empty, struct, UTC_OPT),
+      """{"a":1}"""
+    )
+  }
+
+  test("to_json - struct: unable to convert column of ObjectType to JSON") {
+    val schema = StructType(StructField("a", ObjectType(classOf[java.lang.Integer])) :: Nil)
+    val structData = Literal.create(create_row(Integer.valueOf(1)), schema)
+    assert(StructsToJson(Map.empty, structData).checkInputDataTypes() ==
+      DataTypeMismatch(
+        errorSubClass = "CANNOT_CONVERT_TO_JSON",
+        messageParameters = Map(
+          "name" -> "`a`",
+          "type" -> "\"JAVA.LANG.INTEGER\"")
+      )
+    )
+  }
+
+  test("to_json - array") {
+    val inputSchema = ArrayType(StructType(StructField("a", IntegerType) :: Nil))
+    val input = new GenericArrayData(InternalRow(1) :: InternalRow(2) :: Nil)
+    val output = """[{"a":1},{"a":2}]"""
+    checkEvaluation(
+      StructsToJson(Map.empty, Literal.create(input, inputSchema), UTC_OPT),
+      output)
+  }
+
+  test("to_json - array with single empty row") {
+    val inputSchema = ArrayType(StructType(StructField("a", IntegerType) :: Nil))
+    val input = new GenericArrayData(InternalRow(null) :: Nil)
+    val output = """[{}]"""
+    checkEvaluation(
+      StructsToJson(Map.empty, Literal.create(input, inputSchema), UTC_OPT),
+      output)
+  }
+
+  test("to_json - empty array") {
+    val inputSchema = ArrayType(StructType(StructField("a", IntegerType) :: Nil))
+    val input = new GenericArrayData(Nil)
+    val output = """[]"""
+    checkEvaluation(
+      StructsToJson(Map.empty, Literal.create(input, inputSchema), UTC_OPT),
+      output)
+  }
+
+  test("to_json null input column") {
+    val schema = StructType(StructField("a", IntegerType) :: Nil)
+    val struct = Literal.create(null, schema)
+    checkEvaluation(
+      StructsToJson(Map.empty, struct, UTC_OPT),
+      null
+    )
+  }
+
+  test("to_json with timestamp") {
+    val schema = StructType(StructField("t", TimestampType) :: Nil)
+    val c = Calendar.getInstance(TimeZone.getTimeZone(UTC))
+    c.set(2016, 0, 1, 0, 0, 0)
+    c.set(Calendar.MILLISECOND, 0)
+    val struct = Literal.create(create_row(c.getTimeInMillis * 1000L), schema)
+
+    checkEvaluation(
+      StructsToJson(Map.empty, struct, UTC_OPT),
+      """{"t":"2016-01-01T00:00:00.000Z"}"""
+    )
+    checkEvaluation(
+      StructsToJson(Map.empty, struct, Option(PST.getId)),
+      """{"t":"2015-12-31T16:00:00.000-08:00"}"""
+    )
+
+    checkEvaluation(
+      StructsToJson(
+        Map("timestampFormat" -> "yyyy-MM-dd'T'HH:mm:ss",
+          DateTimeUtils.TIMEZONE_OPTION -> UTC_OPT.get),
+        struct,
+        UTC_OPT),
+      """{"t":"2016-01-01T00:00:00"}"""
+    )
+    checkEvaluation(
+      StructsToJson(
+        Map("timestampFormat" -> "yyyy-MM-dd'T'HH:mm:ss",
+          DateTimeUtils.TIMEZONE_OPTION -> PST.getId),
+        struct,
+        UTC_OPT),
+      """{"t":"2015-12-31T16:00:00"}"""
+    )
+  }
+
+  test("SPARK-21513: to_json support map[string, struct] to json") {
+    val schema = MapType(StringType, StructType(StructField("a", IntegerType) :: Nil))
+    val input = Literal(
+      ArrayBasedMapData(Map(UTF8String.fromString("test") -> InternalRow(1))), schema)
+    checkEvaluation(
+      StructsToJson(Map.empty, input),
+      """{"test":{"a":1}}"""
+    )
+  }
+
+  test("SPARK-21513: to_json support map[struct, struct] to json") {
+    val schema = MapType(StructType(StructField("a", IntegerType) :: Nil),
+      StructType(StructField("b", IntegerType) :: Nil))
+    val input = Literal(ArrayBasedMapData(Map(InternalRow(1) -> InternalRow(2))), schema)
+    checkEvaluation(
+      StructsToJson(Map.empty, input),
+      """{"[1]":{"b":2}}"""
+    )
+  }
+
+  test("SPARK-21513: to_json support map[string, integer] to json") {
+    val schema = MapType(StringType, IntegerType)
+    val input = Literal(ArrayBasedMapData(Map(UTF8String.fromString("a") -> 1)), schema)
+    checkEvaluation(
+      StructsToJson(Map.empty, input),
+      """{"a":1}"""
+    )
+  }
+
+  test("to_json - array with maps") {
+    val inputSchema = ArrayType(MapType(StringType, IntegerType))
+    val input = new GenericArrayData(
+      ArrayBasedMapData(Map(UTF8String.fromString("a") -> 1)) ::
+      ArrayBasedMapData(Map(UTF8String.fromString("b") -> 2)) :: Nil)
+    val output = """[{"a":1},{"b":2}]"""
+    checkEvaluation(
+      StructsToJson(Map.empty, Literal(input, inputSchema), UTC_OPT),
+      output)
+  }
+
+  test("to_json - array with single map") {
+    val inputSchema = ArrayType(MapType(StringType, IntegerType))
+    val input = new GenericArrayData(ArrayBasedMapData(Map(UTF8String.fromString("a") -> 1)) :: Nil)
+    val output = """[{"a":1}]"""
+    checkEvaluation(
+      StructsToJson(Map.empty, Literal.create(input, inputSchema), UTC_OPT),
+      output)
+  }
+
+  test("from/to json - interval support") {
+    val schema = StructType(StructField("i", CalendarIntervalType) :: Nil)
+    checkEvaluation(
+      JsonToStructs(schema, Map.empty, Literal.create("""{"i":"1 year 1 day"}""", StringType)),
+      InternalRow(new CalendarInterval(12, 1, 0)))
+
+    Seq(MapType(CalendarIntervalType, IntegerType), MapType(IntegerType, CalendarIntervalType))
+      .foreach { dt =>
+        val schema = StructField("a", dt) :: Nil
+        val struct = Literal.create(null, StructType(schema))
+        assert(StructsToJson(Map.empty, struct).checkInputDataTypes().isSuccess)
+      }
+  }
+
+  test("from_json missing fields") {
+    val input =
+      """{
+      |  "a": 1,
+      |  "c": "foo"
+      |}
+      |""".stripMargin
+    val jsonSchema = new StructType()
+      .add("a", LongType, nullable = false)
+      .add("b", StringType, nullable = false)
+      .add("c", StringType, nullable = false)
+    val output = InternalRow(1L, null, UTF8String.fromString("foo"))
+    val expr = JsonToStructs(jsonSchema, Map.empty, Literal.create(input, StringType), UTC_OPT)
+    checkEvaluation(expr, output)
+    val schema = expr.dataType
+    val schemaToCompare = jsonSchema.asNullable
+    assert(schemaToCompare == schema)
+  }
+
+  test("SPARK-24709: infer schema of json strings") {
+    checkEvaluation(new SchemaOfJson(Literal.create("""{"col":0}""")),
+      "STRUCT<col: BIGINT>")
+    checkEvaluation(
+      new SchemaOfJson(Literal.create("""{"col0":["a"], "col1": {"col2": "b"}}""")),
+      "STRUCT<col0: ARRAY<STRING>, col1: STRUCT<col2: STRING>>")
+  }
+
+  test("infer schema of JSON strings by using options") {
+    checkEvaluation(
+      new SchemaOfJson(Literal.create("""{"col":01}"""),
+        CreateMap(Seq(Literal.create("allowNumericLeadingZeros"), Literal.create("true")))),
+      "STRUCT<col: BIGINT>")
+  }
+
+  test("parse date with locale") {
+    Seq("en-US", "ru-RU").foreach { langTag =>
+      val locale = Locale.forLanguageTag(langTag)
+      val date = new SimpleDateFormat("yyyy-MM-dd").parse("2018-11-05")
+      val schema = new StructType().add("d", DateType)
+      val dateFormat = "MMM yyyy"
+      val sdf = new SimpleDateFormat(dateFormat, locale)
+      val dateStr = s"""{"d":"${sdf.format(date)}"}"""
+      val options = Map("dateFormat" -> dateFormat, "locale" -> langTag)
+
+      checkEvaluation(
+        JsonToStructs(schema, options, Literal.create(dateStr), UTC_OPT),
+        InternalRow(17836)) // number of days from 1970-01-01
+    }
+  }
+
+  test("verify corrupt column") {
+    checkErrorInExpression[AnalysisException](
+      JsonToStructs(
+        schema = StructType.fromDDL("i int, _unparsed boolean"),
+        options = Map("columnNameOfCorruptRecord" -> "_unparsed"),
+        child = Literal.create("""{"i":"a"}"""),
+        timeZoneId = UTC_OPT), null, "INVALID_CORRUPT_RECORD_TYPE",
+      Map("columnName" -> "`_unparsed`", "actualType" -> "\"BOOLEAN\""))
+  }
+
+  def decimalInput(langTag: String): (Decimal, String) = {
+    val decimalVal = new java.math.BigDecimal("1000.001")
+    val decimalType = new DecimalType(10, 5)
+    val expected = Decimal(decimalVal, decimalType.precision, decimalType.scale)
+    val decimalFormat = new DecimalFormat("",
+      new DecimalFormatSymbols(Locale.forLanguageTag(langTag)))
+    val input = s"""{"d": "${decimalFormat.format(expected.toBigDecimal)}"}"""
+
+    (expected, input)
+  }
+
+  test("parse decimals using locale") {
+    def checkDecimalParsing(langTag: String): Unit = {
+      val schema = new StructType().add("d", DecimalType(10, 5))
+      val options = Map("locale" -> langTag)
+      val (expected, input) = decimalInput(langTag)
+
+      checkEvaluation(
+        JsonToStructs(schema, options, Literal.create(input), UTC_OPT),
+        InternalRow(expected))
+    }
+
+    Seq("en-US", "ko-KR", "ru-RU", "de-DE").foreach(checkDecimalParsing)
+  }
+
+  test("inferring the decimal type using locale") {
+    def checkDecimalInfer(langTag: String, expectedType: String): Unit = {
+      val options = Map("locale" -> langTag, "prefersDecimal" -> "true")
+      val (_, input) = decimalInput(langTag)
+
+      checkEvaluation(
+        SchemaOfJson(Literal.create(input), options),
+        expectedType)
+    }
+
+    Seq("en-US", "ko-KR", "ru-RU", "de-DE").foreach {
+        checkDecimalInfer(_, """STRUCT<d: DECIMAL(7,3)>""")
+    }
+  }
+
+  test("Length of JSON array") {
+    Seq(
+      ("", null),
+      ("[1,2,3]", 3),
+      ("[]", 0),
+      ("[[1],[2,3],[]]", 3),
+      ("""[{"a":123},{"b":"hello"}]""", 2),
+      ("""[1,2,3,[33,44],{"key":[2,3,4]}]""", 5),
+      ("""[1,2,3,4,5""", null),
+      ("Random String", null),
+      ("""{"key":"not a json array"}""", null),
+      ("""{"key": 25}""", null)
+    ).foreach {
+      case(literal, expectedValue) =>
+        checkEvaluation(LengthOfJsonArray(Literal(literal)), expectedValue)
+    }
+  }
+
+  test("json_object_keys") {
+    Seq(
+      // Invalid inputs
+      ("", null),
+      ("[]", null),
+      ("""[{"key": "JSON"}]""", null),
+      ("""{"key": 45, "random_string"}""", null),
+      ("""{[1, 2, {"Key": "Invalid JSON"}]}""", null),
+      // JSON objects
+      ("{}", Seq.empty[UTF8String]),
+      ("""{"key": 1}""", Seq("key")),
+      ("""{"key": "value", "key2": 2}""", Seq("key", "key2")),
+      ("""{"arrayKey": [1, 2, 3]}""", Seq("arrayKey")),
+      ("""{"key":[1,2,3,{"key":"value"},[1,2,3]]}""", Seq("key")),
+      ("""{"f1":"abc","f2":{"f3":"a", "f4":"b"}}""", Seq("f1", "f2")),
+      ("""{"k1": [1, 2, {"key": 5}], "k2": {"key2": [1, 2]}}""", Seq("k1", "k2"))
+    ).foreach {
+      case (input, expected) =>
+        checkEvaluation(JsonObjectKeys(Literal(input)), expected)
+    }
+  }
+
+  test("json_typeof") {
+    Seq(
+      // Invalid or empty inputs return null.
+      ("", null),
+      ("bad", null),
+      ("""{"key": 45, "random_string"}""", null),
+      // Trailing content after a valid value is not a single well-formed JSON document.
+      ("123 true", null),
+      // Valid JSON values return the type of the outermost value.
+      ("{}", "object"),
+      ("""{"key": 1, "arr": [1, 2]}""", "object"),
+      ("[]", "array"),
+      ("[1, 2, 3]", "array"),
+      ("\"hello\"", "string"),
+      ("123", "number"),
+      ("1.5", "number"),
+      ("-123", "number"),
+      ("-1.5", "number"),
+      ("true", "boolean"),
+      ("false", "boolean"),
+      ("null", "null")
+    ).foreach {
+      case (input, expected) =>
+        checkEvaluation(JsonTypeof(Literal(input)), expected)
+    }
+  }
+
+  test("SPARK-35320: from_json should fail with a key type different of StringType") {
+    Seq(
+      (MapType(IntegerType, StringType), """{"1": "test"}"""),
+      (StructType(Seq(StructField("test", MapType(IntegerType, StringType)))),
+        """"test": {"1": "test"}"""),
+      (ArrayType(MapType(IntegerType, StringType)), """[{"1": "test"}]"""),
+      (MapType(StringType, MapType(IntegerType, StringType)), """{"key": {"1" : "test"}}""")
+    ).foreach {
+      case(schema, jsonData) =>
+        assert(JsonToStructs(schema, Map.empty, Literal(jsonData)).checkInputDataTypes() ==
+          DataTypeMismatch(
+            errorSubClass = "INVALID_JSON_MAP_KEY_TYPE",
+            messageParameters = Map(
+              "schema" -> toSQLType(schema)
+            )
+          )
+        )
+    }
+  }
+
+  test("SPARK-46761: support ? characters") {
+    checkEvaluation(
+      GetJsonObject(Literal(s"""{"?":"QUESTION"}"""), Literal("$['?']")),
+      "QUESTION"
+    )
+  }
+
+  test("from_json/to_json with TIME type - all precisions") {
+    // Test data: (timeString, precision) - covers all precisions and edge cases
+    val testCases = Seq(
+      ("00:00:00", 0),
+      ("14:30:45.1", 1),
+      ("14:30:45.12", 2),
+      ("14:30:45.123", 3),
+      ("14:30:45.1234", 4),
+      ("14:30:45.12345", 5),
+      ("23:59:59.999999", 6),
+      ("14:30:45.1234567", 7),
+      ("14:30:45.12345678", 8),
+      ("23:59:59.999999999", 9)
+    )
+
+    testCases.foreach { case (timeStr, precision) =>
+      val schema = StructType(StructField("t", TimeType(precision)) :: Nil)
+      val timeValue = SparkDateTimeUtils.stringToTimeAnsi(UTF8String.fromString(timeStr))
+      val jsonInput = s"""{"t": "$timeStr"}"""
+      val jsonOutput = s"""{"t":"$timeStr"}"""
+
+      // Test from_json
+      checkEvaluation(
+        JsonToStructs(schema, Map.empty, Literal(jsonInput), UTC_OPT),
+        InternalRow(timeValue))
+
+      // Test to_json
+      val struct = Literal.create(create_row(timeValue), schema)
+      checkEvaluation(
+        StructsToJson(Map.empty, struct, UTC_OPT),
+        jsonOutput)
+
+      // Test roundtrip
+      val jsonResult = StructsToJson(Map.empty, struct, UTC_OPT)
+      checkEvaluation(
+        JsonToStructs(schema, Map.empty, jsonResult, UTC_OPT),
+        InternalRow(timeValue))
+    }
+
+    // Test custom format with microsecond precision
+    val schema = StructType(StructField("t", TimeType(6)) :: Nil)
+    val time = SparkDateTimeUtils.stringToTimeAnsi(UTF8String.fromString("14:30:45.123456"))
+    val customFormat = Map("timeFormat" -> "HH-mm-ss.SSSSSS")
+
+    checkEvaluation(
+      JsonToStructs(schema, customFormat, Literal("""{"t": "14-30-45.123456"}"""), UTC_OPT),
+      InternalRow(time))
+
+    checkEvaluation(
+      StructsToJson(customFormat, Literal.create(create_row(time), schema), UTC_OPT),
+      """{"t":"14-30-45.123456"}""")
+  }
+
+  test("to_json - sortKeys with struct") {
+    val schema = StructType(
+      StructField("c", IntegerType) ::
+      StructField("a", IntegerType) ::
+      StructField("b", IntegerType) :: Nil)
+    val struct = Literal.create(create_row(3, 1, 2), schema)
+    checkEvaluation(
+      StructsToJson(Map("sortKeys" -> "true"), struct, UTC_OPT),
+      """{"a":1,"b":2,"c":3}""")
+    checkEvaluation(
+      StructsToJson(Map.empty, struct, UTC_OPT),
+      """{"c":3,"a":1,"b":2}""")
+  }
+
+  test("to_json - sortKeys with map") {
+    val schema = MapType(StringType, IntegerType)
+    val input = Literal(ArrayBasedMapData(Map(
+      UTF8String.fromString("c") -> 3,
+      UTF8String.fromString("a") -> 1,
+      UTF8String.fromString("b") -> 2)), schema)
+    checkEvaluation(
+      StructsToJson(Map("sortKeys" -> "true"), input),
+      """{"a":1,"b":2,"c":3}""")
+  }
+
+  test("to_json - sortKeys with nested struct") {
+    val innerSchema = StructType(
+      StructField("z", IntegerType) :: StructField("y", IntegerType) :: Nil)
+    val outerSchema = StructType(
+      StructField("b", innerSchema) :: StructField("a", IntegerType) :: Nil)
+    val struct = Literal.create(create_row(create_row(2, 1), 0), outerSchema)
+    checkEvaluation(
+      StructsToJson(Map("sortKeys" -> "true"), struct, UTC_OPT),
+      """{"a":0,"b":{"y":1,"z":2}}""")
+  }
+
+  test("TIME type with arrays") {
+    val inputSchema = ArrayType(StructType(StructField("t", TimeType(3)) :: Nil))
+    val time1 = SparkDateTimeUtils.stringToTimeAnsi(UTF8String.fromString("09:00:00.123"))
+    val time2 = SparkDateTimeUtils.stringToTimeAnsi(UTF8String.fromString("17:30:00.456"))
+    val input = new GenericArrayData(InternalRow(time1) :: InternalRow(time2) :: Nil)
+    val expectedJson = """[{"t":"09:00:00.123"},{"t":"17:30:00.456"}]"""
+
+    checkEvaluation(
+      StructsToJson(Map.empty, Literal.create(input, inputSchema), UTC_OPT),
+      expectedJson)
+
+    checkEvaluation(
+      JsonToStructs(inputSchema, Map.empty, Literal(expectedJson), UTC_OPT),
+      input)
+  }
+
+  test("JsonToStructs, GetJsonObject, JsonTuple, MultiGetJsonObject, JsonValue, JsonObjectExpr " +
+      "are stateful and produce fresh copies") {
+    val schema = StructType(StructField("a", IntegerType) :: Nil)
+    val jsonToStructs = JsonToStructs(schema, Map.empty, Literal("{}"), UTC_OPT)
+    assert(jsonToStructs.stateful)
+    assert(jsonToStructs.freshCopyIfContainsStatefulExpression() ne jsonToStructs)
+
+    val getJsonObject = GetJsonObject(Literal("{}"), Literal("$.a"))
+    assert(getJsonObject.stateful)
+    assert(getJsonObject.freshCopyIfContainsStatefulExpression() ne getJsonObject)
+
+    val jsonTuple = JsonTuple(Literal("{}") :: Literal("a") :: Nil)
+    assert(jsonTuple.stateful)
+    assert(jsonTuple.freshCopyIfContainsStatefulExpression() ne jsonTuple)
+
+    val multiGetJsonObject = MultiGetJsonObject(Literal("{}"), Seq("$.a", "$.b"))
+    assert(multiGetJsonObject.stateful)
+    assert(multiGetJsonObject.freshCopyIfContainsStatefulExpression() ne multiGetJsonObject)
+
+    // JsonValue reuses a mutable row to cast the extracted scalar, so it must be stateful.
+    val jsonValue = JsonValue(
+      Literal("{}"), "$.a", StringType,
+      JsonValueBehavior.Null, JsonValueBehavior.Null, None, None)
+    assert(jsonValue.stateful)
+    assert(jsonValue.freshCopyIfContainsStatefulExpression() ne jsonValue)
+
+    // JsonObjectExpr's evaluator owns mutable scratch (a per-task generator, writer, and
+    // validated-text cache), so it must be stateful and hand out a fresh copy.
+    val jsonObject = JsonObjectExpr(
+      Seq((Literal("a"), Literal(1))), Seq(false), Seq(false))
+    assert(jsonObject.stateful)
+    assert(jsonObject.freshCopyIfContainsStatefulExpression() ne jsonObject)
+  }
+
+  test("JSON_OBJECT raises JSON_OBJECT_NULL_KEY before the value in interpreted and codegen") {
+    // Covers the interpreted key-guard branch, which the end-to-end suites do not reach (they run
+    // codegen, or use a non-null key). The guard runs while the carrier struct is evaluated left to
+    // right, so the null-key error must win over a paired value that would itself throw.
+    checkErrorInExpression[SparkRuntimeException](
+      JsonObjectExpr(Seq((Literal(null, StringType), Literal(1))), Seq(false), Seq(false)),
+      "JSON_OBJECT_NULL_KEY")
+    checkErrorInExpression[SparkRuntimeException](
+      JsonObjectExpr(
+        Seq((BoundReference(0, StringType, nullable = true), Literal(1))), Seq(false), Seq(false)),
+      InternalRow(null),
+      "JSON_OBJECT_NULL_KEY")
+    // The value is an ANSI cast that always throws; the null-key error must still win.
+    checkErrorInExpression[SparkRuntimeException](
+      JsonObjectExpr(
+        Seq((Literal(null, StringType), Cast(Literal("x"), IntegerType, None, EvalMode.ANSI))),
+        Seq(false), Seq(false)),
+      "JSON_OBJECT_NULL_KEY")
+  }
+
+  test("a JSON schema argument cannot bring in the FILE type when it is disabled") {
+    val schema = Literal(
+      """{"type":"struct","fields":[{"name":"f","type":"file","nullable":true,"metadata":{}}]}""")
+    withSQLConf(SQLConf.FILE_TYPE_ENABLED.key -> "false") {
+      checkError(
+        exception = intercept[AnalysisException] {
+          ExprUtils.evalTypeExpr(schema)
+        },
+        condition = "UNSUPPORTED_FILE_TYPE",
+        parameters = Map.empty)
+    }
+    withSQLConf(SQLConf.FILE_TYPE_ENABLED.key -> "true") {
+      assert(ExprUtils.evalTypeExpr(schema) ===
+        StructType(StructField("f", FileType.external) :: Nil))
+    }
+  }
+
+  test("SPARK-61552: get_json_object with a foldable path that fails to evaluate") {
+    // `ConstantFolding` leaves such a path in a conditional branch. Only a row that evaluates
+    // the path should fail, also in generated code.
+    withSQLConf(SQLConf.ANSI_ENABLED.key -> "true") {
+      val json = BoundReference(0, StringType, nullable = true)
+      val path = Cast(Divide(Literal(1.0), Literal(0.0)), StringType)
+      val expr = If(IsNull(json), Literal.create(null, StringType), GetJsonObject(json, path))
+      checkEvaluation(expr, null, create_row(null))
+      checkExceptionInExpression[ArithmeticException](expr, create_row("{}"), "DIVIDE_BY_ZERO")
+    }
   }
 }

@@ -30,7 +30,6 @@ setOldClass("jobj")
 #' @seealso groupBy
 #'
 #' @param sgd A Java object reference to the backing Scala GroupedData
-#' @export
 #' @note GroupedData since 1.4.0
 setClass("GroupedData",
          slots = list(sgd = "jobj"))
@@ -56,14 +55,12 @@ setMethod("show", "GroupedData",
 
 #' Count
 #'
-#' Count the number of rows for each group.
+#' Count the number of rows for each group when we have \code{GroupedData} input.
 #' The resulting SparkDataFrame will also contain the grouping columns.
 #'
-#' @param x a GroupedData
-#' @return a SparkDataFrame
+#' @return A SparkDataFrame.
 #' @rdname count
 #' @aliases count,GroupedData-method
-#' @export
 #' @examples
 #' \dontrun{
 #'   count(groupBy(df, "name"))
@@ -83,13 +80,10 @@ setMethod("count",
 #' df2 <- agg(df, <column> = <aggFunction>)
 #' df2 <- agg(df, newColName = aggFunction(column))
 #'
-#' @param x a GroupedData
-#' @return a SparkDataFrame
 #' @rdname summarize
 #' @aliases agg,GroupedData-method
 #' @name agg
 #' @family agg_funcs
-#' @export
 #' @examples
 #' \dontrun{
 #'  df2 <- agg(df, age = "sum")  # new column name will be created as 'SUM(age#0)'
@@ -135,8 +129,8 @@ setMethod("summarize",
 # Aggregate Functions by name
 methods <- c("avg", "max", "mean", "min", "sum")
 
-# These are not exposed on GroupedData: "kurtosis", "skewness", "stddev", "stddev_samp", "stddev_pop",
-# "variance", "var_samp", "var_pop"
+# These are not exposed on GroupedData: "kurtosis", "skewness", "stddev", "stddev_samp",
+# "stddev_pop", "variance", "var_samp", "var_pop"
 
 #' Pivot a column of the GroupedData and perform the specified aggregation.
 #'
@@ -152,7 +146,6 @@ methods <- c("avg", "max", "mean", "min", "sum")
 #' @rdname pivot
 #' @aliases pivot,GroupedData,character-method
 #' @name pivot
-#' @export
 #' @examples
 #' \dontrun{
 #' df <- createDataFrame(data.frame(
@@ -169,7 +162,7 @@ methods <- c("avg", "max", "mean", "min", "sum")
 #' @note pivot since 2.0.0
 setMethod("pivot",
           signature(x = "GroupedData", colname = "character"),
-          function(x, colname, values = list()){
+          function(x, colname, values = list()) {
             stopifnot(length(colname) == 1)
             if (length(values) == 0) {
               result <- callJMethod(x@sgd, "pivot", colname)
@@ -201,11 +194,9 @@ createMethods()
 
 #' gapply
 #'
-#' @param x A GroupedData
 #' @rdname gapply
 #' @aliases gapply,GroupedData-method
 #' @name gapply
-#' @export
 #' @note gapply(GroupedData) since 2.0.0
 setMethod("gapply",
           signature(x = "GroupedData"),
@@ -216,11 +207,9 @@ setMethod("gapply",
 
 #' gapplyCollect
 #'
-#' @param x A GroupedData
 #' @rdname gapplyCollect
 #' @aliases gapplyCollect,GroupedData-method
 #' @name gapplyCollect
-#' @export
 #' @note gapplyCollect(GroupedData) since 2.0.0
 setMethod("gapplyCollect",
           signature(x = "GroupedData"),
@@ -237,6 +226,21 @@ setMethod("gapplyCollect",
           })
 
 gapplyInternal <- function(x, func, schema) {
+  if (is.character(schema)) {
+    schema <- structType(schema)
+  }
+  arrowEnabled <- sparkR.conf("spark.sql.execution.arrow.sparkr.enabled")[[1]] == "true"
+  if (arrowEnabled) {
+    if (inherits(schema, "structType")) {
+      checkSchemaInArrow(schema)
+    } else if (is.null(schema)) {
+      stop("Arrow optimization does not support 'gapplyCollect' yet. Please disable ",
+           "Arrow optimization or use 'collect' and 'gapply' APIs instead.")
+    } else {
+      stop("'schema' should be DDL-formatted string or structType.")
+    }
+  }
+
   packageNamesArr <- serialize(.sparkREnv[[".packages"]],
                        connection = NULL)
   broadcastArr <- lapply(ls(.broadcastNames),

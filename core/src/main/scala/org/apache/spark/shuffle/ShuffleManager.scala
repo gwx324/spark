@@ -17,15 +17,28 @@
 
 package org.apache.spark.shuffle
 
-import org.apache.spark.{ShuffleDependency, TaskContext}
+import java.util.Locale
+
+import org.apache.spark.{ShuffleDependency, SparkConf, TaskContext}
+import org.apache.spark.internal.config
+import org.apache.spark.util.Utils
 
 /**
  * Pluggable interface for shuffle systems. A ShuffleManager is created in SparkEnv on the driver
  * and on each executor, based on the spark.shuffle.manager setting. The driver registers shuffles
  * with it, and executors (or tasks running locally in the driver) can ask to read and write data.
  *
- * NOTE: this will be instantiated by SparkEnv so its constructor can take a SparkConf and
+ * An implementation declares its kind by extending one of its two subtypes:
+ * [[BlockingShuffleManager]] (output is materialized as block-manager-addressed blocks served
+ * through a [[ShuffleBlockResolver]]) or [[PipelinedShuffleManager]] (output is read incrementally
+ * and served out-of-band).
+ *
+ * NOTE:
+ * 1. This will be instantiated by SparkEnv so its constructor can take a SparkConf and
  * boolean isDriver as parameters.
+ * 2. A [[BlockingShuffleManager]] exposes a ShuffleBlockResolver which interacts with the External
+ * Shuffle Service when it is enabled. Pay attention to this when implementing a custom shuffle
+ * manager to make sure it can coexist with the External Shuffle Service.
  */
 private[spark] trait ShuffleManager {
 
@@ -34,33 +47,171 @@ private[spark] trait ShuffleManager {
    */
   def registerShuffle[K, V, C](
       shuffleId: Int,
-      numMaps: Int,
       dependency: ShuffleDependency[K, V, C]): ShuffleHandle
 
   /** Get a writer for a given partition. Called on executors by map tasks. */
-  def getWriter[K, V](handle: ShuffleHandle, mapId: Int, context: TaskContext): ShuffleWriter[K, V]
+  def getWriter[K, V](
+      handle: ShuffleHandle,
+      mapId: Long,
+      context: TaskContext,
+      metrics: ShuffleWriteMetricsReporter): ShuffleWriter[K, V]
+
 
   /**
-   * Get a reader for a range of reduce partitions (startPartition to endPartition-1, inclusive).
+   * Get a reader for a range of reduce partitions (startPartition to endPartition-1, inclusive) to
+   * read from all map outputs of the shuffle.
+   *
+   * Called on executors by reduce tasks.
+   */
+  final def getReader[K, C](
+      handle: ShuffleHandle,
+      startPartition: Int,
+      endPartition: Int,
+      context: TaskContext,
+      metrics: ShuffleReadMetricsReporter): ShuffleReader[K, C] = {
+    getReader(handle, 0, Int.MaxValue, startPartition, endPartition, context, metrics)
+  }
+
+  /**
+   * Get a reader for a range of reduce partitions (startPartition to endPartition-1, inclusive) to
+   * read from a range of map outputs(startMapIndex to endMapIndex-1, inclusive).
+   * If endMapIndex=Int.MaxValue, the actual endMapIndex will be changed to the length of total map
+   * outputs of the shuffle in `getMapSizesByExecutorId`.
+   *
    * Called on executors by reduce tasks.
    */
   def getReader[K, C](
       handle: ShuffleHandle,
+      startMapIndex: Int,
+      endMapIndex: Int,
       startPartition: Int,
       endPartition: Int,
-      context: TaskContext): ShuffleReader[K, C]
+      context: TaskContext,
+      metrics: ShuffleReadMetricsReporter): ShuffleReader[K, C]
 
   /**
    * Remove a shuffle's metadata from the ShuffleManager.
+   *
+   * Implementations must treat an unknown or already-removed shuffleId as an idempotent no-op --
+   * returning false rather than throwing or mutating unrelated state. The id-only `RemoveShuffle`
+   * cleanup path cannot tell which manager owns a shuffle, so it broadcasts to every configured
+   * manager (see `SparkEnv.unregisterShuffleFromAllManagers`), including ones that never handled
+   * this shuffle.
+   *
    * @return true if the metadata removed successfully, otherwise false.
    */
   def unregisterShuffle(shuffleId: Int): Boolean
 
+  /** Shut down this ShuffleManager. */
+  def stop(): Unit
+}
+
+/**
+ * A [[ShuffleManager]] that materializes shuffle output as addressable blocks served through the
+ * block manager (reads, push-based merge, and decommission migration all go through its
+ * [[ShuffleBlockResolver]]). This is the traditional shuffle model: a consumer stage reads the
+ * producer's output only after it is fully written.
+ * [[org.apache.spark.shuffle.sort.SortShuffleManager]] is the built-in implementation. A manager's
+ * type declares its kind -- match on `BlockingShuffleManager` to reach the resolver rather than
+ * assuming every `ShuffleManager` provides one.
+ */
+private[spark] trait BlockingShuffleManager extends ShuffleManager {
   /**
    * Return a resolver capable of retrieving shuffle block data based on block coordinates.
    */
   def shuffleBlockResolver: ShuffleBlockResolver
-
-  /** Shut down this ShuffleManager. */
-  def stop(): Unit
 }
+
+/**
+ * A [[ShuffleManager]] whose output is read incrementally: a consumer stage may begin reading while
+ * the producer is still running (see [[org.apache.spark.PipelinedShuffleDependency]]). Such a
+ * manager serves its output out-of-band and does not produce block-manager-addressed blocks, so it
+ * has no [[ShuffleBlockResolver]]. [[org.apache.spark.shuffle.streaming.StreamingShuffleManager]]
+ * is the built-in implementation.
+ */
+private[spark] trait PipelinedShuffleManager extends ShuffleManager {
+  /**
+   * Whether this manager relies on a `StreamingShuffleOutputTracker` to discover writer task
+   * locations. The RPC streaming transport needs it (writers publish their host/port; readers
+   * look them up to open connections). An in-process transport that finds writer and reader
+   * within the same JVM does not, and returns false so `SparkEnv` skips creating the tracker
+   * and the scheduler skips registering the shuffle with it. Defaults to true so the built-in
+   * streaming manager is unaffected.
+   */
+  def usesStreamingShuffleOutputTracker: Boolean = true
+
+  /**
+   * Whether this manager's writer hands record OBJECTS to a concurrently-running consumer, so
+   * each record must be detached from any producer-reused buffer before `write` sees it (for a
+   * SQL row: `InternalRow.copy()`, done before constructing the shuffle dependency). A transport
+   * that
+   * serializes records promptly -- the RPC streaming manager -- detaches by serializing and
+   * must NOT pay an extra per-row copy on its hot path; that is the default. The in-process
+   * channel transport shares object references across threads and overrides this to true.
+   */
+  def requiresDetachedRecords: Boolean = false
+
+  /**
+   * Whether this manager's writer consumes the driver's live-reduce-partition hint -- the set of
+   * reduce partitions a partial read (LIMIT / executeTake) will actually drain, stamped into the
+   * producer's task properties as `SPARK_PIPELINED_LIVE_REDUCE_PARTITIONS`, plus the per-run epoch
+   * `SPARK_PIPELINED_RUN_EPOCH` that keys its rendezvous.
+   *
+   * Only a transport whose writer would BLOCK on a partition nobody drains needs the hint: the
+   * in-process channel hands batches across a bounded queue, so feeding a reader-less partition
+   * fills it and parks the writer forever. A transport that does not block that way (the RPC
+   * streaming shuffle, whose writer never reads either property) returns false, and the scheduler
+   * then skips computing and stamping the hint entirely -- leaving the Real-Time Mode path exactly
+   * as it is without this feature, rather than paying for a hint nobody reads and risking an abort
+   * whose remedy does not apply to it.
+   */
+  def supportsLiveReducePartitionHints: Boolean = false
+
+  /** Open a job's transport epoch before submitting any of its tasks. */
+  def startRun(epoch: Int): Unit = {}
+
+  /** Release a job's transport state, including on cancellation or failure. */
+  def endRun(epoch: Int): Unit = {}
+
+  /**
+   * Whether this manager currently holds driver-side cleanup state for `shuffleId`.
+   *
+   * A manager that keeps NO output tracker (an in-process transport) has its shuffles in neither
+   * output tracker, so the `ContextCleaner` cannot tell one of them apart from an already-cleaned
+   * regular shuffle by tracker membership; it asks here instead, and only frees what a manager
+   * actually holds. Answer from the state that would leak -- not from a registration record, which
+   * an unregister-before-run sequence drops while the state itself is recreated lazily when the job
+   * finally runs. Defaults to false: a manager whose shuffles ARE in an output tracker is found
+   * that way and never needs this.
+   */
+  def holdsShuffle(shuffleId: Int): Boolean = false
+}
+
+/**
+ * Utility companion object to create a ShuffleManager given a spark configuration.
+ */
+private[spark] object ShuffleManager {
+  def create(conf: SparkConf, isDriver: Boolean): ShuffleManager = {
+    Utils.instantiateSerializerOrShuffleManager[ShuffleManager](
+      getShuffleManagerClassName(conf), conf, isDriver)
+  }
+
+  def getShuffleManagerClassName(conf: SparkConf): String =
+    resolveShortName(conf.get(config.SHUFFLE_MANAGER))
+
+  /**
+   * Resolve a short shuffle-manager alias ("sort", "tungsten-sort", "streaming") to its
+   * fully-qualified class name, passing any other value through unchanged. Shared by the default
+   * manager (spark.shuffle.manager) and the incremental manager (spark.shuffle.manager.incremental)
+   * so the same aliases are accepted for both. "streaming" is the default for the incremental slot.
+   */
+  def resolveShortName(shuffleMgrName: String): String = {
+    val shortShuffleMgrNames = Map(
+      "sort" -> classOf[org.apache.spark.shuffle.sort.SortShuffleManager].getName,
+      "tungsten-sort" -> classOf[org.apache.spark.shuffle.sort.SortShuffleManager].getName,
+      "streaming" -> classOf[org.apache.spark.shuffle.streaming.StreamingShuffleManager].getName)
+
+    shortShuffleMgrNames.getOrElse(shuffleMgrName.toLowerCase(Locale.ROOT), shuffleMgrName)
+  }
+}
+

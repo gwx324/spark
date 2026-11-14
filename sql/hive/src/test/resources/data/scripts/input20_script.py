@@ -16,15 +16,16 @@
 # specific language governing permissions and limitations
 # under the License.
 #
-import sys
 import re
+import sys
+
 line = sys.stdin.readline()
 x = 1
 while line:
-  tem = sys.stdin.readline()
-  if line == tem:
-    x = x + 1
-  else:
-    print str(x).strip()+'\t'+re.sub('\t','_',line.strip())
-    line = tem
-    x = 1
+    tem = sys.stdin.readline()
+    if line == tem:
+        x += 1
+    else:
+        print(str(x).strip() + '\t' + re.sub('\t', '_', line.strip()))
+        line = tem
+        x = 1

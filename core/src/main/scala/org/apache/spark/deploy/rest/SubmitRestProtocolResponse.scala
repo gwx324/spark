@@ -56,6 +56,48 @@ private[spark] class KillSubmissionResponse extends SubmitRestProtocolResponse {
 }
 
 /**
+ * A response to a killAll request in the REST application submission protocol.
+ */
+private[spark] class KillAllSubmissionResponse extends SubmitRestProtocolResponse {
+  protected override def doValidate(): Unit = {
+    super.doValidate()
+    assertFieldIsSet(success, "success")
+  }
+}
+
+/**
+ * A response to a hold or resume request in the REST application submission protocol.
+ */
+private[spark] class HoldApplicationResponse extends SubmitRestProtocolResponse {
+  var appId: String = null
+  protected override def doValidate(): Unit = {
+    super.doValidate()
+    assertFieldIsSet(appId, "appId")
+    assertFieldIsSet(success, "success")
+  }
+}
+
+/**
+ * A response to a clear request in the REST application submission protocol.
+ */
+private[spark] class ClearResponse extends SubmitRestProtocolResponse {
+  protected override def doValidate(): Unit = {
+    super.doValidate()
+    assertFieldIsSet(success, "success")
+  }
+}
+
+/**
+ * A response to a readyz request in the REST application submission protocol.
+ */
+private[spark] class ReadyzResponse extends SubmitRestProtocolResponse {
+  protected override def doValidate(): Unit = {
+    super.doValidate()
+    assertFieldIsSet(success, "success")
+  }
+}
+
+/**
  * A response to a status request in the REST application submission protocol.
  */
 private[spark] class SubmissionStatusResponse extends SubmitRestProtocolResponse {

@@ -21,21 +21,20 @@
 #'
 #' Creates a WindowSpec with the partitioning defined.
 #'
-#' @param col A column name or Column by which rows are partitioned to 
+#' @param col A column name or Column by which rows are partitioned to
 #'            windows.
-#' @param ... Optional column names or Columns in addition to col, by 
+#' @param ... Optional column names or Columns in addition to col, by
 #'            which rows are partitioned to windows.
 #'
 #' @rdname windowPartitionBy
 #' @name windowPartitionBy
 #' @aliases windowPartitionBy,character-method
-#' @export
 #' @examples
 #' \dontrun{
-#'   ws <- windowPartitionBy("key1", "key2")
+#'   ws <- orderBy(windowPartitionBy("key1", "key2"), "key3")
 #'   df1 <- select(df, over(lead("value", 1), ws))
 #'
-#'   ws <- windowPartitionBy(df$key1, df$key2)
+#'   ws <- orderBy(windowPartitionBy(df$key1, df$key2), df$key3)
 #'   df1 <- select(df, over(lead("value", 1), ws))
 #' }
 #' @note windowPartitionBy(character) since 2.0.0
@@ -52,7 +51,6 @@ setMethod("windowPartitionBy",
 #' @rdname windowPartitionBy
 #' @name windowPartitionBy
 #' @aliases windowPartitionBy,Column-method
-#' @export
 #' @note windowPartitionBy(Column) since 2.0.0
 setMethod("windowPartitionBy",
           signature(col = "Column"),
@@ -70,15 +68,14 @@ setMethod("windowPartitionBy",
 #'
 #' Creates a WindowSpec with the ordering defined.
 #'
-#' @param col A column name or Column by which rows are ordered within 
+#' @param col A column name or Column by which rows are ordered within
 #'            windows.
-#' @param ... Optional column names or Columns in addition to col, by 
+#' @param ... Optional column names or Columns in addition to col, by
 #'            which rows are ordered within windows.
 #'
 #' @rdname windowOrderBy
 #' @name windowOrderBy
 #' @aliases windowOrderBy,character-method
-#' @export
 #' @examples
 #' \dontrun{
 #'   ws <- windowOrderBy("key1", "key2")
@@ -101,7 +98,6 @@ setMethod("windowOrderBy",
 #' @rdname windowOrderBy
 #' @name windowOrderBy
 #' @aliases windowOrderBy,Column-method
-#' @export
 #' @note windowOrderBy(Column) since 2.0.0
 setMethod("windowOrderBy",
           signature(col = "Column"),

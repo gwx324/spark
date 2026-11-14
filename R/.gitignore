@@ -4,3 +4,9 @@
 lib
 pkg/man
 pkg/html
+SparkR.Rcheck/
+SparkR_*.tar.gz
+# Transient copies made by dev/make-distribution.sh while building the package.
+pkg/LICENSE
+pkg/NOTICE
+DESCRIPTION.orig

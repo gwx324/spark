@@ -17,8 +17,13 @@
 
 package org.apache.spark.sql.catalyst.expressions.codegen;
 
+import java.util.Map;
+
+import org.apache.spark.SparkIllegalArgumentException;
+import org.apache.spark.SparkUnsupportedOperationException;
 import org.apache.spark.sql.catalyst.expressions.UnsafeRow;
 import org.apache.spark.unsafe.Platform;
+import org.apache.spark.unsafe.array.ByteArrayMethods;
 
 /**
  * A helper class to manage the data buffer for an unsafe row.  The data buffer can grow and
@@ -29,30 +34,31 @@ import org.apache.spark.unsafe.Platform;
  * this class per writing program, so that the memory segment/data buffer can be reused.  Note that
  * for each incoming record, we should call `reset` of BufferHolder instance before write the record
  * and reuse the data buffer.
- *
- * Generally we should call `UnsafeRow.setTotalSize` and pass in `BufferHolder.totalSize` to update
- * the size of the result row, after writing a record to the buffer. However, we can skip this step
- * if the fields of row are all fixed-length, as the size of result row is also fixed.
  */
-public class BufferHolder {
-  public byte[] buffer;
-  public int cursor = Platform.BYTE_ARRAY_OFFSET;
+final class BufferHolder {
+
+  private static final int ARRAY_MAX = ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH;
+
+  // buffer is guarantee to be word-aligned since UnsafeRow assumes each field is word-aligned.
+  private byte[] buffer;
+  private int cursor = Platform.BYTE_ARRAY_OFFSET;
   private final UnsafeRow row;
   private final int fixedSize;
 
-  public BufferHolder(UnsafeRow row) {
+  BufferHolder(UnsafeRow row) {
     this(row, 64);
   }
 
-  public BufferHolder(UnsafeRow row, int initialSize) {
+  BufferHolder(UnsafeRow row, int initialSize) {
     int bitsetWidthInBytes = UnsafeRow.calculateBitSetWidthInBytes(row.numFields());
-    if (row.numFields() > (Integer.MAX_VALUE - initialSize - bitsetWidthInBytes) / 8) {
-      throw new UnsupportedOperationException(
-        "Cannot create BufferHolder for input UnsafeRow because there are " +
-          "too many fields (number of fields: " + row.numFields() + ")");
+    if (row.numFields() > (ARRAY_MAX - initialSize - bitsetWidthInBytes) / 8) {
+      throw new SparkUnsupportedOperationException(
+        "_LEGACY_ERROR_TEMP_3130",
+        Map.of("numFields", String.valueOf(row.numFields())));
     }
     this.fixedSize = bitsetWidthInBytes + 8 * row.numFields();
-    this.buffer = new byte[fixedSize + initialSize];
+    int roundedSize = ByteArrayMethods.roundNumberOfBytesToNearestWord(fixedSize + initialSize);
+    this.buffer = new byte[roundedSize];
     this.row = row;
     this.row.pointTo(buffer, buffer.length);
   }
@@ -60,17 +66,23 @@ public class BufferHolder {
   /**
    * Grows the buffer by at least neededSize and points the row to the buffer.
    */
-  public void grow(int neededSize) {
-    if (neededSize > Integer.MAX_VALUE - totalSize()) {
-      throw new UnsupportedOperationException(
-        "Cannot grow BufferHolder by size " + neededSize + " because the size after growing " +
-          "exceeds size limitation " + Integer.MAX_VALUE);
+  void grow(int neededSize) {
+    if (neededSize < 0) {
+      throw new SparkIllegalArgumentException(
+        "_LEGACY_ERROR_TEMP_3198",
+        Map.of("neededSize", String.valueOf(neededSize)));
+    }
+    if (neededSize > ARRAY_MAX - totalSize()) {
+      throw new SparkIllegalArgumentException(
+        "_LEGACY_ERROR_TEMP_3199",
+        Map.of("neededSize", String.valueOf(neededSize), "arrayMax", String.valueOf(ARRAY_MAX)));
     }
     final int length = totalSize() + neededSize;
     if (buffer.length < length) {
       // This will not happen frequently, because the buffer is re-used.
-      int newLength = length < Integer.MAX_VALUE / 2 ? length * 2 : Integer.MAX_VALUE;
-      final byte[] tmp = new byte[newLength];
+      int newLength = length < ARRAY_MAX / 2 ? length * 2 : ARRAY_MAX;
+      int roundedSize = ByteArrayMethods.roundNumberOfBytesToNearestWord(newLength);
+      final byte[] tmp = new byte[roundedSize];
       Platform.copyMemory(
         buffer,
         Platform.BYTE_ARRAY_OFFSET,
@@ -82,11 +94,23 @@ public class BufferHolder {
     }
   }
 
-  public void reset() {
+  byte[] getBuffer() {
+    return buffer;
+  }
+
+  int getCursor() {
+    return cursor;
+  }
+
+  void increaseCursor(int val) {
+    cursor += val;
+  }
+
+  void reset() {
     cursor = Platform.BYTE_ARRAY_OFFSET + fixedSize;
   }
 
-  public int totalSize() {
+  int totalSize() {
     return cursor - Platform.BYTE_ARRAY_OFFSET;
   }
 }

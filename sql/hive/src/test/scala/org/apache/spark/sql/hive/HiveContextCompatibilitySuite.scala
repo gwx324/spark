@@ -1,29 +1,27 @@
 /*
-* Licensed to the Apache Software Foundation (ASF) under one or more
-* contributor license agreements.  See the NOTICE file distributed with
-* this work for additional information regarding copyright ownership.
-* The ASF licenses this file to You under the Apache License, Version 2.0
-* (the "License"); you may not use this file except in compliance with
-* the License.  You may obtain a copy of the License at
-*
-*    http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
-*/
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package org.apache.spark.sql.hive
 
-import org.scalatest.BeforeAndAfterEach
-
 import org.apache.spark.{SparkConf, SparkContext, SparkFunSuite}
 
+class HiveContextCompatibilitySuite extends SparkFunSuite {
 
-class HiveContextCompatibilitySuite extends SparkFunSuite with BeforeAndAfterEach {
-
+  override protected val enableAutoThreadAudit = false
   private var sc: SparkContext = null
   private var hc: HiveContext = null
 
@@ -56,7 +54,7 @@ class HiveContextCompatibilitySuite extends SparkFunSuite with BeforeAndAfterEac
 
   test("basic operations") {
     val _hc = hc
-    import _hc.implicits._
+    import _hc.sparkSession.implicits._
     val df1 = (1 to 20).map { i => (i, i) }.toDF("a", "x")
     val df2 = (1 to 100).map { i => (i, i % 10, i % 2 == 0) }.toDF("a", "b", "c")
       .select($"a", $"b")
@@ -73,7 +71,7 @@ class HiveContextCompatibilitySuite extends SparkFunSuite with BeforeAndAfterEac
 
   test("basic DDLs") {
     val _hc = hc
-    import _hc.implicits._
+    import _hc.sparkSession.implicits._
     val databases = hc.sql("SHOW DATABASES").collect().map(_.getString(0))
     assert(databases.toSeq == Seq("default"))
     hc.sql("CREATE DATABASE mee_db")
@@ -87,11 +85,11 @@ class HiveContextCompatibilitySuite extends SparkFunSuite with BeforeAndAfterEac
     assert(
       hc.sql("SELECT * FROM moo_table order by name").collect().toSeq ==
       df.collect().toSeq.sortBy(_.getString(0)))
-    val tables = hc.sql("SHOW TABLES IN mee_db").collect().map(_.getString(0))
+    val tables = hc.sql("SHOW TABLES IN mee_db").select("tableName").collect().map(_.getString(0))
     assert(tables.toSet == Set("moo_table", "mee_table"))
     hc.sql("DROP TABLE moo_table")
     hc.sql("DROP TABLE mee_table")
-    val tables2 = hc.sql("SHOW TABLES IN mee_db").collect().map(_.getString(0))
+    val tables2 = hc.sql("SHOW TABLES IN mee_db").select("tableName").collect().map(_.getString(0))
     assert(tables2.isEmpty)
     hc.sql("USE default")
     hc.sql("DROP DATABASE mee_db CASCADE")

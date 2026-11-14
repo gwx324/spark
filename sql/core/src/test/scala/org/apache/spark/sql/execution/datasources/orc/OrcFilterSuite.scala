@@ -1,0 +1,1074 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.execution.datasources.orc
+
+import java.io.File
+import java.math.MathContext
+import java.nio.charset.StandardCharsets
+import java.sql.{Date, Timestamp}
+import java.time.{Duration, Instant, LocalDateTime, LocalTime, Period, ZoneOffset}
+
+import scala.jdk.CollectionConverters._
+
+import org.apache.hadoop.fs.Path
+import org.apache.hadoop.hive.ql.exec.vector.TimestampColumnVector
+import org.apache.hadoop.hive.ql.io.sarg.{PredicateLeaf, SearchArgument, SearchArgumentImpl}
+import org.apache.hadoop.hive.ql.io.sarg.SearchArgumentFactory.newBuilder
+import org.apache.orc.{OrcFile, TypeDescription}
+
+import org.apache.spark.{SparkConf, SparkException, SparkRuntimeException}
+import org.apache.spark.sql.{AnalysisException, Column, DataFrame, Row}
+import org.apache.spark.sql.catalyst.dsl.expressions._
+import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.planning.PhysicalOperation
+import org.apache.spark.sql.catalyst.util.TimestampNanosTestUtils.foreachNanosPrecision
+import org.apache.spark.sql.execution.datasources.v2.ExtractV2Scan
+import org.apache.spark.sql.execution.datasources.v2.orc.OrcScan
+import org.apache.spark.sql.functions.col
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.test.SharedSparkSession
+import org.apache.spark.sql.types._
+import org.apache.spark.tags.ExtendedSQLTest
+import org.apache.spark.util.ArrayImplicits._
+import org.apache.spark.util.Utils
+
+/**
+ * A test suite that tests Apache ORC filter API based filter pushdown optimization.
+ */
+@ExtendedSQLTest
+class OrcFilterSuite extends OrcTest with SharedSparkSession {
+  import testImplicits.{toRichColumn, ColumnConstructorExt}
+
+  override protected def sparkConf: SparkConf =
+    super
+      .sparkConf
+      .set(SQLConf.USE_V1_SOURCE_LIST, "")
+
+  protected def checkFilterPredicate(
+      df: DataFrame,
+      predicate: Predicate,
+      checker: (SearchArgument) => Unit): Unit = {
+    val output = predicate.collect { case a: Attribute => a }.distinct
+    val query = df
+      .select(output.map(e => Column(e)): _*)
+      .where(Column(predicate))
+
+    query.queryExecution.optimizedPlan match {
+      case PhysicalOperation(_, filters, ExtractV2Scan(o: OrcScan)) =>
+        assert(filters.nonEmpty, "No filter is analyzed from the given query")
+        assert(o.pushedFilters.nonEmpty, "No filter is pushed down")
+        val maybeFilter = OrcFilters.createFilter(query.schema, o.pushedFilters.toImmutableArraySeq)
+        assert(maybeFilter.isDefined, s"Couldn't generate filter predicate for " +
+          s"${o.pushedFilters.mkString("pushedFilters(", ", ", ")")}")
+        checker(maybeFilter.get)
+
+      case _ => assert(false, "Can not match OrcTable in the query.")
+    }
+  }
+
+  protected def checkFilterPredicate
+      (predicate: Predicate, filterOperator: PredicateLeaf.Operator)
+      (implicit df: DataFrame): Unit = {
+    def checkComparisonOperator(filter: SearchArgument) = {
+      val operator = filter.getLeaves.asScala
+      assert(operator.map(_.getOperator).contains(filterOperator))
+    }
+    checkFilterPredicate(df, predicate, checkComparisonOperator)
+  }
+
+  protected def checkFilterPredicate
+      (predicate: Predicate, stringExpr: String)
+      (implicit df: DataFrame): Unit = {
+    def checkLogicalOperator(filter: SearchArgument) = {
+      // HIVE-24458 changes toString output and provides `toOldString` for old style.
+      assert(filter.asInstanceOf[SearchArgumentImpl].toOldString == stringExpr)
+    }
+    checkFilterPredicate(df, predicate, checkLogicalOperator)
+  }
+
+  test("filter pushdown - integer") {
+    withNestedOrcDataFrame((1 to 4).map(i => Tuple1(Option(i)))) { case (inputDF, colName, _) =>
+      implicit val df: DataFrame = inputDF
+
+      val intAttr = df(colName).expr
+      assert(df(colName).expr.dataType === IntegerType)
+
+      checkFilterPredicate(intAttr.isNull, PredicateLeaf.Operator.IS_NULL)
+
+      checkFilterPredicate(intAttr === 1, PredicateLeaf.Operator.EQUALS)
+      checkFilterPredicate(intAttr <=> 1, PredicateLeaf.Operator.NULL_SAFE_EQUALS)
+
+      checkFilterPredicate(intAttr < 2, PredicateLeaf.Operator.LESS_THAN)
+      checkFilterPredicate(intAttr > 3, PredicateLeaf.Operator.LESS_THAN_EQUALS)
+      checkFilterPredicate(intAttr <= 1, PredicateLeaf.Operator.LESS_THAN_EQUALS)
+      checkFilterPredicate(intAttr >= 4, PredicateLeaf.Operator.LESS_THAN)
+
+      checkFilterPredicate(Literal(1) === intAttr, PredicateLeaf.Operator.EQUALS)
+      checkFilterPredicate(Literal(1) <=> intAttr, PredicateLeaf.Operator.NULL_SAFE_EQUALS)
+      checkFilterPredicate(Literal(2) > intAttr, PredicateLeaf.Operator.LESS_THAN)
+      checkFilterPredicate(Literal(3) < intAttr, PredicateLeaf.Operator.LESS_THAN_EQUALS)
+      checkFilterPredicate(Literal(1) >= intAttr, PredicateLeaf.Operator.LESS_THAN_EQUALS)
+      checkFilterPredicate(Literal(4) <= intAttr, PredicateLeaf.Operator.LESS_THAN)
+    }
+  }
+
+  test("filter pushdown - long") {
+    withNestedOrcDataFrame(
+        (1 to 4).map(i => Tuple1(Option(i.toLong)))) { case (inputDF, colName, _) =>
+      implicit val df: DataFrame = inputDF
+
+      val longAttr = df(colName).expr
+      assert(df(colName).expr.dataType === LongType)
+
+      checkFilterPredicate(longAttr.isNull, PredicateLeaf.Operator.IS_NULL)
+
+      checkFilterPredicate(longAttr === 1, PredicateLeaf.Operator.EQUALS)
+      checkFilterPredicate(longAttr <=> 1, PredicateLeaf.Operator.NULL_SAFE_EQUALS)
+
+      checkFilterPredicate(longAttr < 2, PredicateLeaf.Operator.LESS_THAN)
+      checkFilterPredicate(longAttr > 3, PredicateLeaf.Operator.LESS_THAN_EQUALS)
+      checkFilterPredicate(longAttr <= 1, PredicateLeaf.Operator.LESS_THAN_EQUALS)
+      checkFilterPredicate(longAttr >= 4, PredicateLeaf.Operator.LESS_THAN)
+
+      checkFilterPredicate(Literal(1) === longAttr, PredicateLeaf.Operator.EQUALS)
+      checkFilterPredicate(Literal(1) <=> longAttr, PredicateLeaf.Operator.NULL_SAFE_EQUALS)
+      checkFilterPredicate(Literal(2) > longAttr, PredicateLeaf.Operator.LESS_THAN)
+      checkFilterPredicate(Literal(3) < longAttr, PredicateLeaf.Operator.LESS_THAN_EQUALS)
+      checkFilterPredicate(Literal(1) >= longAttr, PredicateLeaf.Operator.LESS_THAN_EQUALS)
+      checkFilterPredicate(Literal(4) <= longAttr, PredicateLeaf.Operator.LESS_THAN)
+    }
+  }
+
+  test("filter pushdown - float") {
+    withNestedOrcDataFrame(
+        (1 to 4).map(i => Tuple1(Option(i.toFloat)))) { case (inputDF, colName, _) =>
+      implicit val df: DataFrame = inputDF
+
+      val floatAttr = df(colName).expr
+      assert(df(colName).expr.dataType === FloatType)
+
+      checkFilterPredicate(floatAttr.isNull, PredicateLeaf.Operator.IS_NULL)
+
+      checkFilterPredicate(floatAttr === 1, PredicateLeaf.Operator.EQUALS)
+      checkFilterPredicate(floatAttr <=> 1, PredicateLeaf.Operator.NULL_SAFE_EQUALS)
+
+      checkFilterPredicate(floatAttr < 2, PredicateLeaf.Operator.LESS_THAN)
+      checkFilterPredicate(floatAttr > 3, PredicateLeaf.Operator.LESS_THAN_EQUALS)
+      checkFilterPredicate(floatAttr <= 1, PredicateLeaf.Operator.LESS_THAN_EQUALS)
+      checkFilterPredicate(floatAttr >= 4, PredicateLeaf.Operator.LESS_THAN)
+
+      checkFilterPredicate(Literal(1) === floatAttr, PredicateLeaf.Operator.EQUALS)
+      checkFilterPredicate(Literal(1) <=> floatAttr, PredicateLeaf.Operator.NULL_SAFE_EQUALS)
+      checkFilterPredicate(Literal(2) > floatAttr, PredicateLeaf.Operator.LESS_THAN)
+      checkFilterPredicate(Literal(3) < floatAttr, PredicateLeaf.Operator.LESS_THAN_EQUALS)
+      checkFilterPredicate(Literal(1) >= floatAttr, PredicateLeaf.Operator.LESS_THAN_EQUALS)
+      checkFilterPredicate(Literal(4) <= floatAttr, PredicateLeaf.Operator.LESS_THAN)
+    }
+  }
+
+  test("filter pushdown - double") {
+    withNestedOrcDataFrame(
+        (1 to 4).map(i => Tuple1(Option(i.toDouble)))) { case (inputDF, colName, _) =>
+      implicit val df: DataFrame = inputDF
+
+      val doubleAttr = df(colName).expr
+      assert(df(colName).expr.dataType === DoubleType)
+
+      checkFilterPredicate(doubleAttr.isNull, PredicateLeaf.Operator.IS_NULL)
+
+      checkFilterPredicate(doubleAttr === 1, PredicateLeaf.Operator.EQUALS)
+      checkFilterPredicate(doubleAttr <=> 1, PredicateLeaf.Operator.NULL_SAFE_EQUALS)
+
+      checkFilterPredicate(doubleAttr < 2, PredicateLeaf.Operator.LESS_THAN)
+      checkFilterPredicate(doubleAttr > 3, PredicateLeaf.Operator.LESS_THAN_EQUALS)
+      checkFilterPredicate(doubleAttr <= 1, PredicateLeaf.Operator.LESS_THAN_EQUALS)
+      checkFilterPredicate(doubleAttr >= 4, PredicateLeaf.Operator.LESS_THAN)
+
+      checkFilterPredicate(Literal(1) === doubleAttr, PredicateLeaf.Operator.EQUALS)
+      checkFilterPredicate(Literal(1) <=> doubleAttr, PredicateLeaf.Operator.NULL_SAFE_EQUALS)
+      checkFilterPredicate(Literal(2) > doubleAttr, PredicateLeaf.Operator.LESS_THAN)
+      checkFilterPredicate(Literal(3) < doubleAttr, PredicateLeaf.Operator.LESS_THAN_EQUALS)
+      checkFilterPredicate(Literal(1) >= doubleAttr, PredicateLeaf.Operator.LESS_THAN_EQUALS)
+      checkFilterPredicate(Literal(4) <= doubleAttr, PredicateLeaf.Operator.LESS_THAN)
+    }
+  }
+
+  test("filter pushdown - string") {
+    withNestedOrcDataFrame(
+        (1 to 4).map(i => Tuple1(i.toString))) { case (inputDF, colName, _) =>
+      implicit val df: DataFrame = inputDF
+
+      val strAttr = df(colName).expr
+      assert(df(colName).expr.dataType === StringType)
+
+      checkFilterPredicate(strAttr.isNull, PredicateLeaf.Operator.IS_NULL)
+
+      checkFilterPredicate(strAttr === "1", PredicateLeaf.Operator.EQUALS)
+      checkFilterPredicate(strAttr <=> "1", PredicateLeaf.Operator.NULL_SAFE_EQUALS)
+
+      checkFilterPredicate(strAttr < "2", PredicateLeaf.Operator.LESS_THAN)
+      checkFilterPredicate(strAttr > "3", PredicateLeaf.Operator.LESS_THAN_EQUALS)
+      checkFilterPredicate(strAttr <= "1", PredicateLeaf.Operator.LESS_THAN_EQUALS)
+      checkFilterPredicate(strAttr >= "4", PredicateLeaf.Operator.LESS_THAN)
+
+      checkFilterPredicate(Literal("1") === strAttr, PredicateLeaf.Operator.EQUALS)
+      checkFilterPredicate(Literal("1") <=> strAttr, PredicateLeaf.Operator.NULL_SAFE_EQUALS)
+      checkFilterPredicate(Literal("2") > strAttr, PredicateLeaf.Operator.LESS_THAN)
+      checkFilterPredicate(Literal("3") < strAttr, PredicateLeaf.Operator.LESS_THAN_EQUALS)
+      checkFilterPredicate(Literal("1") >= strAttr, PredicateLeaf.Operator.LESS_THAN_EQUALS)
+      checkFilterPredicate(Literal("4") <= strAttr, PredicateLeaf.Operator.LESS_THAN)
+    }
+  }
+
+  test("filter pushdown - boolean") {
+    withNestedOrcDataFrame(
+        (true :: false :: Nil).map(b => Tuple1.apply(Option(b)))) { case (inputDF, colName, _) =>
+      implicit val df: DataFrame = inputDF
+
+      val booleanAttr = df(colName).expr
+      assert(df(colName).expr.dataType === BooleanType)
+
+      checkFilterPredicate(booleanAttr.isNull, PredicateLeaf.Operator.IS_NULL)
+
+      checkFilterPredicate(booleanAttr === true, PredicateLeaf.Operator.EQUALS)
+      checkFilterPredicate(booleanAttr <=> true, PredicateLeaf.Operator.NULL_SAFE_EQUALS)
+
+      checkFilterPredicate(booleanAttr < true, PredicateLeaf.Operator.LESS_THAN)
+      checkFilterPredicate(booleanAttr > false, PredicateLeaf.Operator.LESS_THAN_EQUALS)
+      checkFilterPredicate(booleanAttr <= false, PredicateLeaf.Operator.LESS_THAN_EQUALS)
+      checkFilterPredicate(booleanAttr >= false, PredicateLeaf.Operator.LESS_THAN)
+
+      checkFilterPredicate(Literal(false) === booleanAttr, PredicateLeaf.Operator.EQUALS)
+      checkFilterPredicate(Literal(false) <=> booleanAttr,
+        PredicateLeaf.Operator.NULL_SAFE_EQUALS)
+      checkFilterPredicate(Literal(false) > booleanAttr, PredicateLeaf.Operator.LESS_THAN)
+      checkFilterPredicate(Literal(true) < booleanAttr, PredicateLeaf.Operator.LESS_THAN_EQUALS)
+      checkFilterPredicate(Literal(true) >= booleanAttr, PredicateLeaf.Operator.LESS_THAN_EQUALS)
+      checkFilterPredicate(Literal(true) <= booleanAttr, PredicateLeaf.Operator.LESS_THAN)
+    }
+  }
+
+  test("filter pushdown - decimal") {
+    withNestedOrcDataFrame(
+        (1 to 4).map(i => Tuple1.apply(BigDecimal.valueOf(i)))) { case (inputDF, colName, _) =>
+      implicit val df: DataFrame = inputDF
+
+      val decimalAttr = df(colName).expr
+      assert(df(colName).expr.dataType === DecimalType(38, 18))
+
+      checkFilterPredicate(decimalAttr.isNull, PredicateLeaf.Operator.IS_NULL)
+
+      checkFilterPredicate(decimalAttr === BigDecimal.valueOf(1), PredicateLeaf.Operator.EQUALS)
+      checkFilterPredicate(decimalAttr <=> BigDecimal.valueOf(1),
+        PredicateLeaf.Operator.NULL_SAFE_EQUALS)
+
+      checkFilterPredicate(decimalAttr < BigDecimal.valueOf(2), PredicateLeaf.Operator.LESS_THAN)
+      checkFilterPredicate(decimalAttr > BigDecimal.valueOf(3),
+        PredicateLeaf.Operator.LESS_THAN_EQUALS)
+      checkFilterPredicate(decimalAttr <= BigDecimal.valueOf(1),
+        PredicateLeaf.Operator.LESS_THAN_EQUALS)
+      checkFilterPredicate(decimalAttr >= BigDecimal.valueOf(4), PredicateLeaf.Operator.LESS_THAN)
+
+      checkFilterPredicate(
+        Literal(BigDecimal.valueOf(1)) === decimalAttr, PredicateLeaf.Operator.EQUALS)
+      checkFilterPredicate(
+        Literal(BigDecimal.valueOf(1)) <=> decimalAttr, PredicateLeaf.Operator.NULL_SAFE_EQUALS)
+      checkFilterPredicate(
+        Literal(BigDecimal.valueOf(2)) > decimalAttr, PredicateLeaf.Operator.LESS_THAN)
+      checkFilterPredicate(
+        Literal(BigDecimal.valueOf(3)) < decimalAttr, PredicateLeaf.Operator.LESS_THAN_EQUALS)
+      checkFilterPredicate(
+        Literal(BigDecimal.valueOf(1)) >= decimalAttr, PredicateLeaf.Operator.LESS_THAN_EQUALS)
+      checkFilterPredicate(
+        Literal(BigDecimal.valueOf(4)) <= decimalAttr, PredicateLeaf.Operator.LESS_THAN)
+    }
+  }
+
+  test("filter pushdown - timestamp") {
+    val input = Seq(
+      "1000-01-01 01:02:03",
+      "1582-10-01 00:11:22",
+      "1900-01-01 23:59:59",
+      "2020-05-25 10:11:12").map(Timestamp.valueOf)
+
+    withOrcFile(input.map(Tuple1(_))) { path =>
+      Seq(false, true).foreach { java8Api =>
+        withSQLConf(SQLConf.DATETIME_JAVA8API_ENABLED.key -> java8Api.toString) {
+          readFile(path) { implicit df =>
+            val timestamps = input.map(Literal(_))
+            checkFilterPredicate($"_1".isNull, PredicateLeaf.Operator.IS_NULL)
+
+            checkFilterPredicate($"_1" === timestamps(0), PredicateLeaf.Operator.BETWEEN)
+            checkFilterPredicate($"_1" <=> timestamps(0), PredicateLeaf.Operator.BETWEEN)
+
+            checkFilterPredicate($"_1" < timestamps(1), PredicateLeaf.Operator.LESS_THAN)
+            checkFilterPredicate($"_1" > timestamps(2), PredicateLeaf.Operator.LESS_THAN_EQUALS)
+            checkFilterPredicate($"_1" <= timestamps(0), PredicateLeaf.Operator.LESS_THAN_EQUALS)
+            checkFilterPredicate($"_1" >= timestamps(3), PredicateLeaf.Operator.LESS_THAN)
+
+            checkFilterPredicate(Literal(timestamps(0)) === $"_1", PredicateLeaf.Operator.BETWEEN)
+            checkFilterPredicate(
+              Literal(timestamps(0)) <=> $"_1", PredicateLeaf.Operator.BETWEEN)
+            checkFilterPredicate(Literal(timestamps(1)) > $"_1", PredicateLeaf.Operator.LESS_THAN)
+            checkFilterPredicate(
+              Literal(timestamps(2)) < $"_1",
+              PredicateLeaf.Operator.LESS_THAN_EQUALS)
+            checkFilterPredicate(
+              Literal(timestamps(0)) >= $"_1",
+              PredicateLeaf.Operator.LESS_THAN_EQUALS)
+            checkFilterPredicate(Literal(timestamps(3)) <= $"_1", PredicateLeaf.Operator.LESS_THAN)
+          }
+        }
+      }
+    }
+  }
+
+  test("SPARK-60449: filter pushdown - timestamp with sub-microsecond digits") {
+    // Another engine (e.g. Hive) can write sub-microsecond digits to an ORC timestamp column, and
+    // Spark reads the column as TimestampType by truncating every value to microseconds. So the
+    // pushed down predicates must not skip the stripes whose truncated values satisfy them.
+    withTempPath { dir =>
+      val schema = TypeDescription.fromString("struct<ts:timestamp>")
+      Seq(
+        "part-0.orc" -> Seq("2020-05-25 10:11:12.123456789", null),
+        // The last stored value that is read as `a` and the first one after it, each alone in its
+        // file, so a pushed down range that misses either edge skips a matching file.
+        "part-1.orc" -> Seq("2020-05-25 10:11:12.123456999"),
+        "part-2.orc" -> Seq("2020-05-25 10:11:12.123457"),
+        "part-3.orc" -> Seq("2020-05-25 10:11:13.000000789")
+      ).foreach { case (name, values) =>
+        val file = new Path(new File(dir, name).getCanonicalPath)
+        val writerOptions =
+          OrcFile.writerOptions(spark.sessionState.newHadoopConf()).setSchema(schema)
+        Utils.tryWithResource(OrcFile.createWriter(file, writerOptions)) { writer =>
+          val batch = schema.createRowBatch()
+          val tsCol = batch.cols(0).asInstanceOf[TimestampColumnVector]
+          values.zipWithIndex.foreach { case (v, i) =>
+            tsCol.set(i, Option(v).map(Timestamp.valueOf(_)).orNull)
+          }
+          batch.size = values.length
+          writer.addRowBatch(batch)
+        }
+      }
+      val path = dir.getCanonicalPath
+      // The stored values are read as `a`, null, `a`, `next`, and `b`.
+      val a = "TIMESTAMP'2020-05-25 10:11:12.123456'"
+      val b = "TIMESTAMP'2020-05-25 10:11:13'"
+      val next = "TIMESTAMP'2020-05-25 10:11:12.123457'"
+      checkAnswer(
+        spark.read.orc(path),
+        sql(s"SELECT $a UNION ALL SELECT null UNION ALL SELECT $a UNION ALL SELECT $next " +
+          s"UNION ALL SELECT $b"))
+
+      Seq(false, true).foreach { java8Api =>
+        withSQLConf(SQLConf.DATETIME_JAVA8API_ENABLED.key -> java8Api.toString) {
+          withAllNativeOrcReaders {
+            val df = spark.read.orc(path)
+            Seq(
+              s"ts = $b" -> 1,
+              s"ts = $a" -> 2,
+              s"ts = $next" -> 1,
+              s"ts <=> $a" -> 2,
+              s"ts <= $a" -> 2,
+              s"ts <= $b" -> 4,
+              s"ts IN ($a, $next)" -> 3,
+              s"ts IN ($a, $b)" -> 3,
+              s"ts < $next" -> 2,
+              s"ts >= $a" -> 4,
+              s"ts > $a" -> 2,
+              s"ts > $b" -> 0,
+              s"ts < $a" -> 0,
+              s"ts != $a" -> 2,
+              s"NOT (ts <=> $a)" -> 3,
+              s"ts NOT IN ($a, $next)" -> 1
+            ).foreach { case (condition, expected) =>
+              assert(df.where(condition).count() === expected, condition)
+            }
+            // The pushed down predicates still skip the files without the matching values.
+            assert(stripSparkFilter(df.where(s"ts = $a")).count() === 3)
+            assert(stripSparkFilter(df.where(s"ts > $a")).count() === 2)
+            assert(stripSparkFilter(df.where(s"ts = $b")).count() === 1)
+          }
+        }
+      }
+    }
+  }
+
+  test("SPARK-36357: filter pushdown - timestamp_ntz") {
+    val localDateTimes = Seq(
+      LocalDateTime.of(1000, 1, 1, 1, 2, 3, 456000000),
+      LocalDateTime.of(1582, 10, 1, 0, 11, 22, 456000000),
+      LocalDateTime.of(1900, 1, 1, 23, 59, 59, 456000000),
+      LocalDateTime.of(2020, 5, 25, 10, 11, 12, 456000000))
+    withOrcFile(localDateTimes.map(Tuple1(_))) { path =>
+      readFile(path) { implicit df =>
+        checkFilterPredicate($"_1".isNull, PredicateLeaf.Operator.IS_NULL)
+
+        checkFilterPredicate($"_1" === localDateTimes(0), PredicateLeaf.Operator.EQUALS)
+        checkFilterPredicate($"_1" <=> localDateTimes(0), PredicateLeaf.Operator.NULL_SAFE_EQUALS)
+
+        checkFilterPredicate($"_1" < localDateTimes(1), PredicateLeaf.Operator.LESS_THAN)
+        checkFilterPredicate($"_1" > localDateTimes(2), PredicateLeaf.Operator.LESS_THAN_EQUALS)
+        checkFilterPredicate($"_1" <= localDateTimes(0), PredicateLeaf.Operator.LESS_THAN_EQUALS)
+        checkFilterPredicate($"_1" >= localDateTimes(3), PredicateLeaf.Operator.LESS_THAN)
+
+        checkFilterPredicate(Literal(localDateTimes(0)) === $"_1", PredicateLeaf.Operator.EQUALS)
+        checkFilterPredicate(
+          Literal(localDateTimes(0)) <=> $"_1", PredicateLeaf.Operator.NULL_SAFE_EQUALS)
+        checkFilterPredicate(Literal(localDateTimes(1)) > $"_1", PredicateLeaf.Operator.LESS_THAN)
+        checkFilterPredicate(
+          Literal(localDateTimes(2)) < $"_1",
+          PredicateLeaf.Operator.LESS_THAN_EQUALS)
+        checkFilterPredicate(
+          Literal(localDateTimes(0)) >= $"_1",
+          PredicateLeaf.Operator.LESS_THAN_EQUALS)
+        checkFilterPredicate(Literal(localDateTimes(3)) <= $"_1", PredicateLeaf.Operator.LESS_THAN)
+      }
+    }
+  }
+
+  test("SPARK-57571: filter pushdown - time") {
+    val times = Seq(
+      LocalTime.of(0, 0, 0),
+      LocalTime.of(1, 2, 3, 456000000),
+      LocalTime.of(12, 30, 45, 123456000),
+      LocalTime.of(23, 59, 59, 999999000))
+    withOrcFile(times.map(Tuple1(_))) { path =>
+      readFile(path) { implicit df =>
+        checkFilterPredicate($"_1".isNull, PredicateLeaf.Operator.IS_NULL)
+
+        checkFilterPredicate($"_1" === times(0), PredicateLeaf.Operator.EQUALS)
+        checkFilterPredicate($"_1" <=> times(0), PredicateLeaf.Operator.NULL_SAFE_EQUALS)
+
+        checkFilterPredicate($"_1" < times(1), PredicateLeaf.Operator.LESS_THAN)
+        checkFilterPredicate($"_1" > times(2), PredicateLeaf.Operator.LESS_THAN_EQUALS)
+        checkFilterPredicate($"_1" <= times(0), PredicateLeaf.Operator.LESS_THAN_EQUALS)
+        checkFilterPredicate($"_1" >= times(3), PredicateLeaf.Operator.LESS_THAN)
+
+        checkFilterPredicate(Literal(times(0)) === $"_1", PredicateLeaf.Operator.EQUALS)
+        checkFilterPredicate(
+          Literal(times(0)) <=> $"_1", PredicateLeaf.Operator.NULL_SAFE_EQUALS)
+        checkFilterPredicate(Literal(times(1)) > $"_1", PredicateLeaf.Operator.LESS_THAN)
+        checkFilterPredicate(
+          Literal(times(2)) < $"_1",
+          PredicateLeaf.Operator.LESS_THAN_EQUALS)
+        checkFilterPredicate(
+          Literal(times(0)) >= $"_1",
+          PredicateLeaf.Operator.LESS_THAN_EQUALS)
+        checkFilterPredicate(Literal(times(3)) <= $"_1", PredicateLeaf.Operator.LESS_THAN)
+      }
+    }
+  }
+
+  test("SPARK-57823: filter pushdown - nanosecond timestamp") {
+    // Wall clocks carry sub-microsecond digits. The literal is explicitly nanos-typed, so even a
+    // microsecond-aligned value would still exercise the nanos pushdown path; the extra digits
+    // exercise value preservation and comparison beyond microsecond precision.
+    val wallClocks = Seq(
+      LocalDateTime.of(1000, 1, 1, 1, 2, 3, 456789123),
+      LocalDateTime.of(1582, 10, 1, 0, 11, 22, 456789123),
+      LocalDateTime.of(1900, 1, 1, 23, 59, 59, 456789123),
+      LocalDateTime.of(2020, 5, 25, 10, 11, 12, 456789123))
+
+    // Builds a nanos-typed literal so the comparison against the nanos column needs no type
+    // coercion: NTZ uses the wall clock as a LocalDateTime, LTZ as the same instant at UTC.
+    def nanosLiteral(nanosType: DataType, wallClock: LocalDateTime): Expression = {
+      val external: Any = nanosType match {
+        case _: TimestampNTZNanosType => wallClock
+        case _: TimestampLTZNanosType => wallClock.toInstant(ZoneOffset.UTC)
+      }
+      Literal.create(external, nanosType)
+    }
+
+    withSQLConf(SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "true") {
+      foreachNanosPrecision { precision =>
+        Seq(TimestampNTZNanosType(precision), TimestampLTZNanosType(precision)).foreach {
+          nanosType =>
+            val ts = wallClocks.map(nanosLiteral(nanosType, _))
+            withTempPath { dir =>
+              val path = dir.getCanonicalPath
+              nanosTimestampDf(nanosType, wallClocks).write.orc(path)
+              // Read back without an explicit schema: the nanos type is recovered from the ORC
+              // catalyst-type attribute, so the pushed-down column is nanos-typed.
+              readFile(path) { implicit df =>
+                assert(df("ts").expr.dataType === nanosType)
+
+                checkFilterPredicate($"ts".isNull, PredicateLeaf.Operator.IS_NULL)
+
+                checkFilterPredicate($"ts" === ts(0), PredicateLeaf.Operator.EQUALS)
+                checkFilterPredicate($"ts" <=> ts(0), PredicateLeaf.Operator.NULL_SAFE_EQUALS)
+
+                checkFilterPredicate($"ts" < ts(1), PredicateLeaf.Operator.LESS_THAN)
+                checkFilterPredicate($"ts" > ts(2), PredicateLeaf.Operator.LESS_THAN_EQUALS)
+                checkFilterPredicate($"ts" <= ts(0), PredicateLeaf.Operator.LESS_THAN_EQUALS)
+                checkFilterPredicate($"ts" >= ts(3), PredicateLeaf.Operator.LESS_THAN)
+
+                checkFilterPredicate(ts(0) === $"ts", PredicateLeaf.Operator.EQUALS)
+                checkFilterPredicate(ts(0) <=> $"ts", PredicateLeaf.Operator.NULL_SAFE_EQUALS)
+                checkFilterPredicate(ts(1) > $"ts", PredicateLeaf.Operator.LESS_THAN)
+                checkFilterPredicate(ts(2) < $"ts", PredicateLeaf.Operator.LESS_THAN_EQUALS)
+                checkFilterPredicate(ts(0) >= $"ts", PredicateLeaf.Operator.LESS_THAN_EQUALS)
+                checkFilterPredicate(ts(3) <= $"ts", PredicateLeaf.Operator.LESS_THAN)
+
+                // In covers the per-value castLiteralValue path (values.map(...)) in
+                // buildLeafSearchArgument, exercising the nanos literal cast for every element.
+                checkFilterPredicate(
+                  In($"ts", Seq(ts(0), ts(2))), PredicateLeaf.Operator.IN)
+              }
+            }
+        }
+      }
+    }
+  }
+
+  test("SPARK-60397: filter pushdown - nanosecond timestamp read with a lower precision") {
+    // A TIMESTAMP(9) value 1970-01-01 00:00:00.123456789 read as TIMESTAMP(7) is truncated to
+    // 00:00:00.1234567, while ORC evaluates a pushed down predicate against the stored value.
+    // For example, a pushed down `ts = 1970-01-01 00:00:00.1234567` would skip the stripe that
+    // holds the matching row.
+    withSQLConf(
+        SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "true",
+        SQLConf.SESSION_LOCAL_TIMEZONE.key -> "UTC") {
+      Seq(
+        "TIMESTAMP_LTZ" -> ((s: String) => Instant.parse(s"1970-01-01T${s}Z")),
+        "TIMESTAMP_NTZ" -> ((s: String) => LocalDateTime.parse(s"1970-01-01T$s"))
+      ).foreach { case (tsType, toValue) =>
+        withTempPath { dir =>
+          sql(s"SELECT CAST(c AS $tsType(9)) AS ts FROM VALUES " +
+            "('1970-01-01 00:00:00.123456789'), ('1970-01-01 00:00:01'), (NULL) AS t(c)")
+            .coalesce(1).write.orc(dir.getCanonicalPath)
+          Seq(7, 8).foreach { p =>
+            val readDF = spark.read.schema(s"ts $tsType($p)").orc(dir.getCanonicalPath)
+            // The stored 00:00:00.123456789 is read as `v`, e.g. 00:00:00.1234567 for p = 7.
+            val v = "00:00:00." + "123456789".take(p)
+            def lit(s: String): String = s"CAST('1970-01-01 $s' AS $tsType($p))"
+            def check(condition: String, expected: Seq[String]): Unit = {
+              checkAnswer(readDF.where(condition), expected.map(s => Row(toValue(s))))
+            }
+            withAllNativeOrcReaders {
+              check(s"ts = ${lit(v)}", Seq(v))
+              check(s"ts <=> ${lit(v)}", Seq(v))
+              check(s"ts != ${lit(v)}", Seq("00:00:01"))
+              check(s"ts < ${lit("00:00:01")}", Seq(v))
+              check(s"ts <= ${lit(v)}", Seq(v))
+              check(s"ts > ${lit(v)}", Seq("00:00:01"))
+              check(s"ts >= ${lit(v)}", Seq(v, "00:00:01"))
+              check(s"ts IN (${lit(v)}, ${lit("00:00:02")})", Seq(v))
+              checkAnswer(readDF.where("ts IS NULL"), Row(null))
+              check("ts IS NOT NULL", Seq(v, "00:00:01"))
+            }
+          }
+        }
+      }
+    }
+  }
+
+  test("SPARK-60397: nanosecond timestamp predicates with a value are pushed down only if " +
+      "the read precision is not lower than the file precision") {
+    import org.apache.spark.sql.sources._
+    // The values of a TIMESTAMP(p) file have at most p fractional digits, and the reader truncates
+    // them to the read precision. So only IsNull and IsNotNull are pushed down for a lower one.
+    def schema(precision: Int): StructType = new StructType()
+      .add("ltz", TimestampLTZNanosType(precision))
+      .add("ntz", TimestampNTZNanosType(precision))
+    val ltz = Instant.parse("1970-01-01T00:00:00.1234567Z")
+    val ntz = LocalDateTime.parse("1970-01-01T00:00:00.1234567")
+    foreachNanosPrecision { filePrecision =>
+      foreachNanosPrecision { readPrecision =>
+        def createFilter(filter: Filter): Option[SearchArgument] = OrcFilters.createFilter(
+          schema(filePrecision), Seq(filter), Some(schema(readPrecision)))
+        val clue = s"file precision $filePrecision, read precision $readPrecision"
+        Seq[(String, Any)]("ltz" -> ltz, "ntz" -> ntz).foreach { case (name, value) =>
+          Seq(IsNull(name), IsNotNull(name)).foreach { filter =>
+            assert(createFilter(filter).isDefined, s"$filter, $clue")
+          }
+          Seq(
+            EqualTo(name, value),
+            EqualNullSafe(name, value),
+            Not(EqualTo(name, value)),
+            LessThan(name, value),
+            LessThanOrEqual(name, value),
+            GreaterThan(name, value),
+            GreaterThanOrEqual(name, value),
+            In(name, Array[Any](value))
+          ).foreach { filter =>
+            assert(createFilter(filter).isDefined === (readPrecision >= filePrecision),
+              s"$filter, $clue")
+          }
+        }
+      }
+    }
+  }
+
+  test("filter pushdown - combinations with logical operators") {
+    withOrcDataFrame((1 to 4).map(i => Tuple1(Option(i)))) { implicit df =>
+      checkFilterPredicate(
+        $"_1".isNotNull,
+        "leaf-0 = (IS_NULL _1), expr = (not leaf-0)"
+      )
+      checkFilterPredicate(
+        $"_1" =!= 1,
+        "leaf-0 = (IS_NULL _1), leaf-1 = (EQUALS _1 1), expr = (and (not leaf-0) (not leaf-1))"
+      )
+      checkFilterPredicate(
+        !($"_1" < 4),
+        "leaf-0 = (IS_NULL _1), leaf-1 = (LESS_THAN _1 4), expr = (and (not leaf-0) (not leaf-1))"
+      )
+      checkFilterPredicate(
+        $"_1" < 2 || $"_1" > 3,
+        "leaf-0 = (LESS_THAN _1 2), leaf-1 = (LESS_THAN_EQUALS _1 3), " +
+          "expr = (or leaf-0 (not leaf-1))"
+      )
+      checkFilterPredicate(
+        $"_1" < 2 && $"_1" > 3,
+        "leaf-0 = (IS_NULL _1), leaf-1 = (LESS_THAN _1 2), leaf-2 = (LESS_THAN_EQUALS _1 3), " +
+          "expr = (and (not leaf-0) leaf-1 (not leaf-2))"
+      )
+    }
+  }
+
+  test("filter pushdown - date") {
+    val input = Seq("2017-08-18", "2017-08-19", "2017-08-20", "2017-08-21").map { day =>
+      Date.valueOf(day)
+    }
+    withOrcFile(input.map(Tuple1(_))) { path =>
+      Seq(false, true).foreach { java8Api =>
+        withSQLConf(SQLConf.DATETIME_JAVA8API_ENABLED.key -> java8Api.toString) {
+          readFile(path) { implicit df =>
+            val dates = input.map(Literal(_))
+            checkFilterPredicate($"_1".isNull, PredicateLeaf.Operator.IS_NULL)
+
+            checkFilterPredicate($"_1" === dates(0), PredicateLeaf.Operator.EQUALS)
+            checkFilterPredicate($"_1" <=> dates(0), PredicateLeaf.Operator.NULL_SAFE_EQUALS)
+
+            checkFilterPredicate($"_1" < dates(1), PredicateLeaf.Operator.LESS_THAN)
+            checkFilterPredicate($"_1" > dates(2), PredicateLeaf.Operator.LESS_THAN_EQUALS)
+            checkFilterPredicate($"_1" <= dates(0), PredicateLeaf.Operator.LESS_THAN_EQUALS)
+            checkFilterPredicate($"_1" >= dates(3), PredicateLeaf.Operator.LESS_THAN)
+
+            checkFilterPredicate(dates(0) === $"_1", PredicateLeaf.Operator.EQUALS)
+            checkFilterPredicate(dates(0) <=> $"_1", PredicateLeaf.Operator.NULL_SAFE_EQUALS)
+            checkFilterPredicate(dates(1) > $"_1", PredicateLeaf.Operator.LESS_THAN)
+            checkFilterPredicate(dates(2) < $"_1", PredicateLeaf.Operator.LESS_THAN_EQUALS)
+            checkFilterPredicate(dates(0) >= $"_1", PredicateLeaf.Operator.LESS_THAN_EQUALS)
+            checkFilterPredicate(dates(3) <= $"_1", PredicateLeaf.Operator.LESS_THAN)
+          }
+        }
+      }
+    }
+  }
+
+  test("SPARK-36960: filter pushdown - year-month interval") {
+    DataTypeTestUtils.yearMonthIntervalTypes.foreach { ymIntervalType =>
+
+      def periods(i: Int): Expression = Literal(Period.of(i, i, 0)).cast(ymIntervalType)
+
+      val baseDF = spark.createDataFrame((1 to 4).map { i =>
+        Tuple1.apply(Period.of(i, i, 0))
+      }).select(col("_1").cast(ymIntervalType))
+
+      withNestedOrcDataFrame(baseDF) {
+        case (inputDF, colName, _) =>
+          implicit val df: DataFrame = inputDF
+
+          val ymIntervalAttr = df(colName).expr
+          assert(df(colName).expr.dataType === ymIntervalType)
+
+         checkFilterPredicate(ymIntervalAttr.isNull, PredicateLeaf.Operator.IS_NULL)
+
+          checkFilterPredicate(ymIntervalAttr === periods(1),
+            PredicateLeaf.Operator.EQUALS)
+          checkFilterPredicate(ymIntervalAttr <=> periods(1),
+            PredicateLeaf.Operator.NULL_SAFE_EQUALS)
+          checkFilterPredicate(ymIntervalAttr < periods(2),
+            PredicateLeaf.Operator.LESS_THAN)
+          checkFilterPredicate(ymIntervalAttr > periods(3),
+            PredicateLeaf.Operator.LESS_THAN_EQUALS)
+          checkFilterPredicate(ymIntervalAttr <= periods(1),
+            PredicateLeaf.Operator.LESS_THAN_EQUALS)
+          checkFilterPredicate(ymIntervalAttr >= periods(4),
+            PredicateLeaf.Operator.LESS_THAN)
+
+          checkFilterPredicate(periods(1) === ymIntervalAttr,
+            PredicateLeaf.Operator.EQUALS)
+          checkFilterPredicate(periods(1) <=> ymIntervalAttr,
+            PredicateLeaf.Operator.NULL_SAFE_EQUALS)
+          checkFilterPredicate(periods(2) > ymIntervalAttr,
+            PredicateLeaf.Operator.LESS_THAN)
+          checkFilterPredicate(periods(3) < ymIntervalAttr,
+            PredicateLeaf.Operator.LESS_THAN_EQUALS)
+          checkFilterPredicate(periods(1) >= ymIntervalAttr,
+            PredicateLeaf.Operator.LESS_THAN_EQUALS)
+          checkFilterPredicate(periods(4) <= ymIntervalAttr,
+            PredicateLeaf.Operator.LESS_THAN)
+      }
+    }
+  }
+
+  test("SPARK-36960: filter pushdown - day-time interval") {
+    DataTypeTestUtils.dayTimeIntervalTypes.foreach { dtIntervalType =>
+
+      def durations(i: Int): Expression =
+        Literal(Duration.ofDays(i).plusHours(i).plusMinutes(i).plusSeconds(i)).cast(dtIntervalType)
+
+      val baseDF = spark.createDataFrame((1 to 4).map { i =>
+        Tuple1.apply(Duration.ofDays(i).plusHours(i).plusMinutes(i).plusSeconds(i))
+      }).select(col("_1").cast(dtIntervalType))
+
+      withNestedOrcDataFrame(baseDF) {
+        case (inputDF, colName, _) =>
+          implicit val df: DataFrame = inputDF
+
+          val ymIntervalAttr = df(colName).expr
+          assert(df(colName).expr.dataType === dtIntervalType)
+
+          checkFilterPredicate(ymIntervalAttr.isNull, PredicateLeaf.Operator.IS_NULL)
+
+          checkFilterPredicate(ymIntervalAttr === durations(1),
+            PredicateLeaf.Operator.EQUALS)
+          checkFilterPredicate(ymIntervalAttr <=> durations(1),
+            PredicateLeaf.Operator.NULL_SAFE_EQUALS)
+          checkFilterPredicate(ymIntervalAttr < durations(2),
+            PredicateLeaf.Operator.LESS_THAN)
+          checkFilterPredicate(ymIntervalAttr > durations(3),
+            PredicateLeaf.Operator.LESS_THAN_EQUALS)
+          checkFilterPredicate(ymIntervalAttr <= durations(1),
+            PredicateLeaf.Operator.LESS_THAN_EQUALS)
+          checkFilterPredicate(ymIntervalAttr >= durations(4),
+            PredicateLeaf.Operator.LESS_THAN)
+
+          checkFilterPredicate(durations(1) === ymIntervalAttr,
+            PredicateLeaf.Operator.EQUALS)
+          checkFilterPredicate(durations(1) <=> ymIntervalAttr,
+            PredicateLeaf.Operator.NULL_SAFE_EQUALS)
+          checkFilterPredicate(durations(2) > ymIntervalAttr,
+            PredicateLeaf.Operator.LESS_THAN)
+          checkFilterPredicate(durations(3) < ymIntervalAttr,
+            PredicateLeaf.Operator.LESS_THAN_EQUALS)
+          checkFilterPredicate(durations(1) >= ymIntervalAttr,
+            PredicateLeaf.Operator.LESS_THAN_EQUALS)
+          checkFilterPredicate(durations(4) <= ymIntervalAttr,
+            PredicateLeaf.Operator.LESS_THAN)
+      }
+    }
+  }
+
+  test("no filter pushdown - non-supported types") {
+    implicit class IntToBinary(int: Int) {
+      def b: Array[Byte] = int.toString.getBytes(StandardCharsets.UTF_8)
+    }
+    // ArrayType
+    withOrcDataFrame((1 to 4).map(i => Tuple1(Array(i)))) { implicit df =>
+      checkNoFilterPredicate($"_1".isNull, noneSupported = true)
+    }
+    // BinaryType
+    withOrcDataFrame((1 to 4).map(i => Tuple1(i.b))) { implicit df =>
+      checkNoFilterPredicate($"_1" <=> 1.b, noneSupported = true)
+    }
+    // MapType
+    withOrcDataFrame((1 to 4).map(i => Tuple1(Map(i -> i)))) { implicit df =>
+      checkNoFilterPredicate($"_1".isNotNull, noneSupported = true)
+    }
+  }
+
+  test("SPARK-12218 and SPARK-25699 Converting conjunctions into ORC SearchArguments") {
+    import org.apache.spark.sql.sources._
+    // The `LessThan` should be converted while the `StringContains` shouldn't
+    val schema = new StructType(
+      Array(
+        StructField("a", IntegerType, nullable = true),
+        StructField("b", StringType, nullable = true)))
+    assertResult("leaf-0 = (LESS_THAN a 10), expr = leaf-0") {
+      OrcFilters.createFilter(schema, Array(
+        LessThan("a", 10),
+        StringContains("b", "prefix")
+      ).toImmutableArraySeq).get.asInstanceOf[SearchArgumentImpl].toOldString
+    }
+
+    // The `LessThan` should be converted while the whole inner `And` shouldn't
+    assertResult("leaf-0 = (LESS_THAN a 10), expr = leaf-0") {
+      OrcFilters.createFilter(schema, Array(
+        LessThan("a", 10),
+        Not(And(
+          GreaterThan("a", 1),
+          StringContains("b", "prefix")
+        ))
+      ).toImmutableArraySeq).get.asInstanceOf[SearchArgumentImpl].toOldString
+    }
+
+    // Safely remove unsupported `StringContains` predicate and push down `LessThan`
+    assertResult("leaf-0 = (LESS_THAN a 10), expr = leaf-0") {
+      OrcFilters.createFilter(schema, Array(
+        And(
+          LessThan("a", 10),
+          StringContains("b", "prefix")
+        )
+      ).toImmutableArraySeq).get.asInstanceOf[SearchArgumentImpl].toOldString
+    }
+
+    // Safely remove unsupported `StringContains` predicate, push down `LessThan` and `GreaterThan`.
+    assertResult("leaf-0 = (LESS_THAN a 10), leaf-1 = (LESS_THAN_EQUALS a 1)," +
+      " expr = (and leaf-0 (not leaf-1))") {
+      OrcFilters.createFilter(schema, Array(
+        And(
+          And(
+            LessThan("a", 10),
+            StringContains("b", "prefix")
+          ),
+          GreaterThan("a", 1)
+        )
+      ).toImmutableArraySeq).get.asInstanceOf[SearchArgumentImpl].toOldString
+    }
+  }
+
+  test("SPARK-27699 Converting disjunctions into ORC SearchArguments") {
+    import org.apache.spark.sql.sources._
+    // The `LessThan` should be converted while the `StringContains` shouldn't
+    val schema = new StructType(
+      Array(
+        StructField("a", IntegerType, nullable = true),
+        StructField("b", StringType, nullable = true)))
+
+    // The predicate `StringContains` predicate is not able to be pushed down.
+    assertResult("leaf-0 = (LESS_THAN_EQUALS a 10), leaf-1 = (LESS_THAN a 1)," +
+      " expr = (or (not leaf-0) leaf-1)") {
+      OrcFilters.createFilter(schema, Array(
+        Or(
+          GreaterThan("a", 10),
+          And(
+            StringContains("b", "prefix"),
+            LessThan("a", 1)
+          )
+        )
+      ).toImmutableArraySeq).get.asInstanceOf[SearchArgumentImpl].toOldString
+    }
+
+    assertResult("leaf-0 = (LESS_THAN_EQUALS a 10), leaf-1 = (LESS_THAN a 1)," +
+      " expr = (or (not leaf-0) leaf-1)") {
+      OrcFilters.createFilter(schema, Array(
+        Or(
+          And(
+            GreaterThan("a", 10),
+            StringContains("b", "foobar")
+          ),
+          And(
+            StringContains("b", "prefix"),
+            LessThan("a", 1)
+          )
+        )
+      ).toImmutableArraySeq).get.asInstanceOf[SearchArgumentImpl].toOldString
+    }
+
+    assert(OrcFilters.createFilter(schema, Array(
+      Or(
+        StringContains("b", "foobar"),
+        And(
+          StringContains("b", "prefix"),
+          LessThan("a", 1)
+        )
+      )
+    ).toImmutableArraySeq).isEmpty)
+  }
+
+  test("SPARK-27160: Fix casting of the DecimalType literal") {
+    import org.apache.spark.sql.sources._
+    val schema = StructType(Array(StructField("a", DecimalType(3, 2))))
+    assertResult("leaf-0 = (LESS_THAN a 3.14), expr = leaf-0") {
+      OrcFilters.createFilter(schema, Array(
+        LessThan(
+          "a",
+          new java.math.BigDecimal(3.14, MathContext.DECIMAL64).setScale(2))).toImmutableArraySeq
+      ).get.asInstanceOf[SearchArgumentImpl].toOldString
+    }
+  }
+
+  test("SPARK-32622: case sensitivity in predicate pushdown") {
+    withTempPath { dir =>
+      val count = 10
+      val tableName = "spark_32622"
+      val tableDir1 = s"${dir.getAbsoluteFile}/table1"
+
+      // Physical ORC files have both `A` and `a` fields.
+      withSQLConf(SQLConf.CASE_SENSITIVE.key -> "true") {
+        spark.range(count).repartition(count).selectExpr("id - 1 as A", "id as a")
+          .write.mode("overwrite").orc(tableDir1)
+      }
+
+      // Metastore table has both `A` and `a` fields too.
+      withTable(tableName) {
+        withSQLConf(SQLConf.CASE_SENSITIVE.key -> "true") {
+          sql(
+            s"""
+               |CREATE TABLE $tableName (A LONG, a LONG) USING ORC LOCATION '$tableDir1'
+             """.stripMargin)
+
+          checkAnswer(sql(s"select a, A from $tableName"), (0 until count).map(c => Row(c, c - 1)))
+
+          val actual1 = stripSparkFilter(sql(s"select A from $tableName where A < 0"))
+          assert(actual1.count() == 1)
+
+          val actual2 = stripSparkFilter(sql(s"select A from $tableName where a < 0"))
+          assert(actual2.count() == 0)
+        }
+
+        // Exception thrown for ambiguous case.
+        withSQLConf(SQLConf.CASE_SENSITIVE.key -> "false") {
+          checkError(
+            exception = intercept[AnalysisException] {
+              sql(s"select a from $tableName where a < 0").collect()
+            },
+            condition = "AMBIGUOUS_REFERENCE",
+            parameters = Map(
+              "name" -> "`a`",
+              "referenceNames" -> ("[`spark_catalog`.`default`.`spark_32622`.`a`, " +
+                "`spark_catalog`.`default`.`spark_32622`.`a`]")),
+            context = ExpectedContext(
+              fragment = "a",
+              start = 32,
+              stop = 32
+            )
+          )
+        }
+      }
+
+      // Metastore table has only `A` field.
+      withTable(tableName) {
+        withSQLConf(SQLConf.CASE_SENSITIVE.key -> "false") {
+          sql(
+            s"""
+               |CREATE TABLE $tableName (A LONG) USING ORC LOCATION '$tableDir1'
+             """.stripMargin)
+
+          val ex = intercept[SparkException] {
+            sql(s"select A from $tableName where A < 0").collect()
+          }
+          assert(ex.getCondition.startsWith("FAILED_READ_FILE"))
+          assert(ex.getCause.isInstanceOf[SparkRuntimeException])
+          assert(ex.getCause.getMessage.contains(
+            """Found duplicate field(s) "A": [A, a] in case-insensitive mode"""))
+        }
+      }
+
+      // Physical ORC files have only `A` field.
+      val tableDir2 = s"${dir.getAbsoluteFile}/table2"
+      withSQLConf(SQLConf.CASE_SENSITIVE.key -> "true") {
+        spark.range(count).repartition(count).selectExpr("id - 1 as A")
+          .write.mode("overwrite").orc(tableDir2)
+      }
+
+      withTable(tableName) {
+        withSQLConf(SQLConf.CASE_SENSITIVE.key -> "false") {
+          sql(
+            s"""
+               |CREATE TABLE $tableName (a LONG) USING ORC LOCATION '$tableDir2'
+             """.stripMargin)
+
+          checkAnswer(sql(s"select a from $tableName"), (0 until count).map(c => Row(c - 1)))
+
+          val actual = stripSparkFilter(sql(s"select a from $tableName where a < 0"))
+          assert(actual.count() == 1)
+        }
+      }
+
+      withTable(tableName) {
+        withSQLConf(SQLConf.CASE_SENSITIVE.key -> "true") {
+          sql(
+            s"""
+               |CREATE TABLE $tableName (A LONG) USING ORC LOCATION '$tableDir2'
+             """.stripMargin)
+
+          checkAnswer(sql(s"select A from $tableName"), (0 until count).map(c => Row(c - 1)))
+
+          val actual = stripSparkFilter(sql(s"select A from $tableName where A < 0"))
+          assert(actual.count() == 1)
+        }
+      }
+    }
+  }
+
+  test("SPARK-32646: Case-insensitive field resolution for pushdown when reading ORC") {
+    import org.apache.spark.sql.sources._
+
+    def getOrcFilter(
+        schema: StructType,
+        filters: Seq[Filter],
+        caseSensitive: String): Option[SearchArgument] = {
+      var orcFilter: Option[SearchArgument] = None
+      withSQLConf(SQLConf.CASE_SENSITIVE.key -> caseSensitive) {
+        orcFilter =
+          OrcFilters.createFilter(schema, filters)
+      }
+      orcFilter
+    }
+
+    def testFilter(
+        schema: StructType,
+        filters: Seq[Filter],
+        expected: SearchArgument): Unit = {
+      val caseSensitiveFilters = getOrcFilter(schema, filters, "true")
+      val caseInsensitiveFilters = getOrcFilter(schema, filters, "false")
+
+      assert(caseSensitiveFilters.isEmpty)
+      assert(caseInsensitiveFilters.isDefined)
+
+      assert(!caseInsensitiveFilters.get.getLeaves().isEmpty)
+      assert(caseInsensitiveFilters.get.getLeaves().size() == expected.getLeaves().size())
+      (0 until expected.getLeaves().size()).foreach { index =>
+        assert(caseInsensitiveFilters.get.getLeaves().get(index) == expected.getLeaves().get(index))
+      }
+    }
+
+    val schema1 = StructType(Seq(StructField("cint", IntegerType)))
+    testFilter(schema1, Seq(GreaterThan("CINT", 1)),
+      newBuilder.startNot()
+        .lessThanEquals("cint", OrcFilters.getPredicateLeafType(IntegerType), 1L).`end`().build())
+    testFilter(schema1, Seq(
+      And(GreaterThan("CINT", 1), EqualTo("Cint", 2))),
+      newBuilder.startAnd()
+        .startNot()
+        .lessThanEquals("cint", OrcFilters.getPredicateLeafType(IntegerType), 1L).`end`()
+        .equals("cint", OrcFilters.getPredicateLeafType(IntegerType), 2L)
+        .`end`().build())
+
+    // Nested column case
+    val schema2 = StructType(Seq(StructField("a",
+      StructType(Seq(StructField("cint", IntegerType))))))
+
+    testFilter(schema2, Seq(GreaterThan("A.CINT", 1)),
+      newBuilder.startNot()
+        .lessThanEquals("a.cint", OrcFilters.getPredicateLeafType(IntegerType), 1L).`end`().build())
+    testFilter(schema2, Seq(GreaterThan("a.CINT", 1)),
+      newBuilder.startNot()
+        .lessThanEquals("a.cint", OrcFilters.getPredicateLeafType(IntegerType), 1L).`end`().build())
+    testFilter(schema2, Seq(GreaterThan("A.cint", 1)),
+      newBuilder.startNot()
+        .lessThanEquals("a.cint", OrcFilters.getPredicateLeafType(IntegerType), 1L).`end`().build())
+    testFilter(schema2, Seq(
+      And(GreaterThan("a.CINT", 1), EqualTo("a.Cint", 2))),
+      newBuilder.startAnd()
+        .startNot()
+        .lessThanEquals("a.cint", OrcFilters.getPredicateLeafType(IntegerType), 1L).`end`()
+        .equals("a.cint", OrcFilters.getPredicateLeafType(IntegerType), 2L)
+        .`end`().build())
+  }
+
+  test("SPARK-58814: CHAR/VARCHAR filters use the ORC string predicate type") {
+    assert(OrcFilters.getPredicateLeafType(CharType(5)) === PredicateLeaf.Type.STRING)
+    assert(OrcFilters.getPredicateLeafType(VarcharType(7)) === PredicateLeaf.Type.STRING)
+  }
+}

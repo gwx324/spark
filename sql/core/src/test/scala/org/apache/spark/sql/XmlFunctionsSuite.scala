@@ -1,0 +1,808 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql
+
+import java.text.SimpleDateFormat
+import java.time.{LocalDateTime, ZoneOffset}
+import java.util.Locale
+
+import scala.jdk.CollectionConverters._
+
+import org.apache.spark.SparkException
+import org.apache.spark.sql.catalyst.util.TimestampNanosTestUtils
+import org.apache.spark.sql.catalyst.util.TimestampNanosTestUtils.foreachNanosPrecision
+import org.apache.spark.sql.execution.WholeStageCodegenExec
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.test.SharedSparkSession
+import org.apache.spark.sql.types._
+
+class XmlFunctionsSuite extends SharedSparkSession {
+  import testImplicits._
+
+  test("from_xml") {
+    val df = Seq("""<ROW><a>1</a></ROW>""").toDS()
+    val schema = new StructType().add("a", IntegerType)
+
+    checkAnswer(
+      df.select(from_xml($"value", schema)),
+      Row(Row(1)) :: Nil)
+  }
+
+  test("SPARK-57164: from_xml with a nanos timestamp DDL schema string") {
+    val df = Seq("""<ROW><c>2020-01-01T00:00:00.123456789</c></ROW>""").toDF("value")
+    // FAILFAST so the value-converter rejection propagates instead of becoming a corrupt record.
+    // Pin the session timezone to UTC so LTZ values are predictable without a zone in the string.
+    val options = Map("mode" -> "FAILFAST").asJava
+    withSQLConf(
+      SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "true",
+      SQLConf.SESSION_LOCAL_TIMEZONE.key -> "UTC") {
+      foreachNanosPrecision { p =>
+        val truncator = TimestampNanosTestUtils.nanoOfSecTruncator(p)
+        val truncNanos = truncator(123456789)
+        val expectedNTZ = LocalDateTime.of(2020, 1, 1, 0, 0, 0, truncNanos)
+        val expectedLTZ = expectedNTZ.toInstant(ZoneOffset.UTC)
+        Seq(
+          s"TIMESTAMP_NTZ($p)" -> (TimestampNTZNanosType(p), expectedNTZ.asInstanceOf[Any]),
+          s"TIMESTAMP_LTZ($p)" -> (TimestampLTZNanosType(p), expectedLTZ.asInstanceOf[Any]),
+          s"TIMESTAMP($p) WITHOUT TIME ZONE" ->
+            (TimestampNTZNanosType(p), expectedNTZ.asInstanceOf[Any]),
+          s"TIMESTAMP($p) WITH LOCAL TIME ZONE" ->
+            (TimestampLTZNanosType(p), expectedLTZ.asInstanceOf[Any])).foreach {
+          case (spelling, (expectedType, expectedVal)) =>
+            val parsed = df.select(from_xml($"value", s"c $spelling", options).as("v"))
+            // The schema string resolves to the nanos type ...
+            val parsedType = parsed.schema("v").dataType.asInstanceOf[StructType]("c").dataType
+            assert(parsedType === expectedType)
+            // ... the XML datasource parses the value and round-trips to the expected value.
+            checkAnswer(parsed, Row(Row(expectedVal)) :: Nil)
+        }
+      }
+    }
+  }
+
+  test("SPARK-57458: from_xml rejects zoned input for NTZ nanos columns") {
+    // A string with an explicit zone offset must be rejected for TIMESTAMP_NTZ(p) because
+    // the NTZ parse path uses allowTimeZone=false, matching the micro NTZ and CSV behaviour.
+    val df = Seq("""<ROW><c>2020-01-01T00:00:00.123456789+05:00</c></ROW>""").toDF("value")
+    val options = Map("mode" -> "FAILFAST").asJava
+    withSQLConf(SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "true") {
+      foreachNanosPrecision { p =>
+        val parsed = df.select(from_xml($"value", s"c TIMESTAMP_NTZ($p)", options).as("v"))
+        intercept[SparkException] {
+          parsed.collect()
+        }
+      }
+    }
+  }
+
+  test("SPARK-48300: from_xml - Codegen Support") {
+    withTempView("XmlToStructsTable") {
+      val dataDF = Seq("""<ROW><a>1</a></ROW>""").toDF("value")
+      dataDF.createOrReplaceTempView("XmlToStructsTable")
+      val df = sql("SELECT from_xml(value, 'a INT') FROM XmlToStructsTable")
+      assert(df.queryExecution.executedPlan.isInstanceOf[WholeStageCodegenExec])
+      checkAnswer(df, Row(Row(1)) :: Nil)
+    }
+  }
+
+  test("from_xml variant output honors the parse mode") {
+    // A raw control char (code 5, ENQ) in XML text is illegal in XML 1.0 and the parser rejects
+    // it. Before the fix the variant path bypassed FailureSafeParser, so the parse `mode` had no
+    // effect and a malformed record aborted the whole query.
+    val badRec = "<Event>ab" + 5.toChar + "cd</Event>"
+    val goodRec = "<Event><a>1</a></Event>"
+    val df = Seq(badRec, goodRec).toDF("value")
+    df.createOrReplaceTempView("from_xml_variant_mode")
+
+    // Exercise both the interpreted path and whole-stage codegen.
+    Seq("true", "false").foreach { wholeStage =>
+      withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> wholeStage) {
+        // PERMISSIVE: the good record parses, the malformed record is rescued to null. Compare
+        // to_json of the variant so the expected value is concrete; key off `value` since row
+        // order is not guaranteed.
+        checkAnswer(
+          spark.sql("SELECT value, to_json(from_xml(value, 'variant', " +
+            "map('rowTag','Event','mode','PERMISSIVE'))) AS json FROM from_xml_variant_mode"),
+          Seq(Row(goodRec, "{\"a\":1}"), Row(badRec, null)))
+
+        // FAILFAST: the malformed record aborts the query.
+        checkError(
+          exception = intercept[SparkException] {
+            spark.sql("SELECT from_xml(value, 'variant', " +
+              "map('rowTag','Event','mode','FAILFAST')) AS d FROM from_xml_variant_mode").collect()
+          },
+          condition = "MALFORMED_RECORD_IN_PARSING.WITHOUT_SUGGESTION",
+          parameters = Map("badRecord" -> "[null]", "failFastMode" -> "FAILFAST"))
+      }
+    }
+  }
+
+  test("from_xml variant output validates each record against rowValidationXSDPath") {
+    val xsdPath =
+      getTestResourcePath("test-data/xml-resources/basket.xsd").replace("file:/", "/")
+    // The first record satisfies basket.xsd; the second has an element not allowed by the schema.
+    val valid = "<basket><entry><key>1</key><value>fork</value></entry></basket>"
+    val invalid = "<basket><unexpected>x</unexpected></basket>"
+    val df = Seq(valid, invalid).toDF("value")
+    df.createOrReplaceTempView("from_xml_xsd")
+
+    Seq("true", "false").foreach { wholeStage =>
+      withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> wholeStage) {
+        val result = spark.sql("SELECT value, to_json(from_xml(value, 'variant', " +
+          s"map('rowTag','basket','rowValidationXSDPath','$xsdPath'))) AS json FROM from_xml_xsd")
+          .collect().map(r => r.getString(0) -> r.getString(1)).toMap
+        assert(result(invalid) == null,
+          s"XSD-invalid record should be rescued to null (wholeStageCodegen=$wholeStage)")
+        assert(result(valid) != null && result(valid).contains("fork"),
+          s"XSD-valid record should parse (wholeStageCodegen=$wholeStage), got: ${result(valid)}")
+      }
+    }
+  }
+
+  test("from_xml with option (timestampFormat)") {
+    val df = Seq("""<ROW><time>26/08/2015 18:00</time></ROW>""").toDS()
+    val schema = new StructType().add("time", TimestampType)
+    val options = Map("timestampFormat" -> "dd/MM/yyyy HH:mm").asJava
+
+    checkAnswer(
+      df.select(from_xml($"value", schema, options)),
+      Row(Row(java.sql.Timestamp.valueOf("2015-08-26 18:00:00.0"))))
+  }
+
+  test("from_xml with option (rowTag)") {
+    val df = Seq("""<foo><a>1</a></foo>""").toDS()
+    val schema = new StructType().add("a", IntegerType)
+    val options = Map("rowTag" -> "foo").asJava
+
+    checkAnswer(
+      df.select(from_xml($"value", schema, options)),
+      Row(Row(1)) :: Nil)
+  }
+
+  test("from_xml with option (dateFormat)") {
+    val df = Seq("""<ROW><time>26/08/2015</time></ROW>""").toDS()
+    val schema = new StructType().add("time", DateType)
+    val options = Map("dateFormat" -> "dd/MM/yyyy").asJava
+
+    checkAnswer(
+      df.select(from_xml($"value", schema, options)),
+      Row(Row(java.sql.Date.valueOf("2015-08-26"))))
+  }
+
+  test("from_xml missing columns") {
+    val df = Seq("""<ROW><a>1</a></ROW>""").toDS()
+    val schema = new StructType().add("b", IntegerType)
+
+    checkAnswer(
+      df.select(from_xml($"value", schema)),
+      Row(Row(null)) :: Nil)
+  }
+
+  test("from_xml invalid xml") {
+    val df = Seq("""<ROW><a>1</ROW>""").toDS()
+    val schema = new StructType().add("a", IntegerType)
+
+    checkAnswer(
+      df.select(from_xml($"value", schema)),
+      Row(Row(null)) :: Nil)
+  }
+
+  test("from_xml - xml doesn't conform to the array type") {
+    val df = Seq("""<ROW><a>1</ROW>""").toDS()
+    val schema = StructType(StructField("a", ArrayType(IntegerType)) :: Nil)
+
+    checkAnswer(df.select(from_xml($"value", schema)), Row(Row(null)))
+  }
+
+  test("from_xml array support") {
+    val df = Seq(s"""<ROW> <a>1</a> <a>2</a> </ROW>""".stripMargin).toDS()
+    val schema = StructType(StructField("a", ArrayType(IntegerType)) :: Nil)
+
+    checkAnswer(
+      df.select(from_xml($"value", schema)),
+      Row(Row(Array(1, 2))))
+  }
+
+  test("from_xml uses DDL strings for defining a schema - java") {
+    val df = Seq("""<ROW> <a>1</a> <b>haa</b> </ROW>""").toDS()
+    checkAnswer(
+      df.select(from_xml($"value", "a INT, b STRING", new java.util.HashMap[String, String]())),
+      Row(Row(1, "haa")) :: Nil)
+  }
+
+  test("SPARK-48363: from_xml with non struct schema") {
+    checkError(
+      exception = intercept[AnalysisException] {
+        Seq("1").toDS().select(from_xml($"value", lit("ARRAY<int>"), Map[String, String]().asJava))
+      },
+      condition = "DATATYPE_MISMATCH.INVALID_XML_SCHEMA",
+      parameters = Map(
+        "schema" -> "\"ARRAY<INT>\"",
+        "sqlExpr" -> "\"from_xml(value)\""
+      ),
+      context = ExpectedContext(fragment = "from_xml", getCurrentClassCallSitePattern)
+    )
+
+    checkError(
+      exception = intercept[AnalysisException] {
+        Seq("1").toDF("xml").selectExpr(s"from_xml(xml, 'ARRAY<int>')")
+      },
+      condition = "DATATYPE_MISMATCH.INVALID_XML_SCHEMA",
+      parameters = Map(
+        "schema" -> "\"ARRAY<INT>\"",
+        "sqlExpr" -> "\"from_xml(xml)\""
+      ),
+      context = ExpectedContext(
+        fragment = "from_xml(xml, 'ARRAY<int>')",
+        start = 0,
+        stop = 26
+      )
+    )
+  }
+
+  test("to_xml - struct") {
+    val schema = StructType(StructField("a", IntegerType, nullable = false) :: Nil)
+    val data = Seq(Row(1))
+    val df = spark.createDataFrame(spark.sparkContext.parallelize(data), schema)
+      .withColumn("a", struct($"a"))
+
+    val expected =
+      s"""|<ROW>
+          |    <a>1</a>
+          |</ROW>""".stripMargin
+    checkAnswer(
+      df.select(to_xml($"a")),
+      Row(expected) :: Nil)
+  }
+
+  test("to_xml ISO default - old dates") {
+    withSQLConf("spark.sql.session.timeZone" -> "America/Los_Angeles") {
+      val schema = StructType(StructField("a", TimestampType, nullable = false) :: Nil)
+      val data = Seq(Row(java.sql.Timestamp.valueOf("1800-01-01 00:00:00.0")))
+      val df = spark.createDataFrame(spark.sparkContext.parallelize(data), schema)
+        .withColumn("a", struct($"a"))
+
+      val expected =
+        s"""|<ROW>
+            |    <a>1800-01-01T00:00:00.000-07:52:58</a>
+            |</ROW>""".stripMargin
+      checkAnswer(
+        df.select(to_xml($"a")),
+        Row(expected) :: Nil)
+    }
+  }
+
+  test("to_xml with option (timestampFormat)") {
+    val options = Map("timestampFormat" -> "dd/MM/yyyy HH:mm")
+    val schema = StructType(StructField("a", TimestampType, nullable = false) :: Nil)
+    val data = Seq(Row(java.sql.Timestamp.valueOf("2015-08-26 18:00:00.0")))
+    val df = spark.createDataFrame(spark.sparkContext.parallelize(data), schema)
+      .withColumn("a", struct($"a"))
+
+    val expected =
+      s"""|<ROW>
+          |    <a>26/08/2015 18:00</a>
+          |</ROW>""".stripMargin
+    checkAnswer(
+      df.select(to_xml($"a", options.asJava)),
+      Row(expected) :: Nil)
+  }
+
+  test("to_xml with option (dateFormat)") {
+    val options = Map("dateFormat" -> "dd/MM/yyyy")
+    val schema = StructType(StructField("a", DateType, nullable = false) :: Nil)
+    val data = Seq(Row(java.sql.Date.valueOf("2015-08-26")))
+    val df = spark.createDataFrame(spark.sparkContext.parallelize(data), schema)
+      .withColumn("a", struct($"a"))
+
+    val expected =
+      s"""|<ROW>
+          |    <a>26/08/2015</a>
+          |</ROW>""".stripMargin
+    checkAnswer(
+      df.select(to_xml($"a", options.asJava)),
+      Row(expected) :: Nil)
+  }
+
+  test("roundtrip in to_xml and from_xml - struct") {
+    val schemaOne = StructType(StructField("a", IntegerType, nullable = false) :: Nil)
+    val dataOne = Seq(Row(1, 2, 3))
+    val df1 = spark.createDataFrame(spark.sparkContext.parallelize(dataOne), schemaOne)
+      .withColumn("a", struct($"a"))
+    val readBackOne = df1.select(to_xml($"a").as("xml"))
+      .select(from_xml($"xml", schemaOne).as("a"))
+    checkAnswer(df1, readBackOne)
+
+    val xml =
+      s"""|<ROW>
+          |    <a>1</a>
+          |</ROW>""".stripMargin
+    val schemaTwo = new StructType().add("a", IntegerType)
+    val dfTwo = Seq(Some(xml), None).toDF("xml")
+    val readBackTwo = dfTwo.select(from_xml($"xml", schemaTwo).as("struct"))
+      .select(to_xml($"struct").as("xml"))
+    checkAnswer(dfTwo, readBackTwo)
+  }
+
+  test("roundtrip in to_xml and from_xml - array") {
+    val schemaOne = StructType(StructField("a", ArrayType(IntegerType), nullable = false) :: Nil)
+    val dataOne = Seq(Row(Array(1, 2, 3)))
+    val df1 = spark.createDataFrame(spark.sparkContext.parallelize(dataOne), schemaOne)
+      .withColumn("a", struct($"a"))
+    val readBackOne = df1.select(to_xml($"a").as("xml"))
+      .select(from_xml($"xml", schemaOne).as("a"))
+    checkAnswer(df1, readBackOne)
+
+    val xml =
+      s"""|<ROW>
+          |    <a>1</a>
+          |    <a>2</a>
+          |</ROW>""".stripMargin
+    val schemaTwo = new StructType().add("a", ArrayType(IntegerType))
+    val dfTwo = Seq(Some(xml), None).toDF("xml")
+    val readBackTwo = dfTwo.select(from_xml($"xml", schemaTwo).as("struct"))
+      .select(to_xml($"struct").as("xml"))
+    checkAnswer(dfTwo, readBackTwo)
+  }
+
+  test("SPARK-57458: to_xml with nanos timestamp types") {
+    withSQLConf(
+        SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "true",
+        SQLConf.SESSION_LOCAL_TIMEZONE.key -> "UTC") {
+      foreachNanosPrecision { p =>
+        // The pattern must carry `p` fractional digits to emit the full declared precision; the
+        // stored value is truncated to precision `p`, so the rendered fraction is the first
+        // `p` digits of 123456789.
+        val fracPat = "S" * p
+        val frac = "123456789".take(p)
+        val ldt = LocalDateTime.of(2020, 1, 1, 0, 0, 0, 123456789)
+        Seq(
+          (TimestampNTZNanosType(p): DataType, "timestampNTZFormat",
+            s"yyyy-MM-dd'T'HH:mm:ss.$fracPat", ldt: Any,
+            s"2020-01-01T00:00:00.$frac"),
+          (TimestampLTZNanosType(p): DataType, "timestampFormat",
+            s"yyyy-MM-dd'T'HH:mm:ss.${fracPat}XXX", ldt.toInstant(ZoneOffset.UTC): Any,
+            s"2020-01-01T00:00:00.${frac}Z")).foreach {
+          case (nanosType, optKey, fmt, value, expectedTs) =>
+            val schema = new StructType().add("ts", nanosType)
+            val df = spark.createDataFrame(
+              spark.sparkContext.parallelize(Seq(Row(value))), schema)
+            val expectedXml =
+              s"""|<ROW>
+                  |    <ts>$expectedTs</ts>
+                  |</ROW>""".stripMargin
+            checkAnswer(
+              df.select(to_xml(struct($"ts"), Map(optKey -> fmt).asJava)),
+              Row(expectedXml))
+        }
+      }
+    }
+  }
+
+  test("SPARK-57458: roundtrip in to_xml and from_xml - nanos timestamps") {
+    withSQLConf(
+        SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "true",
+        SQLConf.SESSION_LOCAL_TIMEZONE.key -> "UTC") {
+      foreachNanosPrecision { p =>
+        val fracPat = "S" * p
+        val ldt = LocalDateTime.of(2020, 1, 1, 0, 0, 0, 123456789)
+        Seq(
+          (TimestampNTZNanosType(p): DataType, "timestampNTZFormat",
+            s"yyyy-MM-dd'T'HH:mm:ss.$fracPat", ldt: Any),
+          (TimestampLTZNanosType(p): DataType, "timestampFormat",
+            s"yyyy-MM-dd'T'HH:mm:ss.${fracPat}XXX", ldt.toInstant(ZoneOffset.UTC): Any)).foreach {
+          case (nanosType, optKey, fmt, value) =>
+            val schema = new StructType().add("ts", nanosType)
+            val df = spark.createDataFrame(
+              spark.sparkContext.parallelize(Seq(Row(value))), schema)
+            val options = Map(optKey -> fmt).asJava
+            // The input column already carries precision `p`, so the to_xml -> from_xml
+            // round-trip with a `p`-digit pattern is loss-free.
+            val readBack = df
+              .select(to_xml(struct($"ts"), options).as("xml"))
+              .select(from_xml($"xml", schema, options).as("data"))
+              .select($"data.ts".as("ts"))
+            checkAnswer(readBack, df.select($"ts"))
+        }
+      }
+    }
+  }
+
+  test("Support to_xml in SQL") {
+    val schemaOne = StructType(StructField("a", IntegerType, nullable = false) :: Nil)
+    val dataOne = Seq(Row(1))
+    val df1 = spark.createDataFrame(spark.sparkContext.parallelize(dataOne), schemaOne)
+      .withColumn("a", struct($"a"))
+    val xml =
+      s"""|<ROW>
+          |    <a>1</a>
+          |</ROW>""".stripMargin
+    checkAnswer (
+      df1.selectExpr("to_xml(a)"),
+      Row(xml) :: Nil)
+
+    val xml2 =
+      s"""|<ROW>
+          |    <a>26/08/2015 18:00</a>
+          |</ROW>""".stripMargin
+    val schema2 = StructType(StructField("a", TimestampType, nullable = false) :: Nil)
+    val dataTwo = Seq(Row(java.sql.Timestamp.valueOf("2015-08-26 18:00:00.0")))
+    val df2 = spark.createDataFrame(spark.sparkContext.parallelize(dataTwo), schema2)
+      .withColumn("a", struct($"a"))
+    checkAnswer(
+      df2.selectExpr("to_xml(a, map('timestampFormat', 'dd/MM/yyyy HH:mm'))"),
+      Row(xml2) :: Nil)
+
+    checkError(
+      exception = intercept[AnalysisException] {
+        df2.selectExpr("to_xml(a, named_struct('a', 1))")
+      },
+      condition = "INVALID_OPTIONS.NON_MAP_FUNCTION",
+      parameters = Map.empty,
+      context = ExpectedContext(
+        fragment = "to_xml(a, named_struct('a', 1))",
+        start = 0,
+        stop = 30
+      )
+    )
+
+    checkError(
+      exception = intercept[AnalysisException] {
+        df2.selectExpr("to_xml(a, map('a', 1))")
+      },
+      condition = "INVALID_OPTIONS.NON_STRING_TYPE",
+      parameters = Map("mapType" -> "\"MAP<STRING, INT>\""),
+      context = ExpectedContext(
+        fragment = "to_xml(a, map('a', 1))",
+        start = 0,
+        stop = 21
+      )
+    )
+
+  }
+
+  test("SPARK-59801: XML functions with non-foldable options") {
+    val df = Seq((Tuple1(1), "<ROW><a>1</a></ROW>", "ROW"))
+      .toDF("a", "xml", "rowTag")
+    val nonFoldableQueries = Seq(
+      "from_xml" -> "from_xml(xml, 'a INT', map('rowTag', rowTag))",
+      "to_xml" -> "to_xml(a, map('rowTag', rowTag))",
+      "schema_of_xml" ->
+        "schema_of_xml('<ROW><a>1</a></ROW>', map('rowTag', rowTag))")
+
+    nonFoldableQueries.foreach { case (functionName, query) =>
+      checkError(
+        exception = intercept[AnalysisException] {
+          df.selectExpr(query)
+        },
+        condition = "NON_FOLDABLE_ARGUMENT",
+        parameters = Map(
+          "funcName" -> s"`$functionName`",
+          "paramName" -> "`options`",
+          "paramType" -> "\"MAP<STRING, STRING>\""),
+        context = ExpectedContext(
+          fragment = query,
+          start = 0,
+          stop = query.length - 1))
+    }
+  }
+
+  test("Support from_xml in SQL") {
+    val xml =
+      s"""|<ROW>
+          |    <a>1</a>
+          |</ROW>""".stripMargin
+    val df1 = Seq(xml).toDS()
+    checkAnswer(
+      df1.selectExpr("from_xml(value, 'a INT')"),
+      Row(Row(1)) :: Nil)
+
+    val xml2 =
+      s"""|<ROW>
+          |    <c0>a</c0>
+          |    <c1>1</c1>
+          |    <c2>
+          |        <c20>
+          |            3.8
+          |        </c20>
+          |        <c21>
+          |            8
+          |        </c21>
+          |    </c2>
+          |</ROW>""".stripMargin
+    val df2 = Seq(xml2).toDS()
+    checkAnswer(
+      df2.selectExpr("from_xml(value, 'c0 STRING, c1 INT, c2 STRUCT<c20: DOUBLE, c21: INT>')"),
+      Row(Row("a", 1, Row(3.8, 8))) :: Nil)
+
+    val xml3 =
+      s"""|<ROW>
+          |    <time>26/08/2015 18:00</time>
+          |</ROW>""".stripMargin
+    val df3 = Seq(xml3).toDS()
+    checkAnswer(
+      df3.selectExpr(
+        "from_xml(value, 'time Timestamp', map('timestampFormat', 'dd/MM/yyyy HH:mm'))"),
+      Row(Row(java.sql.Timestamp.valueOf("2015-08-26 18:00:00.0"))))
+
+    checkError(
+      exception = intercept[AnalysisException] {
+        df3.selectExpr("from_xml(value, 1)")
+      },
+      condition = "INVALID_SCHEMA.NON_STRING_LITERAL",
+      parameters = Map("inputSchema" -> "\"1\""),
+      context = ExpectedContext(
+        fragment = "from_xml(value, 1)",
+        start = 0,
+        stop = 17
+      )
+    )
+    checkError(
+      exception = intercept[AnalysisException] {
+        df3.selectExpr("""from_xml(value, 'time InvalidType')""")
+      },
+      condition = "PARSE_SYNTAX_ERROR",
+      sqlState = "42601",
+      parameters = Map(
+        "error" -> "'InvalidType'",
+        "hint" -> ""
+      ),
+      context = ExpectedContext(
+        fragment = "from_xml(value, 'time InvalidType')",
+        start = 0,
+        stop = 34
+      )
+    )
+    checkError(
+      exception = intercept[AnalysisException] {
+        df3.selectExpr("from_xml(value, 'time Timestamp', named_struct('a', 1))")
+      },
+      condition = "INVALID_OPTIONS.NON_MAP_FUNCTION",
+      parameters = Map.empty,
+      context = ExpectedContext(
+        fragment = "from_xml(value, 'time Timestamp', named_struct('a', 1))",
+        start = 0,
+        stop = 54
+      )
+    )
+    checkError(
+      exception = intercept[AnalysisException] {
+        df3.selectExpr("from_xml(value, 'time Timestamp', map('a', 1))")
+      },
+      condition = "INVALID_OPTIONS.NON_STRING_TYPE",
+      parameters = Map("mapType" -> "\"MAP<STRING, INT>\""),
+      context = ExpectedContext(
+        fragment = "from_xml(value, 'time Timestamp', map('a', 1))",
+        start = 0,
+        stop = 45
+      )
+    )
+  }
+
+  test("infers schemas of xml strings and pass them to from_xml") {
+    val xml =
+      s"""|<ROW>
+          |    <a>1</a>
+          |    <a>2</a>
+          |    <a>3</a>
+          |</ROW>""".stripMargin
+    val in = Seq(xml).toDS()
+    val out = in.select(from_xml($"value", schema_of_xml(xml)) as "parsed")
+    val expected = StructType(StructField(
+      "parsed",
+      StructType(StructField(
+        "a",
+        ArrayType(LongType, true), true) :: Nil),
+      true) :: Nil)
+
+    assert(out.schema == expected)
+  }
+
+  test("infers schemas using options") {
+    val df = spark.range(1)
+      .select(schema_of_xml(lit("<ROW><a>1</a></ROW>"),
+        Map("allowUnquotedFieldNames" -> "true").asJava))
+    checkAnswer(df, Seq(Row("STRUCT<a: BIGINT>")))
+  }
+
+  test("from_xml invalid xml - check modes") {
+    withSQLConf(SQLConf.COLUMN_NAME_OF_CORRUPT_RECORD.key -> "_unparsed") {
+      val schema = new StructType()
+        .add("a", IntegerType)
+        .add("b", IntegerType)
+        .add("_unparsed", StringType)
+      val badRec = """<ROW><a>1<b><2></b></ROW>"""
+      val df = Seq(badRec, """<ROW><a>2</a><b>12</b></ROW>""").toDS()
+
+      checkAnswer(
+        df.select(from_xml($"value", schema, Map("mode" -> "PERMISSIVE").asJava)),
+        Row(Row(null, null, badRec)) :: Row(Row(2, 12, null)) :: Nil)
+    }
+  }
+
+  test("SPARK-48296: to_xml - Codegen Support") {
+    withTempView("StructsToXmlTable") {
+      val schema = StructType(StructField("a", IntegerType, nullable = false) :: Nil)
+      val dataDF = spark.createDataFrame(Seq(Row(1)).asJava, schema).withColumn("a", struct($"a"))
+      dataDF.createOrReplaceTempView("StructsToXmlTable")
+      val df = sql("SELECT to_xml(a) FROM StructsToXmlTable")
+      val plan = df.queryExecution.executedPlan
+      assert(plan.isInstanceOf[WholeStageCodegenExec])
+      val expected =
+        s"""|<ROW>
+            |    <a>1</a>
+            |</ROW>""".stripMargin
+      checkAnswer(df, Seq(Row(expected)))
+    }
+  }
+
+  test("corrupt record column in the middle") {
+    val schema = new StructType()
+      .add("a", IntegerType)
+      .add("_unparsed", StringType)
+      .add("b", IntegerType)
+    val badRec = """<ROW><a>1</a><b>2</ROW>"""
+    val df = Seq(badRec, """<ROW><a>1</a><b>12</b></ROW>""").toDS()
+
+    checkAnswer(
+      df.select(from_xml($"value", schema, Map("columnNameOfCorruptRecord" -> "_unparsed").asJava)),
+      Row(Row(null, badRec, null)) :: Row(Row(1, null, null)) :: Nil)
+  }
+
+  test("parse timestamps with locale") {
+    Seq("en-US", "ko-KR", "zh-CN", "ru-RU").foreach { langTag =>
+      val locale = Locale.forLanguageTag(langTag)
+      val ts = new SimpleDateFormat("dd/MM/yyyy HH:mm").parse("06/11/2018 18:00")
+      val timestampFormat = "dd MMM yyyy HH:mm"
+      val sdf = new SimpleDateFormat(timestampFormat, locale)
+      val input = Seq(s"""<ROW><time>${sdf.format(ts)}</time></ROW>""").toDS()
+      val options = Map("timestampFormat" -> timestampFormat, "locale" -> langTag).asJava
+      val df = input.select(from_xml($"value", "time timestamp", options))
+
+      checkAnswer(df, Row(Row(java.sql.Timestamp.valueOf("2018-11-06 18:00:00.0"))))
+    }
+  }
+
+  test("from_xml - timestamp in micros") {
+    val df = Seq("""<ROW><time>1970-01-01T00:00:00.123456</time></ROW>""").toDS()
+    val schema = new StructType().add("time", TimestampType)
+    val options = Map("timestampFormat" -> "yyyy-MM-dd'T'HH:mm:ss.SSSSSS").asJava
+
+    checkAnswer(
+      df.select(from_xml($"value", schema, options)),
+      Row(Row(java.sql.Timestamp.valueOf("1970-01-01 00:00:00.123456"))))
+  }
+
+  test("to_xml - timestamp in micros") {
+    val s = "2019-11-18 11:56:00.123456"
+    val xml =
+      s"""|<ROW>
+          |    <t>$s</t>
+          |</ROW>""".stripMargin
+    val df = Seq(java.sql.Timestamp.valueOf(s)).toDF("t").select(
+      to_xml(struct($"t"), Map("timestampFormat" -> "yyyy-MM-dd HH:mm:ss.SSSSSS").asJava))
+    checkAnswer(df, Row(xml))
+  }
+
+  test("support foldable schema by from_xml") {
+    val options = Map[String, String]().asJava
+    val schema = regexp_replace(lit("dpt_org_id INT, dpt_org_city STRING"), "dpt_org_", "")
+    checkAnswer(
+      Seq("""<ROW><id>1</id><city>Moscow</city></ROW>""").toDS()
+        .select(from_xml($"value", schema, options)),
+      Row(Row(1, "Moscow")))
+
+    checkError(
+      exception = intercept[AnalysisException] {
+        Seq(("""<ROW><i>1</i></ROW>""", "i int")).toDF("xml", "schema")
+          .select(from_xml($"xml", $"schema", options)).collect()
+      },
+      condition = "INVALID_SCHEMA.NON_STRING_LITERAL",
+      parameters = Map("inputSchema" -> "\"schema\""),
+      context = ExpectedContext(fragment = "from_xml", getCurrentClassCallSitePattern)
+    )
+  }
+
+  test("schema_of_xml - infers the schema of foldable XML string") {
+    val input = regexp_replace(
+      lit("""<ROW><item_id>1</item_id><item_price>0.1</item_price></ROW>"""), "item_", "")
+    checkAnswer(
+      spark.range(1).select(schema_of_xml(input)),
+      Seq(Row("STRUCT<id: BIGINT, price: DOUBLE>")))
+  }
+
+  test("schema_of_xml - empty string as string") {
+    Seq("""<ROW><id></id></ROW>""").foreach { input =>
+      checkAnswer(
+        spark.range(1).select(schema_of_xml(input)),
+        Seq(Row("STRUCT<id: STRING>")))
+    }
+  }
+
+  test("optional datetime parser does not affect xml time formatting") {
+    val s = "2015-08-26 12:34:46"
+    def toDF(p: String): DataFrame = sql(
+      s"""
+         |SELECT
+         | to_xml(
+         |   named_struct('time', timestamp'$s'), map('timestampFormat', "$p")
+         | )
+         | """.stripMargin)
+    checkAnswer(toDF("yyyy-MM-dd'T'HH:mm:ss.SSSXXX"), toDF("yyyy-MM-dd'T'HH:mm:ss[.SSS][XXX]"))
+  }
+
+  test("from_xml/to_xml with TIME type - all precisions") {
+    import java.time.LocalTime
+
+    val testData = Seq(
+      (0, LocalTime.of(14, 30, 45), "14:30:45"),
+      (1, LocalTime.of(14, 30, 45, 100000000), "14:30:45.1"),
+      (2, LocalTime.of(14, 30, 45, 120000000), "14:30:45.12"),
+      (3, LocalTime.of(14, 30, 45, 123000000), "14:30:45.123"),
+      (4, LocalTime.of(14, 30, 45, 123400000), "14:30:45.1234"),
+      (5, LocalTime.of(14, 30, 45, 123450000), "14:30:45.12345"),
+      (6, LocalTime.of(14, 30, 45, 123456000), "14:30:45.123456"),
+      (7, LocalTime.of(14, 30, 45, 123456700), "14:30:45.1234567"),
+      (8, LocalTime.of(14, 30, 45, 123456780), "14:30:45.12345678"),
+      (9, LocalTime.of(14, 30, 45, 123456789), "14:30:45.123456789")
+    )
+
+    testData.foreach { case (precision, time, timeStr) =>
+      val schema = new StructType().add("time", TimeType(precision))
+
+      // Test from_xml
+      val xmlInput = s"""<record><time>$timeStr</time></record>"""
+      val parseResult = Seq(xmlInput).toDS()
+        .select(from_xml($"value", schema, Map("rowTag" -> "record").asJava))
+        .collect().head.getAs[Row](0).getAs[LocalTime](0)
+      assert(parseResult == time, s"from_xml failed for precision $precision")
+
+      // Test to_xml
+      val df = Seq(time).toDF("time").select($"time".cast(TimeType(precision)))
+      val xmlResult = df.select(to_xml(struct($"time"), Map("rowTag" -> "record").asJava))
+        .collect().head.getString(0)
+      assert(xmlResult.contains(timeStr), s"to_xml failed for precision $precision")
+
+      // Test roundtrip
+      val roundtrip = df
+        .select(to_xml(struct($"time"), Map("rowTag" -> "record").asJava).as("xml"))
+        .select(from_xml($"xml", schema, Map("rowTag" -> "record").asJava).as("struct"))
+        .select($"struct.time").collect().head.getAs[LocalTime](0)
+      assert(roundtrip == time, s"Roundtrip failed for precision $precision")
+    }
+
+    // Test custom format: HH-mm-ss.SSSSSS
+    val customTime = LocalTime.of(14, 30, 45, 123456000)
+    val customSchema = new StructType().add("time", TimeType(6))
+    val customOptions = Map("rowTag" -> "record", "timeFormat" -> "HH-mm-ss.SSSSSS").asJava
+
+    val customXmlInput = """<record><time>14-30-45.123456</time></record>"""
+    val customParseResult = Seq(customXmlInput).toDS()
+      .select(from_xml($"value", customSchema, customOptions))
+      .collect().head.getAs[Row](0).getAs[LocalTime](0)
+    assert(customParseResult == customTime, "Custom format from_xml failed")
+
+    val customDF = Seq(customTime).toDF("time").select($"time".cast(TimeType(6)))
+    val customRoundtrip = customDF
+      .select(to_xml(struct($"time"), customOptions).as("xml"))
+      .select(from_xml($"xml", customSchema, customOptions).as("struct"))
+      .select($"struct.time").collect().head.getAs[LocalTime](0)
+    assert(customRoundtrip == customTime, "Custom format roundtrip failed")
+  }
+}

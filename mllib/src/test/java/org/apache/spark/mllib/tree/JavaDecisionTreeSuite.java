@@ -20,13 +20,11 @@ package org.apache.spark.mllib.tree;
 import java.util.HashMap;
 import java.util.List;
 
-import org.junit.Assert;
-import org.junit.Test;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Test;
 
 import org.apache.spark.SharedSparkSession;
 import org.apache.spark.api.java.JavaRDD;
-import org.apache.spark.api.java.function.Function;
-import org.apache.spark.mllib.linalg.Vector;
 import org.apache.spark.mllib.regression.LabeledPoint;
 import org.apache.spark.mllib.tree.configuration.Algo;
 import org.apache.spark.mllib.tree.configuration.Strategy;
@@ -35,7 +33,8 @@ import org.apache.spark.mllib.tree.model.DecisionTreeModel;
 
 public class JavaDecisionTreeSuite extends SharedSparkSession {
 
-  int validatePrediction(List<LabeledPoint> validationData, DecisionTreeModel model) {
+  private static int validatePrediction(
+      List<LabeledPoint> validationData, DecisionTreeModel model) {
     int numCorrect = 0;
     for (LabeledPoint point : validationData) {
       Double prediction = model.predict(point.features());
@@ -63,7 +62,7 @@ public class JavaDecisionTreeSuite extends SharedSparkSession {
     DecisionTreeModel model = learner.run(rdd.rdd());
 
     int numCorrect = validatePrediction(arr, model);
-    Assert.assertTrue(numCorrect == rdd.count());
+    Assertions.assertEquals(numCorrect, rdd.count());
   }
 
   @Test
@@ -82,15 +81,10 @@ public class JavaDecisionTreeSuite extends SharedSparkSession {
     DecisionTreeModel model = DecisionTree$.MODULE$.train(rdd.rdd(), strategy);
 
     // java compatibility test
-    JavaRDD<Double> predictions = model.predict(rdd.map(new Function<LabeledPoint, Vector>() {
-      @Override
-      public Vector call(LabeledPoint v1) {
-        return v1.features();
-      }
-    }));
+    JavaRDD<Double> predictions = model.predict(rdd.map(LabeledPoint::features));
 
     int numCorrect = validatePrediction(arr, model);
-    Assert.assertTrue(numCorrect == rdd.count());
+    Assertions.assertEquals(numCorrect, rdd.count());
   }
 
 }

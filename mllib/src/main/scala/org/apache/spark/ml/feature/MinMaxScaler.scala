@@ -17,19 +17,17 @@
 
 package org.apache.spark.ml.feature
 
+import java.io.{DataInputStream, DataOutputStream}
+
 import org.apache.hadoop.fs.Path
 
 import org.apache.spark.annotation.Since
 import org.apache.spark.ml.{Estimator, Model}
-import org.apache.spark.ml.linalg.{Vector, Vectors, VectorUDT}
+import org.apache.spark.ml.linalg.{SQLDataTypes, Vector, Vectors}
 import org.apache.spark.ml.param.{DoubleParam, ParamMap, Params}
 import org.apache.spark.ml.param.shared.{HasInputCol, HasOutputCol}
+import org.apache.spark.ml.stat.Summarizer
 import org.apache.spark.ml.util._
-import org.apache.spark.mllib.linalg.{Vector => OldVector, Vectors => OldVectors}
-import org.apache.spark.mllib.linalg.VectorImplicits._
-import org.apache.spark.mllib.stat.Statistics
-import org.apache.spark.mllib.util.MLUtils
-import org.apache.spark.rdd.RDD
 import org.apache.spark.sql._
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.{StructField, StructType}
@@ -61,13 +59,15 @@ private[feature] trait MinMaxScalerParams extends Params with HasInputCol with H
   /** @group getParam */
   def getMax: Double = $(max)
 
+  setDefault(min -> 0.0, max -> 1.0)
+
   /** Validates and transforms the input schema. */
   protected def validateAndTransformSchema(schema: StructType): StructType = {
     require($(min) < $(max), s"The specified min(${$(min)}) is larger or equal to max(${$(max)})")
-    SchemaUtils.checkColumnType(schema, $(inputCol), new VectorUDT)
+    SchemaUtils.checkColumnType(schema, $(inputCol), SQLDataTypes.VectorType)
     require(!schema.fieldNames.contains($(outputCol)),
       s"Output column ${$(outputCol)} already exists.")
-    val outputFields = schema.fields :+ StructField($(outputCol), new VectorUDT, false)
+    val outputFields = schema.fields :+ StructField($(outputCol), SQLDataTypes.VectorType, false)
     StructType(outputFields)
   }
 
@@ -78,14 +78,15 @@ private[feature] trait MinMaxScalerParams extends Params with HasInputCol with H
  * statistics, which is also known as min-max normalization or Rescaling. The rescaled value for
  * feature E is calculated as:
  *
- * <p><blockquote>
+ * <blockquote>
  *    $$
  *    Rescaled(e_i) = \frac{e_i - E_{min}}{E_{max} - E_{min}} * (max - min) + min
  *    $$
- * </blockquote></p>
+ * </blockquote>
  *
- * For the case $E_{max} == E_{min}$, $Rescaled(e_i) = 0.5 * (max + min)$.
- * Note that since zero values will probably be transformed to non-zero values, output of the
+ * For the case \(E_{max} == E_{min}\), \(Rescaled(e_i) = 0.5 * (max + min)\).
+ *
+ * @note Since zero values will probably be transformed to non-zero values, output of the
  * transformer will be DenseVector even for sparse input.
  */
 @Since("1.5.0")
@@ -94,8 +95,6 @@ class MinMaxScaler @Since("1.5.0") (@Since("1.5.0") override val uid: String)
 
   @Since("1.5.0")
   def this() = this(Identifiable.randomUID("minMaxScal"))
-
-  setDefault(min -> 0.0, max -> 1.0)
 
   /** @group setParam */
   @Since("1.5.0")
@@ -116,11 +115,13 @@ class MinMaxScaler @Since("1.5.0") (@Since("1.5.0") override val uid: String)
   @Since("2.0.0")
   override def fit(dataset: Dataset[_]): MinMaxScalerModel = {
     transformSchema(dataset.schema, logging = true)
-    val input: RDD[OldVector] = dataset.select($(inputCol)).rdd.map {
-      case Row(v: Vector) => OldVectors.fromML(v)
-    }
-    val summary = Statistics.colStats(input)
-    copyValues(new MinMaxScalerModel(uid, summary.min, summary.max).setParent(this))
+
+    val Row(max: Vector, min: Vector) = dataset
+      .select(Summarizer.metrics("max", "min").summary(col($(inputCol))).as("summary"))
+      .select("summary.max", "summary.min")
+      .first()
+
+    copyValues(new MinMaxScalerModel(uid, min.compressed, max.compressed).setParent(this))
   }
 
   @Since("1.5.0")
@@ -144,8 +145,6 @@ object MinMaxScaler extends DefaultParamsReadable[MinMaxScaler] {
  *
  * @param originalMin min value for each original column during fitting
  * @param originalMax max value for each original column during fitting
- *
- * TODO: The transformer does not yet set the metadata in the output column (SPARK-8529).
  */
 @Since("1.5.0")
 class MinMaxScalerModel private[ml] (
@@ -155,6 +154,20 @@ class MinMaxScalerModel private[ml] (
   extends Model[MinMaxScalerModel] with MinMaxScalerParams with MLWritable {
 
   import MinMaxScalerModel._
+
+  // For ml connect only
+  private[ml] def this() = this("", Vectors.empty, Vectors.empty)
+
+  private[spark] override def estimatedSize: Long = {
+    var size = estimateMatadataSize
+    if (originalMin != null) {
+      size += originalMin.getSizeInBytes
+    }
+    if (originalMax != null) {
+      size += originalMax.getSizeInBytes
+    }
+    size
+  }
 
   /** @group setParam */
   @Since("1.5.0")
@@ -174,31 +187,54 @@ class MinMaxScalerModel private[ml] (
 
   @Since("2.0.0")
   override def transform(dataset: Dataset[_]): DataFrame = {
-    transformSchema(dataset.schema, logging = true)
-    val originalRange = (originalMax.asBreeze - originalMin.asBreeze).toArray
+    val outputSchema = transformSchema(dataset.schema, logging = true)
+
+    val numFeatures = originalMax.size
+    val scale = $(max) - $(min)
+    val minValue = $(min)
+
+    // transformed value for constant cols
+    val constantOutput = ($(min) + $(max)) / 2
     val minArray = originalMin.toArray
 
-    val reScale = udf { (vector: Vector) =>
-      val scale = $(max) - $(min)
-
-      // 0 in sparse vector will probably be rescaled to non-zero
-      val values = vector.toArray
-      val size = values.length
-      var i = 0
-      while (i < size) {
-        val raw = if (originalRange(i) != 0) (values(i) - minArray(i)) / originalRange(i) else 0.5
-        values(i) = raw * scale + $(min)
-        i += 1
-      }
-      Vectors.dense(values)
+    val scaleArray = Array.tabulate(numFeatures) { i =>
+      val range = originalMax(i) - originalMin(i)
+      // scaleArray(i) == 0 iff i-th col is constant (range == 0)
+      if (range != 0) scale / range else 0.0
     }
 
-    dataset.withColumn($(outputCol), reScale(col($(inputCol))))
+    val transformer = udf { vector: Vector =>
+      require(vector.size == numFeatures,
+        s"Number of features must be $numFeatures but got ${vector.size}")
+      // 0 in sparse vector will probably be rescaled to non-zero
+      val values = vector.toArray
+      var i = 0
+      while (i < numFeatures) {
+        if (!values(i).isNaN) {
+          if (scaleArray(i) != 0) {
+            values(i) = (values(i) - minArray(i)) * scaleArray(i) + minValue
+          } else {
+            // scaleArray(i) == 0 means i-th col is constant
+            values(i) = constantOutput
+          }
+        }
+        i += 1
+      }
+      Vectors.dense(values).compressed
+    }
+
+    dataset.withColumn($(outputCol), transformer(col($(inputCol))),
+      outputSchema($(outputCol)).metadata)
   }
 
   @Since("1.5.0")
   override def transformSchema(schema: StructType): StructType = {
-    validateAndTransformSchema(schema)
+    var outputSchema = validateAndTransformSchema(schema)
+    if ($(outputCol).nonEmpty) {
+      outputSchema = SchemaUtils.updateAttributeGroupSize(outputSchema,
+        $(outputCol), originalMin.size)
+    }
+    outputSchema
   }
 
   @Since("1.5.0")
@@ -209,21 +245,39 @@ class MinMaxScalerModel private[ml] (
 
   @Since("1.6.0")
   override def write: MLWriter = new MinMaxScalerModelWriter(this)
+
+  @Since("3.0.0")
+  override def toString: String = {
+    s"MinMaxScalerModel: uid=$uid, numFeatures=${originalMin.size}, min=${$(min)}, " +
+      s"max=${$(max)}"
+  }
 }
 
 @Since("1.6.0")
 object MinMaxScalerModel extends MLReadable[MinMaxScalerModel] {
+  private[ml] case class Data(originalMin: Vector, originalMax: Vector)
+
+  private[ml] def serializeData(data: Data, dos: DataOutputStream): Unit = {
+    import ReadWriteUtils._
+    serializeVector(data.originalMin, dos)
+    serializeVector(data.originalMax, dos)
+  }
+
+  private[ml] def deserializeData(dis: DataInputStream): Data = {
+    import ReadWriteUtils._
+    val originalMin = deserializeVector(dis)
+    val originalMax = deserializeVector(dis)
+    Data(originalMin, originalMax)
+  }
 
   private[MinMaxScalerModel]
   class MinMaxScalerModelWriter(instance: MinMaxScalerModel) extends MLWriter {
 
-    private case class Data(originalMin: Vector, originalMax: Vector)
-
     override protected def saveImpl(path: String): Unit = {
-      DefaultParamsWriter.saveMetadata(instance, path, sc)
-      val data = new Data(instance.originalMin, instance.originalMax)
+      DefaultParamsWriter.saveMetadata(instance, path, sparkSession)
+      val data = Data(instance.originalMin, instance.originalMax)
       val dataPath = new Path(path, "data").toString
-      sparkSession.createDataFrame(Seq(data)).repartition(1).write.parquet(dataPath)
+      ReadWriteUtils.saveObject[Data](dataPath, data, sparkSession, serializeData)
     }
   }
 
@@ -232,15 +286,11 @@ object MinMaxScalerModel extends MLReadable[MinMaxScalerModel] {
     private val className = classOf[MinMaxScalerModel].getName
 
     override def load(path: String): MinMaxScalerModel = {
-      val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
+      val metadata = DefaultParamsReader.loadMetadata(path, sparkSession, className)
       val dataPath = new Path(path, "data").toString
-      val data = sparkSession.read.parquet(dataPath)
-      val Row(originalMin: Vector, originalMax: Vector) =
-        MLUtils.convertVectorColumnsToML(data, "originalMin", "originalMax")
-          .select("originalMin", "originalMax")
-          .head()
-      val model = new MinMaxScalerModel(metadata.uid, originalMin, originalMax)
-      DefaultParamsReader.getAndSetParams(model, metadata)
+      val data = ReadWriteUtils.loadObject[Data](dataPath, sparkSession, deserializeData)
+      val model = new MinMaxScalerModel(metadata.uid, data.originalMin, data.originalMax)
+      metadata.getAndSetParams(model)
       model
     }
   }

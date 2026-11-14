@@ -18,7 +18,7 @@
 package org.apache.spark.mllib.tree.configuration
 
 import scala.beans.BeanProperty
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import org.apache.spark.annotation.Since
 import org.apache.spark.mllib.tree.configuration.Algo._
@@ -28,8 +28,8 @@ import org.apache.spark.mllib.tree.impurity.{Entropy, Gini, Impurity, Variance}
 /**
  * Stores all the configuration options for tree construction
  * @param algo  Learning goal.  Supported:
- *              [[org.apache.spark.mllib.tree.configuration.Algo.Classification]],
- *              [[org.apache.spark.mllib.tree.configuration.Algo.Regression]]
+ *              `org.apache.spark.mllib.tree.configuration.Algo.Classification`,
+ *              `org.apache.spark.mllib.tree.configuration.Algo.Regression`
  * @param impurity Criterion used for information gain calculation.
  *                 Supported for Classification: [[org.apache.spark.mllib.tree.impurity.Gini]],
  *                  [[org.apache.spark.mllib.tree.impurity.Entropy]].
@@ -43,9 +43,9 @@ import org.apache.spark.mllib.tree.impurity.{Entropy, Gini, Impurity, Variance}
  *                for choosing how to split on features at each node.
  *                More bins give higher granularity.
  * @param quantileCalculationStrategy Algorithm for calculating quantiles.  Supported:
- *                             [[org.apache.spark.mllib.tree.configuration.QuantileStrategy.Sort]]
+ *                             `org.apache.spark.mllib.tree.configuration.QuantileStrategy.Sort`
  * @param categoricalFeaturesInfo A map storing information about the categorical variables and the
- *                                number of discrete values they take. An entry (n -> k)
+ *                                number of discrete values they take. An entry (n to k)
  *                                indicates that feature n is categorical with k categories
  *                                indexed from 0: {0, 1, ..., k-1}.
  * @param minInstancesPerNode Minimum number of instances each child must have after split.
@@ -80,7 +80,10 @@ class Strategy @Since("1.3.0") (
     @Since("1.0.0") @BeanProperty var maxMemoryInMB: Int = 256,
     @Since("1.2.0") @BeanProperty var subsamplingRate: Double = 1,
     @Since("1.2.0") @BeanProperty var useNodeIdCache: Boolean = false,
-    @Since("1.2.0") @BeanProperty var checkpointInterval: Int = 10) extends Serializable {
+    @Since("1.2.0") @BeanProperty var checkpointInterval: Int = 10,
+    @Since("3.0.0") @BeanProperty var minWeightFractionPerNode: Double = 0.0,
+    @BeanProperty private[spark] var bootstrap: Boolean = false,
+    @BeanProperty private[spark] var pruneTree: Boolean = true) extends Serializable {
 
   /**
    */
@@ -93,8 +96,58 @@ class Strategy @Since("1.3.0") (
    */
   @Since("1.2.0")
   def isMulticlassWithCategoricalFeatures: Boolean = {
-    isMulticlassClassification && (categoricalFeaturesInfo.size > 0)
+    isMulticlassClassification && (categoricalFeaturesInfo.nonEmpty)
   }
+
+  // scalastyle:off argcount
+  /**
+   * Retains the constructor signature used before the pruning parameter was introduced.
+   */
+  def this(
+      algo: Algo,
+      impurity: Impurity,
+      maxDepth: Int,
+      numClasses: Int,
+      maxBins: Int,
+      quantileCalculationStrategy: QuantileStrategy,
+      categoricalFeaturesInfo: Map[Int, Int],
+      minInstancesPerNode: Int,
+      minInfoGain: Double,
+      maxMemoryInMB: Int,
+      subsamplingRate: Double,
+      useNodeIdCache: Boolean,
+      checkpointInterval: Int,
+      minWeightFractionPerNode: Double,
+      bootstrap: Boolean) = {
+    this(algo, impurity, maxDepth, numClasses, maxBins, quantileCalculationStrategy,
+      categoricalFeaturesInfo, minInstancesPerNode, minInfoGain, maxMemoryInMB,
+      subsamplingRate, useNodeIdCache, checkpointInterval, minWeightFractionPerNode,
+      bootstrap, pruneTree = true)
+  }
+
+  /**
+   * Backwards compatible constructor for [[org.apache.spark.mllib.tree.configuration.Strategy]]
+   */
+  @Since("1.0.0")
+  def this(
+      algo: Algo,
+      impurity: Impurity,
+      maxDepth: Int,
+      numClasses: Int,
+      maxBins: Int,
+      quantileCalculationStrategy: QuantileStrategy,
+      categoricalFeaturesInfo: Map[Int, Int],
+      minInstancesPerNode: Int,
+      minInfoGain: Double,
+      maxMemoryInMB: Int,
+      subsamplingRate: Double,
+      useNodeIdCache: Boolean,
+      checkpointInterval: Int) = {
+    this(algo, impurity, maxDepth, numClasses, maxBins, quantileCalculationStrategy,
+      categoricalFeaturesInfo, minInstancesPerNode, minInfoGain, maxMemoryInMB,
+      subsamplingRate, useNodeIdCache, checkpointInterval, 0.0)
+  }
+  // scalastyle:on argcount
 
   /**
    * Java-friendly constructor for [[org.apache.spark.mllib.tree.configuration.Strategy]]
@@ -106,9 +159,10 @@ class Strategy @Since("1.3.0") (
       maxDepth: Int,
       numClasses: Int,
       maxBins: Int,
-      categoricalFeaturesInfo: java.util.Map[java.lang.Integer, java.lang.Integer]) {
+      categoricalFeaturesInfo: java.util.Map[java.lang.Integer, java.lang.Integer]) = {
     this(algo, impurity, maxDepth, numClasses, maxBins, Sort,
-      categoricalFeaturesInfo.asInstanceOf[java.util.Map[Int, Int]].asScala.toMap)
+      categoricalFeaturesInfo.asInstanceOf[java.util.Map[Int, Int]].asScala.toMap,
+      minWeightFractionPerNode = 0.0)
   }
 
   /**
@@ -171,8 +225,11 @@ class Strategy @Since("1.3.0") (
   @Since("1.2.0")
   def copy: Strategy = {
     new Strategy(algo, impurity, maxDepth, numClasses, maxBins,
-      quantileCalculationStrategy, categoricalFeaturesInfo, minInstancesPerNode, minInfoGain,
-      maxMemoryInMB, subsamplingRate, useNodeIdCache, checkpointInterval)
+      quantileCalculationStrategy, categoricalFeaturesInfo, minInstancesPerNode,
+      minInfoGain, maxMemoryInMB, subsamplingRate, useNodeIdCache,
+      checkpointInterval, minWeightFractionPerNode,
+      bootstrap = bootstrap,
+      pruneTree = pruneTree)
   }
 }
 

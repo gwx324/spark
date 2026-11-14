@@ -17,39 +17,368 @@
 
 package org.apache.spark.sql.execution
 
-import org.apache.spark.sql.Row
-import org.apache.spark.sql.execution.aggregate.HashAggregateExec
-import org.apache.spark.sql.execution.joins.BroadcastHashJoinExec
-import org.apache.spark.sql.expressions.scalalang.typed
-import org.apache.spark.sql.functions.{avg, broadcast, col, max}
-import org.apache.spark.sql.test.SharedSQLContext
-import org.apache.spark.sql.types.{IntegerType, StringType, StructType}
+import java.math.{BigDecimal => JBigDecimal}
+import java.time.Duration
+import java.util.concurrent.{ConcurrentLinkedQueue, CountDownLatch, TimeUnit}
 
-class WholeStageCodegenSuite extends SparkPlanTest with SharedSQLContext {
+import scala.util.{Failure, Success, Try}
+
+import org.apache.logging.log4j.Level
+import org.scalatest.time.SpanSugar._
+
+import org.apache.spark.{SparkArithmeticException, SparkException, SparkNumberFormatException, SparkThrowable}
+import org.apache.spark.metrics.source.CodegenMetrics
+import org.apache.spark.rdd.{MapPartitionsWithEvaluatorRDD, RDD}
+import org.apache.spark.sql.{DataFrame, Dataset, Row, SaveMode}
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.expressions.{And, Attribute, Cast, CodegenObjectFactoryMode, Expression, IsNotNull, Literal, With}
+import org.apache.spark.sql.catalyst.expressions.codegen.{ByteCodeStats, CodeAndComment, CodegenContext, CodeGenerator, ExprCode, ExprValue, GlobalValue, JavaCode, WholeStageSplit, WholeStageSplitKey}
+import org.apache.spark.sql.catalyst.plans.logical.MergeRows
+import org.apache.spark.sql.catalyst.plans.logical.MergeRows.{Keep, Update}
+import org.apache.spark.sql.classic
+import org.apache.spark.sql.errors.DataTypeErrors.{toSQLConf, toSQLId}
+import org.apache.spark.sql.execution.adaptive.DisableAdaptiveExecutionSuite
+import org.apache.spark.sql.execution.aggregate.{HashAggregateExec, SortAggregateExec}
+import org.apache.spark.sql.execution.columnar.InMemoryTableScanExec
+import org.apache.spark.sql.execution.debug.{codegenString, codegenStringSeq}
+import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, BroadcastNestedLoopJoinExec, CartesianProductExec, ShuffledHashJoinExec, SortMergeAsOfJoinExec, SortMergeJoinExec}
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.test.SharedSparkSession
+import org.apache.spark.sql.types.{DayTimeIntervalType, DecimalType, DoubleType, FloatType, IntegerType, LongType, StringType, StructField, StructType}
+
+// Nested-struct fixtures for the SPARK-51356 test below. They are top-level so the Dataset
+// encoders resolve without an outer scope.
+case class Spark51356Inner(d: Int)
+case class Spark51356Mid(c: Spark51356Inner = null)
+case class Spark51356Outer(b: Spark51356Mid = null)
+
+// Disable AQE because the WholeStageCodegenExec is added when running QueryStageExec
+class WholeStageCodegenSuite extends SharedSparkSession
+  with DisableAdaptiveExecutionSuite {
+
+  import testImplicits._
 
   test("range/filter should be combined") {
     val df = spark.range(10).filter("id = 1").selectExpr("id + 1")
     val plan = df.queryExecution.executedPlan
-    assert(plan.find(_.isInstanceOf[WholeStageCodegenExec]).isDefined)
+    assert(plan.exists(_.isInstanceOf[WholeStageCodegenExec]))
     assert(df.collect() === Array(Row(2)))
   }
 
-  test("Aggregate should be included in WholeStageCodegen") {
-    val df = spark.range(10).groupBy().agg(max(col("id")), avg(col("id")))
+  test("HashAggregate should be included in WholeStageCodegen") {
+    val df = spark.range(10).agg(max(col("id")), avg(col("id")))
     val plan = df.queryExecution.executedPlan
-    assert(plan.find(p =>
+    assert(plan.exists(p =>
       p.isInstanceOf[WholeStageCodegenExec] &&
-        p.asInstanceOf[WholeStageCodegenExec].child.isInstanceOf[HashAggregateExec]).isDefined)
+        p.asInstanceOf[WholeStageCodegenExec].child.isInstanceOf[HashAggregateExec]))
     assert(df.collect() === Array(Row(9, 4.5)))
   }
 
-  test("Aggregate with grouping keys should be included in WholeStageCodegen") {
-    val df = spark.range(3).groupBy("id").count().orderBy("id")
+  test("SortAggregate should be included in WholeStageCodegen") {
+    val df = spark.range(10).agg(max(col("id")), avg(col("id")))
+    withSQLConf(SQLConf.USE_HASH_AGG.key -> "false") {
+      val plan = df.queryExecution.executedPlan
+      assert(plan.exists(p =>
+        p.isInstanceOf[WholeStageCodegenExec] &&
+          p.asInstanceOf[WholeStageCodegenExec].child.isInstanceOf[SortAggregateExec]))
+      assert(df.collect() === Array(Row(9, 4.5)))
+    }
+  }
+
+  // Runs `query` on `data` with sort aggregate forced and its code-gen enabled, asserts the plan
+  // actually uses a code-gen'd SortAggregateExec, and checks the result matches the interpreted
+  // (code-gen disabled) result.
+  private def checkSortAggregateCodegen(
+      data: Dataset[Row])(query: Dataset[Row] => Dataset[Row]): Unit = {
+    // Disable both hash-based aggregate operators so the planner always picks SortAggregateExec.
+    val forceSortAggregate = Seq(
+      SQLConf.USE_HASH_AGG.key -> "false",
+      SQLConf.USE_OBJECT_HASH_AGG.key -> "false")
+    val expected = withSQLConf(
+        (forceSortAggregate :+ (SQLConf.ENABLE_SORT_AGGREGATE_CODEGEN.key -> "false")): _*) {
+      val df = query(data)
+      assert(!df.queryExecution.executedPlan.exists(p =>
+        p.isInstanceOf[WholeStageCodegenExec] &&
+          p.asInstanceOf[WholeStageCodegenExec].child.isInstanceOf[SortAggregateExec]),
+        s"Expected no code-gen'd SortAggregateExec in:\n${df.queryExecution.executedPlan}")
+      df.collect()
+    }
+    withSQLConf(
+        (forceSortAggregate :+ (SQLConf.ENABLE_SORT_AGGREGATE_CODEGEN.key -> "true")): _*) {
+      val df = query(data)
+      assert(df.queryExecution.executedPlan.exists(p =>
+        p.isInstanceOf[WholeStageCodegenExec] &&
+          p.asInstanceOf[WholeStageCodegenExec].child.isInstanceOf[SortAggregateExec]),
+        s"Expected a code-gen'd SortAggregateExec in:\n${df.queryExecution.executedPlan}")
+      checkAnswer(df, expected)
+    }
+  }
+
+  test("SPARK-32750: SortAggregate code-gen with grouping keys") {
+    val data = spark.range(200).selectExpr(
+      "id",
+      "id % 7 as k1",
+      "id % 3 as k2",
+      "case when id % 5 = 0 then null else id end as v",
+      "case when id % 4 = 0 then null else cast(id % 11 as string) end as s")
+
+    // Exercise a variety of shapes: multiple/numeric/string grouping keys, null keys and values,
+    // single-row groups, a single all-rows group, and a downstream limit (which exercises the
+    // resumable `shouldStop` path in the generated produce loop).
+    checkSortAggregateCodegen(data) {
+      _.groupBy("k1", "k2")
+        .agg(count(col("v")), sum(col("v")), max(col("v")), min(col("v")))
+        .orderBy("k1", "k2")
+    }
+    // expression grouping keys, aggregates over expressions, and arithmetic on the results
+    checkSortAggregateCodegen(data) {
+      _.groupBy((col("k1") + col("k2")).as("k"))
+        .agg(
+          (sum(col("v") * lit(2)) + lit(1)).as("weighted"),
+          (max(col("v")) - min(col("v"))).as("spread"),
+          count(col("v")).as("cnt"))
+        .orderBy("k")
+    }
+    // aggregates with FILTER (WHERE) clauses
+    checkSortAggregateCodegen(data) {
+      _.groupBy("k1")
+        .agg(
+          expr("sum(v) FILTER (WHERE v > 50)"),
+          expr("count(v) FILTER (WHERE s IS NOT NULL)"),
+          avg(col("v")))
+        .orderBy("k1")
+    }
+    // string grouping key with nulls, followed by a HAVING-style filter on the aggregate
+    checkSortAggregateCodegen(data) {
+      _.groupBy("s").agg(count(col("v")).as("cnt"), sum(col("v")).as("total"))
+        .where(col("cnt") > 2)
+        .orderBy("s")
+    }
+    // count(distinct ...): rewritten to a two-round aggregation, both of which are sort aggregates
+    checkSortAggregateCodegen(data) {
+      _.groupBy("k2").agg(countDistinct(col("v")), sum(col("v"))).orderBy("k2")
+    }
+    // every row is its own group
+    checkSortAggregateCodegen(data)(_.groupBy("id").agg(max(col("v"))).orderBy("id"))
+    // a single group covering all rows
+    checkSortAggregateCodegen(data)(_.groupBy(lit(1)).agg(sum(col("v")), avg(col("v"))))
+    // downstream limit on top of the aggregate
+    checkSortAggregateCodegen(data)(_.groupBy("k1").agg(sum(col("v"))).orderBy("k1").limit(3))
+  }
+
+  test("SPARK-32750: SortAggregate code-gen with grouping keys - empty input") {
+    // No rows: a grouped aggregate over empty input must produce no output rows.
+    val data = spark.range(0).selectExpr("id", "id % 3 as k", "id as v")
+    checkSortAggregateCodegen(data)(_.groupBy("k").agg(sum(col("v")), count(col("v"))).orderBy("k"))
+  }
+
+  test("SPARK-32750: SortAggregate code-gen with grouping keys - single partition") {
+    // Force a single partition so all groups are produced within one task's scan.
+    val data = spark.range(50).repartition(1).selectExpr("id", "id % 4 as k", "id as v")
+    checkSortAggregateCodegen(data) {
+      _.groupBy((col("k") + lit(1)).as("k"))
+        .agg(
+          (sum(col("v")) + max(col("v"))).as("mixed"),
+          avg(col("v") * col("v")).as("avg_sq"),
+          expr("count(v) FILTER (WHERE v % 2 = 0)").as("evens"))
+        .orderBy("k")
+    }
+  }
+
+  test("SPARK-32750: SortAggregate code-gen with float/double grouping keys") {
+    // Float/double are binary-stable so they take the with-keys code-gen path, and group
+    // boundaries are detected via UnsafeRow.equals. Cover -0.0 (which must group with 0.0) and
+    // NaN (all NaNs must group together), whose canonicalization relies on the planner's
+    // NormalizeFloatingNumbers rule running before the keys reach UnsafeRow.
+    val rows = Seq(
+      Row(0.0d, 0.0f, 1L),
+      Row(-0.0d, -0.0f, 2L),
+      Row(Double.NaN, Float.NaN, 3L),
+      Row(java.lang.Double.longBitsToDouble(0x7ff8000000000001L),
+        java.lang.Float.intBitsToFloat(0x7fc00001), 4L),
+      Row(1.5d, 1.5f, 5L),
+      Row(1.5d, 1.5f, 6L),
+      Row(null, null, 7L))
+    val schema = StructType(Seq(
+      StructField("d", DoubleType),
+      StructField("f", FloatType),
+      StructField("v", LongType)))
+    val data = spark.createDataFrame(spark.sparkContext.parallelize(rows), schema)
+    checkSortAggregateCodegen(data) {
+      _.groupBy("d").agg(sum(col("v")), count(col("v"))).orderBy("d")
+    }
+    checkSortAggregateCodegen(data) {
+      _.groupBy("f").agg(sum(col("v")), count(col("v"))).orderBy("f")
+    }
+    checkSortAggregateCodegen(data) {
+      _.groupBy("d", "f").agg(sum(col("v"))).orderBy("d", "f")
+    }
+  }
+
+  test("SPARK-32750: SortAggregate code-gen with decimal grouping keys") {
+    // Decimal is binary-stable and takes the with-keys code-gen path. Include nulls.
+    val data = spark.range(200).selectExpr(
+      "id",
+      "cast(id % 5 as decimal(10, 2)) as k",
+      "case when id % 6 = 0 then null else cast(id as decimal(20, 4)) end as v")
+    checkSortAggregateCodegen(data) {
+      _.groupBy("k").agg(sum(col("v")), count(col("v")), max(col("v"))).orderBy("k")
+    }
+  }
+
+  test("SPARK-32750: SortAggregate code-gen with grouping keys - no aggregate functions") {
+    // Grouping-only aggregate (DISTINCT lowers to a grouping aggregate with no aggregate
+    // functions), exercising the empty-buffer branch of the result code generation.
+    val data = spark.range(200).selectExpr("id % 7 as k1", "id % 3 as k2")
+    checkSortAggregateCodegen(data)(_.select("k1").distinct().orderBy("k1"))
+    checkSortAggregateCodegen(data)(_.select("k1", "k2").distinct().orderBy("k1", "k2"))
+  }
+
+  test("SPARK-32750: SortAggregate code-gen with grouping keys - split aggregate functions") {
+    // Force the aggregate functions into separate split methods so the with-keys path is
+    // exercised with split buffer-update code.
+    val data = spark.range(200).selectExpr("id", "id % 7 as k", "id as v")
+    withSQLConf(
+        SQLConf.CODEGEN_SPLIT_AGGREGATE_FUNC.key -> "true",
+        SQLConf.CODEGEN_METHOD_SPLIT_THRESHOLD.key -> "1") {
+      checkSortAggregateCodegen(data) {
+        _.groupBy("k")
+          .agg(sum(col("v")), count(col("v")), max(col("v")), min(col("v")), avg(col("v")))
+          .orderBy("k")
+      }
+    }
+  }
+
+  test("SPARK-32750: SortAggregate code-gen with grouping keys - config gate") {
+    // When the with-keys config is disabled, the grouped SortAggregate must not be code-gen'd,
+    // while the result stays correct.
+    val data = spark.range(200).selectExpr("id % 7 as k", "id as v")
+    withSQLConf(
+        SQLConf.USE_HASH_AGG.key -> "false",
+        SQLConf.USE_OBJECT_HASH_AGG.key -> "false",
+        SQLConf.ENABLE_SORT_AGGREGATE_CODEGEN.key -> "true",
+        SQLConf.ENABLE_SORT_AGGREGATE_CODEGEN_WITH_KEYS.key -> "false") {
+      val df = data.groupBy("k").agg(sum(col("v"))).orderBy("k")
+      assert(!df.queryExecution.executedPlan.exists(p =>
+        p.isInstanceOf[WholeStageCodegenExec] &&
+          p.asInstanceOf[WholeStageCodegenExec].child.isInstanceOf[SortAggregateExec]),
+        s"Expected no code-gen'd SortAggregateExec in:\n${df.queryExecution.executedPlan}")
+      checkAnswer(df, Seq(0, 1, 2, 3, 4, 5, 6).map { k =>
+        Row(k, (k until 200 by 7).map(_.toLong).sum)
+      })
+    }
+    // With the gate enabled it is code-gen'd (baseline for the assertion above).
+    checkSortAggregateCodegen(data)(_.groupBy("k").agg(sum(col("v"))).orderBy("k"))
+  }
+
+  test("SPARK-32750: SortAggregate code-gen with grouping keys - non-binary collated key") {
+    // A non-binary collation (e.g. UTF8_LCASE) is not binary-stable, so `supportCodegenWithKeys`
+    // returns false and the grouped SortAggregate must fall back to the interpreted path rather
+    // than being code-gen'd, while the collation-aware grouping result stays correct.
+    val data = Seq("a", "A", "b", "B", "c")
+      .toDF("k").selectExpr("k collate UTF8_LCASE as k")
+    withSQLConf(
+        SQLConf.USE_HASH_AGG.key -> "false",
+        SQLConf.USE_OBJECT_HASH_AGG.key -> "false",
+        SQLConf.ENABLE_SORT_AGGREGATE_CODEGEN.key -> "true",
+        SQLConf.ENABLE_SORT_AGGREGATE_CODEGEN_WITH_KEYS.key -> "true") {
+      val df = data.groupBy("k").agg(count(lit(1)).as("cnt")).orderBy("cnt", "k")
+      assert(!df.queryExecution.executedPlan.exists(p =>
+        p.isInstanceOf[WholeStageCodegenExec] &&
+          p.asInstanceOf[WholeStageCodegenExec].child.isInstanceOf[SortAggregateExec]),
+        s"Expected no code-gen'd SortAggregateExec in:\n${df.queryExecution.executedPlan}")
+      // Under UTF8_LCASE, 'a'/'A' and 'b'/'B' each collapse to one group of 2, 'c' stays alone.
+      checkAnswer(df.select("cnt"), Seq(Row(1), Row(2), Row(2)))
+    }
+  }
+
+  testWithWholeStageCodegenOnAndOff("GenerateExec should be" +
+    " included in WholeStageCodegen") { codegenEnabled =>
+    import testImplicits._
+    val arrayData = Seq(("James", Seq("Java", "Scala"), Map("hair" -> "black", "eye" -> "brown")))
+    val df = arrayData.toDF("name", "knownLanguages", "properties")
+
+    // Array - explode
+    var expDF = df.select($"name", explode($"knownLanguages"), $"properties")
+    var plan = expDF.queryExecution.executedPlan
+    assert(plan.exists {
+      case stage: WholeStageCodegenExec =>
+        stage.exists(_.isInstanceOf[GenerateExec])
+      case _ => !codegenEnabled.toBoolean
+    })
+    checkAnswer(expDF, Array(Row("James", "Java", Map("hair" -> "black", "eye" -> "brown")),
+      Row("James", "Scala", Map("hair" -> "black", "eye" -> "brown"))))
+
+    // Map - explode
+    expDF = df.select($"name", $"knownLanguages", explode($"properties"))
+    plan = expDF.queryExecution.executedPlan
+    assert(plan.exists {
+      case stage: WholeStageCodegenExec =>
+        stage.exists(_.isInstanceOf[GenerateExec])
+      case _ => !codegenEnabled.toBoolean
+    })
+    checkAnswer(expDF,
+      Array(Row("James", List("Java", "Scala"), "hair", "black"),
+        Row("James", List("Java", "Scala"), "eye", "brown")))
+
+    // Array - posexplode
+    expDF = df.select($"name", posexplode($"knownLanguages"))
+    plan = expDF.queryExecution.executedPlan
+    assert(plan.exists {
+      case stage: WholeStageCodegenExec =>
+        stage.exists(_.isInstanceOf[GenerateExec])
+      case _ => !codegenEnabled.toBoolean
+    })
+    checkAnswer(expDF,
+      Array(Row("James", 0, "Java"), Row("James", 1, "Scala")))
+
+    // Map - posexplode
+    expDF = df.select($"name", posexplode($"properties"))
+    plan = expDF.queryExecution.executedPlan
+    assert(plan.exists {
+      case stage: WholeStageCodegenExec =>
+        stage.exists(_.isInstanceOf[GenerateExec])
+      case _ => !codegenEnabled.toBoolean
+    })
+    checkAnswer(expDF,
+      Array(Row("James", 0, "hair", "black"), Row("James", 1, "eye", "brown")))
+
+    // Array - explode , selecting all columns
+    expDF = df.select($"*", explode($"knownLanguages"))
+    plan = expDF.queryExecution.executedPlan
+    assert(plan.exists {
+      case stage: WholeStageCodegenExec =>
+        stage.exists(_.isInstanceOf[GenerateExec])
+      case _ => !codegenEnabled.toBoolean
+    })
+    checkAnswer(expDF,
+      Array(Row("James", Seq("Java", "Scala"), Map("hair" -> "black", "eye" -> "brown"), "Java"),
+        Row("James", Seq("Java", "Scala"), Map("hair" -> "black", "eye" -> "brown"), "Scala")))
+
+    // Map - explode, selecting all columns
+    expDF = df.select($"*", explode($"properties"))
+    plan = expDF.queryExecution.executedPlan
+    assert(plan.exists {
+      case stage: WholeStageCodegenExec =>
+        stage.exists(_.isInstanceOf[GenerateExec])
+      case _ => !codegenEnabled.toBoolean
+    })
+    checkAnswer(expDF,
+      Array(
+        Row("James", List("Java", "Scala"),
+          Map("hair" -> "black", "eye" -> "brown"), "hair", "black"),
+        Row("James", List("Java", "Scala"),
+          Map("hair" -> "black", "eye" -> "brown"), "eye", "brown")))
+  }
+
+  test("HashAggregate with grouping keys should be included in WholeStageCodegen") {
+    val df = spark.range(3).groupBy(col("id") * 2).count().orderBy(col("id") * 2)
     val plan = df.queryExecution.executedPlan
-    assert(plan.find(p =>
+    assert(plan.exists(p =>
       p.isInstanceOf[WholeStageCodegenExec] &&
-        p.asInstanceOf[WholeStageCodegenExec].child.isInstanceOf[HashAggregateExec]).isDefined)
-    assert(df.collect() === Array(Row(0, 1), Row(1, 1), Row(2, 1)))
+        p.asInstanceOf[WholeStageCodegenExec].child.isInstanceOf[HashAggregateExec]))
+    assert(df.collect() === Array(Row(0, 1), Row(2, 1), Row(4, 1)))
   }
 
   test("BroadcastHashJoin should be included in WholeStageCodegen") {
@@ -57,19 +386,489 @@ class WholeStageCodegenSuite extends SparkPlanTest with SharedSQLContext {
     val schema = new StructType().add("k", IntegerType).add("v", StringType)
     val smallDF = spark.createDataFrame(rdd, schema)
     val df = spark.range(10).join(broadcast(smallDF), col("k") === col("id"))
-    assert(df.queryExecution.executedPlan.find(p =>
+    assert(df.queryExecution.executedPlan.exists(p =>
       p.isInstanceOf[WholeStageCodegenExec] &&
-        p.asInstanceOf[WholeStageCodegenExec].child.isInstanceOf[BroadcastHashJoinExec]).isDefined)
+        p.asInstanceOf[WholeStageCodegenExec].child.isInstanceOf[BroadcastHashJoinExec]))
     assert(df.collect() === Array(Row(1, 1, "1"), Row(1, 1, "1"), Row(2, 2, "2")))
+  }
+
+  test("Inner ShuffledHashJoin should be included in WholeStageCodegen") {
+    val df1 = spark.range(5).select($"id".as("k1"))
+    val df2 = spark.range(15).select($"id".as("k2"))
+    val df3 = spark.range(6).select($"id".as("k3"))
+
+    // test one shuffled hash join
+    val oneJoinDF = df1.join(df2.hint("SHUFFLE_HASH"), $"k1" === $"k2")
+    assert(oneJoinDF.queryExecution.executedPlan.collect {
+      case WholeStageCodegenExec(_ : ShuffledHashJoinExec) => true
+    }.size === 1)
+    checkAnswer(oneJoinDF, Seq(Row(0, 0), Row(1, 1), Row(2, 2), Row(3, 3), Row(4, 4)))
+
+    // test two shuffled hash joins
+    val twoJoinsDF = df1.join(df2.hint("SHUFFLE_HASH"), $"k1" === $"k2")
+      .join(df3.hint("SHUFFLE_HASH"), $"k1" === $"k3")
+    assert(twoJoinsDF.queryExecution.executedPlan.collect {
+      case WholeStageCodegenExec(_ : ShuffledHashJoinExec) => true
+    }.size === 2)
+    checkAnswer(twoJoinsDF,
+      Seq(Row(0, 0, 0), Row(1, 1, 1), Row(2, 2, 2), Row(3, 3, 3), Row(4, 4, 4)))
+  }
+
+  test("SPARK-44236: disable WholeStageCodegen when set spark.sql.codegen.factoryMode is " +
+    "NO_CODEGEN") {
+    withSQLConf(SQLConf.CODEGEN_FACTORY_MODE.key -> CodegenObjectFactoryMode.NO_CODEGEN.toString) {
+      val df = spark.range(10).select($"id" + 1)
+      val plan = df.queryExecution.executedPlan
+      assert(!plan.exists(_.isInstanceOf[WholeStageCodegenExec]))
+      checkAnswer(df, 1L to 10L map { i => Row(i) })
+    }
+  }
+
+  test("Full Outer ShuffledHashJoin and SortMergeJoin should be included in WholeStageCodegen") {
+    val df1 = spark.range(5).select($"id".as("k1"))
+    val df2 = spark.range(10).select($"id".as("k2"))
+    val df3 = spark.range(3).select($"id".as("k3"))
+
+    Seq("SHUFFLE_HASH", "SHUFFLE_MERGE").foreach { hint =>
+      // test one join with unique key from build side
+      val joinUniqueDF = df1.join(df2.hint(hint), $"k1" === $"k2", "full_outer")
+      assert(joinUniqueDF.queryExecution.executedPlan.collect {
+        case WholeStageCodegenExec(_ : ShuffledHashJoinExec) if hint == "SHUFFLE_HASH" => true
+        case WholeStageCodegenExec(_ : SortMergeJoinExec) if hint == "SHUFFLE_MERGE" => true
+      }.size === 1)
+      checkAnswer(joinUniqueDF, Seq(Row(0, 0), Row(1, 1), Row(2, 2), Row(3, 3), Row(4, 4),
+        Row(null, 5), Row(null, 6), Row(null, 7), Row(null, 8), Row(null, 9)))
+      assert(joinUniqueDF.count() === 10)
+
+      // test one join with non-unique key from build side
+      val joinNonUniqueDF = df1.join(df2.hint(hint), $"k1" === $"k2" % 3, "full_outer")
+      assert(joinNonUniqueDF.queryExecution.executedPlan.collect {
+        case WholeStageCodegenExec(_ : ShuffledHashJoinExec) if hint == "SHUFFLE_HASH" => true
+        case WholeStageCodegenExec(_ : SortMergeJoinExec) if hint == "SHUFFLE_MERGE" => true
+      }.size === 1)
+      checkAnswer(joinNonUniqueDF, Seq(Row(0, 0), Row(0, 3), Row(0, 6), Row(0, 9), Row(1, 1),
+        Row(1, 4), Row(1, 7), Row(2, 2), Row(2, 5), Row(2, 8), Row(3, null), Row(4, null)))
+
+      // test one join with non-equi condition
+      val joinWithNonEquiDF = df1.join(df2.hint(hint),
+        $"k1" === $"k2" % 3 && $"k1" + 3 =!= $"k2", "full_outer")
+      assert(joinWithNonEquiDF.queryExecution.executedPlan.collect {
+        case WholeStageCodegenExec(_ : ShuffledHashJoinExec) if hint == "SHUFFLE_HASH" => true
+        case WholeStageCodegenExec(_ : SortMergeJoinExec) if hint == "SHUFFLE_MERGE" => true
+      }.size === 1)
+      checkAnswer(joinWithNonEquiDF, Seq(Row(0, 0), Row(0, 6), Row(0, 9), Row(1, 1),
+        Row(1, 7), Row(2, 2), Row(2, 8), Row(3, null), Row(4, null), Row(null, 3), Row(null, 4),
+        Row(null, 5)))
+
+      // test two joins
+      val twoJoinsDF = df1.join(df2.hint(hint), $"k1" === $"k2", "full_outer")
+        .join(df3.hint(hint), $"k1" === $"k3" && $"k1" + $"k3" =!= 2, "full_outer")
+      assert(twoJoinsDF.queryExecution.executedPlan.collect {
+        case WholeStageCodegenExec(_ : ShuffledHashJoinExec) if hint == "SHUFFLE_HASH" => true
+        case WholeStageCodegenExec(_ : SortMergeJoinExec) if hint == "SHUFFLE_MERGE" => true
+      }.size === 2)
+      checkAnswer(twoJoinsDF,
+        Seq(Row(0, 0, 0), Row(1, 1, null), Row(2, 2, 2), Row(3, 3, null), Row(4, 4, null),
+          Row(null, 5, null), Row(null, 6, null), Row(null, 7, null), Row(null, 8, null),
+          Row(null, 9, null), Row(null, null, 1)))
+    }
+  }
+
+
+  test("SPARK-44060 Code-gen for build side outer shuffled hash join") {
+    val df1 = spark.range(0, 5).select($"id".as("k1"))
+    val df2 = spark.range(1, 11).select($"id".as("k2"))
+    val df3 = spark.range(2, 5).select($"id".as("k3"))
+
+    withSQLConf(SQLConf.ENABLE_BUILD_SIDE_OUTER_SHUFFLED_HASH_JOIN_CODEGEN.key -> "true") {
+      Seq("SHUFFLE_HASH", "SHUFFLE_MERGE").foreach { hint =>
+        // test right join with unique key from build side
+        val rightJoinUniqueDf = df1.join(df2.hint(hint), $"k1" === $"k2", "right_outer")
+        assert(rightJoinUniqueDf.queryExecution.executedPlan.collect {
+          case WholeStageCodegenExec(_: ShuffledHashJoinExec) if hint == "SHUFFLE_HASH" => true
+          case WholeStageCodegenExec(_: SortMergeJoinExec) if hint == "SHUFFLE_MERGE" => true
+        }.size === 1)
+        checkAnswer(rightJoinUniqueDf, Seq(Row(1, 1), Row(2, 2), Row(3, 3), Row(4, 4),
+          Row(null, 5), Row(null, 6), Row(null, 7), Row(null, 8), Row(null, 9),
+          Row(null, 10)))
+        assert(rightJoinUniqueDf.count() === 10)
+
+        // test left join with unique key from build side
+        val leftJoinUniqueDf = df1.hint(hint).join(df2, $"k1" === $"k2", "left_outer")
+        assert(leftJoinUniqueDf.queryExecution.executedPlan.collect {
+          case WholeStageCodegenExec(_: ShuffledHashJoinExec) if hint == "SHUFFLE_HASH" => true
+          case WholeStageCodegenExec(_: SortMergeJoinExec) if hint == "SHUFFLE_MERGE" => true
+        }.size === 1)
+        checkAnswer(leftJoinUniqueDf, Seq(Row(0, null), Row(1, 1), Row(2, 2), Row(3, 3), Row(4, 4)))
+        assert(leftJoinUniqueDf.count() === 5)
+
+        // test right join with non-unique key from build side
+        val rightJoinNonUniqueDf = df1.join(df2.hint(hint), $"k1" === $"k2" % 3, "right_outer")
+        assert(rightJoinNonUniqueDf.queryExecution.executedPlan.collect {
+          case WholeStageCodegenExec(_: ShuffledHashJoinExec) if hint == "SHUFFLE_HASH" => true
+          case WholeStageCodegenExec(_: SortMergeJoinExec) if hint == "SHUFFLE_MERGE" => true
+        }.size === 1)
+        checkAnswer(rightJoinNonUniqueDf, Seq(Row(0, 3), Row(0, 6), Row(0, 9), Row(1, 1),
+          Row(1, 4), Row(1, 7), Row(1, 10), Row(2, 2), Row(2, 5), Row(2, 8)))
+
+        // test left join with non-unique key from build side
+        val leftJoinNonUniqueDf = df1.hint(hint).join(df2, $"k1" === $"k2" % 3, "left_outer")
+        assert(leftJoinNonUniqueDf.queryExecution.executedPlan.collect {
+          case WholeStageCodegenExec(_: ShuffledHashJoinExec) if hint == "SHUFFLE_HASH" => true
+          case WholeStageCodegenExec(_: SortMergeJoinExec) if hint == "SHUFFLE_MERGE" => true
+        }.size === 1)
+        checkAnswer(leftJoinNonUniqueDf, Seq(Row(0, 3), Row(0, 6), Row(0, 9), Row(1, 1),
+          Row(1, 4), Row(1, 7), Row(1, 10), Row(2, 2), Row(2, 5), Row(2, 8), Row(3, null),
+          Row(4, null)))
+
+        // test right join with non-equi condition
+        val rightJoinWithNonEquiDf = df1.join(df2.hint(hint),
+          $"k1" === $"k2" % 3 && $"k1" + 3 =!= $"k2", "right_outer")
+        assert(rightJoinWithNonEquiDf.queryExecution.executedPlan.collect {
+          case WholeStageCodegenExec(_: ShuffledHashJoinExec) if hint == "SHUFFLE_HASH" => true
+          case WholeStageCodegenExec(_: SortMergeJoinExec) if hint == "SHUFFLE_MERGE" => true
+        }.size === 1)
+        checkAnswer(rightJoinWithNonEquiDf, Seq(Row(0, 6), Row(0, 9), Row(1, 1), Row(1, 7),
+          Row(1, 10), Row(2, 2), Row(2, 8), Row(null, 3), Row(null, 4), Row(null, 5)))
+
+        // test left join with non-equi condition
+        val leftJoinWithNonEquiDf = df1.hint(hint).join(df2,
+          $"k1" === $"k2" % 3 && $"k1" + 3 =!= $"k2", "left_outer")
+        assert(leftJoinWithNonEquiDf.queryExecution.executedPlan.collect {
+          case WholeStageCodegenExec(_: ShuffledHashJoinExec) if hint == "SHUFFLE_HASH" => true
+          case WholeStageCodegenExec(_: SortMergeJoinExec) if hint == "SHUFFLE_MERGE" => true
+        }.size === 1)
+        checkAnswer(leftJoinWithNonEquiDf, Seq(Row(0, 6), Row(0, 9), Row(1, 1), Row(1, 7),
+          Row(1, 10), Row(2, 2), Row(2, 8), Row(3, null), Row(4, null)))
+
+        // test two right joins
+        val twoRightJoinsDf = df1.join(df2.hint(hint), $"k1" === $"k2", "right_outer")
+          .join(df3.hint(hint), $"k1" === $"k3" && $"k1" + $"k3" =!= 2, "right_outer")
+        assert(twoRightJoinsDf.queryExecution.executedPlan.collect {
+          case WholeStageCodegenExec(_: ShuffledHashJoinExec) if hint == "SHUFFLE_HASH" => true
+          case WholeStageCodegenExec(_: SortMergeJoinExec) if hint == "SHUFFLE_MERGE" => true
+        }.size === 2)
+        checkAnswer(twoRightJoinsDf, Seq(Row(2, 2, 2), Row(3, 3, 3), Row(4, 4, 4)))
+
+        // test two left joins
+        val twoLeftJoinsDf = df1.hint(hint).join(df2, $"k1" === $"k2", "left_outer").hint(hint)
+          .join(df3, $"k1" === $"k3" && $"k1" + $"k3" =!= 2, "left_outer")
+        assert(twoLeftJoinsDf.queryExecution.executedPlan.collect {
+          case WholeStageCodegenExec(_: ShuffledHashJoinExec) if hint == "SHUFFLE_HASH" => true
+          case WholeStageCodegenExec(_: SortMergeJoinExec) if hint == "SHUFFLE_MERGE" => true
+        }.size === 2)
+        checkAnswer(twoLeftJoinsDf,
+          Seq(Row(0, null, null), Row(1, 1, null), Row(2, 2, 2), Row(3, 3, 3), Row(4, 4, 4)))
+      }
+    }
+  }
+
+  test("Left/Right Outer SortMergeJoin should be included in WholeStageCodegen") {
+    val df1 = spark.range(10).select($"id".as("k1"))
+    val df2 = spark.range(4).select($"id".as("k2"))
+    val df3 = spark.range(6).select($"id".as("k3"))
+
+    // test one left outer sort merge join
+    val oneLeftOuterJoinDF = df1.join(df2.hint("SHUFFLE_MERGE"), $"k1" === $"k2", "left_outer")
+    assert(oneLeftOuterJoinDF.queryExecution.executedPlan.collect {
+      case WholeStageCodegenExec(_ : SortMergeJoinExec) => true
+    }.size === 1)
+    checkAnswer(oneLeftOuterJoinDF, Seq(Row(0, 0), Row(1, 1), Row(2, 2), Row(3, 3), Row(4, null),
+      Row(5, null), Row(6, null), Row(7, null), Row(8, null), Row(9, null)))
+
+    // test one right outer sort merge join
+    val oneRightOuterJoinDF = df2.join(df3.hint("SHUFFLE_MERGE"), $"k2" === $"k3", "right_outer")
+    assert(oneRightOuterJoinDF.queryExecution.executedPlan.collect {
+      case WholeStageCodegenExec(_ : SortMergeJoinExec) => true
+    }.size === 1)
+    checkAnswer(oneRightOuterJoinDF, Seq(Row(0, 0), Row(1, 1), Row(2, 2), Row(3, 3), Row(null, 4),
+      Row(null, 5)))
+
+    // test two sort merge joins
+    val twoJoinsDF = df3.join(df2.hint("SHUFFLE_MERGE"), $"k3" === $"k2", "left_outer")
+      .join(df1.hint("SHUFFLE_MERGE"), $"k3" === $"k1", "right_outer")
+    assert(twoJoinsDF.queryExecution.executedPlan.collect {
+      case WholeStageCodegenExec(_ : SortMergeJoinExec) => true
+    }.size === 2)
+    checkAnswer(twoJoinsDF,
+      Seq(Row(0, 0, 0), Row(1, 1, 1), Row(2, 2, 2), Row(3, 3, 3), Row(4, null, 4), Row(5, null, 5),
+        Row(null, null, 6), Row(null, null, 7), Row(null, null, 8), Row(null, null, 9)))
+  }
+
+  test("Left Semi SortMergeJoin should be included in WholeStageCodegen") {
+    val df1 = spark.range(10).select($"id".as("k1"))
+    val df2 = spark.range(4).select($"id".as("k2"))
+    val df3 = spark.range(6).select($"id".as("k3"))
+
+    // test one left semi sort merge join
+    val oneJoinDF = df1.join(df2.hint("SHUFFLE_MERGE"), $"k1" === $"k2", "left_semi")
+    assert(oneJoinDF.queryExecution.executedPlan.collect {
+      case WholeStageCodegenExec(ProjectExec(_, _ : SortMergeJoinExec)) => true
+    }.size === 1)
+    checkAnswer(oneJoinDF, Seq(Row(0), Row(1), Row(2), Row(3)))
+
+    // test two left semi sort merge joins
+    val twoJoinsDF = df3.join(df2.hint("SHUFFLE_MERGE"), $"k3" === $"k2", "left_semi")
+      .join(df1.hint("SHUFFLE_MERGE"), $"k3" === $"k1", "left_semi")
+    assert(twoJoinsDF.queryExecution.executedPlan.collect {
+      case WholeStageCodegenExec(ProjectExec(_, _ : SortMergeJoinExec)) |
+           WholeStageCodegenExec(_ : SortMergeJoinExec) => true
+    }.size === 2)
+    checkAnswer(twoJoinsDF, Seq(Row(0), Row(1), Row(2), Row(3)))
+  }
+
+  test("Left Anti SortMergeJoin should be included in WholeStageCodegen") {
+    val df1 = spark.range(10).select($"id".as("k1"))
+    val df2 = spark.range(4).select($"id".as("k2"))
+    val df3 = spark.range(6).select($"id".as("k3"))
+
+    // test one left anti sort merge join
+    val oneJoinDF = df1.join(df2.hint("SHUFFLE_MERGE"), $"k1" === $"k2", "left_anti")
+    assert(oneJoinDF.queryExecution.executedPlan.collect {
+      case WholeStageCodegenExec(ProjectExec(_, _ : SortMergeJoinExec)) => true
+    }.size === 1)
+    checkAnswer(oneJoinDF, Seq(Row(4), Row(5), Row(6), Row(7), Row(8), Row(9)))
+
+    // test two left anti sort merge joins
+    val twoJoinsDF = df1.join(df2.hint("SHUFFLE_MERGE"), $"k1" === $"k2", "left_anti")
+      .join(df3.hint("SHUFFLE_MERGE"), $"k1" === $"k3", "left_anti")
+    assert(twoJoinsDF.queryExecution.executedPlan.collect {
+      case WholeStageCodegenExec(ProjectExec(_, _ : SortMergeJoinExec)) |
+           WholeStageCodegenExec(_ : SortMergeJoinExec) => true
+    }.size === 2)
+    checkAnswer(twoJoinsDF, Seq(Row(6), Row(7), Row(8), Row(9)))
+  }
+
+  test("Backward and forward sort-merge ASOF joins should be included in WholeStageCodegen") {
+    // One partition puts every key in one task, so the scan has to move between keys.
+    withSQLConf(
+        SQLConf.SORT_MERGE_AS_OF_JOIN_ENABLED.key -> "true",
+        SQLConf.SHUFFLE_PARTITIONS.key -> "1") {
+      val trades = Seq((5, 1), (11, 1), (12, 2), (3, 3)).toDF("ts", "k")
+      val quotes = Seq((0, 1, "a"), (7, 1, "b"), (10, 1, "c"), (8, 2, "d"), (9, 3, "e"))
+        .toDF("ts", "k", "v")
+      def asOfJoin(joinType: String, direction: String, tolerance: Option[Int]): DataFrame =
+        trades.joinAsOf(
+          quotes, trades("ts"), quotes("ts"), usingColumns = Seq("k"), joinType = joinType,
+          tolerance = tolerance.map(lit).orNull, allowExactMatches = true, direction = direction)
+      // Whether the ASOF join runs in a codegen stage, and not only in a stage below it.
+      def isGenerated(df: DataFrame): Boolean = {
+        def inStage(plan: SparkPlan): Boolean = plan match {
+          case _: SortMergeAsOfJoinExec => true
+          case _: InputAdapter => false
+          case other => other.children.exists(inStage)
+        }
+        df.queryExecution.executedPlan.collect {
+          case stage: WholeStageCodegenExec if inStage(stage.child) => stage
+        }.nonEmpty
+      }
+      // Whether the plan has the ASOF join at all, so a "not generated" check cannot pass on a
+      // plan without it.
+      def hasAsOfJoin(df: DataFrame): Boolean =
+        df.queryExecution.executedPlan.exists(_.isInstanceOf[SortMergeAsOfJoinExec])
+      // How many tasks of the ASOF join used the cursor scan, read after the join ran.
+      def cursorTasks(df: DataFrame): Long = df.queryExecution.executedPlan.collect {
+        case j: SortMergeAsOfJoinExec => j.metrics("numAsOfCursorTasks").value
+      }.sum
+
+      // Cursor scan: the last quote at or before each trade. The only quote of key 3 is after
+      // trade 3, so trade 3 gets none. A cursor that kept key 2's quote would give it "d".
+      val backward = asOfJoin("inner", "backward", None)
+      assert(isGenerated(backward))
+      checkAnswer(backward,
+        Seq(Row(5, 1, 0, 1, "a"), Row(11, 1, 10, 1, "c"), Row(12, 2, 8, 2, "d")))
+      assert(cursorTasks(backward) > 0, "Expected the cursor scan")
+
+      // Cursor scan, forward: a trade with no later quote keeps nulls in a left outer join.
+      val forward = asOfJoin("leftouter", "forward", None)
+      assert(isGenerated(forward))
+      checkAnswer(forward, Seq(Row(5, 1, 7, 1, "b"), Row(11, 1, null, null, null),
+        Row(12, 2, null, null, null), Row(3, 3, 9, 3, "e")))
+      assert(cursorTasks(forward) > 0, "Expected the cursor scan")
+
+      // Buffered scan: with a tolerance of 2, only trade 11 has a quote close enough.
+      val buffered = asOfJoin("inner", "backward", Some(2))
+      assert(isGenerated(buffered))
+      checkAnswer(buffered, Seq(Row(11, 1, 10, 1, "c")))
+      assert(cursorTasks(buffered) == 0, "Expected the buffered scan")
+
+      // Nearest joins keep the interpreted scan.
+      val nearest = asOfJoin("inner", "nearest", None)
+      assert(hasAsOfJoin(nearest) && !isGenerated(nearest))
+      checkAnswer(nearest, Seq(Row(5, 1, 7, 1, "b"), Row(11, 1, 10, 1, "c"),
+        Row(12, 2, 8, 2, "d"), Row(3, 3, 9, 3, "e")))
+
+      // With the codegen off, the interpreted scan gives the same rows.
+      withSQLConf(SQLConf.ENABLE_SORT_MERGE_AS_OF_JOIN_CODEGEN.key -> "false") {
+        val off = asOfJoin("inner", "backward", None)
+        assert(hasAsOfJoin(off) && !isGenerated(off))
+        checkAnswer(off, Seq(Row(5, 1, 0, 1, "a"), Row(11, 1, 10, 1, "c"), Row(12, 2, 8, 2, "d")))
+      }
+    }
+  }
+
+  test("A skewed sort-merge ASOF join should generate code that compiles") {
+    withSQLConf(SQLConf.SORT_MERGE_AS_OF_JOIN_ENABLED.key -> "true") {
+      val trades = Seq((5, 1), (11, 1)).toDF("ts", "k")
+      val quotes = Seq((0, 1, "a"), (10, 1, "c")).toDF("ts", "k", "v")
+      val df = trades.joinAsOf(
+        quotes, trades("ts"), quotes("ts"), usingColumns = Seq("k"), joinType = "inner",
+        tolerance = null, allowExactMatches = true, direction = "backward")
+      // No skew rule marks an ASOF join here, so mark it by hand. The skew changes its name.
+      val skewed = df.queryExecution.executedPlan.transform {
+        case j: SortMergeAsOfJoinExec => j.copy(isSkewJoin = true)
+      }
+      def inStage(plan: SparkPlan): Boolean = plan match {
+        case j: SortMergeAsOfJoinExec => j.isSkewJoin
+        case _: InputAdapter => false
+        case other => other.children.exists(inStage)
+      }
+      val stages = skewed.collect {
+        case stage: WholeStageCodegenExec if inStage(stage.child) => stage
+      }
+      assert(stages.length == 1, s"Expected the skewed join in one codegen stage:\n$skewed")
+      // Without its own variable prefix, the join names its variables after
+      // "SortMergeAsOfJoin(skew=true)" and the code does not compile.
+      CodeGenerator.compile(stages.head.doCodeGen()._2)
+    }
+  }
+
+  test("Inner/Cross BroadcastNestedLoopJoinExec should be included in WholeStageCodegen") {
+    val df1 = spark.range(4).select($"id".as("k1"))
+    val df2 = spark.range(3).select($"id".as("k2"))
+    val df3 = spark.range(2).select($"id".as("k3"))
+
+    Seq(true, false).foreach { codegenEnabled =>
+      withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> codegenEnabled.toString) {
+        // test broadcast nested loop join without condition
+        val oneJoinDF = df1.join(df2)
+        var hasJoinInCodegen = oneJoinDF.queryExecution.executedPlan.collect {
+          case WholeStageCodegenExec(_ : BroadcastNestedLoopJoinExec) => true
+        }.size === 1
+        assert(hasJoinInCodegen == codegenEnabled)
+        checkAnswer(oneJoinDF,
+          Seq(Row(0, 0), Row(0, 1), Row(0, 2), Row(1, 0), Row(1, 1), Row(1, 2),
+            Row(2, 0), Row(2, 1), Row(2, 2), Row(3, 0), Row(3, 1), Row(3, 2)))
+
+        // test broadcast nested loop join with condition
+        val oneJoinDFWithCondition = df1.join(df2, $"k1" + 1 =!= $"k2")
+        hasJoinInCodegen = oneJoinDFWithCondition.queryExecution.executedPlan.collect {
+          case WholeStageCodegenExec(_ : BroadcastNestedLoopJoinExec) => true
+        }.size === 1
+        assert(hasJoinInCodegen == codegenEnabled)
+        checkAnswer(oneJoinDFWithCondition,
+          Seq(Row(0, 0), Row(0, 2), Row(1, 0), Row(1, 1), Row(2, 0), Row(2, 1),
+            Row(2, 2), Row(3, 0), Row(3, 1), Row(3, 2)))
+
+        // test two broadcast nested loop joins
+        val twoJoinsDF = df1.join(df2, $"k1" < $"k2").crossJoin(df3)
+        hasJoinInCodegen = twoJoinsDF.queryExecution.executedPlan.collect {
+          case WholeStageCodegenExec(BroadcastNestedLoopJoinExec(
+            _: BroadcastNestedLoopJoinExec, _, _, _, _)) => true
+        }.size === 1
+        assert(hasJoinInCodegen == codegenEnabled)
+        checkAnswer(twoJoinsDF,
+          Seq(Row(0, 1, 0), Row(0, 2, 0), Row(1, 2, 0), Row(0, 1, 1), Row(0, 2, 1), Row(1, 2, 1)))
+      }
+    }
+  }
+
+  test("Left/Right outer BroadcastNestedLoopJoinExec should be included in WholeStageCodegen") {
+    val df1 = spark.range(4).select($"id".as("k1"))
+    val df2 = spark.range(3).select($"id".as("k2"))
+    val df3 = spark.range(2).select($"id".as("k3"))
+    val df4 = spark.range(0).select($"id".as("k4"))
+
+    Seq(true, false).foreach { codegenEnabled =>
+      withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> codegenEnabled.toString) {
+        // test left outer join
+        val leftOuterJoinDF = df1.join(df2, $"k1" > $"k2", "left_outer")
+        var hasJoinInCodegen = leftOuterJoinDF.queryExecution.executedPlan.collect {
+          case WholeStageCodegenExec(_: BroadcastNestedLoopJoinExec) => true
+        }.size === 1
+        assert(hasJoinInCodegen == codegenEnabled)
+        checkAnswer(leftOuterJoinDF,
+          Seq(Row(0, null), Row(1, 0), Row(2, 0), Row(2, 1), Row(3, 0), Row(3, 1), Row(3, 2)))
+
+        // test right outer join
+        val rightOuterJoinDF = df1.join(df2, $"k1" < $"k2", "right_outer")
+        hasJoinInCodegen = rightOuterJoinDF.queryExecution.executedPlan.collect {
+          case WholeStageCodegenExec(_: BroadcastNestedLoopJoinExec) => true
+        }.size === 1
+        assert(hasJoinInCodegen == codegenEnabled)
+        checkAnswer(rightOuterJoinDF, Seq(Row(null, 0), Row(0, 1), Row(0, 2), Row(1, 2)))
+
+        // test a combination of left outer and right outer joins
+        val twoJoinsDF = df1.join(df2, $"k1" > $"k2" + 1, "right_outer")
+          .join(df3, $"k1" <= $"k3", "left_outer")
+        hasJoinInCodegen = twoJoinsDF.queryExecution.executedPlan.collect {
+          case WholeStageCodegenExec(BroadcastNestedLoopJoinExec(
+            _: BroadcastNestedLoopJoinExec, _, _, _, _)) => true
+        }.size === 1
+        assert(hasJoinInCodegen == codegenEnabled)
+        checkAnswer(twoJoinsDF,
+          Seq(Row(2, 0, null), Row(3, 0, null), Row(3, 1, null), Row(null, 2, null)))
+
+        // test build side is empty
+        val buildSideIsEmptyDF = df3.join(df4, $"k3" > $"k4", "left_outer")
+        hasJoinInCodegen = buildSideIsEmptyDF.queryExecution.executedPlan.collect {
+          case WholeStageCodegenExec(_: BroadcastNestedLoopJoinExec) => true
+        }.size === 1
+        assert(hasJoinInCodegen == codegenEnabled)
+        checkAnswer(buildSideIsEmptyDF, Seq(Row(0, null), Row(1, null)))
+      }
+    }
+  }
+
+  test("Left semi/anti BroadcastNestedLoopJoinExec should be included in WholeStageCodegen") {
+    val df1 = spark.range(4).select($"id".as("k1"))
+    val df2 = spark.range(3).select($"id".as("k2"))
+    val df3 = spark.range(2).select($"id".as("k3"))
+
+    Seq(true, false).foreach { codegenEnabled =>
+      withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> codegenEnabled.toString) {
+        // test left semi join
+        val semiJoinDF = df1.join(df2, $"k1" + 1 <= $"k2", "left_semi")
+        var hasJoinInCodegen = semiJoinDF.queryExecution.executedPlan.collect {
+          case WholeStageCodegenExec(ProjectExec(_, _ : BroadcastNestedLoopJoinExec)) => true
+        }.size === 1
+        assert(hasJoinInCodegen == codegenEnabled)
+        checkAnswer(semiJoinDF, Seq(Row(0), Row(1)))
+
+        // test left anti join
+        val antiJoinDF = df1.join(df2, $"k1" + 1 <= $"k2", "left_anti")
+        hasJoinInCodegen = antiJoinDF.queryExecution.executedPlan.collect {
+          case WholeStageCodegenExec(ProjectExec(_, _ : BroadcastNestedLoopJoinExec)) => true
+        }.size === 1
+        assert(hasJoinInCodegen == codegenEnabled)
+        checkAnswer(antiJoinDF, Seq(Row(2), Row(3)))
+
+        // test a combination of left semi and left anti joins
+        val twoJoinsDF = df1.join(df2, $"k1" < $"k2", "left_semi")
+          .join(df3, $"k1" > $"k3", "left_anti")
+        hasJoinInCodegen = twoJoinsDF.queryExecution.executedPlan.collect {
+          case WholeStageCodegenExec(ProjectExec(_, BroadcastNestedLoopJoinExec(
+          _: BroadcastNestedLoopJoinExec, _, _, _, _))) => true
+        }.size === 1
+        assert(hasJoinInCodegen == codegenEnabled)
+        checkAnswer(twoJoinsDF, Seq(Row(0)))
+      }
+    }
   }
 
   test("Sort should be included in WholeStageCodegen") {
     val df = spark.range(3, 0, -1).toDF().sort(col("id"))
     val plan = df.queryExecution.executedPlan
-    assert(plan.find(p =>
+    assert(plan.exists(p =>
       p.isInstanceOf[WholeStageCodegenExec] &&
-        p.asInstanceOf[WholeStageCodegenExec].child.isInstanceOf[SortExec]).isDefined)
+        p.asInstanceOf[WholeStageCodegenExec].child.isInstanceOf[SortExec]))
     assert(df.collect() === Array(Row(1), Row(2), Row(3)))
+  }
+
+  test("SPARK-58437: SortExec generates assignable iterator type") {
+    val code = genCode(spark.range(3, 0, -1).toDF().sort(col("id"))).map(_.body).mkString("\n")
+    assert(!code.contains("scala.collection.Iterator<UnsafeRow>"))
+    assert(code.contains("scala.collection.Iterator<InternalRow>"))
   }
 
   test("MapElements should be included in WholeStageCodegen") {
@@ -77,40 +876,2732 @@ class WholeStageCodegenSuite extends SparkPlanTest with SharedSQLContext {
 
     val ds = spark.range(10).map(_.toString)
     val plan = ds.queryExecution.executedPlan
-    assert(plan.find(p =>
+    assert(plan.exists(p =>
       p.isInstanceOf[WholeStageCodegenExec] &&
-      p.asInstanceOf[WholeStageCodegenExec].child.isInstanceOf[SerializeFromObjectExec]).isDefined)
+      p.asInstanceOf[WholeStageCodegenExec].child.isInstanceOf[SerializeFromObjectExec]))
     assert(ds.collect() === 0.until(10).map(_.toString).toArray)
   }
 
   test("typed filter should be included in WholeStageCodegen") {
     val ds = spark.range(10).filter(_ % 2 == 0)
     val plan = ds.queryExecution.executedPlan
-    assert(plan.find(p =>
+    assert(plan.exists(p =>
       p.isInstanceOf[WholeStageCodegenExec] &&
-        p.asInstanceOf[WholeStageCodegenExec].child.isInstanceOf[FilterExec]).isDefined)
+        p.asInstanceOf[WholeStageCodegenExec].child.isInstanceOf[FilterExec]))
     assert(ds.collect() === Array(0, 2, 4, 6, 8))
   }
 
   test("back-to-back typed filter should be included in WholeStageCodegen") {
     val ds = spark.range(10).filter(_ % 2 == 0).filter(_ % 3 == 0)
     val plan = ds.queryExecution.executedPlan
-    assert(plan.find(p =>
+    assert(plan.exists(p =>
       p.isInstanceOf[WholeStageCodegenExec] &&
-      p.asInstanceOf[WholeStageCodegenExec].child.isInstanceOf[FilterExec]).isDefined)
+      p.asInstanceOf[WholeStageCodegenExec].child.isInstanceOf[FilterExec]))
     assert(ds.collect() === Array(0, 6))
   }
 
-  test("simple typed UDAF should be included in WholeStageCodegen") {
+  test("cache for primitive type should be in WholeStageCodegen with InMemoryTableScanExec") {
     import testImplicits._
 
-    val ds = Seq(("a", 10), ("b", 1), ("b", 2), ("c", 1)).toDS()
-      .groupByKey(_._1).agg(typed.sum(_._2))
+    val dsInt = spark.range(3).cache()
+    dsInt.count()
+    val dsIntFilter = dsInt.filter(_ > 0)
+    val planInt = dsIntFilter.queryExecution.executedPlan
+    assert(planInt.collect {
+      case WholeStageCodegenExec(FilterExec(_,
+          InputAdapter(_: InMemoryTableScanExec))) => ()
+    }.length == 1)
+    assert(dsIntFilter.collect() === Array(1, 2))
 
-    val plan = ds.queryExecution.executedPlan
-    assert(plan.find(p =>
-      p.isInstanceOf[WholeStageCodegenExec] &&
-        p.asInstanceOf[WholeStageCodegenExec].child.isInstanceOf[HashAggregateExec]).isDefined)
-    assert(ds.collect() === Array(("a", 10.0), ("b", 3.0), ("c", 1.0)))
+    // cache for string type is not supported for InMemoryTableScanExec
+    val dsString = spark.range(3).map(_.toString).cache()
+    dsString.count()
+    val dsStringFilter = dsString.filter(_ == "1")
+    val planString = dsStringFilter.queryExecution.executedPlan
+    assert(planString.collect {
+      case _: ColumnarToRowExec => ()
+    }.isEmpty)
+    assert(dsStringFilter.collect() === Array("1"))
   }
+
+  test("SPARK-19512 codegen for comparing structs is incorrect") {
+    // this would raise CompileException before the fix
+    spark.range(10)
+      .selectExpr("named_struct('a', id) as col1", "named_struct('a', id+2) as col2")
+      .filter("col1 = col2").count()
+    // this would raise java.lang.IndexOutOfBoundsException before the fix
+    spark.range(10)
+      .selectExpr("named_struct('a', id, 'b', id) as col1",
+        "named_struct('a',id+2, 'b',id+2) as col2")
+      .filter("col1 = col2").count()
+  }
+
+  test("SPARK-21441 SortMergeJoin codegen with CodegenFallback expressions should be disabled") {
+    withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "1") {
+      import testImplicits._
+
+      val df1 = Seq((1, 1), (2, 2), (3, 3)).toDF("key", "int")
+      val df2 = Seq((1, "1"), (2, "2"), (3, "3")).toDF("key", "str")
+
+      val df = df1.join(df2, df1("key") === df2("key"))
+        .filter("int = 2 or reflect('java.lang.Integer', 'valueOf', str) = 1")
+        .select("int")
+
+      val plan = df.queryExecution.executedPlan
+      assert(!plan.exists(p =>
+        p.isInstanceOf[WholeStageCodegenExec] &&
+          p.asInstanceOf[WholeStageCodegenExec].child.children(0)
+            .isInstanceOf[SortMergeJoinExec]))
+      assert(df.collect() === Array(Row(1), Row(2)))
+    }
+  }
+
+  def genGroupByCode(caseNum: Int): CodeAndComment = {
+    val caseExp = (1 to caseNum).map { i =>
+      s"case when id > $i and id <= ${i + 1} then 1 else 0 end as v$i"
+    }.toList
+    val keyExp = List(
+      "id",
+      "(id & 1023) as k1",
+      "cast(id & 1023 as double) as k2",
+      "cast(id & 1023 as int) as k3")
+
+    val ds = spark.range(10)
+      .selectExpr(keyExp:::caseExp: _*)
+      .groupBy("k1", "k2", "k3")
+      .sum()
+    val plan = ds.queryExecution.executedPlan
+
+    val wholeStageCodeGenExec = plan.find(p => p match {
+      case wp: WholeStageCodegenExec => wp.child match {
+        case hp: HashAggregateExec if (hp.child.isInstanceOf[ProjectExec]) => true
+        case _ => false
+      }
+      case _ => false
+    })
+
+    assert(wholeStageCodeGenExec.isDefined)
+    wholeStageCodeGenExec.get.asInstanceOf[WholeStageCodegenExec].doCodeGen()._2
+  }
+
+  def genCode(
+      ds: Dataset[_],
+      transform: SparkPlan => SparkPlan = identity): Seq[CodeAndComment] = {
+    val plan = transform(ds.queryExecution.executedPlan)
+    val wholeStageCodeGenExecs = plan.collect { case p: WholeStageCodegenExec => p }
+    assert(wholeStageCodeGenExecs.nonEmpty, "WholeStageCodegenExec is expected")
+    wholeStageCodeGenExecs.map(_.doCodeGen()._2)
+  }
+
+  ignore("SPARK-21871 check if we can get large code size when compiling too long functions") {
+    val codeWithShortFunctions = genGroupByCode(3)
+    val (_, ByteCodeStats(maxCodeSize1, _, _)) = CodeGenerator.compile(codeWithShortFunctions)
+    assert(maxCodeSize1 < SQLConf.WHOLESTAGE_HUGE_METHOD_LIMIT.defaultValue.get)
+    val codeWithLongFunctions = genGroupByCode(50)
+    val (_, ByteCodeStats(maxCodeSize2, _, _)) = CodeGenerator.compile(codeWithLongFunctions)
+    assert(maxCodeSize2 > SQLConf.WHOLESTAGE_HUGE_METHOD_LIMIT.defaultValue.get)
+  }
+
+  ignore("bytecode of batch file scan exceeds the limit of WHOLESTAGE_HUGE_METHOD_LIMIT") {
+    import testImplicits._
+    withTempPath { dir =>
+      val path = dir.getCanonicalPath
+      val df = spark.range(10).select(Seq.tabulate(201) {i => ($"id" + i).as(s"c$i")} : _*)
+      df.write.mode(SaveMode.Overwrite).parquet(path)
+
+      withSQLConf(SQLConf.WHOLESTAGE_MAX_NUM_FIELDS.key -> "202",
+        SQLConf.WHOLESTAGE_HUGE_METHOD_LIMIT.key -> "2000") {
+        // wide table batch scan causes the byte code of codegen exceeds the limit of
+        // WHOLESTAGE_HUGE_METHOD_LIMIT
+        val df2 = spark.read.parquet(path)
+        val fileScan2 = df2.queryExecution.sparkPlan.find(_.isInstanceOf[FileSourceScanExec]).get
+        assert(fileScan2.asInstanceOf[FileSourceScanExec].supportsColumnar)
+        checkAnswer(df2, df)
+      }
+    }
+  }
+
+  test("Control splitting consume function by operators with config") {
+    import testImplicits._
+    val df = spark.range(10).select(Seq.tabulate(2) {i => ($"id" + i).as(s"c$i")} : _*)
+
+    Seq(true, false).foreach { config =>
+      withSQLConf(SQLConf.WHOLESTAGE_SPLIT_CONSUME_FUNC_BY_OPERATOR.key -> s"$config") {
+        val plan = df.queryExecution.executedPlan
+        val wholeStageCodeGenExec = plan.find(p => p match {
+          case wp: WholeStageCodegenExec => true
+          case _ => false
+        })
+        assert(wholeStageCodeGenExec.isDefined)
+        val code = wholeStageCodeGenExec.get.asInstanceOf[WholeStageCodegenExec].doCodeGen()._2
+        assert(code.body.contains("project_doConsume") == config)
+      }
+    }
+  }
+
+  test("Skip splitting consume function when parameter number exceeds JVM limit") {
+    // since every field is nullable we have 2 params for each input column (one for the value
+    // and one for the isNull variable)
+    Seq((128, false), (127, true)).foreach { case (columnNum, hasSplit) =>
+      withTempPath { dir =>
+        val path = dir.getCanonicalPath
+        spark.range(10).select(Seq.tabulate(columnNum) {i => lit(i).as(s"c$i")} : _*)
+          .write.mode(SaveMode.Overwrite).parquet(path)
+
+        withSQLConf(SQLConf.WHOLESTAGE_MAX_NUM_FIELDS.key -> "255",
+            SQLConf.WHOLESTAGE_SPLIT_CONSUME_FUNC_BY_OPERATOR.key -> "true") {
+          val projection = Seq.tabulate(columnNum)(i => s"c$i + c$i as newC$i")
+          val df = spark.read.parquet(path).selectExpr(projection: _*)
+
+          val plan = df.queryExecution.executedPlan
+          val wholeStageCodeGenExec = plan.find {
+            case _: WholeStageCodegenExec => true
+            case _ => false
+          }
+          assert(wholeStageCodeGenExec.isDefined)
+          val code = wholeStageCodeGenExec.get.asInstanceOf[WholeStageCodegenExec].doCodeGen()._2
+          assert(code.body.contains("project_doConsume") == hasSplit)
+        }
+      }
+    }
+  }
+
+  test("codegen stage IDs should be preserved in transformations after CollapseCodegenStages") {
+    // test case adapted from DataFrameSuite to trigger ReuseExchange
+    withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "2") {
+      val df = spark.range(100)
+      val join = df.join(df, "id")
+      val plan = join.queryExecution.executedPlan
+      assert(!plan.exists(p =>
+        p.isInstanceOf[WholeStageCodegenExec] &&
+          p.asInstanceOf[WholeStageCodegenExec].codegenStageId == 0),
+        "codegen stage IDs should be preserved through ReuseExchange")
+      checkAnswer(join, df.toDF())
+    }
+  }
+
+  test("including codegen stage ID in generated class name should not regress codegen caching") {
+    import testImplicits._
+
+    withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_USE_ID_IN_CLASS_NAME.key -> "true") {
+      // the same query run twice should produce identical code, which would imply a hit in
+      // the generated code cache.
+      val ds1 = spark.range(3).select($"id" + 2)
+      val code1 = genCode(ds1)
+      val ds2 = spark.range(3).select($"id" + 2)
+      val code2 = genCode(ds2) // same query shape as above, deliberately
+      assert(code1 == code2, "Should produce same code")
+    }
+  }
+
+  ignore("SPARK-23598: Codegen working for lots of aggregation operations without runtime errors") {
+    withSQLConf(SQLConf.SHUFFLE_PARTITIONS.key -> "1") {
+      var df = Seq((8, "bat"), (15, "mouse"), (5, "horse")).toDF("age", "name")
+      for (i <- 0 until 70) {
+        df = df.groupBy("name").agg(avg("age").alias("age"))
+      }
+      assert(df.limit(1).collect() === Array(Row("bat", 8.0)))
+    }
+  }
+
+  test("SPARK-56134: Codegen working for empty output") {
+    // Create a balanced tree of AND conditions. This prevents generating a very deep tree,
+    // which can cause stack overflow.
+    def balancedAnd(cols: Seq[String]): String = cols match {
+      case Seq(single) => single
+      case seq =>
+        val (left, right) = seq.splitAt(seq.length / 2)
+        balancedAnd(left) + " and " + balancedAnd(right)
+    }
+
+    withTempPath { dir =>
+        val path = dir.getCanonicalPath
+        sql("select array(0) as value from range(0, 1, 1, 1)")
+          .write.mode(SaveMode.Overwrite).parquet(path)
+
+        val numConditions = 1000
+        val conditions = (0 until numConditions).map(i => s"value <= array($i)")
+        val condition = balancedAnd(conditions)
+        val df = spark.read.parquet(path).filter(condition).selectExpr()
+        assert(df.limit(1).selectExpr("count(*)").collect() === Array(Row(1)))
+    }
+  }
+
+  test("SPARK-25767: Lazy evaluated stream of expressions handled correctly") {
+    val a = Seq(1).toDF("key")
+    val b = Seq((1, "a")).toDF("key", "value")
+    val c = Seq(1).toDF("key")
+
+    val ab = a.join(b, LazyList("key"), "left")
+    val abc = ab.join(c, Seq("key"), "left")
+
+    checkAnswer(abc, Row(1, "a"))
+  }
+
+  test("SPARK-26680: Stream in groupBy does not cause StackOverflowError") {
+    @scala.annotation.nowarn("cat=deprecation")
+    val groupByCols = Stream(col("key"))
+    val df = Seq((1, 2), (2, 3), (1, 3)).toDF("key", "value")
+      .groupBy(groupByCols: _*)
+      .max("value")
+
+    checkAnswer(df, Seq(Row(1, 3), Row(2, 3)))
+  }
+
+  test("SPARK-45685: LazyList in groupBy does not cause StackOverflowError") {
+    val groupByCols = LazyList(col("key"))
+    val df = Seq((1, 2), (2, 3), (1, 3)).toDF("key", "value")
+      .groupBy(groupByCols: _*)
+      .max("value")
+
+    checkAnswer(df, Seq(Row(1, 3), Row(2, 3)))
+  }
+
+  test("SPARK-26572: evaluate non-deterministic expressions for aggregate results") {
+    withSQLConf(
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> Long.MaxValue.toString,
+      SQLConf.SHUFFLE_PARTITIONS.key -> "1") {
+      val baseTable = Seq(1, 1).toDF("idx")
+
+      // BroadcastHashJoinExec with a HashAggregateExec child containing no aggregate expressions
+      val distinctWithId = baseTable.distinct().withColumn("id", monotonically_increasing_id())
+        .join(baseTable, "idx")
+      assert(distinctWithId.queryExecution.executedPlan.exists {
+        case WholeStageCodegenExec(ProjectExec(_,
+          BroadcastHashJoinExec(_, _, _, _, _, _: HashAggregateExec, _, _, _))) => true
+        case _ => false
+      })
+      checkAnswer(distinctWithId, Seq(Row(1, 0), Row(1, 0)))
+
+      // BroadcastHashJoinExec with a HashAggregateExec child containing a Final mode aggregate
+      // expression
+      val groupByWithId =
+        baseTable.groupBy("idx").sum().withColumn("id", monotonically_increasing_id())
+        .join(baseTable, "idx")
+      assert(groupByWithId.queryExecution.executedPlan.exists {
+        case WholeStageCodegenExec(ProjectExec(_,
+          BroadcastHashJoinExec(_, _, _, _, _, _: HashAggregateExec, _, _, _))) => true
+        case _ => false
+      })
+      checkAnswer(groupByWithId, Seq(Row(1, 2, 0), Row(1, 2, 0)))
+    }
+  }
+
+  test("SPARK-28520: WholeStageCodegen does not work properly for LocalTableScanExec") {
+    // Case1: LocalTableScanExec is the root of a query plan tree.
+    // In this case, WholeStageCodegenExec should not be inserted
+    // as the direct parent of LocalTableScanExec.
+    val df = Seq(1, 2, 3).toDF()
+    val rootOfExecutedPlan = df.queryExecution.executedPlan
+
+    // Ensure WholeStageCodegenExec is not inserted and
+    // LocalTableScanExec is still the root.
+    assert(rootOfExecutedPlan.isInstanceOf[LocalTableScanExec],
+      "LocalTableScanExec should be still the root.")
+
+    // Case2: The parent of a LocalTableScanExec supports WholeStageCodegen.
+    // In this case, the LocalTableScanExec should be within a WholeStageCodegen domain
+    // and no more InputAdapter is inserted as the direct parent of the LocalTableScanExec.
+    val aggregatedDF = Seq(1, 2, 3).toDF().groupBy("value").sum()
+    val executedPlan = aggregatedDF.queryExecution.executedPlan
+
+    // HashAggregateExec supports WholeStageCodegen and it's the parent of
+    // LocalTableScanExec so LocalTableScanExec should be within a WholeStageCodegen domain.
+    assert(
+      executedPlan.exists {
+        case WholeStageCodegenExec(
+          HashAggregateExec(_, _, _, _, _, _, _, _, _: LocalTableScanExec)) => true
+        case _ => false
+      },
+      "LocalTableScanExec should be within a WholeStageCodegen domain.")
+  }
+
+  test("Give up splitting aggregate code if a parameter length goes over the limit") {
+    withSQLConf(
+        SQLConf.CODEGEN_SPLIT_AGGREGATE_FUNC.key -> "true",
+        SQLConf.CODEGEN_METHOD_SPLIT_THRESHOLD.key -> "1",
+        "spark.sql.CodeGenerator.validParamLength" -> "0") {
+      withTable("t") {
+        val expectedErrMsg = "Failed to split aggregate code into small functions.*"
+        Seq(
+          // Test case without keys
+          "SELECT AVG(v) FROM VALUES(1) t(v)",
+          // Tet case with keys
+          "SELECT k, AVG(v) FROM VALUES((1, 1)) t(k, v) GROUP BY k").foreach { query =>
+          checkError(
+            exception = intercept[SparkException] {
+              sql(query).collect()
+            },
+            condition = "INTERNAL_ERROR",
+            parameters = Map("message" -> expectedErrMsg),
+            matchPVals = true)
+        }
+      }
+    }
+  }
+
+  test("Give up splitting subexpression code if a parameter length goes over the limit") {
+    withSQLConf(
+        SQLConf.CODEGEN_SPLIT_AGGREGATE_FUNC.key -> "false",
+        SQLConf.CODEGEN_METHOD_SPLIT_THRESHOLD.key -> "1",
+        "spark.sql.CodeGenerator.validParamLength" -> "0") {
+      withTable("t") {
+        val expectedErrMsg = "Failed to split subexpression code into small functions.*"
+        Seq(
+          // Test case without keys
+          "SELECT AVG(a + b), SUM(a + b + c) FROM VALUES((1, 1, 1)) t(a, b, c)",
+          // Tet case with keys
+          "SELECT k, AVG(a + b), SUM(a + b + c) FROM VALUES((1, 1, 1, 1)) t(k, a, b, c) " +
+            "GROUP BY k").foreach { query =>
+          checkError(
+            exception = intercept[SparkException] {
+              sql(query).collect()
+            },
+            condition = "INTERNAL_ERROR",
+            parameters = Map("message" -> expectedErrMsg),
+            matchPVals = true)
+        }
+      }
+    }
+  }
+
+  test("SPARK-47238: Test broadcast threshold for generated code") {
+    // case 1: threshold is -1, shouldn't broadcast since smaller than 0 means disabled.
+    // case 2: threshold is a larger number, shouldn't broadcast since not yet exceeded.
+    // case 3: threshold is 0, should broadcast since it's always smaller than generated code size.
+    Seq((-1, false), (1000000000, false), (0, true)).foreach { case (threshold, shouldBroadcast) =>
+      withSQLConf(SQLConf.WHOLESTAGE_BROADCAST_CLEANED_SOURCE_THRESHOLD.key -> threshold.toString,
+        SQLConf.USE_PARTITION_EVALUATOR.key -> "true") {
+        val df = Seq(0, 1, 2).toDF().groupBy("value").sum()
+        // Invoke WholeStageCodegenExec.execute and cast the rdd, and then get
+        // the evaluatorFactory to check whether it uses broadcast as expected.
+        val wscgExec = df.queryExecution.executedPlan.collectFirst {
+          case exec: WholeStageCodegenExec => exec
+        }
+        assert(wscgExec match {
+          case Some(exec) =>
+            val rdd = exec.execute().asInstanceOf[MapPartitionsWithEvaluatorRDD[_, _]]
+            val evaluatorFactoryField = rdd.getClass.getDeclaredField("evaluatorFactory")
+            evaluatorFactoryField.setAccessible(true)
+            val evaluatorFactory = evaluatorFactoryField.get(rdd)
+            val cleanedSourceOptField = evaluatorFactory.getClass.getDeclaredField(
+              "org$apache$spark$sql$execution$WholeStageCodegenEvaluatorFactory$$cleanedSourceOpt")
+            cleanedSourceOptField.setAccessible(true)
+            cleanedSourceOptField.get(evaluatorFactory).asInstanceOf[Either[_, _]] match {
+              case Left(_) => shouldBroadcast
+              case Right(_) => !shouldBroadcast
+            }
+          case None => false
+        })
+        // Execute and validate that the executor side still yields the correct result.
+        checkAnswer(df, Seq(Row(0, 0), Row(1, 1), Row(2, 2)))
+      }
+    }
+  }
+
+  test("SPARK-56032: subexpression elimination in FilterExec codegen") {
+    val schema = StructType(Seq(
+      StructField("a", DayTimeIntervalType(), nullable = true),
+      StructField("b", DayTimeIntervalType(), nullable = true)))
+    val data = spark.sparkContext.parallelize(Seq(
+      Row(Duration.ofDays(1), Duration.ofDays(5)),
+      Row(null, Duration.ofDays(3)),
+      Row(Duration.ofDays(4), null),
+      Row(Duration.ofDays(5), Duration.ofDays(6)),
+      Row(Duration.ofDays(7), Duration.ofDays(8)),
+      Row(Duration.ofDays(2), Duration.ofDays(3))))
+
+    val expected = Seq(
+      Row(Duration.ofDays(1), Duration.ofDays(5)),
+      Row(Duration.ofDays(5), Duration.ofDays(6)),
+      Row(Duration.ofDays(2), Duration.ofDays(3)))
+
+    Seq("1", Int.MaxValue.toString).foreach { splitThreshold =>
+      def testFilterCSE(cseEnabled: Boolean): String = {
+        withSQLConf(
+          SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> cseEnabled.toString,
+          SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true",
+          SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+          SQLConf.CODEGEN_METHOD_SPLIT_THRESHOLD.key -> splitThreshold) {
+          val df = spark.createDataFrame(data, schema)
+          val filtered = df.where(
+            "a IS NOT NULL AND (a + b) > INTERVAL '3' DAY " +
+              "AND (a + b) < INTERVAL '15' DAY AND (a + b) != INTERVAL '10' DAY")
+          val plan = filtered.queryExecution.executedPlan
+          assert(plan.exists(_.isInstanceOf[WholeStageCodegenExec]),
+            "Filter should be in whole-stage codegen")
+          checkAnswer(filtered, expected)
+          codegenString(plan)
+        }
+      }
+
+      val cseCode = testFilterCSE(cseEnabled = true)
+      val noCseCode = testFilterCSE(cseEnabled = false)
+
+      val addExactPattern = "addExact".r
+      val cseAddCount = addExactPattern.findAllIn(cseCode).length
+      val noCseAddCount = addExactPattern.findAllIn(noCseCode).length
+      assert(cseAddCount < noCseAddCount,
+        s"CSE should reduce repeated evaluation (splitThreshold=$splitThreshold): " +
+          s"addExact appears $cseAddCount times with CSE vs $noCseAddCount times without")
+    }
+  }
+
+  test("SPARK-56431: CSE in FilterExec preserves null guards for notNull columns") {
+    // The CSE precomputation in FilterExec runs BEFORE IsNotNull short-circuits.
+    // If the CSE-bound expressions use the tightened output nullability
+    // (notNullAttributes marked non-null), the generated code omits null
+    // checks and crashes on types whose arithmetic NPEs on null (Decimal).
+    val schema = StructType(Seq(
+      StructField("a", DecimalType(10, 2), nullable = true),
+      StructField("b", DecimalType(10, 2), nullable = true)))
+    val data = spark.sparkContext.parallelize(Seq(
+      Row(null, new JBigDecimal("100.00")),
+      Row(new JBigDecimal("50.00"), new JBigDecimal("200.00")),
+      Row(new JBigDecimal("80.00"), new JBigDecimal("100.00"))))
+
+    withSQLConf(
+      SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> "true",
+      SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true",
+      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
+      val df = spark.createDataFrame(data, schema)
+      // abs(b - a) appears twice, creating a CSE candidate.
+      // a IS NOT NULL puts a in FilterExec.notNullAttributes.
+      // Without the fix the first row (a=null) causes NPE in the
+      // CSE precomputation because Decimal.subtract skips null check.
+      val filtered = df.where(
+        "a IS NOT NULL AND abs(b - a) > 0.10 AND abs(b - a) < 1000.00")
+      val plan = filtered.queryExecution.executedPlan
+      assert(plan.exists(_.isInstanceOf[WholeStageCodegenExec]),
+        "Filter should be in whole-stage codegen")
+      checkAnswer(filtered, Seq(
+        Row(new JBigDecimal("50.00"), new JBigDecimal("200.00")),
+        Row(new JBigDecimal("80.00"), new JBigDecimal("100.00"))))
+    }
+  }
+
+  test("SPARK-56032: FilterExec CSE defers throw-capable notNullPred past guard otherPred") {
+    // `InferFiltersFromConstraints` can add a throw-capable `IsNotNull(cast(s as int))`
+    // alongside an earlier guard otherPred (`kind = 'numeric'`). The non-CSE path
+    // defers leftover notNullPreds to after the otherPreds so the guard short-circuits
+    // before the cast runs; the CSE branch must preserve that ordering.
+    // AQE is disabled here and in the sibling test below so each FilterExec is directly
+    // visible for the plan-shape assertions, rather than wrapped inside an
+    // AdaptiveSparkPlan.
+    val t = Seq(("3", "numeric"), ("abc", "text")).toDF("s", "kind")
+    val idx = Seq(1, 2).toDF("i")
+    withSQLConf(
+      SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> "true",
+      SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true",
+      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+      SQLConf.ANSI_ENABLED.key -> "true") {
+      withTempView("spark_56032_t", "spark_56032_idx") {
+        t.createOrReplaceTempView("spark_56032_t")
+        idx.createOrReplaceTempView("spark_56032_idx")
+        val query =
+          """
+            |WITH guarded AS (SELECT s FROM spark_56032_t WHERE kind = 'numeric'),
+            |     derived AS (SELECT s, CAST(s AS INT) AS n FROM guarded),
+            |     pairs   AS (SELECT s, i FROM derived, spark_56032_idx WHERE i <= n)
+            |SELECT s, i FROM pairs
+            |""".stripMargin
+        val df = spark.sql(query)
+        val plan = df.queryExecution.executedPlan
+        assert(plan.exists(_.isInstanceOf[WholeStageCodegenExec]),
+          "Filter should be in whole-stage codegen")
+        // Guard against optimizer drift: require a single rolled-up FilterExec carrying
+        // both `IsNotNull(Cast(s AS INT))` and a non-IsNotNull guard conjunct -- without
+        // this, `checkAnswer` alone would silently pass even if the buggy ordering
+        // returned.
+        def conjuncts(e: Expression): Seq[Expression] = e match {
+          case And(l, r) => conjuncts(l) ++ conjuncts(r)
+          case other => Seq(other)
+        }
+        val matchingFilter = plan.collect {
+          case f: FilterExec =>
+            val cs = conjuncts(f.condition)
+            val hasThrowingIsNotNull = cs.exists {
+              case IsNotNull(_: Cast) => true
+              case _ => false
+            }
+            val hasGuardOtherPred = cs.exists {
+              case _: IsNotNull => false
+              case _ => true
+            }
+            hasThrowingIsNotNull && hasGuardOtherPred
+        }.exists(identity)
+        assert(matchingFilter,
+          "expected a FilterExec whose condition carries both IsNotNull(Cast(...)) " +
+            "and a non-IsNotNull guard conjunct")
+        checkAnswer(df, Seq(Row("3", 1), Row("3", 2)))
+        // Cross-check the codegen path against the interpreted path.
+        withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false") {
+          checkAnswer(spark.sql(query), Seq(Row("3", 1), Row("3", 2)))
+        }
+      }
+    }
+  }
+
+  test("SPARK-51356: FilterExec emits IsNotNull on a nested field before its otherPred") {
+    // `IsNotNull(b.c)` is null-intolerant and references only `b`, so it is classified as a
+    // notNullPred -- but its child is a complex expression, so it never matches an otherPred's
+    // bare attribute reference. It used to be deferred to the trailing leftover block, i.e.
+    // emitted *after* the UDF that dereferences `b.c`, and `ScalaUDF` hands a null argument to
+    // its deserializer rather than short-circuiting, so `newInstance(Spark51356Inner)` threw.
+    // The interpreted path evaluates the conjunction in order and was unaffected.
+    val data = Seq(
+      Spark51356Outer(null),
+      Spark51356Outer(Spark51356Mid(null)), // the row that used to trigger the failure
+      Spark51356Outer(Spark51356Mid(Spark51356Inner(0))),
+      Spark51356Outer(Spark51356Mid(Spark51356Inner(1))))
+    val isDZero = udf((c: Spark51356Inner) => c.d == 0)
+    def newDf(): Dataset[Spark51356Mid] = {
+      // `map(identity)` keeps the input from being folded into a LocalRelation, so the filter
+      // really goes through whole-stage codegen.
+      val mids = spark.createDataset(data).map(identity)
+        .where(col("b").isNotNull).select(col("b").as[Spark51356Mid])
+      mids.filter(col("c").isNotNull).filter(not(isDZero(col("c"))))
+    }
+
+    withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true") {
+      val df = newDf()
+      val plan = df.queryExecution.executedPlan
+      assert(plan.exists(_.isInstanceOf[WholeStageCodegenExec]),
+        "Filter should be in whole-stage codegen")
+      // Guard against optimizer drift: the regression only exists when a single FilterExec
+      // carries an `IsNotNull` over a complex child together with a non-IsNotNull conjunct
+      // that consumes the same expression.
+      def conjuncts(e: Expression): Seq[Expression] = e match {
+        case And(l, r) => conjuncts(l) ++ conjuncts(r)
+        case other => Seq(other)
+      }
+      val matchingFilter = plan.collect {
+        case f: FilterExec =>
+          val cs = conjuncts(f.condition)
+          val nestedIsNotNulls = cs.collect {
+            case IsNotNull(child) if !child.isInstanceOf[Attribute] => child
+          }
+          nestedIsNotNulls.exists { child =>
+            cs.exists {
+              case _: IsNotNull => false
+              case other => other.exists(_.semanticEquals(child))
+            }
+          }
+      }.exists(identity)
+      assert(matchingFilter,
+        "expected a FilterExec carrying IsNotNull(<complex>) plus a non-IsNotNull conjunct " +
+          "over the same expression")
+      checkAnswer(df.toDF(), Row(Row(1)))
+    }
+    // Cross-check the codegen path against the interpreted path.
+    withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false") {
+      val df = newDf()
+      assert(!df.queryExecution.executedPlan.exists(_.isInstanceOf[WholeStageCodegenExec]),
+        "the cross-check must be planned without whole-stage codegen")
+      checkAnswer(df.toDF(), Row(Row(1)))
+    }
+  }
+
+  test("SPARK-51356: FilterExec CSE emits IsNotNull on a nested field before its otherPred") {
+    // Same defect as above, with a common subexpression eliminated in `FilterExec.doConsume`.
+    // Two otherPreds share the non-cheap `f(c)`, so it is eliminated (a bare `b.c` is cheap
+    // and would not be). The guarding `IsNotNull(b.c)` has to be emitted ahead of the shared CSE
+    // precompute, not after the predicates that consume it.
+    val data = Seq(
+      Spark51356Outer(null),
+      Spark51356Outer(Spark51356Mid(null)), // the row that used to trigger the failure
+      Spark51356Outer(Spark51356Mid(Spark51356Inner(0))),
+      Spark51356Outer(Spark51356Mid(Spark51356Inner(1))))
+    val dOf = udf((c: Spark51356Inner) => c.d)
+    val mids = spark.createDataset(data).map(identity)
+      .where(col("b").isNotNull).select(col("b").as[Spark51356Mid])
+    val df = mids
+      .filter(col("c").isNotNull)
+      .filter(dOf(col("c")) > 0)
+      .filter(dOf(col("c")) < 100)
+
+    withSQLConf(
+      SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> "true",
+      SQLConf.SUBEXPRESSION_ELIMINATION_FILTER_EXEC_ENABLED.key -> "true",
+      SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true") {
+      val plan = df.queryExecution.executedPlan
+      assert(plan.exists(_.isInstanceOf[WholeStageCodegenExec]),
+        "Filter should be in whole-stage codegen")
+      checkAnswer(df.toDF(), Row(Row(1)))
+    }
+  }
+
+  test("SPARK-51356: FilterExec CSE guards an IsNotNull whose child is itself a subexpression") {
+    // A dynamic-gap `session_window` guards the session struct with an IsNotNull over the same
+    // cast the struct is built from, so the guarded expression is itself the common
+    // subexpression. The check must not reference the CSE state, which is emitted later.
+    val df = spark.sql(
+      """
+        |SELECT a, count(*) AS cnt
+        |FROM VALUES ('A1', '2021-01-01 00:00:00'), ('A1', '2021-01-01 00:04:30'),
+        |            ('A2', '2021-01-01 00:01:00') AS tab(a, b)
+        |GROUP BY a, session_window(b, CASE WHEN a = 'A1' THEN '5 minutes' ELSE '1 minute' END)
+      """.stripMargin)
+
+    withSQLConf(
+      SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> "true",
+      SQLConf.SUBEXPRESSION_ELIMINATION_FILTER_EXEC_ENABLED.key -> "true",
+      SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true") {
+      checkAnswer(df, Seq(Row("A1", 2), Row("A2", 1)))
+    }
+  }
+
+  test("SPARK-56032: FilterExec CSE handles shared otherPred refs with guard") {
+    // Filter shape: kind = 'numeric' AND cast(s as int) > 0 AND cast(s as int) < 100.
+    // Exercises invariant (b) on a shape where two cast otherPreds share a ref: the
+    // guard must short-circuit before either cast runs (so the 'abc'/'text' row never
+    // throws under ANSI), and the null-s row must be filtered by the IsNotNull check
+    // emitted ahead of the cast otherPreds rather than reaching the tightened-output
+    // binding. See the sibling test above for the AQE-off rationale.
+    val schema = StructType(Seq(
+      StructField("s", StringType, nullable = true),
+      StructField("kind", StringType, nullable = true)))
+    val data = spark.sparkContext.parallelize(Seq(
+      Row("3", "numeric"),
+      Row("7", "numeric"),
+      Row(null, "numeric"),
+      Row("abc", "text")))
+
+    withSQLConf(
+      SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> "true",
+      SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true",
+      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+      SQLConf.ANSI_ENABLED.key -> "true") {
+      val df = spark.createDataFrame(data, schema).where(
+        "kind = 'numeric' AND cast(s as int) > 0 AND cast(s as int) < 100")
+      val plan = df.queryExecution.executedPlan
+      assert(plan.exists(_.isInstanceOf[WholeStageCodegenExec]),
+        "Filter should be in whole-stage codegen")
+      // Guard against optimizer drift: require the rolled-up filter to still carry
+      // both `cast(s as int)` conjuncts so the shared-ref path is exercised.
+      val castCount = plan.collectFirst { case f: FilterExec =>
+        f.condition.collect { case c: Cast => c }.size
+      }.getOrElse(0)
+      assert(castCount >= 2,
+        s"expected a FilterExec condition with at least 2 Cast expressions, got $castCount")
+      checkAnswer(df, Seq(Row("3", "numeric"), Row("7", "numeric")))
+    }
+  }
+
+  test("SPARK-56032: FilterExec CSE preserves short-circuit across predicates") {
+    // A CSE'd subexpression must not be hoisted above an earlier otherPred's short-circuit,
+    // otherwise rows an earlier otherPred would have rejected still pay the cost of the
+    // later predicate's throw-prone expression. Two shapes worth exercising:
+    //   - CSE within one conjunct: `x > 0 AND ((100 / x) > 0 OR (100 / x) < 1000)` --
+    //     `100 / x` appears twice inside otherPreds(1) only.
+    //   - CSE across two conjuncts: `x > 0 AND (100 / x) > 0 AND (100 / x) < 1000` --
+    //     `100 / x` is shared between otherPreds(1) and otherPreds(2); the precompute
+    //     must be emitted just before otherPreds(1), not at the top of the do { } block.
+    // In both shapes, hoisting to the top of the do { } block evaluates 100 / 0 on the
+    // x=0 row under ANSI and throws before x > 0 rejects.
+    val schema = StructType(Seq(
+      StructField("x", IntegerType, nullable = false)))
+    val data = spark.sparkContext.parallelize(Seq(
+      Row(0), Row(2), Row(4)))
+
+    withSQLConf(
+      SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> "true",
+      SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true",
+      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+      SQLConf.ANSI_ENABLED.key -> "true") {
+      val df = spark.createDataFrame(data, schema)
+      Seq(
+        "x > 0 AND ((100 / x) > 0 OR (100 / x) < 1000)",
+        "x > 0 AND (100 / x) > 0 AND (100 / x) < 1000"
+      ).foreach { predicate =>
+        val filtered = df.where(predicate)
+        val plan = filtered.queryExecution.executedPlan
+        assert(plan.exists(_.isInstanceOf[WholeStageCodegenExec]),
+          s"Filter should be in whole-stage codegen for: $predicate")
+        checkAnswer(filtered, Seq(Row(2), Row(4)))
+      }
+    }
+  }
+
+  test("SPARK-56032: FilterExec skips CSE codegen when there is no common subexpression") {
+    // When otherPreds share no common subexpression, the CSE codegen path provides no benefit
+    // but would still eagerly evaluate every referenced input column at the top of the row loop
+    // (the inputVarsEvalCode prologue), defeating the lazy, short-circuiting column loads of the
+    // non-CSE path. Verify that with CSE enabled we fall back to the exact same generated code as
+    // with CSE disabled, so no column is decoded for rows an earlier predicate would reject.
+    val schema = StructType(Seq(
+      StructField("a", IntegerType, nullable = true),
+      StructField("b", IntegerType, nullable = true)))
+    val data = spark.sparkContext.parallelize(Seq(
+      Row(1, 5), Row(null, 3), Row(4, null), Row(5, 6), Row(7, 8), Row(2, 3)))
+    val expected = Seq(Row(5, 6), Row(7, 8))
+
+    def filterCode(cseEnabled: Boolean): String = {
+      withSQLConf(
+        SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> cseEnabled.toString,
+        SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true",
+        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
+        val df = spark.createDataFrame(data, schema)
+        // `a > 4` and `b > 4` reference different columns and share no subexpression.
+        val filtered = df.where("a IS NOT NULL AND a > 4 AND b > 4")
+        val plan = filtered.queryExecution.executedPlan
+        assert(plan.exists(_.isInstanceOf[WholeStageCodegenExec]),
+          "Filter should be in whole-stage codegen")
+        checkAnswer(filtered, expected)
+        codegenString(plan)
+      }
+    }
+
+    // Each `createDataFrame` mints fresh attribute exprIds (e.g. `a#16`), which appear in the
+    // plan-tree header of the codegen dump but not in the generated Java. Normalize them away so
+    // the comparison reflects the generated code, not the id counter.
+    def normalize(code: String): String = code.replaceAll("#\\d+", "#")
+    assert(normalize(filterCode(cseEnabled = true)) == normalize(filterCode(cseEnabled = false)),
+      "With no common subexpression, CSE-enabled FilterExec codegen should be identical to " +
+        "CSE-disabled codegen (i.e. fall back to the lazy, short-circuiting non-CSE path)")
+  }
+
+  test("SPARK-56032: FilterExec skips CSE codegen when the common subexpression is cheap") {
+    // A column repeated across conjuncts never becomes a common subexpression -- a bare column is a
+    // `LeafExpression`, which `EquivalentExpressions` skips, and `splitConjunctivePredicates` feeds
+    // each conjunct to a separate `addExprTree` call. The realistic cheap-but-recorded case is a
+    // shared *non-leaf* slot read such as a struct field access: `s.x > 5 AND s.x < 100` shares
+    // `GetStructField(s, x)`. Caching that gains nothing over the non-CSE path's lazy load, so the
+    // gate must fall back. (Pre-`isCheap`-gate this took the CSE path, emitting the eager
+    // prologue.)
+    val schema = StructType(Seq(
+      StructField("s", StructType(Seq(StructField("x", IntegerType, nullable = true))),
+        nullable = true)))
+    val data = spark.sparkContext.parallelize(Seq(
+      Row(Row(10)), Row(Row(3)), Row(Row(200)), Row(Row(50)), Row(Row(null)), Row(null)))
+    val expected = Seq(Row(Row(10)), Row(Row(50)))
+
+    def filterCode(cseEnabled: Boolean): String = {
+      withSQLConf(
+        SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> cseEnabled.toString,
+        SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true",
+        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
+        val df = spark.createDataFrame(data, schema)
+        // Both conjuncts share `GetStructField(s, x)`, a cheap non-leaf common subexpression.
+        val filtered = df.where("s.x > 5 AND s.x < 100")
+        val plan = filtered.queryExecution.executedPlan
+        assert(plan.exists(_.isInstanceOf[WholeStageCodegenExec]),
+          "Filter should be in whole-stage codegen")
+        checkAnswer(filtered, expected)
+        codegenString(plan)
+      }
+    }
+
+    def normalize(code: String): String = code.replaceAll("#\\d+", "#")
+    assert(normalize(filterCode(cseEnabled = true)) == normalize(filterCode(cseEnabled = false)),
+      "With only a cheap common subexpression, CSE-enabled FilterExec codegen should be " +
+        "identical to CSE-disabled codegen (i.e. fall back to the lazy, short-circuiting " +
+        "non-CSE path)")
+  }
+
+  test("SPARK-56032: FilterExec takes CSE codegen when the common subexpression is non-cheap") {
+    // The dual of the cheap-subexpression test: when `otherPreds` share a genuinely non-cheap
+    // computation (`a + b`, whose `isCheap` is false), the gate must take the CSE path so the
+    // shared result is computed once. Verify the CSE-enabled code differs from CSE-disabled here,
+    // pinning down that the gate still fires for real repeated computation.
+    val schema = StructType(Seq(
+      StructField("a", IntegerType, nullable = true),
+      StructField("b", IntegerType, nullable = true)))
+    val data = spark.sparkContext.parallelize(Seq(
+      Row(1, 5), Row(60, 50), Row(10, 20), Row(0, 0), Row(null, 5)))
+    val expected = Seq(Row(1, 5), Row(10, 20))
+
+    def filterCode(cseEnabled: Boolean): String = {
+      withSQLConf(
+        SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> cseEnabled.toString,
+        SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true",
+        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
+        val df = spark.createDataFrame(data, schema)
+        // Both conjuncts share `a + b`, a non-cheap common subexpression worth eliminating.
+        val filtered = df.where("(a + b) > 0 AND (a + b) < 100")
+        val plan = filtered.queryExecution.executedPlan
+        assert(plan.exists(_.isInstanceOf[WholeStageCodegenExec]),
+          "Filter should be in whole-stage codegen")
+        checkAnswer(filtered, expected)
+        codegenString(plan)
+      }
+    }
+
+    def normalize(code: String): String = code.replaceAll("#\\d+", "#")
+    assert(normalize(filterCode(cseEnabled = true)) != normalize(filterCode(cseEnabled = false)),
+      "With a non-cheap common subexpression, CSE-enabled FilterExec codegen should differ from " +
+        "CSE-disabled codegen (i.e. take the CSE path that computes the shared result once)")
+  }
+
+  test("SPARK-56032: subexpressionElimination.filterExec.enabled gates FilterExec CSE " +
+    "independently of subexpression elimination") {
+    // The conf disables CSE specifically for FilterExec while leaving subexpression elimination
+    // enabled elsewhere. With a genuine common subexpression in the predicates, turning the conf
+    // off should make FilterExec fall back to the lazy non-CSE path (re-evaluating the shared
+    // subexpression per use), matching the code generated when CSE is globally disabled.
+    val schema = StructType(Seq(
+      StructField("a", DayTimeIntervalType(), nullable = true),
+      StructField("b", DayTimeIntervalType(), nullable = true)))
+    val data = spark.sparkContext.parallelize(Seq(
+      Row(Duration.ofDays(1), Duration.ofDays(5)),
+      Row(Duration.ofDays(5), Duration.ofDays(6)),
+      Row(Duration.ofDays(2), Duration.ofDays(3))))
+    val expected = data.collect().toSeq
+
+    // `a + b` appears three times in the predicate, so it is a CSE candidate. We count `addExact`
+    // occurrences in the generated code: the CSE path evaluates it once, the lazy path per use.
+    def filterCode(filterExecCseEnabled: Boolean): String = {
+      withSQLConf(
+        // Subexpression elimination stays globally on; only the FilterExec gate flips.
+        SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> "true",
+        SQLConf.SUBEXPRESSION_ELIMINATION_FILTER_EXEC_ENABLED.key ->
+          filterExecCseEnabled.toString,
+        SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true",
+        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
+        val df = spark.createDataFrame(data, schema)
+        val filtered = df.where(
+          "a IS NOT NULL AND (a + b) > INTERVAL '3' DAY " +
+            "AND (a + b) < INTERVAL '15' DAY AND (a + b) != INTERVAL '10' DAY")
+        val plan = filtered.queryExecution.executedPlan
+        assert(plan.exists(_.isInstanceOf[WholeStageCodegenExec]),
+          "Filter should be in whole-stage codegen")
+        checkAnswer(filtered, expected)
+        codegenString(plan)
+      }
+    }
+
+    val addExactPattern = "addExact".r
+    val enabledCount = addExactPattern.findAllIn(filterCode(filterExecCseEnabled = true)).length
+    val disabledCount = addExactPattern.findAllIn(filterCode(filterExecCseEnabled = false)).length
+    // With the gate on, CSE collapses the repeated `a + b` evaluations; with the gate off,
+    // FilterExec falls back to the lazy path that re-evaluates per use.
+    assert(enabledCount < disabledCount,
+      s"subexpressionElimination.filterExec.enabled should reduce repeated evaluation: " +
+        s"addExact appears $enabledCount times when enabled vs $disabledCount times when disabled")
+  }
+
+  test("Expand should eliminate common subexpressions across branches") {
+    // The conditions of the two conditional COUNT DISTINCT aggregates share `sinh(v)`, which
+    // `RewriteDistinctAggregates` places in different branches of the Expand. The bases
+    // differ (`k` vs `v`), so the conditional rewrite does not reduce the distinct-group
+    // count and is not applied. Each branch stays the original IF and evaluates `sinh(v)`
+    // once. Since all the branches consume the same input row, with subexpression
+    // elimination `sinh(v)` should be evaluated once per input row (before the branch
+    // loop) instead of once per branch.
+    def runQuery(): String = {
+      val df = spark.range(10)
+        .selectExpr("id as k", "cast(id as double) as v")
+        .selectExpr(
+          "count(DISTINCT IF(sinh(v) > 5.0, k, NULL))",
+          "count(DISTINCT IF(sinh(v) > 50.0, v, NULL))")
+      val plan = df.queryExecution.executedPlan
+      assert(plan.exists(_.isInstanceOf[ExpandExec]), "Expand is expected")
+      checkAnswer(df, Row(7L, 5L))
+      codegenStringSeq(plan).map(_._2).mkString
+    }
+
+    val sinhPattern = "java\\.lang\\.Math\\.sinh".r
+    val enabledCode = withSQLConf(SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> "true") {
+      runQuery()
+    }
+    val disabledCode = withSQLConf(SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> "false") {
+      runQuery()
+    }
+    assert(sinhPattern.findAllIn(enabledCode).length == 1,
+      "sinh(v) should be evaluated only once per input row with subexpression elimination")
+    assert(sinhPattern.findAllIn(disabledCode).length == 2,
+      "sinh(v) should be evaluated once per branch without subexpression elimination")
+
+    // Whether the switch/case bodies are split into separate functions (SPARK-35329)
+    // depends on the amount of code generated for the branches, so force both code paths
+    // explicitly instead of relying on the default methodSplitThreshold. With a tiny
+    // threshold the bodies are split and the eliminated subexpression variables have to
+    // be passed to the split functions as parameters; with a huge threshold the bodies
+    // stay inline and reference the variables directly. ExpandExec names each split
+    // function via `ctx.freshName("switchCaseCode")` (e.g. `switchCaseCode_0`) and emits
+    // both its definition and call site into the generated source, so the substring
+    // "switchCaseCode" appears in the generated code if and only if a split happened.
+    val splitCode = withSQLConf(
+        SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> "true",
+        SQLConf.CODEGEN_METHOD_SPLIT_THRESHOLD.key -> "1") {
+      runQuery()
+    }
+    assert(splitCode.contains("switchCaseCode"),
+      "switch/case bodies should be split into separate functions with a tiny " +
+        "methodSplitThreshold")
+    assert(sinhPattern.findAllIn(splitCode).length == 1,
+      "sinh(v) should be evaluated only once per input row with function splitting")
+
+    val inlineCode = withSQLConf(
+        SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> "true",
+        SQLConf.CODEGEN_METHOD_SPLIT_THRESHOLD.key -> "1000000") {
+      runQuery()
+    }
+    assert(!inlineCode.contains("switchCaseCode"),
+      "switch/case bodies should stay inline with a large methodSplitThreshold")
+    assert(sinhPattern.findAllIn(inlineCode).length == 1,
+      "sinh(v) should be evaluated only once per input row without function splitting")
+  }
+
+  test("SPARK-59589: a subexpression method reads an Expand's varying output as a field") {
+    // `ExpandExec` holds an UNPIVOT's string output in a slot of a compacted mutable state array,
+    // such as `expand_mutableStateArray_0[1]`. A large common subexpression reading it is computed
+    // in a method of its own, which takes the local variables it reads as parameters. Taken for a
+    // local variable, the slot became a parameter `UTF8String expand_mutableStateArray_0[1]` and
+    // the stage did not compile. Handed out as a field, it is read as one, split on or off.
+    val f = "concat(upper(v), lower(v), reverse(v), trim(v), ltrim(v), rtrim(v), initcap(v), " +
+      "repeat(v, 2), lpad(v, 10, 'x'), rpad(v, 10, 'y'))"
+    val stringParameter = "private void \\w*subExpr_\\d+\\([^)]*UTF8String ".r
+    checkExpandSlotRead("subExpr", unpivot => s"SELECT c, $f AS x, concat($f, 'z') AS y $unpivot",
+      code => assert(code.forall(c => stringParameter.findFirstIn(c.body).isEmpty)))
+  }
+
+  test("SPARK-60398: Expand compiles with its switch case functions spilled to nested classes") {
+    // A sliding window has its Expand generate a row for each window a time can fall in: 360 rows
+    // for a window of an hour sliding by 10 seconds. Without subexpression elimination the code
+    // of each case computes the window in full and goes into a function of its own (SPARK-35329),
+    // and the 360 functions, about 2.5 million characters of code, take the class past
+    // `CodeGenerator.GENERATED_CLASS_SIZE_THRESHOLD`, so `addNewFunction` puts the later ones into
+    // nested classes. A call from outside of such a class has to go through its instance, as the
+    // name `addNewFunction` returns does; by the bare name it failed to compile, and the stage ran
+    // without whole stage codegen. The calls come from `expand_doConsume_0`, added after the
+    // functions into a later nested class, and, where the consume code of the operators is not
+    // split into functions, from `processNext` of the outer class.
+    val qualifiedCall = "\\w*nestedClassInstance_\\d+\\.\\w*switchCaseCode_\\d+\\(".r
+    def check(df: => DataFrame): Unit = {
+      val code = genCode(df)
+      code.foreach(CodeGenerator.compile)
+      assert(code.exists(c => qualifiedCall.findFirstIn(c.body).nonEmpty))
+      checkAnswer(df, withoutWholeStage(df))
+    }
+    def times: DataFrame = spark.range(10).selectExpr("timestamp_seconds(id) AS ts")
+    withSQLConf(SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> "false") {
+      check(times.groupBy(window($"ts", "1 hour", "10 seconds")).count())
+      withSQLConf(SQLConf.WHOLESTAGE_SPLIT_CONSUME_FUNC_BY_OPERATOR.key -> "false") {
+        check(times.select(window($"ts", "1 hour", "10 seconds")))
+      }
+    }
+  }
+
+  test("SPARK-59589: split switch cases and aggregate functions read an Expand's output as a " +
+      "field") {
+    // With the consume functions not split by operator, the consumer reads the UNPIVOT's output
+    // directly, and a tiny threshold moves its code into methods: the switch cases of the Expand
+    // that `RewriteDistinctAggregates` adds, and the aggregate functions.
+    withSQLConf(
+        SQLConf.WHOLESTAGE_SPLIT_CONSUME_FUNC_BY_OPERATOR.key -> "false",
+        SQLConf.CODEGEN_METHOD_SPLIT_THRESHOLD.key -> "1") {
+      checkExpandSlotRead("switchCaseCode", unpivot =>
+        s"SELECT count(DISTINCT lpad(v, 10, 'x')), count(DISTINCT rpad(v, 10, 'y')) $unpivot")
+      checkExpandSlotRead("doAggregate_sum", unpivot =>
+        s"SELECT c, sum(length(lpad(v, 10, 'x'))), sum(length(rpad(v, 10, 'y'))) $unpivot " +
+          "GROUP BY c")
+    }
+  }
+
+  test("SPARK-59295: a nested With in a branch is emitted once per scope under whole-stage") {
+    // A whole-stage `Project` passes its input as local variables, which is where
+    // `CommonExprSlots.fill` could not put a definition in a method before. Both `nullif`s survive
+    // the rewrite inside the branch and each reads its definition twice, so pasting the bodies
+    // would leave the innermost one 4 times over. The project list mentions `a` and `b` more than
+    // once, which is what has `ProjectExec` evaluate them before generating this expression -- the
+    // case below covers the other one.
+    val marker = 1234567
+    val df = spark.range(0, 10, 1, 1).selectExpr("cast(id as int) as a", "cast(id as int) + 1 as b")
+    val query = df.selectExpr(
+      s"CASE WHEN a < 0 THEN NULL ELSE nullif(nullif(a + b + $marker, b), a) END AS r")
+    assert(query.queryExecution.executedPlan.exists(_.expressions.exists(_.exists {
+      case _: With => true
+      case _ => false
+    })), "the rewrite left no With to generate")
+    // Pin the threshold: below the innermost body's length that body would go into a method of its
+    // own and the count would be 1, for a reason unrelated to nesting.
+    val source = withSQLConf(SQLConf.CODEGEN_METHOD_SPLIT_THRESHOLD.key -> "1024") {
+      genCode(query).map(_.body).mkString("\n")
+    }
+    val emitted = marker.toString.r.findAllMatchIn(source).size
+    assert(emitted == 2, s"the innermost definition was emitted $emitted times")
+    // One method for the outer definition, called at both of its references. The name carries the
+    // operator's fresh-name prefix, as in `project_computeCommonExpr_0`.
+    val declared = "private void \\w*computeCommonExpr_[0-9]+\\(".r.findAllMatchIn(source).size
+    assert(declared == 1, source)
+    // Runs it too, so the generated source above is known to compile.
+    checkAnswer(query, (0 until 10).map(i => Row(2 * i + marker + 1)))
+  }
+
+  test("SPARK-59295: a definition reading an input variable the operator has not evaluated") {
+    // Such a variable's code is written against the scope of the operator producing the row and
+    // names a local of it -- here the column batch's row index, and after an exchange the input
+    // adapter's row -- so it cannot go into a method along with the body that reads it. `b` is read
+    // once and only inside a definition, which is what leaves it unevaluated: `ProjectExec`
+    // evaluates an attribute up front only where the project list mentions it more than once.
+    val marker = 1234567
+    withTempPath { dir =>
+      val path = dir.getCanonicalPath
+      spark.range(0, 10).selectExpr("cast(id as int) as a", "cast(id as int) + 1 as b")
+        .write.mode(SaveMode.Overwrite).parquet(path)
+      val query = spark.read.parquet(path).selectExpr(
+        s"CASE WHEN a < 0 THEN NULL ELSE nullif(nullif(a + $marker, b), a) END AS r")
+      assert(query.queryExecution.executedPlan.exists(_.expressions.exists(_.exists {
+        case _: With => true
+        case _ => false
+      })), "the rewrite left no With to generate")
+      // Pin the threshold for the two assertions below: under the inner definition's length that
+      // body would go into a method of its own, whatever this case is about.
+      val code = withSQLConf(SQLConf.CODEGEN_METHOD_SPLIT_THRESHOLD.key -> "1024") {
+        genCode(query)
+      }
+      // Compiling it is the check: before this was refused, the method named the row index of the
+      // column batch and janino rejected it, which drops the whole stage.
+      code.foreach(CodeGenerator.compile)
+      val source = code.map(_.body).mkString("\n")
+      assert(!source.contains("computeCommonExpr"),
+        "the definition reads an unevaluated variable, so it cannot go in a method")
+      // Which leaves the inner definition pasted at its two references inside the outer one, itself
+      // pasted at two: 4, against the 2 the case above gets from a method.
+      val emitted = marker.toString.r.findAllMatchIn(source).size
+      assert(emitted == 4, s"the innermost definition was emitted $emitted times")
+      checkAnswer(query, (0 until 10).map(i => Row(i + marker)))
+    }
+  }
+
+  /** `CASE WHEN c = 1 THEN c * 1 WHEN c = 2 THEN c * 2 ... ELSE 0 END` with `n` branches. */
+  private def largeCaseWhen(c: String, n: Int): String =
+    (1 to n).map(k => s"WHEN $c = $k THEN $c * $k").mkString("CASE ", " ", " ELSE 0 END")
+
+  /** The largest method of `df`'s stages, compiled. */
+  private def maxStageMethodSize(df: DataFrame): Int =
+    genCode(df).map(c => CodeGenerator.compile(c)._2.maxMethodCodeSize).max
+
+  /**
+   * Whether a CASE WHEN of one of `df`'s stages was split into methods, whose names carry the
+   * prefix of the operator they were generated for, such as `project_caseWhen_0_0`.
+   */
+  private def splitsCaseWhen(df: DataFrame): Boolean =
+    genCode(df).exists(c => "private byte \\w*caseWhen_\\d".r.findFirstIn(c.body).nonEmpty)
+
+  /** Whether a split method of a CASE WHEN of `df`'s stages takes a row. */
+  private def splitCaseWhenTakesRow(df: DataFrame): Boolean = genCode(df).exists(c =>
+    "private byte \\w*caseWhen_\\d\\w*\\([^)]*InternalRow ".r.findFirstIn(c.body).nonEmpty)
+
+  /** The parameters of each split method of a CASE WHEN of `df`'s stages. */
+  private def splitCaseWhenParameters(df: DataFrame): Seq[Seq[String]] = genCode(df).flatMap { c =>
+    "private byte \\w*caseWhen_\\d\\w*\\(([^)]*)\\)".r.findAllMatchIn(c.body).map { m =>
+      m.group(1).split(",").map(_.trim).filter(_.nonEmpty).toSeq
+    }
+  }
+
+  /**
+   * Runs `body` with every splittable expression of a stage split: the tests of what a split
+   * method looks like use shapes small enough for the stage to keep its code unsplit otherwise
+   * (`spark.sql.codegen.wholeStage.splitExpressions.methodLimit`).
+   */
+  private def withSplitAlways[T](body: => T): T =
+    withSQLConf(SQLConf.WHOLESTAGE_SPLIT_EXPRESSIONS_METHOD_LIMIT.key -> "0")(body)
+
+  /** The splits recorded in generating `df`'s stages with them recorded, as the gate first does. */
+  private def recordedSplits(df: DataFrame): Int = df.queryExecution.executedPlan.collect {
+    case w: WholeStageCodegenExec => w.generate(WholeStageSplit.Record)._1.wholeStageSplitsRecorded
+      .length
+  }.sum
+
+  /** `CASE WHEN v = 0 THEN v * 0 ... ELSE end END AS r FROM t`, `n` branches. */
+  private def caseWhenOverT(n: Int, end: Int): String = (0 until n)
+    .map(i => s"WHEN v = $i THEN v * $i")
+    .mkString("SELECT CASE ", " ", s" ELSE $end END AS r FROM t")
+
+  /** `CASE WHEN v = 0 THEN v * base ... END`, `n` branches, whose products tell them apart. */
+  private def caseWhenOverV(n: Int, base: Int): String =
+    (0 until n).map(i => s"WHEN v = $i THEN v * ${base + i}").mkString("CASE ", " ", " END")
+
+  /**
+   * Eight columns `<alias>0` to `<alias>7` over the column `col`, whose common subexpressions
+   * take the split pass of subexpression elimination.
+   */
+  private def commonSubexprColumns(col: String, alias: String): Seq[String] = (0 until 8).map { i =>
+    val repeated = s"cast(array($col, $col + $i, $col * 2) AS STRING)"
+    s"concat($repeated, $repeated) AS $alias$i"
+  }
+
+  /**
+   * Whether running `body` reports a method past the JIT limit, as the logger the compilers
+   * report under says.
+   */
+  private def reportsHugeMethod(body: => Unit): Boolean = {
+    val logs = new LogAppender("methods too long to be JIT compiled")
+    withLogAppender(logs, loggerNames = Seq(classOf[CodeGenerator[_, _]].getName),
+        level = Some(Level.INFO))(body)
+    logs.loggingEvents.exists(_.getMessage.getFormattedMessage.contains(
+      "too long to be JIT compiled"))
+  }
+
+  /** The first whole-stage codegen stage of `df`. */
+  private def stageOf(df: DataFrame): WholeStageCodegenExec =
+    df.queryExecution.executedPlan.collectFirst { case w: WholeStageCodegenExec => w }.get
+
+  /**
+   * The methods of the generated class `code` whose code holds `text`, by name, whose prefix
+   * says which operator they were generated for, such as `project_caseWhen_0_0`.
+   */
+  private def methodsHolding(code: CodeAndComment, text: String): Set[String] = {
+    val header = "(?m)^\\s*(?:private|public|protected)\\s[^{}();=]*?([A-Za-z_$][\\w$]*)\\s*\\(".r
+    val starts = header.findAllMatchIn(code.body).map(m => (m.start, m.group(1))).toSeq
+    starts.zip(starts.drop(1).map(_._1) :+ code.body.length).collect {
+      case ((start, name), end) if code.body.substring(start, end).contains(text) => name
+    }.toSet
+  }
+
+  /** The rows of `query` computed without whole stage codegen, which each test checks against. */
+  private def withoutWholeStage(query: => DataFrame): Seq[Row] =
+    withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false") {
+      query.collect().toSeq
+    }
+
+  /**
+   * Checks the query `query` builds from a FROM clause that UNPIVOTs two string columns into
+   * `v`, with the whole stage split on and off: a method named like `method` calls `lpad` on the
+   * slot of the compacted mutable state array that `ExpandExec` holds `v` in, `check` holds of
+   * the code, the code compiles, and the rows match those computed without whole stage codegen.
+   * With the slot handed out as a local variable instead, building that method fails the testing
+   * check on its parameters.
+   */
+  private def checkExpandSlotRead(
+      method: String,
+      query: String => String,
+      check: Seq[CodeAndComment] => Unit = _ => ()): Unit = {
+    withTempView("t") {
+      spark.range(10).selectExpr("concat('a', CAST(id AS STRING)) AS a",
+        "concat('b', CAST(id AS STRING)) AS b").createOrReplaceTempView("t")
+      def df: DataFrame = sql(query("FROM t UNPIVOT (v FOR c IN (a, b))"))
+      val expected = withoutWholeStage(df)
+      Seq("true", "false").foreach { split =>
+        withSQLConf(SQLConf.WHOLESTAGE_SPLIT_EXPRESSIONS.key -> split) {
+          val code = genCode(df)
+          // A subexpression method or a switch case also writes into a slot of the same array,
+          // so the array's name alone does not show a read.
+          assert(code.exists(c => methodsHolding(c, "].lpad(").exists(_.contains(method))),
+            s"$method $split")
+          withClue(s"$method $split: ")(check(code))
+          code.foreach(CodeGenerator.compile)
+          checkAnswer(df, expected)
+        }
+      }
+      withSQLConf(SQLConf.WHOLESTAGE_SPLIT_EXPRESSIONS.key -> "false") {
+        // The bottom `ExpandExec` hands out its output as local variables, as before SPARK-59589.
+        val e = intercept[AssertionError](genCode(df, _.transformUp {
+          case x: ExpandExec if !x.child.exists(_.isInstanceOf[ExpandExec]) => LocalOutputExec(x)
+        }))
+        assert(s"\\w*$method\\w* takes \\w+\\[\\d+\\]".r.findFirstIn(e.getMessage).isDefined,
+          e.getMessage)
+      }
+    }
+  }
+
+  test("SPARK-33301: a CASE WHEN too large for one method is split under whole stage codegen") {
+    // Inside a stage the inputs are local variables of the stage's method, and the branches were
+    // not split into methods at all: at 3000 branches the method went past the JVM's 64KB limit,
+    // failed to compile, and the stage fell back to running without whole stage codegen (under
+    // testing, the compile error is thrown). Split, with the calls to the split methods grouped
+    // in turn, every method of the stage is small enough for HotSpot to compile.
+    val df = spark.range(10).selectExpr(s"${largeCaseWhen("id", 3000)} AS v")
+    assert(df.queryExecution.executedPlan.exists {
+      case w: WholeStageCodegenExec => w.child.isInstanceOf[ProjectExec]
+      case _ => false
+    })
+    assert(splitsCaseWhen(df))
+    assert(maxStageMethodSize(df) <= CodeGenerator.DEFAULT_JVM_HUGE_METHOD_LIMIT)
+    checkAnswer(df, (0L until 10L).map(i => Row(i * i)))
+  }
+
+  test("SPARK-33301: the split keeps a stage's method JIT-compilable, and can be turned off") {
+    // Below the 64KB limit the unsplit method still goes past HotSpot's 8000 bytes, and is then
+    // never JIT-compiled.
+    def query: DataFrame = spark.range(10).selectExpr(s"${largeCaseWhen("id", 300)} AS v")
+    assert(maxStageMethodSize(query) <= CodeGenerator.DEFAULT_JVM_HUGE_METHOD_LIMIT)
+    withSQLConf(SQLConf.WHOLESTAGE_SPLIT_EXPRESSIONS.key -> "false") {
+      assert(!splitsCaseWhen(query))
+      assert(maxStageMethodSize(query) > CodeGenerator.DEFAULT_JVM_HUGE_METHOD_LIMIT)
+      checkAnswer(query, (0L until 10L).map(i => Row(i * i)))
+    }
+  }
+
+  test("SPARK-33301: several large CASE WHENs in one projection keep its method small") {
+    // A projection evaluates all its outputs in one method, so the calls every CASE WHEN leaves
+    // there add up: under whole stage codegen the calls are grouped until at most
+    // `SPLIT_CALLS_PER_GROUP` are left per CASE WHEN, which keeps that method JIT-compilable
+    // however many there are. Fourteen of 64 branches and four of 300.
+    for ((count, branches) <- Seq((14, 64), (4, 300))) {
+      def df: DataFrame = spark.range(100)
+        .selectExpr((1 to count).map(i => s"id + $i AS c$i"): _*)
+        .selectExpr((1 to count).map(i => s"${largeCaseWhen(s"c$i", branches)} AS v$i"): _*)
+      assert(splitsCaseWhen(df))
+      assert(maxStageMethodSize(df) <= CodeGenerator.DEFAULT_JVM_HUGE_METHOD_LIMIT,
+        s"$count CASE WHENs of $branches branches")
+      checkAnswer(df, withoutWholeStage(df))
+    }
+  }
+
+  test("SPARK-33301: a stage the JIT compiles whole keeps the code it had without the split") {
+    // A CASE WHEN of 64 branches leaves the stage's method under 8000 bytes, so the stage keeps
+    // its unsplit code, the code with the conf off, and splits only when told to always split.
+    withTempView("t") {
+      spark.range(100).selectExpr("id AS v").createOrReplaceTempView("t")
+      val query = () => sql(caseWhenOverT(64, end = -1))
+      val gated = genCode(query()).map(_.body)
+      val off = withSQLConf(SQLConf.WHOLESTAGE_SPLIT_EXPRESSIONS.key -> "false") {
+        genCode(query()).map(_.body)
+      }
+      assert(gated === off)
+      assert(!splitsCaseWhen(query()))
+      assert(withSplitAlways(splitsCaseWhen(query())))
+      checkAnswer(query(), withoutWholeStage(query()))
+      // So does a stage with no CASE WHEN whose common subexpressions take the split pass of
+      // subexpression elimination, whose discarded first pass keeps the helpers it added, as
+      // with the conf off.
+      val common = () => sql(commonSubexprColumns("v", "c").mkString("SELECT ", ", ", " FROM t"))
+      assert(genCode(common()).map(_.body) ===
+        withSQLConf(SQLConf.WHOLESTAGE_SPLIT_EXPRESSIONS.key -> "false") {
+          genCode(common()).map(_.body)
+        })
+    }
+  }
+
+  test("SPARK-33301: a stage splits only the CASE WHENs in its methods past the limit") {
+    // The filter's CASE WHEN is generated into `processNext`, which stays under the limit; the
+    // projection's into a method of its own, past it. Only the projection's is split: the
+    // filter's would only be slowed down by the calls, in a method the JIT compiles whole.
+    withTempView("t") {
+      spark.range(100).selectExpr("id AS v").createOrReplaceTempView("t")
+      val query = () => sql(s"SELECT ${caseWhenOverV(300, 9000)} AS r FROM t " +
+        s"WHERE ${caseWhenOverV(64, 7000)} > 5")
+      val code = stageOf(query()).doCodeGen()._2
+      def methodsWith(literal: String): Set[String] = methodsHolding(code, literal)
+      assert(methodsWith("9001L").nonEmpty &&
+        methodsWith("9001L").forall(_.startsWith("project_caseWhen")),
+        "the projection's CASE WHEN is split")
+      assert(methodsWith("7001L").nonEmpty && !methodsWith("7001L").exists(_.contains("caseWhen")),
+        "the filter's CASE WHEN stays where it was")
+      checkAnswer(query(), withoutWholeStage(query()))
+    }
+  }
+
+  test("SPARK-33301: the group calls of a split outside a stage are not held to its audit") {
+    // Under testing every call a whole stage split leaves in a subexpression's method is checked
+    // against that method's parameters. A struct hash split by `splitExpressions` passes its own
+    // locals to its group functions, which is right, and is not checked.
+    withSQLConf(SQLConf.CODEGEN_METHOD_SPLIT_THRESHOLD.key -> "1") {
+      val struct = (0 until 200).map(i => s"'f$i', id + $i").mkString("named_struct(", ", ", ")")
+      def df: DataFrame =
+        sql(s"SELECT hash($struct) + 1 AS a, hash($struct) + 2 AS b FROM range(10)")
+      checkAnswer(df, withoutWholeStage(df))
+    }
+  }
+
+  test("SPARK-33301: the trial compile of a stage past the limit reports nothing") {
+    // The unsplit code of 300 branches has a method past the JIT limit; it is compiled only to
+    // decide to split, so the once-per-JVM warning about such a method is not spent on it. The
+    // JDK backend compiles and reports on a thread of its own, which the trial goes to as well.
+    withTempView("t") {
+      spark.range(100).selectExpr("id AS v").createOrReplaceTempView("t")
+      val query = caseWhenOverT(300, end = -1)
+      for (backend <- Seq("janino", "jdk")) {
+        withSQLConf(SQLConf.CODEGEN_COMPILER.key -> backend) {
+          // The warning is once per JVM and INFO after it, so INFO and above is every report.
+          assert(!reportsHugeMethod {
+            assert(splitsCaseWhen(sql(query)))
+            sql(query).collect()
+          }, backend)
+        }
+      }
+    }
+  }
+
+  test("SPARK-33301: the code a stage keeps unsplit reports its method past the JIT limit") {
+    // The trial compile holds its reports back for the code kept. Here the default limit keeps
+    // the split of 300 branches, whose code in one piece was compiled in a trial and is not kept.
+    // That code then leaves the compile cache, so a later compile of it reports its method past
+    // the JIT limit, as for any compiled code: with the split turned off, and with the limit
+    // raised past HotSpot's 8000 bytes, where the stage keeps the code in one piece although the
+    // JIT leaves its method interpreted.
+    withTempView("t") {
+      spark.range(100).selectExpr("id AS v").createOrReplaceTempView("t")
+      val query = caseWhenOverT(300, end = -7)
+      def reports(confs: (String, String)*): Boolean = reportsHugeMethod {
+        // Compiled here rather than by running the query, which compiles with the session's
+        // class loader, and so with Janino whatever the backend (`CodeCompiler.active`).
+        withSQLConf(confs: _*)(genCode(sql(query)).foreach(CodeGenerator.compile))
+      }
+      for (backend <- Seq("janino", "jdk")) {
+        withSQLConf(SQLConf.CODEGEN_COMPILER.key -> backend) {
+          assert(splitsCaseWhen(sql(query)))
+          assert(reports(SQLConf.WHOLESTAGE_SPLIT_EXPRESSIONS.key -> "false"), backend)
+          assert(reports(SQLConf.WHOLESTAGE_SPLIT_EXPRESSIONS_METHOD_LIMIT.key -> "65535"), backend)
+          withSQLConf(SQLConf.WHOLESTAGE_SPLIT_EXPRESSIONS_METHOD_LIMIT.key -> "65535") {
+            assert(!splitsCaseWhen(sql(query)))
+          }
+        }
+      }
+    }
+  }
+
+  test("SPARK-33301: which code a stage keeps, from its trial compiles") {
+    // `chooseCode`'s decisions, with the compile replaced, so that a method can be as large as a
+    // decision needs and a split can fail to compile.
+    withTempView("t") {
+      spark.range(100).selectExpr("id AS v").createOrReplaceTempView("t")
+      val stage = stageOf(sql(caseWhenOverT(300, end = -1)))
+      val recorded = stage.generate(WholeStageSplit.Record)
+      val ctx = recorded._1
+      assert(ctx.wholeStageSplitsRecorded.length === 1)
+      // The method the CASE WHEN's code lands in.
+      val Seq(method) = ctx.wholeStageSplitMarkersByFunction.get(0).toSeq.flatten
+      val failure = new IllegalStateException("does not compile")
+      // Whether `body` holds and warns that the split failed to compile, carrying `failure` where
+      // `withFailure`, the split's compile having reported nothing of it.
+      def warnsOfSplitFailure(withFailure: Boolean)(body: => Boolean): Boolean = {
+        val logs = new LogAppender("the split's failure")
+        var holds = false
+        withLogAppender(logs, loggerNames = Seq(classOf[WholeStageCodegenExec].getName),
+            level = Some(Level.WARN)) {
+          holds = body
+        }
+        holds && logs.loggingEvents.exists { e =>
+          e.getLevel == Level.WARN &&
+            (if (withFailure) e.getThrown eq failure else e.getThrown == null) &&
+            e.getMessage.getFormattedMessage.contains(
+              "failed to compile with its expressions split, so its code is kept in one piece")
+        }
+      }
+      // Each case its own decision, which is remembered by the digest of the marked code.
+      var copies = 0
+      class Run(
+          whole: Try[Option[Map[String, Int]]],
+          split: Try[Option[Map[String, Int]]],
+          splitsNothing: Boolean = false,
+          gate: Option[CountDownLatch] = None) {
+        copies += 1
+        private val digest = s"copy $copies"
+        val code = (ctx, new CodeAndComment(recorded._2.body + s"\n/* $digest */",
+          recorded._2.comment))
+        // The split's code differs from the code in one piece even where it turns no block into
+        // a method, as the helpers of a discarded subexpression pass can make it.
+        private val splitCtx = new CodegenContext
+        splitCtx.wholeStageBlocksSplit = if (splitsNothing) 0 else 1
+        val splitCode =
+          (splitCtx, new CodeAndComment(code._2.body + "\n/* split */", code._2.comment))
+        var splitAsked = Seq.empty[Option[Set[WholeStageSplitKey]]]
+        var compiles = 0
+        // Whether each compile, in order, expects its failure.
+        var failureExpected = Seq.empty[Boolean]
+        var invalidated = Seq.empty[CodeAndComment]
+        // Which trial each replay of held reports belongs to, in order.
+        var replayed = Seq.empty[String]
+        def choose(throwSplitFailure: Boolean = false): CodeAndComment = {
+          ctx.wholeStageSplitDigest = digest
+          stage.chooseCode(code,
+            only => synchronized { splitAsked :+= only; splitCode },
+            (c, expected) => {
+              gate.foreach(g => assert(g.await(60, TimeUnit.SECONDS)))
+              synchronized {
+                compiles += 1
+                failureExpected :+= expected
+              }
+              val trial = if (c eq code._2) "whole" else "split"
+              WholeStageCodegenExec.TrialResult(if (c eq code._2) whole else split,
+                () => synchronized { replayed :+= trial })
+            },
+            c => synchronized { invalidated :+= c }, throwSplitFailure)._2
+        }
+      }
+      def sizes(m: (String, Int)*): Try[Option[Map[String, Int]]] = Success(Some(m.toMap))
+      val notCompiling = Failure(failure)
+      val unknown = Success(None)
+      val recordedOnly = Some(Set(ctx.wholeStageSplitsRecorded.head))
+      // The split is kept where it lowers the bytes past the limit, and the code in one piece
+      // leaves the compile cache.
+      val kept = new Run(sizes(method -> 20000), sizes(method -> 3000))
+      assert(kept.choose() eq kept.splitCode._2)
+      assert(kept.splitAsked === Seq(recordedOnly) && kept.invalidated === Seq(kept.code._2))
+      // The reports held back are made for the code kept, and for it alone: below, `replayed`
+      // says which trial's each Run made.
+      assert(kept.replayed === Seq("split"))
+      // A larger method that holds nothing marked does not stop the split of the one that does.
+      val beside = new Run(sizes(method -> 9000, "other" -> 12000),
+        sizes(method -> 1500, "other" -> 12000))
+      assert(beside.choose() eq beside.splitCode._2)
+      assert(beside.replayed === Seq("split"))
+      // A method past the limit that holds nothing marked, or a method run once, is left alone,
+      // with no split generated.
+      for (whole <- Seq(sizes(method -> 1000, "other" -> 20000),
+          sizes(method -> 1000, "init" -> 20000))) {
+        val left = new Run(whole, notCompiling)
+        assert(left.choose() eq left.code._2)
+        assert(left.splitAsked.isEmpty && left.compiles === 1)
+        assert(left.replayed === Seq("whole"))
+      }
+      // A split that leaves the bytes past the limit as they were is not kept, and leaves the
+      // compile cache itself.
+      val same = new Run(sizes(method -> 20000), sizes(method -> 20000))
+      assert(same.choose() eq same.code._2)
+      assert(same.invalidated === Seq(same.splitCode._2))
+      assert(same.replayed === Seq("whole"))
+      // A split that turns no block into a method is neither compiled nor dropped, though its code
+      // differs: the code in one piece is kept, and its class stays cached for `doExecute`.
+      val identical = new Run(sizes(method -> 20000), notCompiling, splitsNothing = true)
+      assert(identical.choose() eq identical.code._2)
+      assert(identical.compiles === 1 && identical.invalidated.isEmpty)
+      assert(identical.replayed === Seq("whole"))
+      // A split that fails to compile leaves the code in one piece, which compiled, and is not
+      // tried again; its compile reports the failure, which the warning does not repeat. Under
+      // testing the failure is thrown.
+      val fails = new Run(sizes(method -> 20000), notCompiling)
+      assert(warnsOfSplitFailure(withFailure = false)(fails.choose() eq fails.code._2))
+      assert(fails.failureExpected === Seq(true, false))
+      assert(fails.choose() eq fails.code._2)
+      assert(fails.compiles === 2)
+      assert(fails.replayed === Seq("whole"))
+      val thrown = new Run(sizes(method -> 20000), notCompiling)
+      assert(intercept[IllegalStateException](thrown.choose(throwSplitFailure = true)) eq failure)
+      // The failure is thrown before the code in one piece makes its reports.
+      assert(thrown.replayed.isEmpty)
+      // Code in one piece that fails to compile has every expression split where that compiles,
+      // and the decision is remembered: the next generation asks for the same split with no trial.
+      val broken = new Run(notCompiling, sizes(method -> 3000))
+      assert(broken.choose() eq broken.splitCode._2)
+      assert(broken.choose() eq broken.splitCode._2)
+      assert(broken.splitAsked === Seq(None, None) && broken.compiles === 2)
+      assert(broken.replayed === Seq("split"))
+      // Where the split fails too, the code in one piece is left to `doExecute`, which reports
+      // its failure as without the split; the split's own failure is warned about, its compile
+      // expecting it so that it reports no error of its own, and that is remembered as well.
+      // Under testing the split's failure is thrown, its compile reporting it as an error.
+      val bothFail = new Run(notCompiling, notCompiling)
+      assert(warnsOfSplitFailure(withFailure = true)(bothFail.choose() eq bothFail.code._2))
+      assert(bothFail.choose() eq bothFail.code._2)
+      assert(bothFail.compiles === 2 && bothFail.failureExpected === Seq(true, true))
+      assert(bothFail.replayed.isEmpty)
+      val bothFailThrown = new Run(notCompiling, notCompiling)
+      assert(intercept[IllegalStateException](
+        bothFailThrown.choose(throwSplitFailure = true)) eq failure)
+      assert(bothFailThrown.failureExpected === Seq(true, false))
+      assert(bothFailThrown.replayed.isEmpty)
+      // Where no block can be split, the split is not compiled: the code in one piece is left to
+      // `doExecute` with one compile, as without the split.
+      val nothingToSplit = new Run(notCompiling, notCompiling, splitsNothing = true)
+      assert(nothingToSplit.choose(throwSplitFailure = true) eq nothingToSplit.code._2)
+      assert(nothingToSplit.compiles === 1 && nothingToSplit.splitAsked === Seq(None))
+      assert(nothingToSplit.replayed.isEmpty)
+      // Sizes unknown, a second compile cache hit, keep the code in one piece and decide nothing,
+      // so the next generation compiles again.
+      val unknownWhole = new Run(unknown, notCompiling)
+      assert(unknownWhole.choose() eq unknownWhole.code._2)
+      assert(unknownWhole.choose() eq unknownWhole.code._2)
+      assert(unknownWhole.compiles === 2 && unknownWhole.splitAsked.isEmpty)
+      assert(unknownWhole.replayed === Seq("whole", "whole"))
+      val unknownSplit = new Run(sizes(method -> 20000), unknown)
+      assert(unknownSplit.choose() eq unknownSplit.code._2)
+      assert(unknownSplit.choose() eq unknownSplit.code._2)
+      assert(unknownSplit.compiles === 4)
+      assert(unknownSplit.replayed === Seq("whole", "whole"))
+      // Threads that meet an undecided key at once decide it once: the second waits for the first
+      // to decide, then generates the code of that decision with no trial of its own.
+      val gate = new CountDownLatch(1)
+      val raced = new Run(sizes(method -> 20000), sizes(method -> 3000), gate = Some(gate))
+      val chosen = new ConcurrentLinkedQueue[CodeAndComment]()
+      val errors = new ConcurrentLinkedQueue[Throwable]()
+      val threads = Seq.fill(2)(new Thread(() =>
+        try chosen.add(raced.choose()) catch { case t: Throwable => errors.add(t) }))
+      try {
+        threads.head.start()
+        // The first is in its trial compile, held at the gate.
+        eventually(timeout(30.seconds)) {
+          assert(threads.head.getState === Thread.State.TIMED_WAITING, errors)
+        }
+        threads.last.start()
+        // The second waits on the key's lock, not for the gate.
+        eventually(timeout(30.seconds)) {
+          assert(threads.last.getState === Thread.State.WAITING, errors)
+        }
+      } finally {
+        gate.countDown()
+        threads.foreach(_.join(60000))
+      }
+      assert(threads.forall(!_.isAlive))
+      assert(errors.isEmpty, errors)
+      assert(chosen.size === 2 && chosen.toArray.forall(_ eq raced.splitCode._2))
+      assert(raced.compiles === 2 && raced.splitAsked === Seq(recordedOnly, recordedOnly))
+      assert(raced.replayed === Seq("split"))
+    }
+  }
+
+  test("SPARK-33301: a decision is not replayed under another methodSplitThreshold") {
+    // Which CASE WHENs are recorded depends on the threshold, while the code without the marks
+    // does not, so a decision made under one threshold names other expressions under another.
+    // Each order of the two, in one session, runs the query right, and under 1024 splits `b`,
+    // whose method is past the limit.
+    withTempView("t") {
+      spark.range(10).selectExpr("id").createOrReplaceTempView("t")
+      val a = (0 until 60).map(k => s"WHEN id = $k THEN id * $k").mkString("CASE ", " ", " END")
+      val b = (0 until 300).map(k => s"WHEN id + 1 = $k THEN id * $k")
+        .mkString("CASE ", " ", " END")
+      for ((first, second) <- Seq(("1024", "40000"), ("40000", "1024"))) {
+        val query = s"SELECT $a AS a, $b AS b, $first AS threshold FROM t"
+        for (threshold <- Seq(first, second)) {
+          withSQLConf(SQLConf.CODEGEN_METHOD_SPLIT_THRESHOLD.key -> threshold) {
+            if (threshold == "1024") {
+              val holding = methodsHolding(stageOf(sql(query)).doCodeGen()._2, "299L")
+              assert(holding.exists(_.contains("caseWhen")), holding)
+            }
+            checkAnswer(sql(query), withoutWholeStage(sql(query)))
+          }
+        }
+      }
+    }
+  }
+
+  test("SPARK-33301: a literal holding the text of a mark is left as it is") {
+    // A foldable pattern is written into the code as a Java literal. The stage records its CASE
+    // WHEN and keeps its code in one piece, the marks stripped, and the literal with them.
+    withTempView("t") {
+      spark.range(100).selectExpr("id AS v", "CAST(id AS STRING) AS s")
+        .createOrReplaceTempView("t")
+      val caseWhen = (0 until 64).map(k => s"WHEN v = $k THEN v * $k")
+        .mkString("CASE ", " ", " ELSE -1 END")
+      def df: DataFrame = sql(s"SELECT $caseWhen AS r, s RLIKE '/*wholeStageSplit:0*/' AS m " +
+        "FROM t")
+      assert(recordedSplits(df) > 0 && !splitsCaseWhen(df))
+      checkAnswer(df, withoutWholeStage(df))
+      checkAnswer(sql(s"SELECT count(*) FROM t WHERE s RLIKE '/*wholeStageSplit:0*/' AND " +
+        s"$caseWhen > -2"), Row(0))
+    }
+    val code = "a(); /*wholeStageSplit:0*/ b(\"/*wholeStageSplit:1*/\", '\\'') // x\n" +
+      "/* other */ c(); /*wholeStageSplit:2*/"
+    assert(CodeGenerator.stripWholeStageSplitMarkers(code) ===
+      "a();  b(\"/*wholeStageSplit:1*/\", '\\'') // x\n/* other */ c(); ")
+  }
+
+  test("SPARK-33301: a simple CASE over a collated column is split") {
+    // The collated column is in every condition, so it is a common subexpression, whose code is
+    // the column's: the split methods take the column. Its values match branches case-blind, so
+    // values computed in the split methods are checked.
+    withTempView("t") {
+      spark.range(100).selectExpr("concat('K', CAST(id % 20 AS STRING)) AS s")
+        .createOrReplaceTempView("t")
+      val caseWhen = (0 until 300).map(k => s"WHEN 'k$k' THEN ${k + 1}")
+        .mkString("CASE s COLLATE UNICODE_CI ", " ", " ELSE 0 END")
+      def df: DataFrame = sql(s"SELECT $caseWhen AS r FROM t")
+      withSQLConf(SQLConf.WHOLESTAGE_SPLIT_EXPRESSIONS.key -> "false") {
+        assert(maxStageMethodSize(df) > CodeGenerator.DEFAULT_JVM_HUGE_METHOD_LIMIT)
+      }
+      assert(maxStageMethodSize(df) <= CodeGenerator.DEFAULT_JVM_HUGE_METHOD_LIMIT)
+      assert(df.collect().count(_.getInt(0) != 0) === 100)
+      checkAnswer(df, withoutWholeStage(df))
+    }
+  }
+
+  test("SPARK-33301: a simple CASE over a cast that only renames struct fields is split") {
+    // The cast changes nothing but the field's name, so its code is its child's, which reads the
+    // column: the split methods look through the cast's common subexpression to take the column.
+    withTempPath { path =>
+      spark.range(100).selectExpr("named_struct('a', id % 20) AS s")
+        .write.parquet(path.getCanonicalPath)
+      val caseWhen = (0 until 300).map(k => s"WHEN named_struct('b', ${k}L) THEN $k")
+        .mkString("CASE CAST(s AS STRUCT<b: BIGINT>) ", " ", " ELSE -1 END")
+      def df: DataFrame = spark.read.parquet(path.getCanonicalPath).selectExpr(s"$caseWhen AS r")
+      withSQLConf(SQLConf.WHOLESTAGE_SPLIT_EXPRESSIONS.key -> "false") {
+        assert(maxStageMethodSize(df) > CodeGenerator.DEFAULT_JVM_HUGE_METHOD_LIMIT)
+      }
+      assert(splitsCaseWhen(df))
+      assert(maxStageMethodSize(df) <= CodeGenerator.DEFAULT_JVM_HUGE_METHOD_LIMIT)
+      assert(df.collect().count(_.getInt(0) != -1) === 100)
+      checkAnswer(df, withoutWholeStage(df))
+    }
+  }
+
+  test("SPARK-33301: a filter's copy of a projection's CASE WHEN is split only where it is past " +
+      "the limit") {
+    // The filter is pushed below the projection with its alias replaced, so the filter evaluates
+    // a copy of the projection's CASE WHEN, in a method under the limit; the projection's copy
+    // is in its own method, past the limit, and only that copy is split.
+    withTempView("t") {
+      spark.range(100).selectExpr("id AS v").createOrReplaceTempView("t")
+      def query: DataFrame = sql(s"SELECT * FROM (SELECT v, ${caseWhenOverV(64, 7000)} AS b, " +
+        s"${caseWhenOverV(300, 9000)} AS c FROM t) WHERE b <> -1")
+      val holding = methodsHolding(stageOf(query).doCodeGen()._2, "7001L")
+      val split = holding.filter(_.contains("caseWhen"))
+      assert(split.nonEmpty && split.forall(_.startsWith("project_")), holding)
+      assert(holding.exists(!_.contains("caseWhen")), holding)
+      checkAnswer(query, withoutWholeStage(query))
+    }
+  }
+
+  test("SPARK-33301: a CASE WHEN in a join key that holds lambda variables is split") {
+    // Each branch of the stream side's key holds a `transform`, whose lambda variables every
+    // generation of the stage copies afresh, so the split generation matches the recorded CASE
+    // WHEN with their values ignored. Unsplit, the method is past the JIT limit and compiles.
+    withTempView("l", "r") {
+      spark.range(100).selectExpr("id % 50 AS v", "array(id, id + 1) AS a")
+        .createOrReplaceTempView("l")
+      spark.range(100).selectExpr("array(id, id + 1) AS w").createOrReplaceTempView("r")
+      val key = (0 until 60).map(k => s"WHEN v = $k THEN transform(a, x -> x + $k)")
+        .mkString("CASE ", " ", " END")
+      def df: DataFrame = sql(s"SELECT /*+ BROADCAST(r) */ v, w FROM l JOIN r ON $key = w")
+      withSQLConf(SQLConf.WHOLESTAGE_SPLIT_EXPRESSIONS.key -> "false") {
+        val size = maxStageMethodSize(df)
+        assert(size > CodeGenerator.DEFAULT_JVM_HUGE_METHOD_LIMIT && size <= 65535, size)
+      }
+      assert(splitsCaseWhen(df))
+      assert(df.collect().nonEmpty)
+      checkAnswer(df, withoutWholeStage(df))
+    }
+  }
+
+  test("SPARK-33301: a split that turns no block into a method is not compiled") {
+    // Every block of the CASE WHEN holds a branch, or the ELSE, reading a column read once, which
+    // the projection leaves to where it is used, so no block can be split, though the branches
+    // reading only `k` could be and the CASE WHEN is recorded. The common subexpressions beside
+    // it take the split pass of subexpression elimination, whose discarded first pass leaves
+    // helpers in the code in one piece that the split generation removes, so the two differ;
+    // still only the code in one piece is compiled, and kept.
+    withTempPath { path =>
+      spark.range(10).selectExpr("id % 300 AS k" +: (0 to 75).map(i => s"id + $i AS c$i"): _*)
+        .write.parquet(path.getCanonicalPath)
+      val branches = (0 until 150).map { i =>
+        if (i % 2 == 0) s"WHEN k = $i THEN k * ${1000 + i}" else s"WHEN k = $i THEN c${i / 2}"
+      }.mkString(" ")
+      val common = commonSubexprColumns("k", "s")
+      // So that no decision is remembered for this code yet.
+      val salt = System.nanoTime()
+      def df: DataFrame = spark.read.parquet(path.getCanonicalPath)
+        .selectExpr(s"CASE $branches ELSE c75 END AS v" +: s"${salt}L AS salt" +: common: _*)
+      val stage = stageOf(df)
+      val recorded = stage.generate(WholeStageSplit.Record)
+      assert(recorded._1.wholeStageSplitsRecorded.nonEmpty)
+      var splits = Seq.empty[(CodegenContext, CodeAndComment)]
+      var compiles = 0
+      val chosen = stage.chooseCode(recorded,
+        only => {
+          val split = stage.generate(WholeStageSplit.Split(only))
+          splits :+= split
+          split
+        },
+        (code, failureExpected) => {
+          compiles += 1
+          WholeStageCodegenExec.trialCompile(code, failureExpected)
+        },
+        CodeGenerator.invalidateCompiled, throwSplitFailure = true)
+      val Seq((splitCtx, splitCode)) = splits
+      assert(splitCtx.wholeStageBlocksSplit === 0)
+      assert(splitCode != recorded._2)
+      assert(chosen._2 eq recorded._2)
+      assert(compiles === 1)
+      checkAnswer(df, withoutWholeStage(df))
+    }
+  }
+
+  test("SPARK-33301: only the code a stage keeps counts in the codegen metrics") {
+    // The stage's code in one piece and its split are both compiled, as trials; only the split
+    // runs, and only its compile is counted.
+    withTempView("t") {
+      spark.range(100).selectExpr("id AS v").createOrReplaceTempView("t")
+      val df = sql(caseWhenOverT(300, end = -13))
+      val compiles = CodegenMetrics.METRIC_COMPILATION_TIME.getCount
+      assert(splitsCaseWhen(df))
+      assert(CodegenMetrics.METRIC_COMPILATION_TIME.getCount === compiles + 1)
+    }
+  }
+
+  test("SPARK-33301: the split methods take nullable, string and subexpression inputs") {
+    withSplitAlways {
+      // Read from a file, so the inputs are columns. `upper(s)` is in every condition, so
+      // subexpression elimination computes it once into local variables, which the split methods
+      // take as parameters beside the columns.
+      withTempPath { path =>
+        spark.range(200)
+          .selectExpr(
+            "if(id % 7 = 0, null, concat('v', cast(id % 50 as string))) AS s",
+            "if(id % 11 = 0, null, id) AS k")
+          .write.parquet(path.getCanonicalPath)
+        val branches = (0 until 50).map { i =>
+          s"WHEN upper(s) = 'V$i' THEN concat(s, cast(k + $i as string))"
+        }.mkString(" ")
+        def df: DataFrame =
+          spark.read.parquet(path.getCanonicalPath).selectExpr(s"CASE $branches ELSE upper(s) END")
+        assert(splitsCaseWhen(df))
+        checkAnswer(df, withoutWholeStage(df))
+      }
+    }
+  }
+
+  test("SPARK-33301: each split method takes only what its own branches read") {
+    withSplitAlways {
+      // Every branch reads its own nullable `bigint` column, three parameter slots each, so the
+      // union over all branches is past the 255 slots a method can take, while each method takes
+      // the columns of the branches it holds, and the methods grouping the calls the union of what
+      // their calls take. Each column is read twice, so the projection evaluates it before the
+      // CASE WHEN.
+      withTempPath { path =>
+        val columns = 90
+        spark.range(100)
+          .selectExpr((1 to columns).map(i => s"if(id % $i = 0, null, id + $i) AS c$i"): _*)
+          .write.parquet(path.getCanonicalPath)
+        val branches = (1 to columns).map(i => s"WHEN c$i > 150 THEN c$i").mkString(" ")
+        def df: DataFrame =
+          spark.read.parquet(path.getCanonicalPath).selectExpr(s"CASE $branches ELSE -1 END AS v")
+        assert(splitsCaseWhen(df))
+        checkAnswer(df, withoutWholeStage(df))
+      }
+    }
+  }
+
+  test("SPARK-33301: a block whose method would take too many parameters stays inline") {
+    withSplitAlways {
+      // Every branch reads all three `bigint` columns, and no expression repeats, so that
+      // subexpression elimination, which the same limit governs, has nothing to split. Under the
+      // default limit the branches are split into methods taking the columns; under a limit of four
+      // parameter slots, a method taking them and their nullness would need ten, `this` included,
+      // so the blocks of branches stay inline and only what fits the limit is split.
+      withTempPath { path =>
+        spark.range(50).selectExpr("id AS a", "id + 1 AS b", "id + 2 AS c")
+          .write.parquet(path.getCanonicalPath)
+        val branches = (1 to 100).map(k => s"WHEN a + $k = b THEN c * $k").mkString(" ")
+        def df: DataFrame =
+          spark.read.parquet(path.getCanonicalPath).selectExpr(s"CASE $branches ELSE 0 END AS v")
+        assert(splitCaseWhenParameters(df).exists(_.count(_.startsWith("long ")) == 3))
+        withSQLConf("spark.sql.CodeGenerator.validParamLength" -> "4") {
+          val slots = splitCaseWhenParameters(df).map { parameters =>
+            1 + parameters.map(p => if (p.startsWith("long ")) 2 else 1).sum
+          }
+          assert(slots.forall(_ <= 4), slots)
+          checkAnswer(df, withoutWholeStage(df))
+        }
+      }
+    }
+  }
+
+  test("SPARK-33301: a block reading an input not evaluated yet stays inline between the calls") {
+    withSplitAlways {
+      // `code` is read in every branch, so the projection evaluates it before the CASE WHEN; `name`
+      // is read once, in the ELSE, so the projection leaves its reading to where it is used, and
+      // that code names locals of the scan that no method could take. The ELSE stays inline after
+      // the calls to the methods holding the other branches.
+      withTempPath { path =>
+        spark.range(500)
+          .selectExpr("CAST(id % 250 AS INT) AS code", "concat('n', cast(id AS string)) AS name")
+          .write.parquet(path.getCanonicalPath)
+        val branches = (1 to 200).map(k => s"WHEN $k THEN 'c$k'").mkString(" ")
+        def df: DataFrame = spark.read.parquet(path.getCanonicalPath)
+          .selectExpr(s"CASE code $branches ELSE name END AS v")
+        assert(splitsCaseWhen(df))
+        checkAnswer(df, withoutWholeStage(df))
+      }
+    }
+  }
+
+  test("SPARK-33301: a CASE WHEN whose every block reads an input not evaluated yet stays whole") {
+    withSplitAlways {
+      // Each `c<i>` is read once, the ELSE's `c0` too, so every block's code reads the scan's
+      // locals and no block can be split. Read twice, the columns are evaluated before the CASE
+      // WHEN, and it splits.
+      withTempPath { path =>
+        spark.range(10).selectExpr("id % 40 AS k" +: (0 to 40).map(i => s"id + $i AS c$i"): _*)
+          .write.parquet(path.getCanonicalPath)
+        val once = (1 to 40).map(i => s"WHEN k = $i THEN c$i * 2").mkString(" ")
+        def df: DataFrame = spark.read.parquet(path.getCanonicalPath)
+          .selectExpr(s"CASE $once ELSE c0 END AS v")
+        assert(!splitsCaseWhen(df))
+        checkAnswer(df, withoutWholeStage(df))
+        val twice = (1 to 40).map(i => s"WHEN k = $i THEN c$i * 2 + c$i").mkString(" ")
+        def evaluated: DataFrame = spark.read.parquet(path.getCanonicalPath)
+          .selectExpr(s"CASE $twice ELSE c0 + c0 END AS v")
+        assert(splitsCaseWhen(evaluated))
+        checkAnswer(evaluated, withoutWholeStage(evaluated))
+        // A split no block can take is not recorded, so the gate compiles no trial for it.
+        assert(recordedSplits(df) === 0)
+        assert(recordedSplits(evaluated) > 0)
+      }
+    }
+  }
+
+  test("SPARK-33301: a CASE WHEN under a keyed aggregate takes its input, not the buffer row") {
+    withSplitAlways {
+      // The aggregate's update code reads the buffer from `INPUT_ROW` and the input from local
+      // variables. The CASE WHEN reads only the input, so its split methods take that and not the
+      // buffer row, which is passed only to code that reads it.
+      withTempView("t") {
+        spark.range(1000).selectExpr("id % 13 AS k", "id % 300 AS v").createOrReplaceTempView("t")
+        val query = s"SELECT k, sum(${largeCaseWhen("v", 300)}) AS s FROM t GROUP BY k"
+        val df = sql(query)
+        assert(df.queryExecution.executedPlan.exists {
+          case w: WholeStageCodegenExec => w.child.isInstanceOf[HashAggregateExec]
+          case _ => false
+        })
+        assert(splitsCaseWhen(df))
+        assert(!splitCaseWhenTakesRow(df))
+        checkAnswer(df, withoutWholeStage(sql(query)))
+      }
+    }
+  }
+
+  test("SPARK-33301: a common expression in a branch under a keyed aggregate takes the buffer") {
+    withSplitAlways {
+      // `nullif` is a `With`, which stays in the plan in a branch other than the first, and whose
+      // definition, made a method, is called with `INPUT_ROW`: the aggregate's buffer, which the
+      // split method holding that branch therefore takes.
+      withTempView("t") {
+        spark.range(1000).selectExpr("id % 7 AS k", "CAST(id % 400 AS INT) AS v")
+          .createOrReplaceTempView("t")
+        val branches = "WHEN v = 0 THEN 0 WHEN v = 1 THEN nullif(nullif(v * 3, 1), 2) " +
+          (2 to 300).map(k => s"WHEN v = $k THEN v * $k").mkString(" ")
+        val query = s"SELECT k, sum(CASE $branches ELSE 0 END) AS s FROM t GROUP BY k"
+        val df = sql(query)
+        assert(splitsCaseWhen(df))
+        assert(splitCaseWhenTakesRow(df))
+        checkAnswer(df, withoutWholeStage(sql(query)))
+      }
+    }
+  }
+
+  test("SPARK-33301: max_by under a keyed aggregate, whose update reads the buffer") {
+    withSplitAlways {
+      // `max_by` updates and merges its buffer with CASE WHENs of three branches that read the
+      // buffer through `INPUT_ROW`, so their split methods take the row. The value is a number: a
+      // string one is not updatable in place, and Spark plans a sort aggregate outside the stage.
+      withTempView("t") {
+        spark.range(1000).selectExpr("id % 7 AS k", "id % 97 AS o").createOrReplaceTempView("t")
+        val query = "SELECT k, max_by(o * 3, o), min_by(o * 3, o) FROM t GROUP BY k"
+        assert(splitsCaseWhen(sql(query)))
+        assert(splitCaseWhenTakesRow(sql(query)))
+        checkAnswer(sql(query), withoutWholeStage(sql(query)))
+      }
+    }
+  }
+
+  test("SPARK-33301: a large CASE WHEN in a join condition compiles") {
+    withSplitAlways {
+      // A join generates its condition inside the loop over the matches, where `INPUT_ROW` names
+      // the row of the build side; the split methods take it only if the code reads it.
+      withTempView("l", "r") {
+        spark.range(200).selectExpr("id % 20 AS k", "id % 300 AS v").createOrReplaceTempView("l")
+        spark.range(100).selectExpr("id % 20 AS k", "id % 7 AS w").createOrReplaceTempView("r")
+        val condition = s"${largeCaseWhen("l.v", 300)} + r.w > 50"
+        Seq(
+          s"SELECT /*+ MERGE(r) */ l.k, l.v, r.w FROM l JOIN r ON l.k = r.k AND $condition",
+          s"SELECT /*+ BROADCAST(r) */ l.k, l.v, r.w FROM l JOIN r ON l.k = r.k AND $condition",
+          s"SELECT /*+ MERGE(r) */ l.k, l.v, r.w FROM l LEFT JOIN r " +
+            s"ON l.k = r.k AND ${largeCaseWhen("l.v", 300)} > 50"
+        ).foreach { query =>
+          val df = sql(query)
+          assert(splitsCaseWhen(df), query)
+          checkAnswer(df, withoutWholeStage(sql(query)))
+        }
+      }
+    }
+  }
+
+  test("SPARK-33301: a common expression in a join condition's CASE WHEN") {
+    withSplitAlways {
+      // `RewriteWithExpression` keeps the `With` of a `nullif` in a branch other than the first, in
+      // a join condition too. Its definition is short, so it is inlined rather than made a method,
+      // and the split methods read what it reads without taking the build side's row.
+      withTempView("l", "r") {
+        spark.range(200).selectExpr("id % 20 AS k", "id % 300 AS v").createOrReplaceTempView("l")
+        spark.range(100).selectExpr("id % 20 AS k", "id % 7 AS w").createOrReplaceTempView("r")
+        val branches = "WHEN l.v = 0 THEN 0 WHEN l.v = 1 THEN nullif(l.v * 3 + r.w, 1) " +
+          (2 to 300).map(k => s"WHEN l.v = $k THEN l.v * $k").mkString(" ")
+        Seq("MERGE", "BROADCAST").foreach { hint =>
+          val query = s"SELECT /*+ $hint(r) */ l.k, l.v, r.w FROM l JOIN r " +
+            s"ON l.k = r.k AND CASE $branches ELSE 0 END > 50"
+          val df = sql(query)
+          assert(splitsCaseWhen(df), query)
+          assert(!splitCaseWhenTakesRow(df), query)
+          checkAnswer(df, withoutWholeStage(sql(query)))
+        }
+      }
+    }
+  }
+
+  test("SPARK-33301: a CASE WHEN inside a CASE WHEN's branch, whose common expression takes " +
+      "the build side's row, leaves the outer split its calls, which pass the row on") {
+    // The inner CASE WHEN is split first, and its methods take the row because the `With` of
+    // its `nullif` became a method that takes it; the outer CASE WHEN's block then holds the
+    // calls to the inner's methods, which pass the row, so the outer's method must take it too
+    // although the outer's own expressions read it nowhere. Found by the differential fuzz.
+    withSplitAlways {
+      withSQLConf(SQLConf.CODEGEN_METHOD_SPLIT_THRESHOLD.key -> "1") {
+        withTempView("l", "r") {
+          spark.range(200).selectExpr("id % 20 AS k", "id % 300 AS v").createOrReplaceTempView("l")
+          spark.range(100).selectExpr("id % 20 AS k", "id % 7 AS w", "id % 11 AS a")
+            .createOrReplaceTempView("r")
+          val inner = "CASE WHEN r.w = 0 THEN nullif(r.a * 3 + l.v, 1) " +
+            (1 to 5).map(k => s"WHEN r.w = $k THEN r.a + $k").mkString(" ") + " ELSE r.w END"
+          val outer = s"CASE WHEN l.v = 0 THEN 0 WHEN l.v = 1 THEN $inner " +
+            (2 to 40).map(k => s"WHEN l.v = $k THEN l.v * $k").mkString(" ") + " ELSE 0 END"
+          Seq("MERGE", "BROADCAST").foreach { hint =>
+            val query = s"SELECT /*+ $hint(r) */ l.k, l.v, r.w FROM l JOIN r " +
+              s"ON l.k = r.k AND $outer > 5"
+            val df = sql(query)
+            assert(splitsCaseWhen(df), query)
+            assert(splitCaseWhenTakesRow(df), query)
+            checkAnswer(df, withoutWholeStage(sql(query)))
+          }
+        }
+      }
+    }
+  }
+
+  test("SPARK-33301: a CASE WHEN stays out of the streamed-only condition of an outer join") {
+    withSplitAlways {
+      // With `splitStreamedSideJoinCondition`, an outer join evaluates the part of its condition
+      // that reads only the streamed side before its loop over the matches, where `INPUT_ROW`
+      // names a row declared later. A CASE WHEN never qualifies for that part, so it is split in
+      // the rest of the condition, inside the loop.
+      withSQLConf("spark.sql.join.splitStreamedSideJoinCondition" -> "true") {
+        withTempView("l", "r") {
+          spark.range(200).selectExpr("id % 20 AS k", "id % 300 AS v").createOrReplaceTempView("l")
+          spark.range(100).selectExpr("id % 20 AS k", "id % 7 AS w").createOrReplaceTempView("r")
+          Seq("MERGE", "BROADCAST").foreach { hint =>
+            val query = s"SELECT /*+ $hint(r) */ l.k, l.v, r.w FROM l LEFT JOIN r " +
+              s"ON l.k = r.k AND ${largeCaseWhen("l.v", 300)} > 50 AND l.v > 3"
+            val df = sql(query)
+            assert(splitsCaseWhen(df), query)
+            checkAnswer(df, withoutWholeStage(sql(query)))
+          }
+        }
+      }
+    }
+  }
+
+  test("SPARK-33301: a CASE WHEN in an aggregate over a ROLLUP") {
+    withSplitAlways {
+      // The aggregate reads the rows `ExpandExec` produces, through the parameters of its own
+      // consume method.
+      withTempView("t") {
+        spark.range(300)
+          .selectExpr("id % 300 AS v", "concat('g', cast(id % 3 AS string)) AS g")
+          .createOrReplaceTempView("t")
+        val query =
+          s"SELECT g, sum(${largeCaseWhen("v", 300)}) AS s FROM t GROUP BY ROLLUP(g, v % 2)"
+        val df = sql(query)
+        assert(splitsCaseWhen(df))
+        checkAnswer(df, withoutWholeStage(sql(query)))
+      }
+    }
+  }
+
+  test("SPARK-33301: a CASE WHEN that is itself a split common subexpression") {
+    withSplitAlways {
+      // The same CASE WHEN twice is one subexpression, split into a method of its own; the CASE
+      // WHEN's split methods are called from inside it.
+      val caseWhen = largeCaseWhen("id", 300)
+      val df = spark.range(10).selectExpr(s"($caseWhen) + 1 AS a", s"($caseWhen) + 2 AS b")
+      assert(splitsCaseWhen(df))
+      checkAnswer(df, (0L until 10L).map(i => Row(i * i + 1, i * i + 2)))
+    }
+  }
+
+  test("SPARK-33301: a split common subexpression under a keyed aggregate takes the buffer") {
+    withSplitAlways {
+      // The same expression in two aggregates is one subexpression; holding two large CASE
+      // WHENs, whose grouped calls are past the split threshold, it is split into a `subExpr`
+      // method of its own. A `nullif` branch makes a split method of the first CASE WHEN take
+      // the aggregate's buffer, so the `subExpr` method, which calls it, must take it too.
+      withTempView("t") {
+        spark.range(1000).selectExpr("id % 7 AS k", "CAST(id % 400 AS INT) AS v")
+          .createOrReplaceTempView("t")
+        val branches = "WHEN v = 0 THEN 0 WHEN v = 1 THEN nullif(nullif(v * 3, 1), 2) " +
+          (2 to 300).map(k => s"WHEN v = $k THEN v * $k").mkString(" ")
+        val caseWhen = s"(CASE $branches ELSE 0 END) + (${largeCaseWhen("v", 300)})"
+        val query = s"SELECT k, sum($caseWhen), max($caseWhen) FROM t GROUP BY k"
+        val df = sql(query)
+        assert(splitCaseWhenTakesRow(df))
+        // A `subExpr` method takes the buffer and passes it on to the CASE WHEN's method, the
+        // call naming its parameter.
+        val passesBuffer = ("(?s)private void \\w*subExpr_\\d+\\([^)]*InternalRow (\\w+)" +
+          "[^)]*\\) \\{(?:(?!\\n(?:private|protected|public) ).)*?" +
+          "caseWhen_\\w*\\([^)]*\\b\\1\\b").r
+        assert(genCode(df).exists(c => passesBuffer.findFirstIn(c.body).nonEmpty))
+        checkAnswer(df, withoutWholeStage(sql(query)))
+      }
+    }
+  }
+
+  /**
+   * The CASE WHEN, `With` and group methods declared in `df`'s stages that nothing in the stage
+   * calls.
+   */
+  private def uncalledSplitMethods(df: DataFrame): Seq[String] = genCode(df).flatMap { c =>
+    val declared = "private \\w+ (\\w*(?:caseWhen|computeCommonExpr)\\w*)\\(".r
+      .findAllMatchIn(c.body).map(_.group(1)).toSeq
+    declared.filter(name => s"(?<![\\w$$])$name\\(".r.findAllIn(c.body).length == 1)
+  }
+
+  test("SPARK-33301: functions added in a discarded pass of subexpression elimination go") {
+    withSplitAlways {
+      // Subexpression elimination generates its subexpressions once without splitting and, when
+      // that code is too large, again split, discarding the first; the methods the first pass
+      // added go with it, `computeCommonExpr` methods of a `nullif` included, whose calls to the
+      // first pass's CASE WHEN methods would otherwise name methods no longer declared. Every
+      // method left is called.
+      val caseWhen = largeCaseWhen("id", 300)
+      val second = (1 to 300).map(k => s"WHEN id = $k THEN id + $k")
+        .mkString("CASE ", " ", " ELSE 0 END")
+      def df: DataFrame = spark.range(10).selectExpr(s"($caseWhen) + 1 AS a",
+        s"($caseWhen) + 2 AS b", s"IF(id < 0, 0, nullif($second, 0)) AS c",
+        s"IF(id < 0, 0, nullif($second, 0)) AS d")
+      assert(splitsCaseWhen(df))
+      assert(uncalledSplitMethods(df).isEmpty, uncalledSplitMethods(df))
+      checkAnswer(df, withoutWholeStage(df))
+      // With the split off, the class keeps what the first pass added, as before the split: here
+      // the `computeCommonExpr` method of the first generation of the `nullif`.
+      withSQLConf(SQLConf.WHOLESTAGE_SPLIT_EXPRESSIONS.key -> "false") {
+        assert(!splitsCaseWhen(df))
+        assert(uncalledSplitMethods(df).exists(_.contains("computeCommonExpr")))
+        checkAnswer(df, withoutWholeStage(df))
+      }
+    }
+  }
+
+  test("SPARK-33301: a split method reads a slot of a compacted mutable state array as a field") {
+    withSplitAlways {
+      // `ExpandExec` holds an output of a type that is not primitive in a slot of a compacted
+      // mutable state array, such as `expand_mutableStateArray_0[0]`, and hands it out as a field.
+      // An UNPIVOT of string columns gives such an output, which the projection above reads
+      // directly when the operators' consume functions are not split into methods of their own.
+      // Every block reads it, the ELSE too, and each reads it as the field it is.
+      withSQLConf(SQLConf.WHOLESTAGE_SPLIT_CONSUME_FUNC_BY_OPERATOR.key -> "false") {
+        withTempView("t") {
+          spark.range(100).selectExpr("id", "concat('a', CAST(id % 50 AS STRING)) AS a",
+            "concat('a', CAST(id % 30 AS STRING)) AS b").createOrReplaceTempView("t")
+          val branches = (0 until 50).map(k => s"WHEN value = 'a$k' THEN id + $k").mkString(" ")
+          def df: DataFrame = sql(s"SELECT id, CASE $branches ELSE length(value) END AS v " +
+            "FROM t UNPIVOT (value FOR name IN (a, b))")
+          assert(splitsCaseWhen(df))
+          assert(genCode(df).exists { c =>
+            methodsHolding(c, "expand_mutableStateArray").exists(_.contains("caseWhen"))
+          })
+          checkAnswer(df, withoutWholeStage(df))
+        }
+      }
+    }
+  }
+
+  // A Parquet table, so that the filter is not evaluated by the optimizer on a local relation.
+  // On the first row `NOT (a > 0 AND b > 0)` is NULL, and no `isnotnull(a)` is inferred from it.
+  // The second row passes every condition of the tests below, except `b < 0`, `(a > 0 OR b < 0)`
+  // and `coalesce(b, cast(s AS INT)) < 0`. The rows can be
+  // written to different files, so the filter is not pushed down, which would skip the first
+  // row's file by its statistics.
+  private def withNullConjunctTable(y: Int)(f: => Unit): Unit = {
+    withTable("t") {
+      sql("CREATE TABLE t USING parquet AS " +
+        s"SELECT * FROM VALUES (NULL, 1, $y, NULL, 'x'), (0, 1, 0, 1, '1') AS v(a, b, y, x, s)")
+      f
+    }
+  }
+
+  // A common subexpression after the NULL conjunct takes the CSE path of FilterExec.
+  private val nullConjunctCSEQuery =
+    "SELECT a FROM t WHERE NOT (a > 0 AND b > 0) AND y + 1 > 0 AND y + 1 > -1"
+
+  private def checkArithmeticOverflow(query: String): Unit = {
+    checkError(
+      exception = intercept[SparkArithmeticException] {
+        sql(query).collect()
+      },
+      condition = "ARITHMETIC_OVERFLOW",
+      parameters = Map(
+        "message" -> "overflow",
+        "alternative" -> " Use 'try_add' to tolerate overflow and return NULL instead.",
+        "config" -> toSQLConf(SQLConf.ANSI_ENABLED.key)),
+      context = ExpectedContext(
+        fragment = "y + 1",
+        start = query.indexOf("y + 1"),
+        stop = query.indexOf("y + 1") + 4))
+  }
+
+  private def checkCastInvalidInput(query: String): Unit = {
+    val start = query.lastIndexOf("cast(s AS INT)")
+    checkError(
+      exception = intercept[SparkNumberFormatException] {
+        sql(query).collect()
+      },
+      condition = "CAST_INVALID_INPUT",
+      parameters = Map(
+        "expression" -> "'x'",
+        "sourceType" -> "\"STRING\"",
+        "targetType" -> "\"INT\"",
+        "ansiConfig" -> toSQLConf(SQLConf.ANSI_ENABLED.key)),
+      context = ExpectedContext(fragment = "cast(s AS INT)", start = start, stop = start + 13))
+  }
+
+  // Runs `f` with whole-stage codegen on and off and with the legacy behavior on and off, and
+  // passes it whether the filter drops a row at its first NULL conjunct.
+  private def withNullConjunctConfs(otherConfs: (String, String)*)(f: Boolean => Unit): Unit = {
+    for (codegen <- Seq(true, false); legacy <- Seq(true, false)) {
+      withSQLConf(otherConfs ++ Seq(
+          SQLConf.PARQUET_FILTER_PUSHDOWN_ENABLED.key -> "false",
+          SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> codegen.toString,
+          SQLConf.LEGACY_FILTER_SHORT_CIRCUIT_ON_NULL_CONJUNCT.key -> legacy.toString): _*) {
+        withClue(s"wholeStage=$codegen, legacy=$legacy: ") {
+          f(codegen && legacy)
+        }
+      }
+    }
+  }
+
+  test("SPARK-60315: a filter evaluates the conjuncts after a NULL one") {
+    withNullConjunctTable(Int.MaxValue) {
+      // The CSE path evaluates the common `y + 1` once, the non-CSE path at each use. Both
+      // generate the flag that keeps the row's evaluation going after a NULL conjunct.
+      def cseQueryCode(filterExecCSE: Boolean): String = {
+        withSQLConf(
+            SQLConf.ANSI_ENABLED.key -> "true",
+            SQLConf.SUBEXPRESSION_ELIMINATION_FILTER_EXEC_ENABLED.key -> filterExecCSE.toString) {
+          val code = codegenString(sql(nullConjunctCSEQuery).queryExecution.executedPlan)
+          assert(code.contains("nullConjunct"))
+          code
+        }
+      }
+      assert("addExact".r.findAllIn(cseQueryCode(filterExecCSE = true)).length <
+        "addExact".r.findAllIn(cseQueryCode(filterExecCSE = false)).length)
+
+      Seq("true", "false").foreach { filterExecCSE =>
+        Seq(
+          "SELECT a FROM t WHERE NOT (a > 0 AND b > 0) AND y + 1 > 0",
+          nullConjunctCSEQuery
+        ).foreach { query =>
+          withNullConjunctConfs(
+              SQLConf.ANSI_ENABLED.key -> "true",
+              SQLConf.SUBEXPRESSION_ELIMINATION_FILTER_EXEC_ENABLED.key -> filterExecCSE) {
+            skipsAtNull =>
+              if (skipsAtNull) {
+                checkAnswer(sql(query), Row(0))
+              } else {
+                checkArithmeticOverflow(query)
+              }
+          }
+        }
+      }
+    }
+    // A NULL conjunct from OR. The second row does not pass it.
+    withNullConjunctTable(Int.MaxValue) {
+      val query = "SELECT a FROM t WHERE (a > 0 OR b < 0) AND y + 1 > 0"
+      withNullConjunctConfs(SQLConf.ANSI_ENABLED.key -> "true") { skipsAtNull =>
+        if (skipsAtNull) {
+          checkAnswer(sql(query), Seq.empty)
+        } else {
+          checkArithmeticOverflow(query)
+        }
+      }
+    }
+    // Without an error, the CSE path drops the first row after its last conjunct is evaluated.
+    withNullConjunctTable(0) {
+      withNullConjunctConfs(
+          SQLConf.ANSI_ENABLED.key -> "true",
+          SQLConf.SUBEXPRESSION_ELIMINATION_FILTER_EXEC_ENABLED.key -> "true") { _ =>
+        checkAnswer(sql(nullConjunctCSEQuery), Row(0))
+      }
+    }
+  }
+
+  test("SPARK-60315: a filter evaluates the conjuncts after a NULL one in non-ANSI mode") {
+    // Year-month interval arithmetic raises on overflow in every mode.
+    withNullConjunctTable(178956970) {
+      val condition = "NOT (a > 0 AND b > 0) AND " +
+        "make_ym_interval(y, 0) + INTERVAL '1' YEAR > INTERVAL '0' YEAR"
+      val query = s"SELECT a FROM t WHERE $condition"
+      withNullConjunctConfs(SQLConf.ANSI_ENABLED.key -> "false") { skipsAtNull =>
+        if (skipsAtNull) {
+          checkAnswer(sql(query), Row(0))
+        } else {
+          checkError(
+            exception = intercept[SparkArithmeticException] {
+              sql(query).collect()
+            },
+            condition = "INTERVAL_ARITHMETIC_OVERFLOW.WITH_SUGGESTION",
+            parameters = Map("functionName" -> toSQLId("try_add")))
+        }
+        // A check on an expression, not on a column, that precedes the NULL conjunct:
+        // `cast(s AS INT)` is NULL on the first row, so the check is FALSE and drops the row
+        // before the overflowing conjunct, as with codegen off.
+        checkAnswer(
+          sql(s"SELECT a FROM t WHERE cast(s AS INT) IS NOT NULL AND $condition"), Row(0))
+      }
+    }
+  }
+
+  test("SPARK-60315: a filter drops a row with a NULL conjunct and stops at a FALSE one") {
+    withNullConjunctTable(Int.MaxValue) {
+      withNullConjunctConfs(SQLConf.ANSI_ENABLED.key -> "true") { _ =>
+        // The first row is dropped after its last conjunct is evaluated.
+        checkAnswer(sql("SELECT a FROM t WHERE NOT (a > 0 AND b > 0) AND y > -1"), Row(0))
+        // FALSE decides the AND, so the overflowing conjunct after it is not evaluated.
+        checkAnswer(
+          sql("SELECT a FROM t WHERE NOT (a > 0 AND b > 0) AND b < 0 AND y + 1 > 0"),
+          Seq.empty)
+      }
+      def hasNullConjunctFlag(query: String): Boolean =
+        genCode(sql(query)).exists(_.body.contains("nullConjunct"))
+      // `b > 0` cannot be NULL after the inferred `isnotnull(b)`, so no flag is generated.
+      val noNullConjunct = "SELECT a FROM t WHERE b > 0 AND y > -1"
+      checkAnswer(sql(noNullConjunct), Seq(Row(null), Row(0)))
+      assert(!hasNullConjunctFlag(noNullConjunct))
+      // `a > 0 OR b > 0` can be NULL, but neither the conjuncts after it nor the inferred checks
+      // can raise an error, so the evaluation after a NULL conjunct is not observable and no
+      // flag is generated either: the generated code is the one of the legacy behavior.
+      val noRaise = "SELECT a FROM t WHERE (a > 0 OR b > 0) AND x = 1 AND y = 0"
+      checkAnswer(sql(noRaise), Row(0))
+      assert(!hasNullConjunctFlag(noRaise))
+      // `y + 1 > 0` can raise in ANSI mode, so the flag is generated.
+      val raise = "SELECT a FROM t WHERE (a > 0 OR b > 0) AND x = 1 AND y + 1 > 0"
+      withSQLConf(SQLConf.ANSI_ENABLED.key -> "true") {
+        checkAnswer(sql(raise), Row(0))
+        assert(hasNullConjunctFlag(raise))
+      }
+      // With ANSI mode off, it can not, so no flag is generated.
+      withSQLConf(SQLConf.ANSI_ENABLED.key -> "false") {
+        checkAnswer(sql(raise), Row(0))
+        assert(!hasNullConjunctFlag(raise))
+      }
+    }
+  }
+
+  test("SPARK-60315: a filter checks IS NOT NULL before the conjuncts it precedes") {
+    withNullConjunctTable(Int.MaxValue) {
+      // `x` is NULL on the first row. With codegen off, a FALSE `isnotnull(x)` drops the row
+      // before a conjunct after it in the condition is evaluated. With codegen on, the check is
+      // generated just before the first conjunct that references `x`, or after all of them, so
+      // after a NULL conjunct it has to be generated before the conjuncts it precedes.
+      //
+      // The common `b * 2` takes the CSE path of FilterExec, while the overflowing `y + 1` is
+      // not common, so it is evaluated at its conjunct in both modes.
+      val cseQuery = "SELECT a FROM t WHERE x IS NOT NULL AND NOT (a > 0 AND b > 0) AND " +
+        "y + 1 > 0 AND b * 2 > 0 AND b * 2 > -1"
+      def multiplyExactCount(filterExecCSE: Boolean): Int = {
+        withSQLConf(
+            SQLConf.ANSI_ENABLED.key -> "true",
+            SQLConf.SUBEXPRESSION_ELIMINATION_FILTER_EXEC_ENABLED.key -> filterExecCSE.toString) {
+          val code = codegenString(sql(cseQuery).queryExecution.executedPlan)
+          "multiplyExact".r.findAllIn(code).length
+        }
+      }
+      assert(multiplyExactCount(filterExecCSE = true) < multiplyExactCount(filterExecCSE = false))
+
+      Seq("true", "false").foreach { filterExecCSE =>
+        withNullConjunctConfs(
+            SQLConf.ANSI_ENABLED.key -> "true",
+            SQLConf.SUBEXPRESSION_ELIMINATION_FILTER_EXEC_ENABLED.key -> filterExecCSE) {
+          skipsAtNull =>
+            // `isnotnull(x)` is inferred from `x > 0` and precedes the overflowing conjunct.
+            checkAnswer(
+              sql("SELECT a FROM t WHERE NOT (a > 0 AND b > 0) AND y + 1 > 0 AND x > 0"),
+              Row(0))
+            // A user-written check that no other conjunct references.
+            checkAnswer(
+              sql("SELECT a FROM t WHERE x IS NOT NULL AND NOT (a > 0 AND b > 0) AND y + 1 > 0"),
+              Row(0))
+            // The same with a common subexpression.
+            checkAnswer(sql(cseQuery), Row(0))
+            // A check written after the overflowing conjunct stays after it.
+            val checkAfter =
+              "SELECT a FROM t WHERE NOT (a > 0 AND b > 0) AND y + 1 > 0 AND x IS NOT NULL"
+            if (skipsAtNull) {
+              checkAnswer(sql(checkAfter), Row(0))
+            } else {
+              checkArithmeticOverflow(checkAfter)
+            }
+            // The same through the CSE branch of FilterExec, which generates the pending checks
+            // before `y + 1 > 0`, the first conjunct after the NULL one that can raise, and not
+            // before the conjuncts after it.
+            val checkAfterCSE = checkAfter + " AND b * 2 > 0 AND b * 2 > -1"
+            if (skipsAtNull) {
+              checkAnswer(sql(checkAfterCSE), Row(0))
+            } else {
+              checkArithmeticOverflow(checkAfterCSE)
+            }
+        }
+      }
+      // The aggregate FILTER clause goes through the same code generation.
+      withNullConjunctConfs(SQLConf.ANSI_ENABLED.key -> "true") { _ =>
+        checkAnswer(
+          sql("SELECT count(1) FILTER (WHERE x IS NOT NULL AND NOT (a > 0 AND b > 0) AND " +
+            "y + 1 > 0) FROM t"),
+          Row(1))
+      }
+    }
+  }
+
+  test("SPARK-60315: a filter checks IS NOT NULL on an expression after the conjunct it follows") {
+    withNullConjunctTable(Int.MaxValue) {
+      // `cast(s AS INT)` raises on the first row. With codegen on, a check on an expression is
+      // generated just before the first conjunct that contains the expression (SPARK-51356),
+      // even when it is written after that conjunct. After a NULL conjunct, it has to stay after
+      // the conjunct, as with codegen off: `coalesce(b, cast(s AS INT)) < 0` is FALSE on the row
+      // and drops it before the check raises, while `coalesce(b, cast(s AS INT)) < 2` is TRUE and
+      // the check raises after it. The second row passes the latter condition.
+      //
+      // The common `b * 2` takes the CSE path of FilterExec.
+      def query(conjunct: String, cse: Boolean): String = {
+        val common = if (cse) "b * 2 > 0 AND b * 2 > -1 AND " else ""
+        s"SELECT a FROM t WHERE NOT (a > 0 AND b > 0) AND $common$conjunct AND " +
+          "cast(s AS INT) IS NOT NULL"
+      }
+      def multiplyExactCount(filterExecCSE: Boolean): Int = {
+        withSQLConf(
+            SQLConf.ANSI_ENABLED.key -> "true",
+            SQLConf.SUBEXPRESSION_ELIMINATION_FILTER_EXEC_ENABLED.key -> filterExecCSE.toString) {
+          val plan = sql(query("coalesce(b, cast(s AS INT)) < 0", cse = true)).queryExecution
+          "multiplyExact".r.findAllIn(codegenString(plan.executedPlan)).length
+        }
+      }
+      assert(multiplyExactCount(filterExecCSE = true) < multiplyExactCount(filterExecCSE = false))
+
+      Seq(true, false).foreach { cse =>
+        withNullConjunctConfs(
+            SQLConf.ANSI_ENABLED.key -> "true",
+            SQLConf.SUBEXPRESSION_ELIMINATION_FILTER_EXEC_ENABLED.key -> cse.toString) {
+          skipsAtNull =>
+            checkAnswer(sql(query("coalesce(b, cast(s AS INT)) < 0", cse)), Seq.empty)
+            val raising = query("coalesce(b, cast(s AS INT)) < 2", cse)
+            if (skipsAtNull) {
+              checkAnswer(sql(raising), Row(0))
+            } else {
+              checkCastInvalidInput(raising)
+            }
+        }
+      }
+      // The placement of the checks is decided at code generation, so once a conjunct can be
+      // NULL, the checks after it are evaluated in the order of the condition on every row. Here
+      // the check written first is generated before `y < 0` and raises on the first row, as with
+      // codegen off, although `a > 0 OR b > 0` is TRUE on the row. The legacy behavior evaluates
+      // `y < 0` first, which is FALSE on both rows, and never reaches the check.
+      val checkFirst =
+        "SELECT a FROM t WHERE cast(s AS INT) IS NOT NULL AND (a > 0 OR b > 0) AND y < 0"
+      withNullConjunctConfs(SQLConf.ANSI_ENABLED.key -> "true") { skipsAtNull =>
+        if (skipsAtNull) {
+          checkAnswer(sql(checkFirst), Seq.empty)
+        } else {
+          checkCastInvalidInput(checkFirst)
+        }
+      }
+    }
+  }
+
+  test("SPARK-60315: an aggregate FILTER evaluates the conjuncts after a NULL one") {
+    withNullConjunctTable(Int.MaxValue) {
+      val query = "SELECT count(a) FILTER (WHERE NOT (a > 0 AND b > 0) AND y + 1 > 0) FROM t"
+      withNullConjunctConfs(SQLConf.ANSI_ENABLED.key -> "true") { skipsAtNull =>
+        if (skipsAtNull) {
+          checkAnswer(sql(query), Row(1))
+        } else {
+          checkArithmeticOverflow(query)
+        }
+      }
+    }
+  }
+
+  test("SPARK-60332: a filter evaluates a common subexpression after the conjuncts before it") {
+    withNullConjunctTable(Int.MaxValue) {
+      // With codegen off, the condition is evaluated by a generated predicate with subexpression
+      // elimination, where `y + 1`, common to the last two conjuncts, overflows on the first row.
+      // The predicate evaluates it just before the first conjunct that references it, as the CSE
+      // branch of FilterExec does with codegen on, so the FALSE `isnotnull(x)`, or `b < 0`, drops
+      // the row first in every combination, as `And.eval` does.
+      withNullConjunctConfs(SQLConf.ANSI_ENABLED.key -> "true") { skipsAtNull =>
+        checkAnswer(
+          sql("SELECT a FROM t WHERE x IS NOT NULL AND NOT (a > 0 AND b > 0) AND y + 1 > 0 AND " +
+            "y + 1 > -1"),
+          Row(0))
+        checkAnswer(sql("SELECT a FROM t WHERE b < 0 AND y + 1 > 0 AND y + 1 > -1"), Seq.empty)
+        // A NULL conjunct does not stop the evaluation, so the common `y + 1` is evaluated,
+        // unless the legacy behavior skips the row at the NULL conjunct.
+        val nullConjunct =
+          "SELECT a FROM t WHERE NOT (a > 0 AND b > 0) AND y + 1 > 0 AND y + 1 > -1"
+        if (skipsAtNull) {
+          checkAnswer(sql(nullConjunct), Row(0))
+        } else {
+          checkArithmeticOverflow(nullConjunct)
+        }
+      }
+      // A join condition is evaluated by the same generated predicate on the join paths without
+      // whole-stage codegen, here a cartesian product. Every conjunct references both sides, so
+      // none is pushed down into a filter, and the FALSE `b < k` stops the evaluation before
+      // the common `y + 1` overflows, whatever the whole-stage codegen config.
+      withTempView("u") {
+        Seq(0).toDF("k").createOrReplaceTempView("u")
+        val join = "SELECT a FROM t JOIN u ON b < k AND y + 1 > k AND y + 1 > k - 1"
+        Seq(true, false).foreach { codegen =>
+          withSQLConf(
+              SQLConf.ANSI_ENABLED.key -> "true",
+              SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+              SQLConf.PARQUET_FILTER_PUSHDOWN_ENABLED.key -> "false",
+              SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> codegen.toString) {
+            val df = sql(join)
+            assert(df.queryExecution.executedPlan.exists(_.isInstanceOf[CartesianProductExec]))
+            checkAnswer(df, Seq.empty)
+          }
+        }
+      }
+    }
+    // `(a + c) + b` in the IF branch of the first conjunct is `(a + b) + c`, common to the next
+    // two conjuncts, under the canonicalization of `+`, but holds no `a + b`, common to the last
+    // three. `a + b` is evaluated before the first conjunct, which the function of `(a + b) + c`
+    // reads, not before the second, or `(a + b) + c` would read the previous row's `a + b`, -5,
+    // and drop the last row. The filter runs through the generated predicate both when the
+    // optimizer filters the local data, with `ConvertToLocalRelation`, which the shared session
+    // excludes, and in `FilterExec` without whole-stage codegen.
+    val localData = "SELECT a FROM VALUES (3, 3, 1, 1, 0), (-5, 0, 1, 1, 0), (3, 3, 1, 1, 1) " +
+      "AS t(a, b, c, d, x) WHERE IF(x > 0, a + c + b, d) > 0 AND a + b + c > 1 AND " +
+      "a + b + c < 10 AND a + b > 5"
+    Seq(
+      SQLConf.OPTIMIZER_EXCLUDED_RULES.key -> "",
+      SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false").foreach { conf =>
+      withSQLConf(
+          conf,
+          SQLConf.CODEGEN_FACTORY_MODE.key -> CodegenObjectFactoryMode.CODEGEN_ONLY.toString) {
+        checkAnswer(sql(localData), Seq(Row(3), Row(3)))
+      }
+    }
+    // The common subexpressions are found in the whole predicate, as before, so that a predicate
+    // with a subquery gets no elimination inside a task (SPARK-38333), and the conjuncts are not
+    // compared with a subquery plan on an executor.
+    withSQLConf(
+        SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false",
+        SQLConf.CODEGEN_FACTORY_MODE.key -> CodegenObjectFactoryMode.CODEGEN_ONLY.toString) {
+      withTempView("u") {
+        spark.range(10).toDF("k").cache().createOrReplaceTempView("u")
+        spark.table("u").collect()
+        checkAnswer(
+          spark.range(10).selectExpr("id AS x", "id AS y")
+            .where("x > (SELECT max(k) - 20 FROM u) AND y + 1 > 0 AND y + 1 < 100")
+            .selectExpr("count(*)"),
+          Row(10))
+      }
+    }
+  }
+
+  // The conditions of the test below, with whether FilterExec eliminates a common subexpression
+  // from them. They mix columns that can be NULL, IS NOT NULL checks that are written or inferred,
+  // on columns and on expressions, before and after the conjuncts that reference them, conjuncts
+  // that can be NULL, common subexpressions, and conjuncts that can raise an error.
+  private val filterConjunctions: Seq[(String, Boolean)] = Seq(
+    "NOT (a > 0 AND b > 0) AND y + 1 > 0" -> false,
+    "NOT (a > 0 AND b > 0) AND y + 1 > 0 AND y + 1 > -1" -> true,
+    "(a > 0 OR b < 0) AND y + 1 > 0" -> false,
+    "b > 0 AND y > -1" -> false,
+    "(a > 0 OR b > 0) AND x = 1 AND y + 1 > 0" -> false,
+    "x IS NOT NULL AND NOT (a > 0 AND b > 0) AND y + 1 > 0 AND b * 2 > 0 AND b * 2 > -1" -> true,
+    "NOT (a > 0 AND b > 0) AND y + 1 > 0 AND x > 0" -> false,
+    "NOT (a > 0 AND b > 0) AND y + 1 > 0 AND x IS NOT NULL" -> false,
+    "NOT (a > 0 AND b > 0) AND y + 1 > 0 AND x IS NOT NULL AND b * 2 > 0 AND b * 2 > -1" -> true,
+    "NOT (a > 0 AND b > 0) AND b * 2 > 0 AND b * 2 > -1 AND " +
+      "coalesce(b, cast(s AS INT)) < 2 AND cast(s AS INT) IS NOT NULL" -> true,
+    "NOT (a > 0 AND b > 0) AND coalesce(b, cast(s AS INT)) < 2 AND " +
+      "cast(s AS INT) IS NOT NULL" -> false,
+    "NOT (a > 0 AND b > 0) AND b * 2 > 0 AND b * 2 > -1 AND " +
+      "coalesce(b, cast(s AS INT)) < 0 AND cast(s AS INT) IS NOT NULL" -> true,
+    "NOT (a > 0 AND b > 0) AND coalesce(b, cast(s AS INT)) < 0 AND " +
+      "cast(s AS INT) IS NOT NULL" -> false,
+    "cast(s AS INT) IS NOT NULL AND (a > 0 OR b > 0) AND y < 0" -> false,
+    "x IS NOT NULL AND NOT (a > 0 AND b > 0) AND y + 1 > 0 AND y + 1 > -1" -> true,
+    "b < 0 AND y + 1 > 0 AND y + 1 > -1" -> true,
+    "a > 0 AND x > 0 AND a * x > 3 AND a * x < 100" -> true,
+    "cast(s AS INT) > 0 AND cast(s AS INT) < 10 AND a > 0" -> true,
+    "a > 1 AND cast(s AS INT) + x > 0 AND cast(s AS INT) + x < 10 AND " +
+      "cast(s AS INT) IS NOT NULL" -> true,
+    "st.c.d > 0 AND st.c.d < 100" -> false,
+    "st.c.d > 0 AND st.c.d * a > 3 AND st.c.d * a < 100" -> true,
+    "st.c IS NOT NULL AND st.c.d + y > 0 AND st.c.d + y < 5 AND x IS NOT NULL" -> true,
+    "upper(s) = 'X' AND length(upper(s)) > 0 AND a IS NOT NULL" -> true)
+
+  test("SPARK-61556: a filter gives the same result with and without subexpression " +
+      "elimination") {
+    // The rows of a query, or the error condition that it fails with.
+    def outcome(query: String): Either[String, Seq[String]] = {
+      try {
+        Right(sql(query).collect().map(_.toString).sorted.toSeq)
+      } catch {
+        case e: Throwable =>
+          val error = Iterator.iterate(e)(_.getCause).takeWhile(_ != null).collectFirst {
+            case t: SparkThrowable if t.getCondition != null => t.getCondition
+          }
+          Left(error.getOrElse(throw e))
+      }
+    }
+    // With whole-stage codegen, FilterExec eliminates the common subexpressions under both
+    // configs. Without it, the condition is a generated predicate under the first config alone.
+    val subExprConfs = Seq(("true", "true"), ("true", "false"), ("false", "false"))
+    // On the first set of rows, `y + 1` overflows and `cast(s AS INT)` fails in ANSI mode.
+    val rowSets = Seq(
+      s"(NULL, 1, ${Int.MaxValue}, NULL, 'x'), (0, 1, 0, 1, '1'), (1, NULL, 3, 2, '2'), " +
+        s"(2, 5, ${Int.MaxValue}, 1, NULL), (3, 2, 1, NULL, '7'), (1, 1, 1, 1, 'x')",
+      "(NULL, 1, 5, NULL, '3'), (0, 1, 0, 1, '1'), (1, NULL, 3, 2, '2'), (2, 5, 7, 1, NULL), " +
+        "(3, 2, 1, NULL, '7'), (1, 1, 1, 1, '4'), (2, 3, -1, 2, 'X'), " +
+        "(NULL, NULL, NULL, NULL, NULL)")
+    rowSets.foreach { rows =>
+      withTable("t") {
+        // A Parquet table, so that the optimizer does not evaluate the filter. A single file
+        // keeps the order of the rows, and so the first row that a query fails on.
+        sql("CREATE TABLE t USING parquet AS SELECT /*+ COALESCE(1) */ *, " +
+          "IF(a = 3, NULL, named_struct('c', named_struct('d', b))) AS st " +
+          s"FROM VALUES $rows AS v(a, b, y, x, s)")
+        for (ansi <- Seq(true, false); legacy <- Seq(true, false);
+            (condition, eliminates) <- filterConjunctions) {
+          val query = s"SELECT a, b, y, x, s FROM t WHERE $condition"
+          def run(wholeStage: Boolean, subExprConf: (String, String)): Either[String, Seq[String]] =
+            withSQLConf(
+                SQLConf.ANSI_ENABLED.key -> ansi.toString,
+                SQLConf.LEGACY_FILTER_SHORT_CIRCUIT_ON_NULL_CONJUNCT.key -> legacy.toString,
+                SQLConf.PARQUET_FILTER_PUSHDOWN_ENABLED.key -> "false",
+                SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> wholeStage.toString,
+                SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> subExprConf._1,
+                SQLConf.SUBEXPRESSION_ELIMINATION_FILTER_EXEC_ENABLED.key -> subExprConf._2) {
+              outcome(query)
+            }
+          withClue(s"ansi=$ansi, legacy=$legacy, condition=$condition: ") {
+            val outcomes = Seq(true, false).map { wholeStage =>
+              val results = subExprConfs.map(run(wholeStage, _))
+              assert(results.distinct.size == 1, s"wholeStage=$wholeStage")
+              results.head
+            }
+            // The legacy behavior drops a row at its first NULL conjunct with whole-stage
+            // codegen alone, so the two can differ under it.
+            if (!legacy) {
+              assert(outcomes.distinct.size == 1)
+            }
+            // The conditions take the code path that they are meant to cover.
+            val codes = Seq("true", "false").map { filterExecCSE =>
+              withSQLConf(
+                  SQLConf.ANSI_ENABLED.key -> ansi.toString,
+                  SQLConf.LEGACY_FILTER_SHORT_CIRCUIT_ON_NULL_CONJUNCT.key -> legacy.toString,
+                  SQLConf.PARQUET_FILTER_PUSHDOWN_ENABLED.key -> "false",
+                  SQLConf.SUBEXPRESSION_ELIMINATION_FILTER_EXEC_ENABLED.key -> filterExecCSE) {
+                genCode(sql(query)).map(_.body)
+              }
+            }
+            assert((codes.head != codes.last) == eliminates)
+          }
+        }
+      }
+    }
+  }
+
+  test("SPARK-60403: full outer joins compile with their functions spilled to nested classes") {
+    // A full outer join outputs its rows through a function of its own, and generates the code of
+    // the operators above it, for the body of that function, before adding the function: here a
+    // CASE WHEN of 2000 branches, split into methods (SPARK-33301) that take the class past
+    // `CodeGenerator.GENERATED_CLASS_SIZE_THRESHOLD`, so `addNewFunction` puts the join's
+    // functions into a nested class. A call from outside of such a class has to go through its
+    // instance, as the name `addNewFunction` returns does; by the bare name it failed to compile.
+    // The join loop in `processNext` of the outer class makes these calls: to `findNextJoinRows`
+    // and `consumeFullOuterJoinRow` in a sort merge join, and to `consumeOuterJoinRow` in a
+    // shuffled hash join.
+    withSplitAlways {
+      withTempView("l", "r") {
+        spark.range(0, 10).selectExpr("id AS k").createOrReplaceTempView("l")
+        spark.range(5, 15).selectExpr("id AS k").createOrReplaceTempView("r")
+        Seq("MERGE" -> "findNextJoinRows", "SHUFFLE_HASH" -> "consumeOuterJoinRow").foreach {
+          case (hint, function) =>
+            val query = s"SELECT /*+ $hint(r) */ l.k, r.k, ${largeCaseWhen("l.k", 2000)} AS v " +
+              "FROM l FULL OUTER JOIN r ON l.k = r.k"
+            val code = genCode(sql(query))
+            code.foreach(CodeGenerator.compile)
+            val qualifiedCall = s"\\w*nestedClassInstance_\\d+\\.\\w*${function}_\\d+\\(".r
+            assert(code.exists(c => qualifiedCall.findFirstIn(c.body).nonEmpty), hint)
+            checkAnswer(sql(query), withoutWholeStage(sql(query)))
+        }
+      }
+    }
+  }
+
+  test("SPARK-60403: MergeRows compiles with its function spilled to a nested class") {
+    // `MergeRowsExec` processes each row in a function of its own, and generates the code of the
+    // operators above it, for the body of that function, before adding the function: here a CASE
+    // WHEN of 2000 branches, split into methods (SPARK-33301) that take the class past
+    // `CodeGenerator.GENERATED_CLASS_SIZE_THRESHOLD`, so the function goes into a nested class.
+    // With the consume code of the operators not split into functions, the call to it is in
+    // `processNext` of the outer class, where by the bare name it failed to compile. Split, the
+    // call is in a consume function added right after it, into the same nested class unless that
+    // class fills up in between. The MergeRows node is built as in `MergeRowsExecBenchmark`,
+    // matching every row.
+    val source = spark.range(10).selectExpr("CAST(id AS INT) AS t", "CAST(id AS INT) AS s")
+    val attrs = source.queryExecution.analyzed.output
+    val mergeRows = MergeRows(
+      isSourceRowPresent = Literal.TrueLiteral,
+      isTargetRowPresent = Literal.TrueLiteral,
+      matchedInstructions = Seq(Keep(Update, Literal.TrueLiteral, attrs)),
+      notMatchedInstructions = Nil,
+      notMatchedBySourceInstructions = Nil,
+      checkCardinality = false,
+      output = attrs.map(_.newInstance()),
+      child = source.queryExecution.analyzed)
+    def df: DataFrame =
+      classic.Dataset.ofRows(spark, mergeRows).selectExpr(s"${largeCaseWhen("s", 2000)} AS v")
+    withSplitAlways {
+      withSQLConf(SQLConf.WHOLESTAGE_SPLIT_CONSUME_FUNC_BY_OPERATOR.key -> "false") {
+        val code = genCode(df)
+        code.foreach(CodeGenerator.compile)
+        val qualifiedCall = "\\w*nestedClassInstance_\\d+\\.\\w*mergeProcessRow_\\d+\\(".r
+        assert(code.exists(c => qualifiedCall.findFirstIn(c.body).nonEmpty))
+        checkAnswer(df, withoutWholeStage(df))
+      }
+    }
+  }
+
+  test("SPARK-60760: Lambda variable names are not in the generated code") {
+    val name = "lambdaName*/b"
+    withTempView("t") {
+      spark.range(3).selectExpr("array(id, id + 1) AS a").createOrReplaceTempView("t")
+      Seq(
+        s"transform(a, (e, `$name`) -> e + `$name`)" ->
+          Seq(Row(Seq(0, 2)), Row(Seq(1, 3)), Row(Seq(2, 4))),
+        s"filter(a, `$name` -> `$name` > 0)" ->
+          Seq(Row(Seq(1)), Row(Seq(1, 2)), Row(Seq(2, 3))),
+        s"aggregate(a, 0L, (`$name`, e) -> `$name` + e, acc -> acc)" ->
+          Seq(Row(1), Row(3), Row(5)),
+        s"aggregate(a, 0L, (acc, e) -> acc + e, `$name` -> `$name`)" ->
+          Seq(Row(1), Row(3), Row(5))
+      ).foreach { case (expr, expected) =>
+        val df = sql(s"SELECT $expr AS r FROM t")
+        genCode(df).foreach(code => assert(!code.body.contains("lambdaName")))
+        checkAnswer(df, expected)
+      }
+    }
+  }
+
+  test("SPARK-60760: A new lambda variable name does not compile a generated class again") {
+    withTempView("t") {
+      spark.range(3).selectExpr("array(id, id + 1) AS a").createOrReplaceTempView("t")
+      val query = () => spark.table("t").select(transform($"a", x => x + 98765))
+      query().collect()
+      val compiles = CodegenMetrics.METRIC_COMPILATION_TIME.getCount
+      query().collect()
+      assert(CodegenMetrics.METRIC_COMPILATION_TIME.getCount == compiles)
+    }
+  }
+}
+
+/** Hands out the values and null flags its child hands out as fields as local variables. */
+private case class LocalOutputExec(child: SparkPlan) extends UnaryExecNode with CodegenSupport {
+  override def output: Seq[Attribute] = child.output
+
+  override def inputRDDs(): Seq[RDD[InternalRow]] =
+    child.asInstanceOf[CodegenSupport].inputRDDs()
+
+  override protected def doProduce(ctx: CodegenContext): String =
+    child.asInstanceOf[CodegenSupport].produce(ctx, this)
+
+  override def doConsume(ctx: CodegenContext, input: Seq[ExprCode], row: ExprCode): String =
+    consume(ctx, input.map(e => e.copy(isNull = local(e.isNull), value = local(e.value))))
+
+  private def local(v: ExprValue): ExprValue = v match {
+    case GlobalValue(name, javaType) => JavaCode.variable(name, javaType)
+    case _ => v
+  }
+
+  override protected def doExecute(): RDD[InternalRow] = child.execute()
+
+  override protected def withNewChildInternal(newChild: SparkPlan): LocalOutputExec =
+    copy(child = newChild)
 }

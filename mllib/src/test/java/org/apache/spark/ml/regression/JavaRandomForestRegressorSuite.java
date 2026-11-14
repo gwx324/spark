@@ -17,11 +17,13 @@
 
 package org.apache.spark.ml.regression;
 
+import java.io.File;
+import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
 
-import org.junit.Assert;
-import org.junit.Test;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Test;
 
 import org.apache.spark.SharedSparkSession;
 import org.apache.spark.api.java.JavaRDD;
@@ -31,12 +33,13 @@ import org.apache.spark.ml.linalg.Vector;
 import org.apache.spark.ml.tree.impl.TreeTests;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
+import org.apache.spark.util.Utils;
 
 
 public class JavaRandomForestRegressorSuite extends SharedSparkSession {
 
   @Test
-  public void runDT() {
+  public void runDT() throws IOException {
     int nPoints = 20;
     double A = 2.0;
     double B = -1.5;
@@ -75,12 +78,8 @@ public class JavaRandomForestRegressorSuite extends SharedSparkSession {
     }
     String[] invalidStrategies = {"-.1", "-.10", "-0.10", ".0", "0.0", "1.1", "0"};
     for (String strategy : invalidStrategies) {
-      try {
-        rf.setFeatureSubsetStrategy(strategy);
-        Assert.fail("Expected exception to be thrown for invalid strategies");
-      } catch (Exception e) {
-        Assert.assertTrue(e instanceof IllegalArgumentException);
-      }
+      Assertions.assertThrows(IllegalArgumentException.class,
+        () -> rf.setFeatureSubsetStrategy(strategy));
     }
 
     RandomForestRegressionModel model = rf.fit(dataFrame);
@@ -92,17 +91,14 @@ public class JavaRandomForestRegressorSuite extends SharedSparkSession {
     model.treeWeights();
     Vector importances = model.featureImportances();
 
-    /*
-    // TODO: Add test once save/load are implemented.   SPARK-6725
     File tempDir = Utils.createTempDir(System.getProperty("java.io.tmpdir"), "spark");
-    String path = tempDir.toURI().toString();
+    String path = new File(tempDir, "model").getPath();
     try {
-      model2.save(sc.sc(), path);
-      RandomForestRegressionModel sameModel = RandomForestRegressionModel.load(sc.sc(), path);
-      TreeTests.checkEqual(model2, sameModel);
+      model.save(path);
+      RandomForestRegressionModel sameModel = RandomForestRegressionModel.load(path);
+      TreeTests.checkEqual(model, sameModel);
     } finally {
       Utils.deleteRecursively(tempDir);
     }
-    */
   }
 }

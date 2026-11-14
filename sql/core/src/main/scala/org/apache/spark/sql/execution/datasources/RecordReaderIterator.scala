@@ -17,9 +17,11 @@
 
 package org.apache.spark.sql.execution.datasources
 
+import java.io.Closeable
+
 import org.apache.hadoop.mapreduce.RecordReader
 
-import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.errors.QueryExecutionErrors
 
 /**
  * An adaptor from a Hadoop [[RecordReader]] to an [[Iterator]] over the values returned.
@@ -27,7 +29,8 @@ import org.apache.spark.sql.catalyst.InternalRow
  * Note that this returns [[Object]]s instead of [[InternalRow]] because we rely on erasure to pass
  * column batches by pretending they are rows.
  */
-class RecordReaderIterator[T](rowReader: RecordReader[_, T]) extends Iterator[T] {
+class RecordReaderIterator[T](
+    private[this] var rowReader: RecordReader[_, T]) extends Iterator[T] with Closeable {
   private[this] var havePair = false
   private[this] var finished = false
 
@@ -38,7 +41,7 @@ class RecordReaderIterator[T](rowReader: RecordReader[_, T]) extends Iterator[T]
         // Close and release the reader here; close() will also be called when the task
         // completes, but for tasks that read from many files, it helps to release the
         // resources early.
-        rowReader.close()
+        close()
       }
       havePair = !finished
     }
@@ -47,9 +50,26 @@ class RecordReaderIterator[T](rowReader: RecordReader[_, T]) extends Iterator[T]
 
   override def next(): T = {
     if (!hasNext) {
-      throw new java.util.NoSuchElementException("End of stream")
+      throw QueryExecutionErrors.endOfStreamError()
     }
     havePair = false
     rowReader.getCurrentValue
+  }
+
+  override def map[B](f: (T) => B): Iterator[B] with Closeable =
+    new Iterator[B] with Closeable {
+      override def hasNext: Boolean = RecordReaderIterator.this.hasNext
+      override def next(): B = f(RecordReaderIterator.this.next())
+      override def close(): Unit = RecordReaderIterator.this.close()
+    }
+
+  override def close(): Unit = {
+    if (rowReader != null) {
+      try {
+        rowReader.close()
+      } finally {
+        rowReader = null
+      }
+    }
   }
 }

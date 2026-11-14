@@ -1,0 +1,245 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.api.python
+
+import java.io.InputStream
+import java.nio.channels.{Channels, SocketChannel}
+
+import net.razorvine.pickle.{Pickler, Unpickler}
+
+import org.apache.spark.SparkContext
+import org.apache.spark.api.python.DechunkedInputStream
+import org.apache.spark.security.SocketAuthServer
+import org.apache.spark.sql.{internal, Column, DataFrame, DataFrameReader, Dataset, Encoders, Row, SparkSession, TableArg}
+import org.apache.spark.sql.catalyst.{CatalystTypeConverters, InternalRow}
+import org.apache.spark.sql.catalyst.analysis.{FunctionRegistry, TableFunctionRegistry}
+import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
+import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
+import org.apache.spark.sql.classic.{DataFrameReader => ClassicDataFrameReader}
+import org.apache.spark.sql.classic.ClassicConversions._
+import org.apache.spark.sql.classic.ExpressionUtils.expression
+import org.apache.spark.sql.errors.QueryCompilationErrors
+import org.apache.spark.sql.execution.{ExplainMode, QueryExecution}
+import org.apache.spark.sql.execution.arrow.ArrowConverters
+import org.apache.spark.sql.execution.python.EvaluatePython
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.types.{DataType, StructType}
+import org.apache.spark.storage.PythonWorkerLogBlockId
+
+private[sql] object PythonSQLUtils {
+  private def withInternalRowPickler(f: Pickler => Array[Byte]): Array[Byte] = {
+    EvaluatePython.registerPicklers()
+    val pickler = new Pickler(true, false)
+    val ret = try {
+        f(pickler)
+      } finally {
+        pickler.close()
+      }
+    ret
+  }
+
+  private def withInternalRowUnpickler(f: Unpickler => Any): Any = {
+    EvaluatePython.registerPicklers()
+    val unpickler = new Unpickler
+    val ret = try {
+        f(unpickler)
+      } finally {
+        unpickler.close()
+      }
+    ret
+  }
+
+  def parseDataType(typeText: String): DataType = CatalystSqlParser.parseDataType(typeText)
+
+  // This is needed when generating SQL documentation for built-in functions.
+  def listBuiltinFunctionInfos(): Array[ExpressionInfo] = {
+    (FunctionRegistry.functionSet.flatMap(f => FunctionRegistry.builtin.lookupFunction(f)) ++
+      TableFunctionRegistry.functionSet.flatMap(
+        f => TableFunctionRegistry.builtin.lookupFunction(f))).
+      groupBy(_.getName).map(v => v._2.head).toArray
+  }
+
+  private def listAllSQLConfigs(): Seq[(String, String, String, String)] = {
+    val conf = new SQLConf()
+    conf.getAllDefinedConfs
+  }
+
+  def listRuntimeSQLConfigs(): Array[(String, String, String, String)] = {
+    // Py4J doesn't seem to translate Seq well, so we convert to an Array.
+    listAllSQLConfigs().filterNot(p => SQLConf.isStaticConfigKey(p._1)).toArray
+  }
+
+  def listStaticSQLConfigs(): Array[(String, String, String, String)] = {
+    listAllSQLConfigs().filter(p => SQLConf.isStaticConfigKey(p._1)).toArray
+  }
+
+  def isTimestampNTZPreferred: Boolean =
+    SQLConf.get.timestampType == org.apache.spark.sql.types.TimestampNTZType
+
+  /**
+   * Python callable function to read a file in Arrow stream format and create an iterator
+   * of serialized ArrowRecordBatches.
+   */
+  def readArrowStreamFromFile(filename: String): Iterator[Array[Byte]] = {
+    ArrowConverters.readArrowStreamFromFile(filename).iterator
+  }
+
+  /**
+   * Python callable function to read a file in Arrow stream format and create a [[DataFrame]]
+   * from the Arrow batch iterator.
+   */
+  def toDataFrame(
+      arrowBatches: Iterator[Array[Byte]],
+      schemaString: String,
+      session: SparkSession): DataFrame = {
+    ArrowConverters.toDataFrame(arrowBatches, schemaString, session)
+  }
+
+  def explainString(queryExecution: QueryExecution, mode: String): String = {
+    queryExecution.explainString(ExplainMode.fromString(mode))
+  }
+
+  def toPyRow(row: Row): Array[Byte] = {
+    assert(row.isInstanceOf[GenericRowWithSchema])
+    withInternalRowPickler(_.dumps(EvaluatePython.toJava(
+      CatalystTypeConverters.convertToCatalyst(row), row.schema, SQLConf.get.pysparkBinaryAsBytes)))
+  }
+
+  def toJVMRow(
+      arr: Array[Byte],
+      returnType: StructType,
+      deserializer: ExpressionEncoder.Deserializer[Row]): Row = {
+    val fromJava = EvaluatePython.makeFromJava(returnType)
+    val internalRow =
+        fromJava(withInternalRowUnpickler(_.loads(arr))).asInstanceOf[InternalRow]
+    deserializer(internalRow)
+  }
+
+  def jsonToDDL(json: String): String = {
+    DataType.fromJson(json).asInstanceOf[StructType].toDDL
+  }
+
+  def ddlToJson(ddl: String): String = {
+    val dataType = try {
+      // DDL format, "fieldname datatype, fieldname datatype".
+      StructType.fromDDL(ddl)
+    } catch {
+      case e: Throwable =>
+        try {
+          // For backwards compatibility, "integer", "struct<fieldname: datatype>" and etc.
+          parseDataType(ddl)
+        } catch {
+          case _: Throwable =>
+            try {
+              // For backwards compatibility, "fieldname: datatype, fieldname: datatype" case.
+              parseDataType(s"struct<${ddl.trim}>")
+            } catch {
+              case _: Throwable =>
+                throw e
+            }
+        }
+    }
+    dataType.json
+  }
+
+  def unresolvedNamedLambdaVariable(name: String): Column =
+    Column(internal.UnresolvedNamedLambdaVariable.apply(name))
+
+  @scala.annotation.varargs
+  def lambdaFunction(function: Column, variables: Column*): Column = {
+    val arguments = variables.map(_.node.asInstanceOf[internal.UnresolvedNamedLambdaVariable])
+    Column(internal.LambdaFunction(function.node, arguments))
+  }
+
+  def namedArgumentExpression(name: String, e: Column): Column =
+    Column(NamedArgumentExpression(name, expression(e)))
+
+  def namedArgumentExpression(name: String, e: TableArg): Column =
+    Column(NamedArgumentExpression(name, e.expression))
+
+  @scala.annotation.varargs
+  def fn(name: String, arguments: Column*): Column = Column.fn(name, arguments: _*)
+
+  @scala.annotation.varargs
+  def internalFn(name: String, inputs: Column*): Column = Column.internalFn(name, inputs: _*)
+
+  /**
+   * Validates that the input [[DataFrame]] has exactly one column of StringType
+   * and converts it to a Dataset[String].
+   */
+  private def toStringDataset(df: DataFrame): Dataset[String] = {
+    val fields = df.schema.fields
+    if (fields.length != 1) {
+      throw QueryCompilationErrors.dataframeInputNotSingleColumnError(fields.length)
+    }
+    if (fields.head.dataType != org.apache.spark.sql.types.StringType) {
+      throw QueryCompilationErrors.dataframeInputNotStringTypeError(fields.head.dataType)
+    }
+    df.as(Encoders.STRING)
+  }
+
+  def jsonFromDataFrame(
+      reader: DataFrameReader,
+      df: DataFrame): DataFrame = {
+    reader.asInstanceOf[ClassicDataFrameReader].json(toStringDataset(df))
+  }
+
+  def csvFromDataFrame(
+      reader: DataFrameReader,
+      df: DataFrame): DataFrame = {
+    reader.asInstanceOf[ClassicDataFrameReader].csv(toStringDataset(df))
+  }
+
+  def xmlFromDataFrame(
+      reader: DataFrameReader,
+      df: DataFrame): DataFrame = {
+    reader.asInstanceOf[ClassicDataFrameReader].xml(toStringDataset(df))
+  }
+
+  def cleanupPythonWorkerLogs(sessionUUID: String, sparkContext: SparkContext): Unit = {
+    if (!sparkContext.isStopped) {
+      try {
+        val blockManager = sparkContext.env.blockManager.master
+        blockManager.getMatchingBlockIds(
+            id => id.isInstanceOf[PythonWorkerLogBlockId] &&
+              id.asInstanceOf[PythonWorkerLogBlockId].sessionId == sessionUUID,
+            askStorageEndpoints = true)
+          .distinct
+          .foreach(blockManager.removeBlock)
+      } catch {
+        case _ if sparkContext.isStopped => // Ignore when SparkContext is stopped.
+      }
+    }
+  }
+}
+
+/**
+ * Helper for making a dataframe from Arrow data from data sent from python over a socket. This is
+ * used when encryption is enabled, and we don't want to write data to a file.
+ */
+private[spark] class ArrowIteratorServer
+  extends SocketAuthServer[Iterator[Array[Byte]]]("pyspark-arrow-batches-server") {
+
+  def handleConnection(sock: SocketChannel): Iterator[Array[Byte]] = {
+    val in = Channels.newInputStream(sock)
+    val dechunkedInput: InputStream = new DechunkedInputStream(in)
+    // Create array to consume iterator so that we can safely close the file
+    ArrowConverters.getBatchesFromStream(Channels.newChannel(dechunkedInput)).toArray.iterator
+  }
+}

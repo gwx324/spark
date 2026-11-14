@@ -19,12 +19,13 @@ package org.apache.spark.streaming.scheduler.rate
 
 import org.apache.spark.SparkConf
 import org.apache.spark.streaming.Duration
+import org.apache.spark.streaming.StreamingConf._
 
 /**
  * A component that estimates the rate at which an `InputDStream` should ingest
  * records, based on updates at every batch completion.
  *
- * @see [[org.apache.spark.streaming.scheduler.RateController]]
+ * Please see `org.apache.spark.streaming.scheduler.RateController` for more details.
  */
 private[streaming] trait RateEstimator extends Serializable {
 
@@ -57,12 +58,12 @@ object RateEstimator {
    * @throws IllegalArgumentException if the configured RateEstimator is not `pid`.
    */
   def create(conf: SparkConf, batchInterval: Duration): RateEstimator =
-    conf.get("spark.streaming.backpressure.rateEstimator", "pid") match {
+    conf.get(BACKPRESSURE_RATE_ESTIMATOR) match {
       case "pid" =>
-        val proportional = conf.getDouble("spark.streaming.backpressure.pid.proportional", 1.0)
-        val integral = conf.getDouble("spark.streaming.backpressure.pid.integral", 0.2)
-        val derived = conf.getDouble("spark.streaming.backpressure.pid.derived", 0.0)
-        val minRate = conf.getDouble("spark.streaming.backpressure.pid.minRate", 100)
+        val proportional = conf.get(BACKPRESSURE_PID_PROPORTIONAL)
+        val integral = conf.get(BACKPRESSURE_PID_INTEGRAL)
+        val derived = conf.get(BACKPRESSURE_PID_DERIVED)
+        val minRate = conf.get(BACKPRESSURE_PID_MIN_RATE)
         new PIDRateEstimator(batchInterval.milliseconds, proportional, integral, derived, minRate)
 
       case estimator =>

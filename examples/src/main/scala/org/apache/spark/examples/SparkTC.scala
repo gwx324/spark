@@ -41,9 +41,9 @@ object SparkTC {
     edges.toSeq
   }
 
-  def main(args: Array[String]) {
+  def main(args: Array[String]): Unit = {
     val spark = SparkSession
-      .builder
+      .builder()
       .appName("SparkTC")
       .getOrCreate()
     val slices = if (args.length > 0) args(0).toInt else 2
@@ -68,7 +68,7 @@ object SparkTC {
       nextCount = tc.count()
     } while (nextCount != oldCount)
 
-    println("TC has " + tc.count() + " edges.")
+    println(s"TC has ${tc.count()} edges.")
     spark.stop()
   }
 }

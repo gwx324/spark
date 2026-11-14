@@ -17,6 +17,8 @@
 
 package org.apache.spark.launcher;
 
+import java.util.Optional;
+
 /**
  * A handle to a running Spark application.
  * <p>
@@ -91,9 +93,6 @@ public interface SparkAppHandle {
    * Tries to kill the underlying application. Implies {@link #disconnect()}. This will not send
    * a {@link #stop()} message to the application, so it's recommended that users first try to
    * stop the application cleanly and only resort to this method if that fails.
-   * <p>
-   * Note that if the application is running as a child process, this method fail to kill the
-   * process when using Java 7. This may happen if, for example, the application is deadlocked.
    */
   void kill();
 
@@ -104,12 +103,18 @@ public interface SparkAppHandle {
   void disconnect();
 
   /**
+   * If the application failed due to an error, return the underlying error. If the app
+   * succeeded, this method returns an empty {@link Optional}.
+   */
+  Optional<Throwable> getError();
+
+  /**
    * Listener for updates to a handle's state. The callbacks do not receive information about
    * what exactly has changed, just that an update has occurred.
    *
    * @since 1.6.0
    */
-  public interface Listener {
+  interface Listener {
 
     /**
      * Callback for changes in the handle's state.

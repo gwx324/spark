@@ -17,12 +17,48 @@
 
 package org.apache.spark.ml.stat.distribution
 
+import java.util.concurrent.{Callable, CountDownLatch, Executors, TimeUnit}
+
 import org.apache.spark.ml.SparkMLFunSuite
 import org.apache.spark.ml.linalg.{Matrices, Vectors}
 import org.apache.spark.ml.util.TestingUtils._
 
 
 class MultivariateGaussianSuite extends SparkMLFunSuite {
+
+  test("SPARK-59618: multivariate Gaussian can be initialized concurrently") {
+    val numThreads = 64
+    val ready = new CountDownLatch(numThreads)
+    val start = new CountDownLatch(1)
+    val executor = Executors.newFixedThreadPool(numThreads, (runnable: Runnable) => {
+      val thread = new Thread(runnable, "multivariate-gaussian-test")
+      thread.setDaemon(true)
+      thread
+    })
+
+    try {
+      val results = (0 until numThreads).map { _ =>
+        executor.submit(new Callable[Double] {
+          override def call(): Double = {
+            ready.countDown()
+            start.await()
+            val dist = new MultivariateGaussian(
+              Vectors.dense(0.0, 0.0),
+              Matrices.dense(2, 2, Array(1.0, 0.0, 0.0, 1.0)))
+            dist.pdf(Vectors.dense(0.0, 0.0))
+          }
+        })
+      }
+      assert(ready.await(10, TimeUnit.SECONDS))
+      start.countDown()
+
+      results.foreach { result =>
+        assert(result.get(30, TimeUnit.SECONDS) ~== 0.15915 absTol 1E-5)
+      }
+    } finally {
+      executor.shutdownNow()
+    }
+  }
 
   test("univariate") {
     val x1 = Vectors.dense(0.0)
@@ -31,11 +67,15 @@ class MultivariateGaussianSuite extends SparkMLFunSuite {
     val mu = Vectors.dense(0.0)
     val sigma1 = Matrices.dense(1, 1, Array(1.0))
     val dist1 = new MultivariateGaussian(mu, sigma1)
+    assert(dist1.logpdf(x1) ~== -0.9189385332046727 absTol 1E-5)
+    assert(dist1.logpdf(x2) ~== -2.0439385332046727 absTol 1E-5)
     assert(dist1.pdf(x1) ~== 0.39894 absTol 1E-5)
     assert(dist1.pdf(x2) ~== 0.12952 absTol 1E-5)
 
     val sigma2 = Matrices.dense(1, 1, Array(4.0))
     val dist2 = new MultivariateGaussian(mu, sigma2)
+    assert(dist2.logpdf(x1) ~== -1.612085713764618 absTol 1E-5)
+    assert(dist2.logpdf(x2) ~== -1.893335713764618 absTol 1E-5)
     assert(dist2.pdf(x1) ~== 0.19947 absTol 1E-5)
     assert(dist2.pdf(x2) ~== 0.15057 absTol 1E-5)
   }
@@ -47,11 +87,15 @@ class MultivariateGaussianSuite extends SparkMLFunSuite {
     val mu = Vectors.dense(0.0, 0.0)
     val sigma1 = Matrices.dense(2, 2, Array(1.0, 0.0, 0.0, 1.0))
     val dist1 = new MultivariateGaussian(mu, sigma1)
+    assert(dist1.logpdf(x1) ~== -1.8378770664093453 absTol 1E-5)
+    assert(dist1.logpdf(x2) ~== -2.8378770664093453 absTol 1E-5)
     assert(dist1.pdf(x1) ~== 0.15915 absTol 1E-5)
     assert(dist1.pdf(x2) ~== 0.05855 absTol 1E-5)
 
     val sigma2 = Matrices.dense(2, 2, Array(4.0, -1.0, -1.0, 2.0))
     val dist2 = new MultivariateGaussian(mu, sigma2)
+    assert(dist2.logpdf(x1) ~== -2.810832140937002 absTol 1E-5)
+    assert(dist2.logpdf(x2) ~== -3.3822607123655732 absTol 1E-5)
     assert(dist2.pdf(x1) ~== 0.060155 absTol 1E-5)
     assert(dist2.pdf(x2) ~== 0.033971 absTol 1E-5)
   }

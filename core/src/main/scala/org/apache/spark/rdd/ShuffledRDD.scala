@@ -25,10 +25,6 @@ import org.apache.spark.serializer.Serializer
 
 private[spark] class ShuffledRDDPartition(val idx: Int) extends Partition {
   override val index: Int = idx
-
-  override def hashCode(): Int = index
-
-  override def equals(other: Any): Boolean = super.equals(other)
 }
 
 /**
@@ -45,7 +41,10 @@ private[spark] class ShuffledRDDPartition(val idx: Int) extends Partition {
 class ShuffledRDD[K: ClassTag, V: ClassTag, C: ClassTag](
     @transient var prev: RDD[_ <: Product2[K, V]],
     part: Partitioner)
-  extends RDD[(K, C)](prev.context, Nil) {
+  extends RDD[(K, C)](prev.context, Nil) with ShuffleReducePartitionMapping {
+
+  // One partition per reduce partition, in order (see getPartitions), so the mapping is identity.
+  override def reducePartitionIndex(partitionIndex: Int): Option[Int] = Some(partitionIndex)
 
   private var userSpecifiedSerializer: Option[Serializer] = None
 
@@ -105,13 +104,17 @@ class ShuffledRDD[K: ClassTag, V: ClassTag, C: ClassTag](
 
   override def compute(split: Partition, context: TaskContext): Iterator[(K, C)] = {
     val dep = dependencies.head.asInstanceOf[ShuffleDependency[K, V, C]]
-    SparkEnv.get.shuffleManager.getReader(dep.shuffleHandle, split.index, split.index + 1, context)
+    val metrics = context.taskMetrics().createTempShuffleReadMetrics()
+    SparkEnv.get.shuffleManagerFor(dep).getReader(
+      dep.shuffleHandle, split.index, split.index + 1, context, metrics)
       .read()
       .asInstanceOf[Iterator[(K, C)]]
   }
 
-  override def clearDependencies() {
+  override def clearDependencies(): Unit = {
     super.clearDependencies()
     prev = null
   }
+
+  private[spark] override def isBarrier(): Boolean = false
 }

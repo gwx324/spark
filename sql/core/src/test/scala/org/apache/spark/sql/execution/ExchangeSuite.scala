@@ -17,36 +17,92 @@
 
 package org.apache.spark.sql.execution
 
-import org.apache.spark.sql.Row
-import org.apache.spark.sql.catalyst.expressions.{Alias, Literal}
-import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, IdentityBroadcastMode, SinglePartition}
-import org.apache.spark.sql.execution.exchange.{BroadcastExchangeExec, ReusedExchangeExec, ShuffleExchange}
-import org.apache.spark.sql.execution.joins.HashedRelationBroadcastMode
-import org.apache.spark.sql.test.SharedSQLContext
+import scala.util.Random
 
-class ExchangeSuite extends SparkPlanTest with SharedSQLContext {
+import org.apache.spark.rdd.{DeterministicLevel, RDD}
+import org.apache.spark.sql.{Dataset, Row}
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.expressions.{Alias, Literal}
+import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, IdentityBroadcastMode, NullAwareHashPartitioning, SinglePartition}
+import org.apache.spark.sql.execution.exchange.{BroadcastExchangeExec, Exchange, ReusedExchangeExec, ShuffleExchangeExec}
+import org.apache.spark.sql.execution.joins.HashedRelationBroadcastMode
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.test.SharedSparkSession
+import org.apache.spark.sql.vectorized.ColumnarBatch
+
+class RanColumnar extends RuntimeException
+class RanRowBased extends RuntimeException
+
+case class ColumnarExchange(child: SparkPlan) extends Exchange {
+
+  override def supportsColumnar: Boolean = true
+
+  override protected def doExecute(): RDD[InternalRow] = throw new RanRowBased
+
+  override protected def doExecuteColumnar(): RDD[ColumnarBatch] = throw new RanColumnar
+
+  override protected def withNewChildInternal(newChild: SparkPlan): ColumnarExchange =
+    copy(child = newChild)
+}
+
+class ExchangeSuite extends SharedSparkSession {
   import testImplicits._
+
+  setupTestData()
 
   test("shuffling UnsafeRows in exchange") {
     val input = (1 to 1000).map(Tuple1.apply)
     checkAnswer(
       input.toDF(),
-      plan => ShuffleExchange(SinglePartition, plan),
+      plan => ShuffleExchangeExec(SinglePartition, plan),
       input.map(Row.fromTuple)
     )
   }
 
-  test("compatible BroadcastMode") {
+  test("null-aware hash shuffle spreads identical NULL keys from one mapper") {
+    val input = Seq.fill(64)(Tuple1(null.asInstanceOf[Integer])).toDF("k").coalesce(1)
+    val plan = input.queryExecution.executedPlan
+    val exchange = ShuffleExchangeExec(NullAwareHashPartitioning(plan.output, 4), plan)
+    val partitionSizes = exchange.execute().collectPartitions().map(_.length)
+
+    assert(partitionSizes.sorted === Array(16, 16, 16, 16))
+  }
+
+  test("null-aware hash shuffle preserves retry determinism with local sorting") {
+    withSQLConf(SQLConf.SORT_BEFORE_REPARTITION.key -> "true") {
+      val input = spark.range(64).repartition(4).selectExpr("CAST(NULL AS INT) AS k")
+      val plan = input.queryExecution.executedPlan
+      val exchange = ShuffleExchangeExec(NullAwareHashPartitioning(plan.output, 4), plan)
+
+      assert(plan.execute().outputDeterministicLevel == DeterministicLevel.UNORDERED)
+      assert(exchange.shuffleDependency.rdd.outputDeterministicLevel !=
+        DeterministicLevel.INDETERMINATE)
+    }
+  }
+
+  test("null-aware hash shuffle marks unsorted repartitioning as order-sensitive") {
+    withSQLConf(SQLConf.SORT_BEFORE_REPARTITION.key -> "false") {
+      val input = spark.range(64).repartition(4).selectExpr("CAST(NULL AS INT) AS k")
+      val plan = input.queryExecution.executedPlan
+      val exchange = ShuffleExchangeExec(NullAwareHashPartitioning(plan.output, 4), plan)
+
+      assert(plan.execute().outputDeterministicLevel == DeterministicLevel.UNORDERED)
+      assert(exchange.shuffleDependency.rdd.outputDeterministicLevel ==
+        DeterministicLevel.INDETERMINATE)
+    }
+  }
+
+  test("BroadcastMode.canonicalized") {
     val mode1 = IdentityBroadcastMode
     val mode2 = HashedRelationBroadcastMode(Literal(1L) :: Nil)
     val mode3 = HashedRelationBroadcastMode(Literal("s") :: Nil)
 
-    assert(mode1.compatibleWith(mode1))
-    assert(!mode1.compatibleWith(mode2))
-    assert(!mode2.compatibleWith(mode1))
-    assert(mode2.compatibleWith(mode2))
-    assert(!mode2.compatibleWith(mode3))
-    assert(mode3.compatibleWith(mode3))
+    assert(mode1.canonicalized == mode1.canonicalized)
+    assert(mode1.canonicalized != mode2.canonicalized)
+    assert(mode2.canonicalized != mode1.canonicalized)
+    assert(mode2.canonicalized == mode2.canonicalized)
+    assert(mode2.canonicalized != mode3.canonicalized)
+    assert(mode3.canonicalized == mode3.canonicalized)
   }
 
   test("BroadcastExchange same result") {
@@ -70,7 +126,7 @@ class ExchangeSuite extends SparkPlanTest with SharedSQLContext {
 
     assert(!exchange1.sameResult(exchange2))
     assert(!exchange2.sameResult(exchange3))
-    assert(!exchange3.sameResult(exchange4))
+    assert(exchange3.sameResult(exchange4))
     assert(exchange4 sameResult exchange3)
   }
 
@@ -81,12 +137,12 @@ class ExchangeSuite extends SparkPlanTest with SharedSQLContext {
     assert(plan sameResult plan)
 
     val part1 = HashPartitioning(output, 1)
-    val exchange1 = ShuffleExchange(part1, plan)
-    val exchange2 = ShuffleExchange(part1, plan)
+    val exchange1 = ShuffleExchangeExec(part1, plan)
+    val exchange2 = ShuffleExchangeExec(part1, plan)
     val part2 = HashPartitioning(output, 2)
-    val exchange3 = ShuffleExchange(part2, plan)
+    val exchange3 = ShuffleExchangeExec(part2, plan)
     val part3 = HashPartitioning(output ++ output, 2)
-    val exchange4 = ShuffleExchange(part3, plan)
+    val exchange4 = ShuffleExchangeExec(part3, plan)
     val exchange5 = ReusedExchangeExec(output, exchange4)
 
     assert(exchange1 sameResult exchange1)
@@ -98,7 +154,116 @@ class ExchangeSuite extends SparkPlanTest with SharedSQLContext {
     assert(exchange1 sameResult exchange2)
     assert(!exchange2.sameResult(exchange3))
     assert(!exchange3.sameResult(exchange4))
-    assert(!exchange4.sameResult(exchange5))
+    assert(exchange4.sameResult(exchange5))
     assert(exchange5 sameResult exchange4)
+  }
+
+  test("Columnar exchange works") {
+    val df = spark.range(10)
+    val plan = df.queryExecution.executedPlan
+    val exchange = ColumnarExchange(plan)
+    val reused = ReusedExchangeExec(plan.output, exchange)
+
+    assertThrows[RanColumnar](reused.executeColumnar())
+  }
+
+  test("SPARK-23207: Make repartition() generate consistent output") {
+    def assertConsistency(ds: Dataset[java.lang.Long]): Unit = {
+      ds.persist()
+
+      val exchange = ds.mapPartitions { iter =>
+        Random.shuffle(iter)
+      }.repartition(111)
+      val exchange2 = ds.repartition(111)
+
+      assert(exchange.rdd.collectPartitions() === exchange2.rdd.collectPartitions())
+    }
+
+    withSQLConf(SQLConf.SORT_BEFORE_REPARTITION.key -> "true") {
+      // repartition() should generate consistent output.
+      assertConsistency(spark.range(10000))
+
+      // case when input contains duplicated rows.
+      assertConsistency(spark.range(10000).map(i => Random.nextInt(1000).toLong))
+    }
+  }
+
+  test("SPARK-23614: Fix incorrect reuse exchange when caching is used") {
+    val cached = spark.createDataset(Seq((1, 2, 3), (4, 5, 6))).cache()
+    val projection1 = cached.select("_1", "_2").queryExecution.executedPlan
+    val projection2 = cached.select("_1", "_3").queryExecution.executedPlan
+    assert(!projection1.sameResult(projection2))
+  }
+
+  test("Exchange reuse across the whole plan") {
+    withSQLConf(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
+      val df = sql(
+        """
+          |SELECT
+          |  (SELECT max(a.key) FROM testData AS a JOIN testData AS b ON b.key = a.key),
+          |  a.key
+          |FROM testData AS a
+          |JOIN testData AS b ON b.key = a.key
+      """.stripMargin)
+
+      val plan = df.queryExecution.executedPlan
+
+      val exchangeIds = plan.collectWithSubqueries { case e: Exchange => e.id }
+      val reusedExchangeIds = plan.collectWithSubqueries {
+        case re: ReusedExchangeExec => re.child.id
+      }
+
+      assert(exchangeIds.size == 2, "Whole plan exchange reusing not working correctly")
+      assert(reusedExchangeIds.size == 3, "Whole plan exchange reusing not working correctly")
+      assert(reusedExchangeIds.forall(exchangeIds.contains(_)),
+        "ReusedExchangeExec should reuse an existing exchange")
+
+      val df2 = sql(
+        """
+          |SELECT
+          |  (SELECT min(a.key) FROM testData AS a JOIN testData AS b ON b.key = a.key),
+          |  (SELECT max(a.key) FROM testData AS a JOIN testData2 AS b ON b.a = a.key)
+      """.stripMargin)
+
+      val plan2 = df2.queryExecution.executedPlan
+
+      val exchangeIds2 = plan2.collectWithSubqueries { case e: Exchange => e.id }
+      val reusedExchangeIds2 = plan2.collectWithSubqueries {
+        case re: ReusedExchangeExec => re.child.id
+      }
+
+      assert(exchangeIds2.size == 4, "Whole plan exchange reusing not working correctly")
+      assert(reusedExchangeIds2.size == 2, "Whole plan exchange reusing not working correctly")
+      assert(reusedExchangeIds2.forall(exchangeIds2.contains(_)),
+        "ReusedExchangeExec should reuse an existing exchange")
+    }
+  }
+
+  test("ShuffleExchangeExec string args show `pipelined` only when it is set") {
+    val plan = spark.range(10).selectExpr("id % 4 AS key").queryExecution.executedPlan
+    val partitioning = HashPartitioning(Seq(Literal(1)), 4)
+
+    // The default: nothing about pipelining is printed, so plan output (and every golden file that
+    // captures it) is unchanged by the existence of the field.
+    val nonPipelined = ShuffleExchangeExec(partitioning, plan).simpleString(10)
+    assert(!nonPipelined.contains("pipelined") && !nonPipelined.contains("false"),
+      s"a non-pipelined exchange should not mention pipelining, but was: $nonPipelined")
+
+    // When set, it is printed with a name rather than as a bare positional `true`.
+    val pipelined = ShuffleExchangeExec(partitioning, plan, pipelined = true).simpleString(10)
+    assert(pipelined.contains("isPipelined=true"),
+      s"a pipelined exchange should report it, but was: $pipelined")
+
+    // `stringArgs` drops `pipelined` by position, so it must stay the last constructor field --
+    // otherwise a newly added field would be dropped instead and the bare `false` would come back.
+    val exchange = ShuffleExchangeExec(partitioning, plan)
+    assert(exchange.productElementName(exchange.productArity - 1) == "pipelined",
+      "`pipelined` must remain the last constructor field of ShuffleExchangeExec, because " +
+        "stringArgs drops it positionally")
+
+    // Exchange's plan_id suffix is re-appended by the override and must survive.
+    Seq(nonPipelined, pipelined).foreach { s =>
+      assert(s.contains("[plan_id="), s"the plan_id suffix should be preserved, but was: $s")
+    }
   }
 }

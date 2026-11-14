@@ -17,13 +17,35 @@
 
 package org.apache.spark.scheduler
 
+import java.io.{DataInputStream, DataOutputStream}
 import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets
+import java.util.Properties
 
-import org.apache.spark.util.SerializableBuffer
+import scala.collection.immutable
+import scala.collection.mutable.{HashMap, Map}
+import scala.jdk.CollectionConverters._
+
+import org.apache.spark.{JobArtifactSet, JobArtifactState}
+import org.apache.spark.resource.CpuAmount
+import org.apache.spark.util.{ByteBufferInputStream, ByteBufferOutputStream, Utils}
 
 /**
  * Description of a task that gets passed onto executors to be executed, usually created by
- * [[TaskSetManager.resourceOffer]].
+ * `TaskSetManager.resourceOffer`.
+ *
+ * TaskDescriptions and the associated Task need to be serialized carefully for two reasons:
+ *
+ *     (1) When a TaskDescription is received by an Executor, the Executor needs to first get the
+ *         list of JARs and files and add these to the classpath, and set the properties, before
+ *         deserializing the Task object (serializedTask). This is why the Properties are included
+ *         in the TaskDescription, even though they're also in the serialized task.
+ *     (2) Because a TaskDescription is serialized and sent to an executor for each task, efficient
+ *         serialization (both in terms of serialization time and serialized buffer size) is
+ *         important. For this reason, we serialize TaskDescriptions ourselves with the
+ *         TaskDescription.encode and TaskDescription.decode methods.  This results in a smaller
+ *         serialized size because it avoids serializing unnecessary fields in the Map objects
+ *         (which can introduce significant overhead when the maps are small).
  */
 private[spark] class TaskDescription(
     val taskId: Long,
@@ -31,13 +53,217 @@ private[spark] class TaskDescription(
     val executorId: String,
     val name: String,
     val index: Int,    // Index within this task's TaskSet
-    _serializedTask: ByteBuffer)
-  extends Serializable {
+    val partitionId: Int,
+    val artifacts: JobArtifactSet,
+    val properties: Properties,
+    val cpus: BigDecimal,
+    // resources is the total resources assigned to the task
+    // Eg, Map("gpu" -> Map("0" -> ResourceAmountUtils.toInternalResource(0.7))):
+    // assign 0.7 of the gpu address "0" to this task
+    val resources: immutable.Map[String, immutable.Map[String, Long]],
+    // OIDC credentials with version for stale-update prevention.
+    // The version is a monotonic counter from UserCredentialManager; executors only apply
+    // credentials if the version is newer than what they already have. This prevents a
+    // delayed TaskDescription from overwriting fresher credentials delivered via RPC.
+    // Trade-off: every TaskDescription carries the full serialized UserCredentials (a few KB).
+    // This is acceptable because OIDC credentials are short-lived (minutes) unlike Hadoop
+    // delegation tokens (hours/days), making the race between RPC broadcast and task dispatch
+    // a practical concern. For short-task-heavy workloads, the overhead is bounded by
+    // credential size x tasks-in-flight at any instant (not total task count).
+    val userCredentials: Option[(Long, Array[Byte])],
+    val serializedTask: ByteBuffer) {
 
-  // Because ByteBuffers are not serializable, wrap the task in a SerializableBuffer
-  private val buffer = new SerializableBuffer(_serializedTask)
+  assert(cpus > 0, "CPUs per task should be > 0")
 
-  def serializedTask: ByteBuffer = buffer.value
+  override def toString: String = s"TaskDescription($name)"
+}
 
-  override def toString: String = "TaskDescription(TID=%d, index=%d)".format(taskId, index)
+private[spark] object TaskDescription {
+  private def serializeStringLongMap(map: Map[String, Long], dataOut: DataOutputStream): Unit = {
+    dataOut.writeInt(map.size)
+    map.foreach { case (key, value) =>
+      dataOut.writeUTF(key)
+      dataOut.writeLong(value)
+    }
+  }
+
+  private def serializeResources(map: immutable.Map[String, immutable.Map[String, Long]],
+      dataOut: DataOutputStream): Unit = {
+    dataOut.writeInt(map.size)
+    map.foreach { case (rName, addressAmountMap) =>
+      dataOut.writeUTF(rName)
+      dataOut.writeInt(addressAmountMap.size)
+      addressAmountMap.foreach { case (address, amount) =>
+        dataOut.writeUTF(address)
+        dataOut.writeLong(amount)
+      }
+    }
+  }
+
+  def encode(taskDescription: TaskDescription): ByteBuffer = {
+    val bytesOut = new ByteBufferOutputStream(4096)
+    val dataOut = new DataOutputStream(bytesOut)
+
+    dataOut.writeLong(taskDescription.taskId)
+    dataOut.writeInt(taskDescription.attemptNumber)
+    dataOut.writeUTF(taskDescription.executorId)
+    dataOut.writeUTF(taskDescription.name)
+    dataOut.writeInt(taskDescription.index)
+    dataOut.writeInt(taskDescription.partitionId)
+
+    // Write artifacts
+    serializeArtifacts(taskDescription.artifacts, dataOut)
+
+    // Write properties.
+    dataOut.writeInt(taskDescription.properties.size())
+    taskDescription.properties.asScala.foreach { case (key, value) =>
+      dataOut.writeUTF(key)
+      // SPARK-19796 -- writeUTF doesn't work for long strings, which can happen for property values
+      val bytes = value.getBytes(StandardCharsets.UTF_8)
+      dataOut.writeInt(bytes.length)
+      dataOut.write(bytes)
+    }
+
+    // Write cpus in its minimal (trailing-zero-trimmed) decimal string form; it is re-normalized
+    // to the fixed CPU scale on read, so fractional values round-trip exactly.
+    dataOut.writeUTF(CpuAmount.toDisplayString(taskDescription.cpus))
+
+    // Write resources.
+    serializeResources(taskDescription.resources, dataOut)
+
+    // Write user credentials (OIDC).
+    taskDescription.userCredentials match {
+      case Some((version, creds)) =>
+        dataOut.writeBoolean(true)
+        dataOut.writeLong(version)
+        dataOut.writeInt(creds.length)
+        dataOut.write(creds)
+      case None =>
+        dataOut.writeBoolean(false)
+    }
+
+    // Write the task. The task is already serialized, so write it directly to the byte buffer.
+    Utils.writeByteBuffer(taskDescription.serializedTask, bytesOut)
+
+    dataOut.close()
+    bytesOut.close()
+    bytesOut.toByteBuffer
+  }
+
+  private def deserializeOptionString(in: DataInputStream): Option[String] = {
+    if (in.readBoolean()) {
+      Some(in.readUTF())
+    } else {
+      None
+    }
+  }
+
+  private def deserializeArtifacts(dataIn: DataInputStream): JobArtifactSet = {
+    new JobArtifactSet(
+      state = deserializeOptionString(dataIn).map { uuid =>
+        JobArtifactState(
+          uuid = uuid,
+          replClassDirUri = deserializeOptionString(dataIn))
+      },
+      jars = immutable.Map(deserializeStringLongMap(dataIn).toSeq: _*),
+      files = immutable.Map(deserializeStringLongMap(dataIn).toSeq: _*),
+      archives = immutable.Map(deserializeStringLongMap(dataIn).toSeq: _*))
+  }
+
+  private def serializeOptionString(str: Option[String], out: DataOutputStream): Unit = {
+    out.writeBoolean(str.isDefined)
+    if (str.isDefined) {
+      out.writeUTF(str.get)
+    }
+  }
+
+  private def serializeArtifacts(artifacts: JobArtifactSet, dataOut: DataOutputStream): Unit = {
+    serializeOptionString(artifacts.state.map(_.uuid), dataOut)
+    artifacts.state.foreach { state =>
+      serializeOptionString(state.replClassDirUri, dataOut)
+    }
+    serializeStringLongMap(Map(artifacts.jars.toSeq: _*), dataOut)
+    serializeStringLongMap(Map(artifacts.files.toSeq: _*), dataOut)
+    serializeStringLongMap(Map(artifacts.archives.toSeq: _*), dataOut)
+  }
+
+  private def deserializeStringLongMap(dataIn: DataInputStream): HashMap[String, Long] = {
+    val map = new HashMap[String, Long]()
+    val mapSize = dataIn.readInt()
+    var i = 0
+    while (i < mapSize) {
+      map(dataIn.readUTF()) = dataIn.readLong()
+      i += 1
+    }
+    map
+  }
+
+  private def deserializeResources(dataIn: DataInputStream):
+      immutable.Map[String, immutable.Map[String, Long]] = {
+    val map = new HashMap[String, immutable.Map[String, Long]]()
+    val mapSize = dataIn.readInt()
+    var i = 0
+    while (i < mapSize) {
+      val resType = dataIn.readUTF()
+      val addressAmountMap = new HashMap[String, Long]()
+      val addressAmountSize = dataIn.readInt()
+      var j = 0
+      while (j < addressAmountSize) {
+        val address = dataIn.readUTF()
+        val amount = dataIn.readLong()
+        addressAmountMap(address) = amount
+        j += 1
+      }
+      map.put(resType, addressAmountMap.toMap)
+      i += 1
+    }
+    map.toMap
+  }
+
+  def decode(byteBuffer: ByteBuffer): TaskDescription = {
+    val dataIn = new DataInputStream(new ByteBufferInputStream(byteBuffer))
+    val taskId = dataIn.readLong()
+    val attemptNumber = dataIn.readInt()
+    val executorId = dataIn.readUTF()
+    val name = dataIn.readUTF()
+    val index = dataIn.readInt()
+    val partitionId = dataIn.readInt()
+
+    // Read artifacts.
+    val artifacts = deserializeArtifacts(dataIn)
+
+    // Read properties.
+    val properties = new Properties()
+    val numProperties = dataIn.readInt()
+    for (i <- 0 until numProperties) {
+      val key = dataIn.readUTF()
+      val valueLength = dataIn.readInt()
+      val valueBytes = new Array[Byte](valueLength)
+      dataIn.readFully(valueBytes)
+      properties.setProperty(key, new String(valueBytes, StandardCharsets.UTF_8))
+    }
+
+    // Read cpus and normalize to the fixed CPU accounting scale.
+    val cpus = CpuAmount.normalize(BigDecimal(dataIn.readUTF()))
+
+    // Read resources.
+    val resources = deserializeResources(dataIn)
+
+    // Read user credentials (OIDC).
+    val userCredentials = if (dataIn.readBoolean()) {
+      val version = dataIn.readLong()
+      val length = dataIn.readInt()
+      val creds = new Array[Byte](length)
+      dataIn.readFully(creds)
+      Some((version, creds))
+    } else {
+      None
+    }
+
+    // Create a sub-buffer for the serialized task into its own buffer (to be deserialized later).
+    val serializedTask = byteBuffer.slice()
+
+    new TaskDescription(taskId, attemptNumber, executorId, name, index, partitionId, artifacts,
+      properties, cpus, resources, userCredentials, serializedTask)
+  }
 }

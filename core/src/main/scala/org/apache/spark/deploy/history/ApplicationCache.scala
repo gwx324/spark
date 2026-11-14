@@ -17,35 +17,29 @@
 
 package org.apache.spark.deploy.history
 
-import java.util.NoSuchElementException
-import javax.servlet.{DispatcherType, Filter, FilterChain, FilterConfig, ServletException, ServletRequest, ServletResponse}
-import javax.servlet.http.{HttpServletRequest, HttpServletResponse}
+import java.util.concurrent.{ConcurrentHashMap, CountDownLatch, ExecutionException}
 
-import scala.collection.JavaConverters._
-import scala.util.control.NonFatal
+import scala.jdk.CollectionConverters._
 
 import com.codahale.metrics.{Counter, MetricRegistry, Timer}
 import com.google.common.cache.{CacheBuilder, CacheLoader, LoadingCache, RemovalListener, RemovalNotification}
-import org.eclipse.jetty.servlet.FilterHolder
+import com.google.common.util.concurrent.UncheckedExecutionException
+import jakarta.servlet.{DispatcherType, Filter, FilterChain, ServletException, ServletRequest, ServletResponse}
+import jakarta.servlet.http.{HttpServletRequest, HttpServletResponse}
+import org.eclipse.jetty.ee10.servlet.FilterHolder
 
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.LogKeys._
 import org.apache.spark.metrics.source.Source
 import org.apache.spark.ui.SparkUI
 import org.apache.spark.util.Clock
 
 /**
- * Cache for applications.
+ * Cache for application UIs.
  *
- * Completed applications are cached for as long as there is capacity for them.
- * Incompleted applications have their update time checked on every
- * retrieval; if the cached entry is out of date, it is refreshed.
+ * Applications are cached for as long as there is capacity for them. See [[LoadedAppUI]] for a
+ * discussion of the UI lifecycle.
  *
- * @note there must be only one instance of [[ApplicationCache]] in a
- * JVM at a time. This is because a static field in [[ApplicationCacheCheckFilterRelay]]
- * keeps a reference to the cache so that HTTP requests on the attempt-specific web UIs
- * can probe the current cache to see if the attempts have changed.
- *
- * Creating multiple instances will break this routing.
  * @param operations implementation of record access operations
  * @param retainedApplications number of retained applications
  * @param clock time source
@@ -56,40 +50,44 @@ private[history] class ApplicationCache(
     val clock: Clock) extends Logging {
 
   /**
-   * Services the load request from the cache.
+   * Keep track of SparkUIs in [[ApplicationCache#appCache]] and SparkUIs removed from
+   * [[ApplicationCache#appCache]] but not detached yet.
    */
+  private val loadedApps = new ConcurrentHashMap[CacheKey, CountDownLatch]()
+
   private val appLoader = new CacheLoader[CacheKey, CacheEntry] {
 
     /** the cache key doesn't match a cached entry, or the entry is out-of-date, so load it. */
     override def load(key: CacheKey): CacheEntry = {
-      loadApplicationEntry(key.appId, key.attemptId)
+      // Ensure old SparkUI has been detached before loading new one.
+      val removalLatch = loadedApps.get(key)
+      if (removalLatch != null) {
+        removalLatch.await()
+      }
+      val entry = loadApplicationEntry(key.appId, key.attemptId)
+      loadedApps.put(key, new CountDownLatch(1))
+      entry
     }
 
   }
 
-  /**
-   * Handler for callbacks from the cache of entry removal.
-   */
   private val removalListener = new RemovalListener[CacheKey, CacheEntry] {
 
     /**
      * Removal event notifies the provider to detach the UI.
      * @param rm removal notification
      */
-    override def onRemoval(rm: RemovalNotification[CacheKey, CacheEntry]): Unit = {
+    override def onRemoval(rm: RemovalNotification[CacheKey, CacheEntry]): Unit = try {
       metrics.evictionCount.inc()
       val key = rm.getKey
       logDebug(s"Evicting entry ${key}")
-      operations.detachSparkUI(key.appId, key.attemptId, rm.getValue().ui)
+      operations.detachSparkUI(key.appId, key.attemptId, rm.getValue().loadedUI.ui)
+    } finally {
+      loadedApps.remove(rm.getKey()).countDown()
     }
   }
 
-  /**
-   * The cache of applications.
-   *
-   * Tagged as `protected` so as to allow subclasses in tests to access it directly
-   */
-  protected val appCache: LoadingCache[CacheKey, CacheEntry] = {
+  private val appCache: LoadingCache[CacheKey, CacheEntry] = {
     CacheBuilder.newBuilder()
         .maximumSize(retainedApplications)
         .removalListener(removalListener)
@@ -101,151 +99,51 @@ private[history] class ApplicationCache(
    */
   val metrics = new CacheMetrics("history.cache")
 
-  init()
-
-  /**
-   * Perform any startup operations.
-   *
-   * This includes declaring this instance as the cache to use in the
-   * [[ApplicationCacheCheckFilterRelay]].
-   */
-  private def init(): Unit = {
-    ApplicationCacheCheckFilterRelay.setApplicationCache(this)
-  }
-
-  /**
-   * Stop the cache.
-   * This will reset the relay in [[ApplicationCacheCheckFilterRelay]].
-   */
-  def stop(): Unit = {
-    ApplicationCacheCheckFilterRelay.resetApplicationCache()
-  }
-
-  /**
-   * Get an entry.
-   *
-   * Cache fetch/refresh will have taken place by the time this method returns.
-   * @param appAndAttempt application to look up in the format needed by the history server web UI,
-   *                      `appId/attemptId` or `appId`.
-   * @return the entry
-   */
-  def get(appAndAttempt: String): SparkUI = {
-    val parts = splitAppAndAttemptKey(appAndAttempt)
-    get(parts._1, parts._2)
-  }
-
-  /**
-   * Get the Spark UI, converting a lookup failure from an exception to `None`.
-   * @param appAndAttempt application to look up in the format needed by the history server web UI,
-   *                      `appId/attemptId` or `appId`.
-   * @return the entry
-   */
-  def getSparkUI(appAndAttempt: String): Option[SparkUI] = {
+  def get(appId: String, attemptId: Option[String] = None): CacheEntry = {
     try {
-      val ui = get(appAndAttempt)
-      Some(ui)
+      appCache.get(new CacheKey(appId, attemptId))
     } catch {
-      case NonFatal(e) => e.getCause() match {
-        case nsee: NoSuchElementException =>
-          None
-        case cause: Exception => throw cause
-      }
+      case e @ (_: ExecutionException | _: UncheckedExecutionException) =>
+        throw Option(e.getCause()).getOrElse(e)
     }
   }
 
   /**
-   * Get the associated spark UI.
-   *
-   * Cache fetch/refresh will have taken place by the time this method returns.
-   * @param appId application ID
-   * @param attemptId optional attempt ID
-   * @return the entry
+   * Run a closure while holding an application's UI read lock. This prevents the history server
+   * from closing the UI data store while it's being used.
    */
-  def get(appId: String, attemptId: Option[String]): SparkUI = {
-    lookupAndUpdate(appId, attemptId)._1.ui
-  }
+  def withSparkUI[T](appId: String, attemptId: Option[String])(fn: SparkUI => T): T = {
+    var entry = get(appId, attemptId)
 
-  /**
-   * Look up the entry; update it if needed.
-   * @param appId application ID
-   * @param attemptId optional attempt ID
-   * @return the underlying cache entry -which can have its timestamp changed, and a flag to
-   *         indicate that the entry has changed
-   */
-  private def lookupAndUpdate(appId: String, attemptId: Option[String]): (CacheEntry, Boolean) = {
-    metrics.lookupCount.inc()
-    val cacheKey = CacheKey(appId, attemptId)
-    var entry = appCache.getIfPresent(cacheKey)
-    var updated = false
-    if (entry == null) {
-      // no entry, so fetch without any post-fetch probes for out-of-dateness
-      // this will trigger a callback to loadApplicationEntry()
-      entry = appCache.get(cacheKey)
-    } else if (!entry.completed) {
-      val now = clock.getTimeMillis()
-      log.debug(s"Probing at time $now for updated application $cacheKey -> $entry")
-      metrics.updateProbeCount.inc()
-      updated = time(metrics.updateProbeTimer) {
-        entry.updateProbe()
+    // If the entry exists, we need to make sure we run the closure with a valid entry. So
+    // we need to re-try until we can lock a valid entry for read.
+    entry.loadedUI.lock.readLock().lock()
+    try {
+      while (!entry.loadedUI.valid) {
+        entry.loadedUI.lock.readLock().unlock()
+        entry = null
+        try {
+          invalidate(new CacheKey(appId, attemptId))
+          entry = get(appId, attemptId)
+          metrics.loadCount.inc()
+        } finally {
+          if (entry != null) {
+            entry.loadedUI.lock.readLock().lock()
+          }
+        }
       }
-      if (updated) {
-        logDebug(s"refreshing $cacheKey")
-        metrics.updateTriggeredCount.inc()
-        appCache.refresh(cacheKey)
-        // and repeat the lookup
-        entry = appCache.get(cacheKey)
-      } else {
-        // update the probe timestamp to the current time
-        entry.probeTime = now
+
+      fn(entry.loadedUI.ui)
+    } finally {
+      if (entry != null) {
+        entry.loadedUI.lock.readLock().unlock()
       }
     }
-    (entry, updated)
   }
 
-  /**
-   * This method is visible for testing.
-   *
-   * It looks up the cached entry *and returns a clone of it*.
-   * This ensures that the cached entries never leak
-   * @param appId application ID
-   * @param attemptId optional attempt ID
-   * @return a new entry with shared SparkUI, but copies of the other fields.
-   */
-  def lookupCacheEntry(appId: String, attemptId: Option[String]): CacheEntry = {
-    val entry = lookupAndUpdate(appId, attemptId)._1
-    new CacheEntry(entry.ui, entry.completed, entry.updateProbe, entry.probeTime)
-  }
-
-  /**
-   * Probe for an application being updated.
-   * @param appId application ID
-   * @param attemptId attempt ID
-   * @return true if an update has been triggered
-   */
-  def checkForUpdates(appId: String, attemptId: Option[String]): Boolean = {
-    val (entry, updated) = lookupAndUpdate(appId, attemptId)
-    updated
-  }
-
-  /**
-   * Size probe, primarily for testing.
-   * @return size
-   */
+  /** @return Number of cached UIs. */
   def size(): Long = appCache.size()
 
-  /**
-   * Emptiness predicate, primarily for testing.
-   * @return true if the cache is empty
-   */
-  def isEmpty: Boolean = appCache.size() == 0
-
-  /**
-   * Time a closure, returning its output.
-   * @param t timer
-   * @param f function
-   * @tparam T type of return value of time
-   * @return the result of the function.
-   */
   private def time[T](t: Timer)(f: => T): T = {
     val timeCtx = t.time()
     try {
@@ -272,61 +170,38 @@ private[history] class ApplicationCache(
    * @throws NoSuchElementException if there is no matching element
    */
   @throws[NoSuchElementException]
-  def loadApplicationEntry(appId: String, attemptId: Option[String]): CacheEntry = {
-
-    logDebug(s"Loading application Entry $appId/$attemptId")
+  private def loadApplicationEntry(appId: String, attemptId: Option[String]): CacheEntry = {
+    lazy val application = log"${MDC(APP_ID, appId)}/${MDC(APP_ATTEMPT_ID, attemptId.mkString)}"
+    logDebug(log"Loading application Entry " + application)
     metrics.loadCount.inc()
-    time(metrics.loadTimer) {
+    val loadedUI = time(metrics.loadTimer) {
+      metrics.lookupCount.inc()
       operations.getAppUI(appId, attemptId) match {
-        case Some(LoadedAppUI(ui, updateState)) =>
-          val completed = ui.getApplicationInfoList.exists(_.attempts.last.completed)
-          if (completed) {
-            // completed spark UIs are attached directly
-            operations.attachSparkUI(appId, attemptId, ui, completed)
-          } else {
-            // incomplete UIs have the cache-check filter put in front of them.
-            ApplicationCacheCheckFilterRelay.registerFilter(ui, appId, attemptId)
-            operations.attachSparkUI(appId, attemptId, ui, completed)
-          }
-          // build the cache entry
-          val now = clock.getTimeMillis()
-          val entry = new CacheEntry(ui, completed, updateState, now)
-          logDebug(s"Loaded application $appId/$attemptId -> $entry")
-          entry
+        case Some(loadedUI) =>
+          logDebug(log"Loaded application " + application)
+          loadedUI
         case None =>
           metrics.lookupFailureCount.inc()
           // guava's cache logs via java.util log, so is of limited use. Hence: our own message
-          logInfo(s"Failed to load application attempt $appId/$attemptId")
+          logInfo(log"Failed to load application attempt " + application)
           throw new NoSuchElementException(s"no application with application Id '$appId'" +
               attemptId.map { id => s" attemptId '$id'" }.getOrElse(" and no attempt Id"))
       }
     }
-  }
-
-  /**
-   * Split up an `applicationId/attemptId` or `applicationId` key into the separate pieces.
-   *
-   * @param appAndAttempt combined key
-   * @return a tuple of the application ID and, if present, the attemptID
-   */
-  def splitAppAndAttemptKey(appAndAttempt: String): (String, Option[String]) = {
-    val parts = appAndAttempt.split("/")
-    require(parts.length == 1 || parts.length == 2, s"Invalid app key $appAndAttempt")
-    val appId = parts(0)
-    val attemptId = if (parts.length > 1) Some(parts(1)) else None
-    (appId, attemptId)
-  }
-
-  /**
-   * Merge an appId and optional attempt Id into a key of the form `applicationId/attemptId`.
-   *
-   * If there is an `attemptId`; `applicationId` if not.
-   * @param appId application ID
-   * @param attemptId optional attempt ID
-   * @return a unified string
-   */
-  def mergeAppAndAttemptToKey(appId: String, attemptId: Option[String]): String = {
-    appId + attemptId.map { id => s"/$id" }.getOrElse("")
+    try {
+      val completed = loadedUI.ui.getApplicationInfoList.exists(_.attempts.last.completed)
+      if (!completed) {
+        // incomplete UIs have the cache-check filter put in front of them.
+        registerFilter(new CacheKey(appId, attemptId), loadedUI)
+      }
+      operations.attachSparkUI(appId, attemptId, loadedUI.ui, completed)
+      new CacheEntry(loadedUI, completed)
+    } catch {
+      case e: Exception =>
+        logWarning(log"Failed to initialize application UI for ${MDC(APP_ID, application)}", e)
+        operations.detachSparkUI(appId, attemptId, loadedUI.ui)
+        throw e
+    }
   }
 
   /**
@@ -347,27 +222,41 @@ private[history] class ApplicationCache(
     sb.append("----\n")
     sb.toString()
   }
+
+  /**
+   * Register a filter for the web UI which checks for updates to the given app/attempt
+   * @param key consisted of appId and attemptId
+   * @param loadedUI Spark UI to attach filters to
+   */
+  private def registerFilter(key: CacheKey, loadedUI: LoadedAppUI): Unit = {
+    require(loadedUI != null)
+    val enumDispatcher = java.util.EnumSet.of(DispatcherType.ASYNC, DispatcherType.REQUEST)
+    val filter = new ApplicationCacheCheckFilter(key, loadedUI, this)
+    val holder = new FilterHolder(filter)
+    require(loadedUI.ui.getHandlers != null, "null handlers")
+    loadedUI.ui.getHandlers.foreach { handler =>
+      handler.addFilter(holder, "/*", enumDispatcher)
+    }
+  }
+
+  def invalidate(key: CacheKey): Unit = appCache.invalidate(key)
+
 }
 
 /**
  * An entry in the cache.
  *
- * @param ui Spark UI
+ * @param loadedUI Spark UI
  * @param completed Flag to indicated that the application has completed (and so
  *                 does not need refreshing).
- * @param updateProbe function to call to see if the application has been updated and
- *                    therefore that the cached value needs to be refreshed.
- * @param probeTime Times in milliseconds when the probe was last executed.
  */
 private[history] final class CacheEntry(
-    val ui: SparkUI,
-    val completed: Boolean,
-    val updateProbe: () => Boolean,
-    var probeTime: Long) {
+    val loadedUI: LoadedAppUI,
+    val completed: Boolean) {
 
   /** string value is for test assertions */
   override def toString: String = {
-    s"UI $ui, completed=$completed, probeTime=$probeTime"
+    s"UI ${loadedUI.ui}, completed=$completed"
   }
 }
 
@@ -396,23 +285,13 @@ private[history] class CacheMetrics(prefix: String) extends Source {
   val evictionCount = new Counter()
   val loadCount = new Counter()
   val loadTimer = new Timer()
-  val updateProbeCount = new Counter()
-  val updateProbeTimer = new Timer()
-  val updateTriggeredCount = new Counter()
 
   /** all the counters: for registration and string conversion. */
   private val counters = Seq(
     ("lookup.count", lookupCount),
     ("lookup.failure.count", lookupFailureCount),
     ("eviction.count", evictionCount),
-    ("load.count", loadCount),
-    ("update.probe.count", updateProbeCount),
-    ("update.triggered.count", updateTriggeredCount))
-
-  /** all metrics, including timers */
-  private val allMetrics = counters ++ Seq(
-    ("load.timer", loadTimer),
-    ("update.probe.timer", updateProbeTimer))
+    ("load.count", loadCount))
 
   /**
    * Name of metric source
@@ -420,16 +299,6 @@ private[history] class CacheMetrics(prefix: String) extends Source {
   override val sourceName = "ApplicationCache"
 
   override val metricRegistry: MetricRegistry = new MetricRegistry
-
-  /**
-   * Startup actions.
-   * This includes registering metrics with [[metricRegistry]]
-   */
-  private def init(): Unit = {
-    allMetrics.foreach { case (name, metric) =>
-      metricRegistry.register(MetricRegistry.name(prefix, name), metric)
-    }
-  }
 
   override def toString: String = {
     val sb = new StringBuilder()
@@ -498,23 +367,11 @@ private[history] trait ApplicationCacheOperations {
  * Implementation note: there's some abuse of a shared global entry here because
  * the configuration data passed to the servlet is just a string:string map.
  */
-private[history] class ApplicationCacheCheckFilter() extends Filter with Logging {
-
-  import ApplicationCacheCheckFilterRelay._
-  var appId: String = _
-  var attemptId: Option[String] = _
-
-  /**
-   * Bind the app and attempt ID, throwing an exception if no application ID was provided.
-   * @param filterConfig configuration
-   */
-  override def init(filterConfig: FilterConfig): Unit = {
-
-    appId = Option(filterConfig.getInitParameter(APP_ID))
-      .getOrElse(throw new ServletException(s"Missing Parameter $APP_ID"))
-    attemptId = Option(filterConfig.getInitParameter(ATTEMPT_ID))
-    logDebug(s"initializing filter $this")
-  }
+private[history] class ApplicationCacheCheckFilter(
+    key: CacheKey,
+    loadedUI: LoadedAppUI,
+    cache: ApplicationCache)
+  extends Filter with Logging {
 
   /**
    * Filter the request.
@@ -539,127 +396,22 @@ private[history] class ApplicationCacheCheckFilter() extends Filter with Logging
     val httpRequest = request.asInstanceOf[HttpServletRequest]
     val httpResponse = response.asInstanceOf[HttpServletResponse]
     val requestURI = httpRequest.getRequestURI
-    val operation = httpRequest.getMethod
 
     // if the request is for an attempt, check to see if it is in need of delete/refresh
     // and have the cache update the UI if so
-    if (operation=="HEAD" || operation=="GET"
-        && checkForUpdates(requestURI, appId, attemptId)) {
-      // send a redirect back to the same location. This will be routed
-      // to the *new* UI
-      logInfo(s"Application Attempt $appId/$attemptId updated; refreshing")
+    loadedUI.lock.readLock().lock()
+    if (loadedUI.valid) {
+      try {
+        chain.doFilter(request, response)
+      } finally {
+        loadedUI.lock.readLock.unlock()
+      }
+    } else {
+      loadedUI.lock.readLock.unlock()
+      cache.invalidate(key)
       val queryStr = Option(httpRequest.getQueryString).map("?" + _).getOrElse("")
       val redirectUrl = httpResponse.encodeRedirectURL(requestURI + queryStr)
       httpResponse.sendRedirect(redirectUrl)
-    } else {
-      chain.doFilter(request, response)
-    }
-  }
-
-  override def destroy(): Unit = {
-  }
-
-  override def toString: String = s"ApplicationCacheCheckFilter for $appId/$attemptId"
-}
-
-/**
- * Global state for the [[ApplicationCacheCheckFilter]] instances, so that they can relay cache
- * probes to the cache.
- *
- * This is an ugly workaround for the limitation of servlets and filters in the Java servlet
- * API; they are still configured on the model of a list of classnames and configuration
- * strings in a `web.xml` field, rather than a chain of instances wired up by hand or
- * via an injection framework. There is no way to directly configure a servlet filter instance
- * with a reference to the application cache which is must use: some global state is needed.
- *
- * Here, [[ApplicationCacheCheckFilter]] is that global state; it relays all requests
- * to the singleton [[ApplicationCache]]
- *
- * The field `applicationCache` must be set for the filters to work -
- * this is done during the construction of [[ApplicationCache]], which requires that there
- * is only one cache serving requests through the WebUI.
- *
- * *Important* In test runs, if there is more than one [[ApplicationCache]], the relay logic
- * will break: filters may not find instances. Tests must not do that.
- *
- */
-private[history] object ApplicationCacheCheckFilterRelay extends Logging {
-  // name of the app ID entry in the filter configuration. Mandatory.
-  val APP_ID = "appId"
-
-  // name of the attempt ID entry in the filter configuration. Optional.
-  val ATTEMPT_ID = "attemptId"
-
-  // name of the filter to register
-  val FILTER_NAME = "org.apache.spark.deploy.history.ApplicationCacheCheckFilter"
-
-  /** the application cache to relay requests to */
-  @volatile
-  private var applicationCache: Option[ApplicationCache] = None
-
-  /**
-   * Set the application cache. Logs a warning if it is overwriting an existing value
-   * @param cache new cache
-   */
-  def setApplicationCache(cache: ApplicationCache): Unit = {
-    applicationCache.foreach( c => logWarning(s"Overwriting application cache $c"))
-    applicationCache = Some(cache)
-  }
-
-  /**
-   * Reset the application cache
-   */
-  def resetApplicationCache(): Unit = {
-    applicationCache = None
-  }
-
-  /**
-   * Check to see if there has been an update
-   * @param requestURI URI the request came in on
-   * @param appId application ID
-   * @param attemptId attempt ID
-   * @return true if an update was loaded for the app/attempt
-   */
-  def checkForUpdates(requestURI: String, appId: String, attemptId: Option[String]): Boolean = {
-
-    logDebug(s"Checking $appId/$attemptId from $requestURI")
-    applicationCache match {
-      case Some(cache) =>
-        try {
-          cache.checkForUpdates(appId, attemptId)
-        } catch {
-          case ex: Exception =>
-            // something went wrong. Keep going with the existing UI
-            logWarning(s"When checking for $appId/$attemptId from $requestURI", ex)
-            false
-        }
-
-      case None =>
-        logWarning("No application cache instance defined")
-        false
-    }
-  }
-
-
-  /**
-   * Register a filter for the web UI which checks for updates to the given app/attempt
-   * @param ui Spark UI to attach filters to
-   * @param appId application ID
-   * @param attemptId attempt ID
-   */
-  def registerFilter(
-      ui: SparkUI,
-      appId: String,
-      attemptId: Option[String] ): Unit = {
-    require(ui != null)
-    val enumDispatcher = java.util.EnumSet.of(DispatcherType.ASYNC, DispatcherType.REQUEST)
-    val holder = new FilterHolder()
-    holder.setClassName(FILTER_NAME)
-    holder.setInitParameter(APP_ID, appId)
-    attemptId.foreach( id => holder.setInitParameter(ATTEMPT_ID, id))
-    require(ui.getHandlers != null, "null handlers")
-    ui.getHandlers.foreach { handler =>
-      handler.addFilter(holder, "/*", enumDispatcher)
     }
   }
 }

@@ -29,7 +29,7 @@ import org.apache.spark.sql.SparkSession
 object GradientBoostedTreeRegressorExample {
   def main(args: Array[String]): Unit = {
     val spark = SparkSession
-      .builder
+      .builder()
       .appName("GradientBoostedTreeRegressorExample")
       .getOrCreate()
 
@@ -73,10 +73,10 @@ object GradientBoostedTreeRegressorExample {
       .setPredictionCol("prediction")
       .setMetricName("rmse")
     val rmse = evaluator.evaluate(predictions)
-    println("Root Mean Squared Error (RMSE) on test data = " + rmse)
+    println(s"Root Mean Squared Error (RMSE) on test data = $rmse")
 
     val gbtModel = model.stages(1).asInstanceOf[GBTRegressionModel]
-    println("Learned regression GBT model:\n" + gbtModel.toDebugString)
+    println(s"Learned regression GBT model:\n ${gbtModel.toDebugString}")
     // $example off$
 
     spark.stop()

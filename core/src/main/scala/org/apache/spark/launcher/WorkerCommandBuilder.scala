@@ -20,7 +20,7 @@ package org.apache.spark.launcher
 import java.io.File
 import java.util.{HashMap => JHashMap, List => JList, Map => JMap}
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import org.apache.spark.deploy.Command
 
@@ -39,8 +39,6 @@ private[spark] class WorkerCommandBuilder(sparkHome: String, memoryMb: Int, comm
     val cmd = buildJavaCommand(command.classPathEntries.mkString(File.pathSeparator))
     cmd.add(s"-Xmx${memoryMb}M")
     command.javaOpts.foreach(cmd.add)
-    CommandBuilderUtils.addPermGenSizeOpt(cmd)
-    addOptionString(cmd, getenv("SPARK_JAVA_OPTS"))
     cmd
   }
 

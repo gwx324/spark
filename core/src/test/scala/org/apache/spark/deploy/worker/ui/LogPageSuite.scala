@@ -19,19 +19,24 @@ package org.apache.spark.deploy.worker.ui
 
 import java.io.{File, FileWriter}
 
+import jakarta.servlet.http.HttpServletRequest
 import org.mockito.Mockito.{mock, when}
 import org.scalatest.PrivateMethodTester
 
-import org.apache.spark.SparkFunSuite
+import org.apache.spark.{SparkConf, SparkFunSuite}
+import org.apache.spark.deploy.worker.Worker
 
 class LogPageSuite extends SparkFunSuite with PrivateMethodTester {
 
   test("get logs simple") {
     val webui = mock(classOf[WorkerWebUI])
+    val worker = mock(classOf[Worker])
     val tmpDir = new File(sys.props("java.io.tmpdir"))
     val workDir = new File(tmpDir, "work-dir")
     workDir.mkdir()
     when(webui.workDir).thenReturn(workDir)
+    when(webui.worker).thenReturn(worker)
+    when(worker.conf).thenReturn(new SparkConf())
     val logPage = new LogPage(webui)
 
     // Prepare some fake log files to read later
@@ -49,7 +54,7 @@ class LogPageSuite extends SparkFunSuite with PrivateMethodTester {
     write(tmpRand, "1 6 4 5 2 7 8")
 
     // Get the logs. All log types other than "stderr" or "stdout" will be rejected
-    val getLog = PrivateMethod[(String, Long, Long, Long)]('getLog)
+    val getLog = PrivateMethod[(String, Long, Long, Long)](Symbol("getLog"))
     val (stdout, _, _, _) =
       logPage invokePrivate getLog(workDir.getAbsolutePath, "stdout", None, 100)
     val (stderr, _, _, _) =
@@ -69,6 +74,33 @@ class LogPageSuite extends SparkFunSuite with PrivateMethodTester {
     assert(error2.startsWith("Error: Log type must be one of "))
     assert(error3.startsWith("Error: invalid log directory"))
     assert(error4.startsWith("Error: invalid log directory"))
+  }
+
+  test("render encodes request parameters embedded in the inline script") {
+    val webui = mock(classOf[WorkerWebUI])
+    val worker = mock(classOf[Worker])
+    withTempDir { tmpDir =>
+      val workDir = new File(tmpDir, "work-dir")
+      workDir.mkdir()
+      when(webui.workDir).thenReturn(workDir)
+      when(webui.worker).thenReturn(worker)
+      when(worker.conf).thenReturn(new SparkConf())
+      when(worker.activeMasterWebUiUrl).thenReturn("http://master:8080")
+      val logPage = new LogPage(webui)
+
+      val request = mock(classOf[HttpServletRequest])
+      // appId is user-controlled; a '&' in it would inject an extra parameter into the /log
+      // requests, and the '</script>' would break out of the inline <script> block, if emitted raw.
+      when(request.getParameter("appId")).thenReturn("app&byteLength=0</script>")
+      when(request.getParameter("executorId")).thenReturn("0")
+      when(request.getParameter("logType")).thenReturn("stdout")
+      val html = logPage.render(request).mkString
+
+      // The value is percent-encoded, so it stays a single opaque appId value and cannot inject a
+      // parameter or close the script element.
+      assert(html.contains("appId=app%26byteLength%3D0%3C%2Fscript%3E&executorId=0"))
+      assert(!html.contains("app&byteLength=0</script>"))
+    }
   }
 
   /** Write the specified string to the file. */

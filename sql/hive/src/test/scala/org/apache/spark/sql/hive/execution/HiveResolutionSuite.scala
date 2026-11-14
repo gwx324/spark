@@ -19,7 +19,8 @@ package org.apache.spark.sql.hive.execution
 
 import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.hive.test.TestHive.{read, sparkContext, sql}
-import org.apache.spark.sql.hive.test.TestHive.implicits._
+import org.apache.spark.sql.hive.test.TestHive.sparkSession.implicits._
+import org.apache.spark.tags.SlowHiveTest
 
 case class Nested(a: Int, B: Int)
 case class Data(a: Int, B: Int, n: Nested, nestedArray: Seq[Nested])
@@ -28,24 +29,29 @@ case class Data(a: Int, B: Int, n: Nested, nestedArray: Seq[Nested])
  * A set of test cases expressed in Hive QL that are not covered by the tests
  * included in the hive distribution.
  */
+@SlowHiveTest
 class HiveResolutionSuite extends HiveComparisonTest {
 
   test("SPARK-3698: case insensitive test for nested data") {
-    read.json(sparkContext.makeRDD(
-      """{"a": [{"a": {"a": 1}}]}""" :: Nil)).createOrReplaceTempView("nested")
+    read.json(Seq("""{"a": [{"a": {"a": 1}}]}""").toDS())
+      .createOrReplaceTempView("nested")
     // This should be successfully analyzed
     sql("SELECT a[0].A.A from nested").queryExecution.analyzed
   }
 
   test("SPARK-5278: check ambiguous reference to fields") {
-    read.json(sparkContext.makeRDD(
-      """{"a": [{"b": 1, "B": 2}]}""" :: Nil)).createOrReplaceTempView("nested")
+    read.json(Seq("""{"a": [{"b": 1, "B": 2}]}""").toDS())
+      .createOrReplaceTempView("nested")
 
     // there are 2 filed matching field name "b", we should report Ambiguous reference error
-    val exception = intercept[AnalysisException] {
-      sql("SELECT a[0].b from nested").queryExecution.analyzed
-    }
-    assert(exception.getMessage.contains("Ambiguous reference to fields"))
+    checkError(
+      exception = intercept[AnalysisException] {
+        sql("SELECT a[0].b from nested").queryExecution.analyzed
+      },
+      condition = "AMBIGUOUS_REFERENCE_TO_FIELDS",
+      sqlState = "42000",
+      parameters = Map("field" -> "`b`", "count" -> "2")
+    )
   }
 
   createQueryTest("table.attr",
@@ -111,7 +117,6 @@ class HiveResolutionSuite extends HiveComparisonTest {
 
   /**
    * Negative examples.  Currently only left here for documentation purposes.
-   * TODO(marmbrus): Test that catalyst fails on these queries.
    */
 
   /* SemanticException [Error 10009]: Line 1:7 Invalid table alias 'src'

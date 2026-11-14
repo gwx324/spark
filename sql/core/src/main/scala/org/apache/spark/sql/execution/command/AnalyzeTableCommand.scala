@@ -17,95 +17,19 @@
 
 package org.apache.spark.sql.execution.command
 
-import scala.util.control.NonFatal
-
-import org.apache.hadoop.fs.{FileSystem, Path}
-
-import org.apache.spark.sql.{AnalysisException, Row, SparkSession}
-import org.apache.spark.sql.catalyst.analysis.EliminateSubqueryAliases
-import org.apache.spark.sql.catalyst.catalog.{CatalogRelation, CatalogTable}
-
+import org.apache.spark.sql.{Row, SparkSession}
+import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.classic.ClassicConversions.castToImpl
 
 /**
- * Analyzes the given table in the current database to generate statistics, which will be
- * used in query optimizations.
- *
- * Right now, it only supports Hive tables and it only updates the size of a Hive table
- * in the Hive metastore.
+ * Analyzes the given table to generate statistics, which will be used in query optimizations.
  */
-case class AnalyzeTableCommand(tableName: String) extends RunnableCommand {
+case class AnalyzeTableCommand(
+    tableIdent: TableIdentifier,
+    noScan: Boolean = true) extends LeafRunnableCommand {
 
   override def run(sparkSession: SparkSession): Seq[Row] = {
-    val sessionState = sparkSession.sessionState
-    val tableIdent = sessionState.sqlParser.parseTableIdentifier(tableName)
-    val relation = EliminateSubqueryAliases(sessionState.catalog.lookupRelation(tableIdent))
-
-    relation match {
-      case relation: CatalogRelation =>
-        val catalogTable: CatalogTable = relation.catalogTable
-        // This method is mainly based on
-        // org.apache.hadoop.hive.ql.stats.StatsUtils.getFileSizeForTable(HiveConf, Table)
-        // in Hive 0.13 (except that we do not use fs.getContentSummary).
-        // TODO: Generalize statistics collection.
-        // TODO: Why fs.getContentSummary returns wrong size on Jenkins?
-        // Can we use fs.getContentSummary in future?
-        // Seems fs.getContentSummary returns wrong table size on Jenkins. So we use
-        // countFileSize to count the table size.
-        val stagingDir = sessionState.conf.getConfString("hive.exec.stagingdir", ".hive-staging")
-
-        def calculateTableSize(fs: FileSystem, path: Path): Long = {
-          val fileStatus = fs.getFileStatus(path)
-          val size = if (fileStatus.isDirectory) {
-            fs.listStatus(path)
-              .map { status =>
-                if (!status.getPath.getName.startsWith(stagingDir)) {
-                  calculateTableSize(fs, status.getPath)
-                } else {
-                  0L
-                }
-              }.sum
-          } else {
-            fileStatus.getLen
-          }
-
-          size
-        }
-
-        val tableParameters = catalogTable.properties
-        val oldTotalSize = tableParameters.get("totalSize").map(_.toLong).getOrElse(0L)
-        val newTotalSize =
-          catalogTable.storage.locationUri.map { p =>
-            val path = new Path(p)
-            try {
-              val fs = path.getFileSystem(sparkSession.sessionState.newHadoopConf())
-              calculateTableSize(fs, path)
-            } catch {
-              case NonFatal(e) =>
-                logWarning(
-                  s"Failed to get the size of table ${catalogTable.identifier.table} in the " +
-                    s"database ${catalogTable.identifier.database} because of ${e.toString}", e)
-                0L
-            }
-          }.getOrElse(0L)
-
-        // Update the Hive metastore if the total size of the table is different than the size
-        // recorded in the Hive metastore.
-        // This logic is based on org.apache.hadoop.hive.ql.exec.StatsTask.aggregateStats().
-        if (newTotalSize > 0 && newTotalSize != oldTotalSize) {
-          sessionState.catalog.alterTable(
-            catalogTable.copy(
-              properties = relation.catalogTable.properties +
-                (AnalyzeTableCommand.TOTAL_SIZE_FIELD -> newTotalSize.toString)))
-        }
-
-      case otherRelation =>
-        throw new AnalysisException(s"ANALYZE TABLE is only supported for Hive tables, " +
-          s"but '${tableIdent.unquotedString}' is a ${otherRelation.nodeName}.")
-    }
+    CommandUtils.analyzeTable(sparkSession, tableIdent, noScan)
     Seq.empty[Row]
   }
-}
-
-object AnalyzeTableCommand {
-  val TOTAL_SIZE_FIELD = "totalSize"
 }

@@ -17,25 +17,27 @@
 
 package org.apache.spark.network;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 
 import io.netty.channel.Channel;
+import io.netty.channel.ChannelPipeline;
 import io.netty.channel.local.LocalChannel;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
-import static org.junit.Assert.assertEquals;
-import static org.mockito.Matchers.any;
-import static org.mockito.Matchers.eq;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.Mockito.*;
 
-import org.apache.spark.network.buffer.ManagedBuffer;
 import org.apache.spark.network.buffer.NioManagedBuffer;
 import org.apache.spark.network.client.ChunkReceivedCallback;
+import org.apache.spark.network.client.MergedBlockMetaResponseCallback;
 import org.apache.spark.network.client.RpcResponseCallback;
 import org.apache.spark.network.client.StreamCallback;
 import org.apache.spark.network.client.TransportResponseHandler;
 import org.apache.spark.network.protocol.ChunkFetchFailure;
 import org.apache.spark.network.protocol.ChunkFetchSuccess;
+import org.apache.spark.network.protocol.MergedBlockMetaSuccess;
 import org.apache.spark.network.protocol.RpcFailure;
 import org.apache.spark.network.protocol.RpcResponse;
 import org.apache.spark.network.protocol.StreamChunkId;
@@ -54,7 +56,7 @@ public class TransportResponseHandlerSuite {
     assertEquals(1, handler.numOutstandingRequests());
 
     handler.handle(new ChunkFetchSuccess(streamChunkId, new TestManagedBuffer(123)));
-    verify(callback, times(1)).onSuccess(eq(0), (ManagedBuffer) any());
+    verify(callback, times(1)).onSuccess(eq(0), any());
     assertEquals(0, handler.numOutstandingRequests());
   }
 
@@ -67,7 +69,7 @@ public class TransportResponseHandlerSuite {
     assertEquals(1, handler.numOutstandingRequests());
 
     handler.handle(new ChunkFetchFailure(streamChunkId, "some error msg"));
-    verify(callback, times(1)).onFailure(eq(0), (Throwable) any());
+    verify(callback, times(1)).onFailure(eq(0), any());
     assertEquals(0, handler.numOutstandingRequests());
   }
 
@@ -84,9 +86,9 @@ public class TransportResponseHandlerSuite {
     handler.exceptionCaught(new Exception("duh duh duhhhh"));
 
     // should fail both b2 and b3
-    verify(callback, times(1)).onSuccess(eq(0), (ManagedBuffer) any());
-    verify(callback, times(1)).onFailure(eq(1), (Throwable) any());
-    verify(callback, times(1)).onFailure(eq(2), (Throwable) any());
+    verify(callback, times(1)).onSuccess(eq(0), any());
+    verify(callback, times(1)).onFailure(eq(1), any());
+    verify(callback, times(1)).onFailure(eq(2), any());
     assertEquals(0, handler.numOutstandingRequests());
   }
 
@@ -118,7 +120,7 @@ public class TransportResponseHandlerSuite {
     assertEquals(1, handler.numOutstandingRequests());
 
     handler.handle(new RpcFailure(12345, "oh no"));
-    verify(callback, times(1)).onFailure((Throwable) any());
+    verify(callback, times(1)).onFailure(any());
     assertEquals(0, handler.numOutstandingRequests());
   }
 
@@ -130,7 +132,7 @@ public class TransportResponseHandlerSuite {
 
     StreamResponse response = new StreamResponse("stream", 1234L, null);
     StreamCallback cb = mock(StreamCallback.class);
-    handler.addStreamCallback(cb);
+    handler.addStreamCallback("stream", cb);
     assertEquals(1, handler.numOutstandingRequests());
     handler.handle(response);
     assertEquals(1, handler.numOutstandingRequests());
@@ -138,9 +140,95 @@ public class TransportResponseHandlerSuite {
     assertEquals(0, handler.numOutstandingRequests());
 
     StreamFailure failure = new StreamFailure("stream", "uh-oh");
-    handler.addStreamCallback(cb);
+    handler.addStreamCallback("stream", cb);
     assertEquals(1, handler.numOutstandingRequests());
     handler.handle(failure);
+    assertEquals(0, handler.numOutstandingRequests());
+  }
+
+  @Test
+  public void failOutstandingStreamCallbackOnClose() throws Exception {
+    Channel c = new LocalChannel();
+    c.pipeline().addLast(TransportFrameDecoder.HANDLER_NAME, new TransportFrameDecoder());
+    TransportResponseHandler handler = new TransportResponseHandler(c);
+
+    StreamCallback cb = mock(StreamCallback.class);
+    handler.addStreamCallback("stream-1", cb);
+    handler.channelInactive();
+
+    verify(cb).onFailure(eq("stream-1"), isA(IOException.class));
+  }
+
+  @Test
+  public void failOutstandingStreamCallbackOnException() throws Exception {
+    Channel c = new LocalChannel();
+    c.pipeline().addLast(TransportFrameDecoder.HANDLER_NAME, new TransportFrameDecoder());
+    TransportResponseHandler handler = new TransportResponseHandler(c);
+
+    StreamCallback cb = mock(StreamCallback.class);
+    handler.addStreamCallback("stream-1", cb);
+    handler.exceptionCaught(new IOException("Oops!"));
+
+    verify(cb).onFailure(eq("stream-1"), isA(IOException.class));
+  }
+
+  @Test
+  public void failStreamCallbackWhenInstallingInterceptorFails() throws Exception {
+    // With no TransportFrameDecoder in the pipeline, the decoder lookup in the StreamResponse
+    // branch returns null and installing the interceptor throws. The handler must fail the
+    // callback (so the caller does not hang) and close the channel rather than reuse a
+    // connection it can no longer decode.
+    Channel c = mock(Channel.class);
+    ChannelPipeline pipeline = mock(ChannelPipeline.class);
+    when(c.pipeline()).thenReturn(pipeline);
+    when(pipeline.get(TransportFrameDecoder.HANDLER_NAME)).thenReturn(null);
+    TransportResponseHandler handler = new TransportResponseHandler(c);
+
+    StreamCallback cb = mock(StreamCallback.class);
+    handler.addStreamCallback("stream", cb);
+    assertEquals(1, handler.numOutstandingRequests());
+
+    // byteCount > 0 so the handler takes the interceptor-installation path.
+    handler.handle(new StreamResponse("stream", 1234L, null));
+
+    verify(cb, times(1)).onFailure(eq("stream"), isA(NullPointerException.class));
+    verify(c, times(1)).close();
+    assertEquals(0, handler.numOutstandingRequests());
+  }
+
+  @Test
+  public void handleSuccessfulMergedBlockMeta() throws Exception {
+    TransportResponseHandler handler = new TransportResponseHandler(new LocalChannel());
+    MergedBlockMetaResponseCallback callback = mock(MergedBlockMetaResponseCallback.class);
+    handler.addRpcRequest(13, callback);
+    assertEquals(1, handler.numOutstandingRequests());
+
+    // This response should be ignored.
+    handler.handle(new MergedBlockMetaSuccess(22, 2,
+      new NioManagedBuffer(ByteBuffer.allocate(7))));
+    assertEquals(1, handler.numOutstandingRequests());
+
+    ByteBuffer resp = ByteBuffer.allocate(10);
+    handler.handle(new MergedBlockMetaSuccess(13, 2, new NioManagedBuffer(resp)));
+    ArgumentCaptor<NioManagedBuffer> bufferCaptor = ArgumentCaptor.forClass(NioManagedBuffer.class);
+    verify(callback, times(1)).onSuccess(eq(2), bufferCaptor.capture());
+    assertEquals(resp, bufferCaptor.getValue().nioByteBuffer());
+    assertEquals(0, handler.numOutstandingRequests());
+  }
+
+  @Test
+  public void handleFailedMergedBlockMeta() throws Exception {
+    TransportResponseHandler handler = new TransportResponseHandler(new LocalChannel());
+    MergedBlockMetaResponseCallback callback = mock(MergedBlockMetaResponseCallback.class);
+    handler.addRpcRequest(51, callback);
+    assertEquals(1, handler.numOutstandingRequests());
+
+    // This response should be ignored.
+    handler.handle(new RpcFailure(6, "failed"));
+    assertEquals(1, handler.numOutstandingRequests());
+
+    handler.handle(new RpcFailure(51, "failed"));
+    verify(callback, times(1)).onFailure(any());
     assertEquals(0, handler.numOutstandingRequests());
   }
 }

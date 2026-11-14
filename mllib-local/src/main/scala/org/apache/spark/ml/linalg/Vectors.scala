@@ -21,7 +21,8 @@ import java.lang.{Double => JavaDouble, Integer => JavaInteger, Iterable => Java
 import java.util
 
 import scala.annotation.varargs
-import scala.collection.JavaConverters._
+import scala.collection.{immutable, mutable}
+import scala.jdk.CollectionConverters._
 
 import breeze.linalg.{DenseVector => BDV, SparseVector => BSV, Vector => BV}
 
@@ -30,7 +31,7 @@ import org.apache.spark.annotation.Since
 /**
  * Represents a numeric vector, whose index type is Int and value type is Double.
  *
- * Note: Users should not implement this interface.
+ * @note Users should not implement this interface.
  */
 @Since("2.0.0")
 sealed trait Vector extends Serializable {
@@ -53,11 +54,15 @@ sealed trait Vector extends Serializable {
         if (this.size != v2.size) return false
         (this, v2) match {
           case (s1: SparseVector, s2: SparseVector) =>
-            Vectors.equals(s1.indices, s1.values, s2.indices, s2.values)
+            Vectors.equals(
+              immutable.ArraySeq.unsafeWrapArray(s1.indices), s1.values,
+              immutable.ArraySeq.unsafeWrapArray(s2.indices), s2.values)
           case (s1: SparseVector, d1: DenseVector) =>
-            Vectors.equals(s1.indices, s1.values, 0 until d1.size, d1.values)
+            Vectors.equals(
+              immutable.ArraySeq.unsafeWrapArray(s1.indices), s1.values, 0 until d1.size, d1.values)
           case (d1: DenseVector, s1: SparseVector) =>
-            Vectors.equals(0 until d1.size, d1.values, s1.indices, s1.values)
+            Vectors.equals(
+              0 until d1.size, d1.values, immutable.ArraySeq.unsafeWrapArray(s1.indices), s1.values)
           case (_, _) => util.Arrays.equals(this.toArray, v2.toArray)
         }
       case _ => false
@@ -106,8 +111,18 @@ sealed trait Vector extends Serializable {
    */
   @Since("2.0.0")
   def copy: Vector = {
-    throw new NotImplementedError(s"copy is not implemented for ${this.getClass}.")
+    throw new UnsupportedOperationException(s"copy is not implemented for ${this.getClass}.")
   }
+
+  /**
+   * Applies a function `f` to all the elements of dense and sparse vector.
+   *
+   * @param f the function takes two parameters where the first parameter is the index of
+   *          the vector with type `Int`, and the second parameter is the corresponding value
+   *          with type `Double`.
+   */
+  private[spark] def foreach(f: (Int, Double) => Unit): Unit =
+    iterator.foreach { case (i, v) => f(i, v) }
 
   /**
    * Applies a function `f` to all the active elements of dense and sparse vector.
@@ -117,7 +132,18 @@ sealed trait Vector extends Serializable {
    *          with type `Double`.
    */
   @Since("2.0.0")
-  def foreachActive(f: (Int, Double) => Unit): Unit
+  def foreachActive(f: (Int, Double) => Unit): Unit =
+    activeIterator.foreach { case (i, v) => f(i, v) }
+
+  /**
+   * Applies a function `f` to all the non-zero elements of dense and sparse vector.
+   *
+   * @param f the function takes two parameters where the first parameter is the index of
+   *          the vector with type `Int`, and the second parameter is the corresponding value
+   *          with type `Double`.
+   */
+  private[spark] def foreachNonZero(f: (Int, Double) => Unit): Unit =
+    nonZeroIterator.foreach { case (i, v) => f(i, v) }
 
   /**
    * Number of active entries.  An "active entry" is an element which is explicitly stored,
@@ -136,7 +162,21 @@ sealed trait Vector extends Serializable {
    * Converts this vector to a sparse vector with all explicit zeros removed.
    */
   @Since("2.0.0")
-  def toSparse: SparseVector
+  def toSparse: SparseVector = toSparseWithSize(numNonzeros)
+
+  /**
+   * Converts this vector to a sparse vector with all explicit zeros removed when the size is known.
+   * This method is used to avoid re-computing the number of non-zero elements when it is
+   * already known. This method should only be called after computing the number of non-zero
+   * elements via [[numNonzeros]]. e.g.
+   * {{{
+   *   val nnz = numNonzeros
+   *   val sv = toSparse(nnz)
+   * }}}
+   *
+   * If `nnz` is under-specified, a [[java.lang.ArrayIndexOutOfBoundsException]] is thrown.
+   */
+  private[linalg] def toSparseWithSize(nnz: Int): SparseVector
 
   /**
    * Converts this vector to a dense vector.
@@ -148,11 +188,11 @@ sealed trait Vector extends Serializable {
    * Returns a vector in either dense or sparse format, whichever uses less storage.
    */
   @Since("2.0.0")
-  def compressed: Vector = {
-    val nnz = numNonzeros
-    // A dense vector needs 8 * size + 8 bytes, while a sparse vector needs 12 * nnz + 20 bytes.
-    if (1.5 * (nnz + 1.0) < size) {
-      toSparse
+  def compressed: Vector = compressedWithNNZ(numNonzeros)
+
+  private[ml] def compressedWithNNZ(nnz: Int): Vector = {
+    if (Vectors.getSparseSize(nnz) < Vectors.getDenseSize(size)) {
+      toSparseWithSize(nnz)
     } else {
       toDense
     }
@@ -164,15 +204,44 @@ sealed trait Vector extends Serializable {
    */
   @Since("2.0.0")
   def argmax: Int
+
+  /**
+   * Calculate the dot product of this vector with another.
+   *
+   * If `size` does not match an [[IllegalArgumentException]] is thrown.
+   */
+  @Since("3.0.0")
+  def dot(v: Vector): Double = BLAS.dot(this, v)
+
+  /**
+   * Returns an iterator over all the elements of this vector.
+   */
+  private[spark] def iterator: Iterator[(Int, Double)] =
+    Iterator.tabulate(size)(i => (i, apply(i)))
+
+  /**
+   * Returns an iterator over all the active elements of this vector.
+   */
+  private[spark] def activeIterator: Iterator[(Int, Double)]
+
+  /**
+   * Returns an iterator over all the non-zero elements of this vector.
+   */
+  private[spark] def nonZeroIterator: Iterator[(Int, Double)] =
+    activeIterator.filter(_._2 != 0)
+
+  private[ml] def getSizeInBytes: Long
 }
 
 /**
  * Factory methods for [[org.apache.spark.ml.linalg.Vector]].
  * We don't use the name `Vector` because Scala imports
- * [[scala.collection.immutable.Vector]] by default.
+ * `scala.collection.immutable.Vector` by default.
  */
 @Since("2.0.0")
 object Vectors {
+
+  private[ml] val empty: DenseVector = new DenseVector(Array.emptyDoubleArray)
 
   /**
    * Creates a dense vector from its values.
@@ -208,17 +277,7 @@ object Vectors {
    */
   @Since("2.0.0")
   def sparse(size: Int, elements: Seq[(Int, Double)]): Vector = {
-    require(size > 0, "The size of the requested sparse vector must be greater than 0.")
-
     val (indices, values) = elements.sortBy(_._1).unzip
-    var prev = -1
-    indices.foreach { i =>
-      require(prev < i, s"Found duplicate indices: $i.")
-      prev = i
-    }
-    require(prev < size, s"You may not write an element to index $prev because the declared " +
-      s"size of your vector is $size")
-
     new SparseVector(size, indices.toArray, values.toArray)
   }
 
@@ -278,47 +337,45 @@ object Vectors {
   def norm(vector: Vector, p: Double): Double = {
     require(p >= 1.0, "To compute the p-norm of the vector, we require that you specify a p>=1. " +
       s"You specified p=$p.")
-    val values = vector match {
-      case DenseVector(vs) => vs
-      case SparseVector(n, ids, vs) => vs
-      case v => throw new IllegalArgumentException("Do not support vector type " + v.getClass)
-    }
-    val size = values.length
 
     if (p == 1) {
-      var sum = 0.0
-      var i = 0
-      while (i < size) {
-        sum += math.abs(values(i))
-        i += 1
-      }
-      sum
+      BLAS.asum(vector)
     } else if (p == 2) {
-      var sum = 0.0
-      var i = 0
-      while (i < size) {
-        sum += values(i) * values(i)
-        i += 1
-      }
-      math.sqrt(sum)
-    } else if (p == Double.PositiveInfinity) {
-      var max = 0.0
-      var i = 0
-      while (i < size) {
-        val value = math.abs(values(i))
-        if (value > max) max = value
-        i += 1
-      }
-      max
+      BLAS.nrm2(vector)
     } else {
-      var sum = 0.0
-      var i = 0
-      while (i < size) {
-        sum += math.pow(math.abs(values(i)), p)
-        i += 1
+      val values = vector match {
+        case DenseVector(vs) => vs
+        case SparseVector(n, ids, vs) => vs
+        case v => throw new IllegalArgumentException("Do not support vector type " + v.getClass)
       }
-      math.pow(sum, 1.0 / p)
+      val size = values.length
+
+      if (p == Double.PositiveInfinity) {
+        var max = 0.0
+        var i = 0
+        while (i < size) {
+          val value = math.abs(values(i))
+          if (value > max) max = value
+          i += 1
+        }
+        max
+      } else {
+        var sum = 0.0
+        var i = 0
+        while (i < size) {
+          sum += math.pow(math.abs(values(i)), p)
+          i += 1
+        }
+        math.pow(sum, 1.0 / p)
+      }
     }
+  }
+
+  private[ml] def normalize(vector: Vector, p: Double): Vector = {
+    val n = norm(vector, p)
+    require(n > 0, "Can not normalize zero-length vectors.")
+    BLAS.scal(1.0 / n, vector)
+    vector
   }
 
   /**
@@ -439,6 +496,27 @@ object Vectors {
 
   /** Max number of nonzero entries used in computing hash code. */
   private[linalg] val MAX_HASH_NNZ = 128
+
+  private[ml] def getSparseSize(nnz: Long): Long = {
+    /*
+      A sparse vector stores one double array, one int array and one int:
+      8 * values.length + 4 * values.length + arrayHeader * 2 + 4
+     */
+    val doubleBytes = java.lang.Double.BYTES
+    val intBytes = java.lang.Integer.BYTES
+    val arrayHeader = 12L
+    (doubleBytes + intBytes) * nnz + arrayHeader * 2L + 4L
+  }
+
+  private[ml] def getDenseSize(size: Long): Long = {
+    /*
+      A dense vector stores one double array:
+      8 * values.length + arrayHeader
+     */
+    val doubleBytes = java.lang.Double.BYTES
+    val arrayHeader = 12L
+    doubleBytes * size + arrayHeader
+  }
 }
 
 /**
@@ -459,17 +537,6 @@ class DenseVector @Since("2.0.0") ( @Since("2.0.0") val values: Array[Double]) e
 
   override def copy: DenseVector = {
     new DenseVector(values.clone())
-  }
-
-  override def foreachActive(f: (Int, Double) => Unit): Unit = {
-    var i = 0
-    val localValuesSize = values.length
-    val localValues = values
-
-    while (i < localValuesSize) {
-      f(i, localValues(i))
-      i += 1
-    }
   }
 
   override def equals(other: Any): Boolean = super.equals(other)
@@ -505,17 +572,14 @@ class DenseVector @Since("2.0.0") ( @Since("2.0.0") val values: Array[Double]) e
     nnz
   }
 
-  override def toSparse: SparseVector = {
-    val nnz = numNonzeros
+  private[linalg] override def toSparseWithSize(nnz: Int): SparseVector = {
     val ii = new Array[Int](nnz)
     val vv = new Array[Double](nnz)
     var k = 0
-    foreachActive { (i, v) =>
-      if (v != 0) {
-        ii(k) = i
-        vv(k) = v
-        k += 1
-      }
+    foreachNonZero { (i, v) =>
+      ii(k) = i
+      vv(k) = v
+      k += 1
     }
     new SparseVector(size, ii, vv)
   }
@@ -537,6 +601,16 @@ class DenseVector @Since("2.0.0") ( @Since("2.0.0") val values: Array[Double]) e
       maxIdx
     }
   }
+
+  private[spark] override def iterator: Iterator[(Int, Double)] = {
+    val localValues = values
+    Iterator.tabulate(size)(i => (i, localValues(i)))
+  }
+
+  private[spark] override def activeIterator: Iterator[(Int, Double)] =
+    iterator
+
+  override private[ml] def getSizeInBytes: Long = Vectors.getDenseSize(values.length)
 }
 
 @Since("2.0.0")
@@ -560,11 +634,25 @@ class SparseVector @Since("2.0.0") (
     @Since("2.0.0") val indices: Array[Int],
     @Since("2.0.0") val values: Array[Double]) extends Vector {
 
-  require(indices.length == values.length, "Sparse vectors require that the dimension of the" +
-    s" indices match the dimension of the values. You provided ${indices.length} indices and " +
-    s" ${values.length} values.")
-  require(indices.length <= size, s"You provided ${indices.length} indices and values, " +
-    s"which exceeds the specified vector size ${size}.")
+  // validate the data
+  {
+    require(size >= 0, "The size of the requested sparse vector must be no less than 0.")
+    require(indices.length == values.length, "Sparse vectors require that the dimension of the" +
+      s" indices match the dimension of the values. You provided ${indices.length} indices and " +
+      s" ${values.length} values.")
+    require(indices.length <= size, s"You provided ${indices.length} indices and values, " +
+      s"which exceeds the specified vector size ${size}.")
+
+    if (indices.nonEmpty) {
+      require(indices(0) >= 0, s"Found negative index: ${indices(0)}.")
+    }
+    var prev = -1
+    indices.foreach { i =>
+      require(prev < i, s"Index $i follows $prev and is not strictly increasing")
+      prev = i
+    }
+    require(prev < size, s"Index $prev out of bounds for vector of size $size")
+  }
 
   override def toString: String =
     s"($size,${indices.mkString("[", ",", "]")},${values.mkString("[", ",", "]")})"
@@ -586,16 +674,13 @@ class SparseVector @Since("2.0.0") (
 
   private[spark] override def asBreeze: BV[Double] = new BSV[Double](indices, values, size)
 
-  override def foreachActive(f: (Int, Double) => Unit): Unit = {
-    var i = 0
-    val localValuesSize = values.length
-    val localIndices = indices
-    val localValues = values
-
-    while (i < localValuesSize) {
-      f(localIndices(i), localValues(i))
-      i += 1
+  override def apply(i: Int): Double = {
+    if (i < 0 || i >= size) {
+      throw new IndexOutOfBoundsException(s"Index $i out of bounds [0, $size)")
     }
+
+    val j = util.Arrays.binarySearch(indices, i)
+    if (j < 0) 0.0 else values(j)
   }
 
   override def equals(other: Any): Boolean = super.equals(other)
@@ -631,20 +716,17 @@ class SparseVector @Since("2.0.0") (
     nnz
   }
 
-  override def toSparse: SparseVector = {
-    val nnz = numNonzeros
+  private[linalg] override def toSparseWithSize(nnz: Int): SparseVector = {
     if (nnz == numActives) {
       this
     } else {
       val ii = new Array[Int](nnz)
       val vv = new Array[Double](nnz)
       var k = 0
-      foreachActive { (i, v) =>
-        if (v != 0.0) {
-          ii(k) = i
-          vv(k) = v
-          k += 1
-        }
+      foreachNonZero { (i, v) =>
+        ii(k) = i
+        vv(k) = v
+        k += 1
       }
       new SparseVector(size, ii, vv)
     }
@@ -653,6 +735,8 @@ class SparseVector @Since("2.0.0") (
   override def argmax: Int = {
     if (size == 0) {
       -1
+    } else if (numActives == 0) {
+      0
     } else {
       // Find the max active entry.
       var maxIdx = indices(0)
@@ -699,25 +783,85 @@ class SparseVector @Since("2.0.0") (
    * Create a slice of this vector based on the given indices.
    * @param selectedIndices Unsorted list of indices into the vector.
    *                        This does NOT do bound checking.
+   * @param sorted Whether the input indices are already sorted.
+   *               This does NOT do ordering checking.
    * @return  New SparseVector with values in the order specified by the given indices.
    *
    * NOTE: The API needs to be discussed before making this public.
-   *       Also, if we have a version assuming indices are sorted, we should optimize it.
    */
-  private[spark] def slice(selectedIndices: Array[Int]): SparseVector = {
-    var currentIdx = 0
-    val (sliceInds, sliceVals) = selectedIndices.flatMap { origIdx =>
-      val iIdx = java.util.Arrays.binarySearch(this.indices, origIdx)
-      val i_v = if (iIdx >= 0) {
-        Iterator((currentIdx, this.values(iIdx)))
-      } else {
-        Iterator()
+  private[spark] def slice(selectedIndices: Array[Int], sorted: Boolean = false): SparseVector = {
+    val localIndices = indices
+    val localValues = values
+    val ns = selectedIndices.length
+    val indexBuff = mutable.ArrayBuilder.make[Int]
+    val valueBuff = mutable.ArrayBuilder.make[Double]
+
+    if (sorted) {
+      val nk = localIndices.length
+      var k = 0
+      var s = 0
+      while (k < nk && s < ns) {
+        val i = localIndices(k)
+        val v = localValues(k)
+        if (v != 0) {
+          while (s < ns && selectedIndices(s) < i) { s += 1 }
+          if (s < ns && selectedIndices(s) == i) {
+            indexBuff += s
+            valueBuff += v
+            s += 1
+          }
+        }
+        k += 1
       }
-      currentIdx += 1
-      i_v
-    }.unzip
-    new SparseVector(selectedIndices.length, sliceInds.toArray, sliceVals.toArray)
+    } else {
+      var s = 0
+      while (s < ns) {
+        val j = java.util.Arrays.binarySearch(localIndices, selectedIndices(s))
+        if (j >= 0) {
+          val v = localValues(j)
+          if (v != 0) {
+            indexBuff += s
+            valueBuff += v
+          }
+        }
+        s += 1
+      }
+    }
+    new SparseVector(ns, indexBuff.result(), valueBuff.result())
   }
+
+  private[spark] override def iterator: Iterator[(Int, Double)] = {
+    val localSize = size
+    val localNumActives = numActives
+    val localIndices = indices
+    val localValues = values
+
+    new Iterator[(Int, Double)]() {
+      private var i = 0
+      private var j = 0
+      private var k = localIndices.headOption.getOrElse(-1)
+
+      override def hasNext: Boolean = i < localSize
+
+      override def next(): (Int, Double) = {
+        val v = if (i == k) {
+          j += 1
+          k = if (j < localNumActives) localIndices(j) else -1
+          localValues(j - 1)
+        } else 0.0
+        i += 1
+        (i - 1, v)
+      }
+    }
+  }
+
+  private[spark] override def activeIterator: Iterator[(Int, Double)] = {
+    val localIndices = indices
+    val localValues = values
+    Iterator.tabulate(numActives)(j => (localIndices(j), localValues(j)))
+  }
+
+  override private[ml] def getSizeInBytes: Long = Vectors.getSparseSize(values.length)
 }
 
 @Since("2.0.0")

@@ -1,0 +1,92 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.spark.sql.catalyst.util
+
+import org.apache.spark.sql.errors.DataTypeErrors
+import org.apache.spark.sql.internal.SqlApiConf
+import org.apache.spark.sql.types.{ArrayType, CharType, DataType, MapType, StructType, VarcharType}
+
+trait SparkCharVarcharUtils {
+
+  /**
+   * Returns true if the given data type is CharType/VarcharType or has nested
+   * CharType/VarcharType.
+   */
+  def hasCharVarchar(dt: DataType): Boolean = {
+    dt.existsRecursively(f => f.isInstanceOf[CharType] || f.isInstanceOf[VarcharType])
+  }
+
+  /**
+   * Logical type name for CHAR/VARCHAR, used when stamping `spark.sql.catalyst.type` on STRING
+   * storage (ORC/Avro). None for other types, including unbounded STRING.
+   */
+  def charVarcharTypeName(dt: DataType): Option[String] = dt match {
+    case c: CharType => Some(c.typeName)
+    case v: VarcharType => Some(v.typeName)
+    case _ => None
+  }
+
+  /**
+   * Fail if the type contains CHAR/VARCHAR unless legacy-as-string or first-class CHAR/VARCHAR is
+   * enabled (standard semantics or preserveCharVarcharTypeInfo).
+   */
+  def failIfHasCharVarchar(dt: DataType): DataType = {
+    if (SqlApiConf.get.charVarcharFirstClassTypes) {
+      dt
+    } else if (!SqlApiConf.get.charVarcharAsString && hasCharVarchar(dt)) {
+      throw DataTypeErrors.charOrVarcharTypeAsStringUnsupportedError()
+    } else {
+      replaceCharVarcharWithString(dt)
+    }
+  }
+
+  /**
+   * Replaces CharType/VarcharType with StringType recursively in the given data type. First-class
+   * CHAR/VARCHAR (standard semantics or preserveCharVarcharTypeInfo) is left as-is.
+   */
+  def replaceCharVarcharWithString(dt: DataType): DataType = {
+    if (SqlApiConf.get.charVarcharFirstClassTypes) {
+      dt
+    } else {
+      replaceCharVarcharWithStringAlways(dt)
+    }
+  }
+
+  /**
+   * Always replaces CharType/VarcharType with unbounded StringType, including when first-class
+   * CHAR/VARCHAR types are enabled. Used for Hive TRANSFORM script I/O, which is
+   * STRING-on-the-wire regardless of the declared AS types.
+   */
+  private[sql] def replaceCharVarcharWithStringAlways(dt: DataType): DataType = dt match {
+    case ArrayType(et, nullable) =>
+      ArrayType(replaceCharVarcharWithStringAlways(et), nullable)
+    case MapType(kt, vt, nullable) =>
+      MapType(
+        replaceCharVarcharWithStringAlways(kt),
+        replaceCharVarcharWithStringAlways(vt),
+        nullable)
+    case StructType(fields) =>
+      StructType(fields.map { field =>
+        field.copy(dataType = replaceCharVarcharWithStringAlways(field.dataType))
+      })
+    case c: CharType => c.toStringType
+    case v: VarcharType => v.toStringType
+    case other => other
+  }
+}
+
+object SparkCharVarcharUtils extends SparkCharVarcharUtils

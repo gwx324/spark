@@ -19,7 +19,7 @@ package org.apache.spark.sql
 
 import java.io.ByteArrayOutputStream
 
-import org.apache.spark.{SparkConf, SparkFunSuite}
+import org.apache.spark.{SparkConf, SparkFunSuite, SparkIllegalArgumentException}
 import org.apache.spark.serializer.{JavaSerializer, KryoSerializer}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{UnsafeProjection, UnsafeRow}
@@ -101,9 +101,22 @@ class UnsafeRowSuite extends SparkFunSuite {
         MemoryAllocator.UNSAFE.free(offheapRowPage)
       }
     }
+    val (bytesFromArrayBackedRowWithOffset, field0StringFromArrayBackedRowWithOffset) = {
+      val baos = new ByteArrayOutputStream()
+      val numBytes = arrayBackedUnsafeRow.getSizeInBytes
+      val bytesWithOffset = new Array[Byte](numBytes + 100)
+      System.arraycopy(arrayBackedUnsafeRow.getBaseObject.asInstanceOf[Array[Byte]], 0,
+        bytesWithOffset, 100, numBytes)
+      val arrayBackedRow = new UnsafeRow(arrayBackedUnsafeRow.numFields())
+      arrayBackedRow.pointTo(bytesWithOffset, Platform.BYTE_ARRAY_OFFSET + 100, numBytes)
+      arrayBackedRow.writeToStream(baos, null)
+      (baos.toByteArray, arrayBackedRow.getString(0))
+    }
 
     assert(bytesFromArrayBackedRow === bytesFromOffheapRow)
     assert(field0StringFromArrayBackedRow === field0StringFromOffheapRow)
+    assert(bytesFromArrayBackedRow === bytesFromArrayBackedRowWithOffset)
+    assert(field0StringFromArrayBackedRow === field0StringFromArrayBackedRowWithOffset)
   }
 
   test("calling getDouble() and getFloat() on null columns") {
@@ -116,7 +129,12 @@ class UnsafeRowSuite extends SparkFunSuite {
   test("calling get(ordinal, datatype) on null columns") {
     val row = InternalRow.apply(null)
     val unsafeRow = UnsafeProjection.create(Array[DataType](NullType)).apply(row)
-    for (dataType <- DataTypeTestUtils.atomicTypes) {
+    // Iterate `atomicTypes` plus the parameterized nanosecond timestamp types, which aren't yet
+    // included in `DataTypeTestUtils.atomicTypes` but should still return null for null columns
+    // (their physical row support was added in SPARK-56981).
+    val typesToCheck: Set[DataType] = DataTypeTestUtils.atomicTypes.toSet[DataType] ++
+      Set(TimestampNTZNanosType(9), TimestampLTZNanosType(9))
+    for (dataType <- typesToCheck) {
       assert(unsafeRow.get(0, dataType) === null)
     }
   }
@@ -164,5 +182,51 @@ class UnsafeRowSuite extends SparkFunSuite {
     val unsafeRow = UnsafeProjection.create(Array[DataType](ArrayType(LongType))).apply(row)
     // Makes sure hashCode on unsafe array won't crash
     unsafeRow.getArray(0).hashCode()
+  }
+
+  test("SPARK-32018: setDecimal with overflowed value") {
+    val d1 = new Decimal().set(BigDecimal("10000000000000000000")).toPrecision(38, 18)
+    val row = InternalRow.apply(d1)
+    val unsafeRow = UnsafeProjection.create(Array[DataType](DecimalType(38, 18))).apply(row)
+    assert(unsafeRow.getDecimal(0, 38, 18) === d1)
+    val d2 = (d1 * Decimal(10)).toPrecision(39, 18)
+    unsafeRow.setDecimal(0, d2, 38)
+    assert(unsafeRow.getDecimal(0, 38, 18) === null)
+  }
+
+  test("SPARK-48713: throw SparkIllegalArgumentException for illegal UnsafeRow.pointTo") {
+    val emptyRow = UnsafeRow.createFromByteArray(64, 2)
+    val byteArray = new Array[Byte](64)
+
+    // Out of bounds
+    var errorMsg = intercept[SparkIllegalArgumentException] {
+      emptyRow.pointTo(byteArray, Platform.BYTE_ARRAY_OFFSET + 50, 32)
+    }.getMessage
+    assert(
+      errorMsg.contains(
+        "Invalid byte array backed UnsafeRow: byte array length=64, offset=50, byte size=32"
+      )
+    )
+
+    // Negative size
+    errorMsg = intercept[SparkIllegalArgumentException] {
+      emptyRow.pointTo(byteArray, Platform.BYTE_ARRAY_OFFSET + 50, -32)
+    }.getMessage
+    assert(
+      errorMsg.contains(
+        "Invalid byte array backed UnsafeRow: byte array length=64, offset=50, byte size=-32"
+      )
+    )
+
+    // Negative offset
+    errorMsg = intercept[SparkIllegalArgumentException] {
+      emptyRow.pointTo(byteArray, -5, 32)
+    }.getMessage
+    assert(
+      errorMsg.contains(
+        s"Invalid byte array backed UnsafeRow: byte array length=64, " +
+          s"offset=${-5 - Platform.BYTE_ARRAY_OFFSET}, byte size=32"
+      )
+    )
   }
 }

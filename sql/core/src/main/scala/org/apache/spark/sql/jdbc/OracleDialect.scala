@@ -17,42 +17,228 @@
 
 package org.apache.spark.sql.jdbc
 
-import java.sql.Types
+import java.sql.{Date, SQLException, Timestamp, Types}
+import java.sql.Types.TIMESTAMP
+import java.time.LocalDateTime
+import java.util.Locale
 
+import scala.util.control.NonFatal
+
+import org.apache.spark.{SparkThrowable, SparkUnsupportedOperationException}
+import org.apache.spark.sql.catalyst.SQLConfHelper
+import org.apache.spark.sql.catalyst.util.CharVarcharUtils
+import org.apache.spark.sql.connector.expressions.{Expression, Extract, Literal}
+import org.apache.spark.sql.errors.QueryCompilationErrors
+import org.apache.spark.sql.execution.datasources.jdbc.{JDBCOptions, JdbcUtils}
+import org.apache.spark.sql.jdbc.OracleDialect._
 import org.apache.spark.sql.types._
 
 
-private case object OracleDialect extends JdbcDialect {
+private case class OracleDialect() extends JdbcDialect with SQLConfHelper with NoLegacyJDBCError {
+  override def canHandle(url: String): Boolean =
+    url.toLowerCase(Locale.ROOT).startsWith("jdbc:oracle")
 
-  override def canHandle(url: String): Boolean = url.startsWith("jdbc:oracle")
+  private val distinctUnsupportedAggregateFunctions =
+    Set("VAR_POP", "VAR_SAMP", "STDDEV_POP", "STDDEV_SAMP", "COVAR_POP", "COVAR_SAMP", "CORR",
+      "REGR_INTERCEPT", "REGR_R2", "REGR_SLOPE", "REGR_SXY")
+
+  // scalastyle:off line.size.limit
+  // https://docs.oracle.com/en/database/oracle/oracle-database/19/sqlrf/Aggregate-Functions.html#GUID-62BE676B-AF18-4E63-BD14-25206FEA0848
+  // scalastyle:on line.size.limit
+  private val supportedAggregateFunctions =
+    Set("MAX", "MIN", "SUM", "COUNT", "AVG") ++ distinctUnsupportedAggregateFunctions
+  private val supportedFunctions =
+    supportedAggregateFunctions ++
+      Set("TRUNC", CharVarcharUtils.V2_CHAR_READ_SIDE_PADDING)
+
+  override def isSupportedFunction(funcName: String): Boolean =
+    supportedFunctions.contains(funcName)
+
+  override def isObjectNotFoundException(e: SQLException): Boolean = {
+    e.getMessage.contains("ORA-00942") ||
+      e.getMessage.contains("ORA-39165")
+  }
+
+  override def isNotSelectableObjectException(e: SQLException): Boolean = {
+    // ORA-04044: object is not a table (e.g. a synonym to a procedure/function/package).
+    e.getMessage.contains("ORA-04044") ||
+      // ORA-00980: synonym translation is no longer valid (synonym whose target is missing).
+      e.getMessage.contains("ORA-00980") ||
+      // ORA-04063: object is invalid (e.g. a view over a dropped base table).
+      e.getMessage.contains("ORA-04063")
+  }
+
+  class OracleSQLBuilder extends JDBCSQLBuilder {
+
+    override def visitExtract(extract: Extract): String = {
+      val field = extract.field
+      field match {
+        // YEAR, MONTH, DAY, HOUR, MINUTE are identical on Oracle and Spark for
+        // both datetime and interval types.
+        case "YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" =>
+          super.visitExtract(field, build(extract.source()))
+        // Oracle does not support the following date fields: DAY_OF_YEAR, WEEK, QUARTER,
+        // DAY_OF_WEEK, or YEAR_OF_WEEK.
+        // We can't push down SECOND due to the difference in result types between Spark and
+        // Oracle. Spark returns decimal(8, 6), but Oracle returns integer.
+        case _ =>
+          visitUnexpectedExpr(extract)
+      }
+    }
+
+    override def visitSQLFunction(funcName: String, inputs: Array[String]): String = {
+      funcName match {
+        case "TRUNC" =>
+          // Map Spark's trunc format strings to Oracle equivalents.
+          // inputs(1) arrives quoted, e.g. "'MONTH'" (see JDBCSQLBuilder.visitLiteral).
+          // Case-insensitive: Spark's parseTruncLevel uppercases before matching.
+          val fmt = inputs(1).toUpperCase(Locale.ROOT)
+          val oracleFormat = fmt match {
+            case "'WEEK'" => "'IW'"
+            case "'MONTH'" | "'MM'" | "'MON'" => "'MM'"
+            case "'QUARTER'" => "'Q'"
+            case "'YEAR'" | "'YYYY'" | "'YY'" => "'YYYY'"
+            case _ =>
+              // Unmapped formats: don't push down. compileExpression catches the
+              // exception and returns None, so Spark evaluates trunc locally.
+              throw new IllegalArgumentException(
+                s"Unsupported Oracle TRUNC format: ${inputs(1)}")
+          }
+          s"TRUNC(${inputs(0)}, $oracleFormat)"
+        case _ => super.visitSQLFunction(funcName, inputs)
+      }
+    }
+
+    override def visitAggregateFunction(
+        funcName: String, isDistinct: Boolean, inputs: Array[String]): String =
+      if (isDistinct && distinctUnsupportedAggregateFunctions.contains(funcName)) {
+        throw new SparkUnsupportedOperationException(
+          errorClass = "_LEGACY_ERROR_TEMP_3184",
+          messageParameters = Map(
+            "class" -> this.getClass.getSimpleName,
+            "funcName" -> funcName))
+      } else {
+        super.visitAggregateFunction(funcName, isDistinct, inputs)
+      }
+
+    override def visitIn(v: String, list: java.util.List[String]): String = {
+      if (list.size() <= 1000) {
+        super.visitIn(v, list)
+      } else {
+        val chunks = new java.util.ArrayList[String]()
+        var i = 0
+        while (i < list.size()) {
+          val end = Math.min(i + 1000, list.size())
+          val ins = new java.lang.StringBuilder(v).append(" IN (")
+          var j = i
+          while (j < end) {
+            if (j > i) ins.append(", ")
+            ins.append(list.get(j))
+            j += 1
+          }
+          ins.append(")")
+          chunks.add(ins.toString)
+          i = end
+        }
+        chunks.toArray.mkString("(", " OR ", ")")
+      }
+    }
+
+    override def visitBinaryComparison(name: String, le: Expression, re: Expression): String = {
+      (le, re) match {
+        case (lit: Literal[_], _) if lit.dataType == BinaryType =>
+          compareBlob(lit, name, re)
+        case (_, lit: Literal[_]) if lit.dataType == BinaryType =>
+          compareBlob(le, name, lit)
+        case _ =>
+          super.visitBinaryComparison(name, le, re)
+      }
+    }
+
+    private def compareBlob(lhs: Expression, operator: String, rhs: Expression): String = {
+      val l = inputToSQL(lhs)
+      val r = inputToSQL(rhs)
+      if (operator == "<=>") {
+        val compare = s"DBMS_LOB.COMPARE($l, $r) = 0"
+        s"(($l IS NOT NULL AND $r IS NOT NULL AND $compare) OR ($l IS NULL AND $r IS NULL))"
+      } else {
+        s"DBMS_LOB.COMPARE($l, $r) $operator 0"
+      }
+    }
+  }
+
+  override def compileExpression(expr: Expression): Option[String] = {
+    val oracleSQLBuilder = new OracleSQLBuilder()
+    try {
+      Some(oracleSQLBuilder.build(expr))
+    } catch {
+      case NonFatal(e) =>
+        logWarning("Error occurs while compiling V2 expression", e)
+        None
+    }
+  }
 
   override def getCatalystType(
       sqlType: Int, typeName: String, size: Int, md: MetadataBuilder): Option[DataType] = {
-    if (sqlType == Types.NUMERIC) {
-      val scale = if (null != md) md.build().getLong("scale") else 0L
-      size match {
-        // Handle NUMBER fields that have no precision/scale in special way
-        // because JDBC ResultSetMetaData converts this to 0 precision and -127 scale
-        // For more details, please see
-        // https://github.com/apache/spark/pull/8780#issuecomment-145598968
-        // and
-        // https://github.com/apache/spark/pull/8780#issuecomment-144541760
-        case 0 => Option(DecimalType(DecimalType.MAX_PRECISION, 10))
-        // Handle FLOAT fields in a special way because JDBC ResultSetMetaData converts
-        // this to NUMERIC with -127 scale
-        // Not sure if there is a more robust way to identify the field as a float (or other
-        // numeric types that do not specify a scale.
-        case _ if scale == -127L => Option(DecimalType(DecimalType.MAX_PRECISION, 10))
-        case 1 => Option(BooleanType)
-        case 3 | 5 | 10 => Option(IntegerType)
-        case 19 if scale == 0L => Option(LongType)
-        case 19 if scale == 4L => Option(FloatType)
-        case _ => None
-      }
-    } else {
-      None
+    sqlType match {
+      case Types.NUMERIC =>
+        val scale = if (null != md) md.build().getLong("scale") else 0L
+        val defaultScale = if (conf.legacyOracleNumberMappingEnabled) 10
+          else DecimalType.DEFAULT_SCALE
+        size match {
+          // Handle NUMBER fields that have no precision/scale in special way
+          // because JDBC ResultSetMetaData converts this to 0 precision and -127 scale
+          // For more details, please see
+          // https://github.com/apache/spark/pull/8780#issuecomment-145598968
+          // and
+          // https://github.com/apache/spark/pull/8780#issuecomment-144541760
+          case 0 => Option(DecimalType(DecimalType.MAX_PRECISION, defaultScale))
+          // Handle FLOAT fields in a special way because JDBC ResultSetMetaData converts
+          // this to NUMERIC with -127 scale
+          // Not sure if there is a more robust way to identify the field as a float (or other
+          // numeric types that do not specify a scale.
+          case _ if scale == -127L => Option(DecimalType(DecimalType.MAX_PRECISION, defaultScale))
+          case _ => None
+        }
+      case TIMESTAMP_TZ | TIMESTAMP_LTZ =>
+        // TIMESTAMP WITH TIME ZONE and TIMESTAMP WITH LOCAL TIME ZONE types can be represented
+        // as standard java.sql.Timestamp type.
+        // The byte representation of TIMESTAMP WITH TIME ZONE and TIMESTAMP WITH LOCAL TIME ZONE
+        // types to java.sql.Timestamp is straight forward.
+        // This is because the internal format of TIMESTAMP WITH TIME ZONE and TIMESTAMP WITH LOCAL
+        // TIME ZONE data types is GMT, and java.sql.Timestamp type objects internally use a
+        // milliseconds time value that is the number of milliseconds since EPOCH.
+        Some(TimestampType)
+      case BINARY_FLOAT => Some(FloatType) // Value for OracleTypes.BINARY_FLOAT
+      case BINARY_DOUBLE => Some(DoubleType) // Value for OracleTypes.BINARY_DOUBLE
+      case INTERVAL_YM => Some(YearMonthIntervalType())
+      case INTERVAL_DS => Some(DayTimeIntervalType())
+      case TIMESTAMP if typeName != null &&
+          typeName.toUpperCase(Locale.ROOT).matches("DATE|TIMESTAMP") &&
+          zonelessTimestampAsNTZ(md) =>
+        val metadata = if (md != null) md.build() else Metadata.empty
+        // Absent scale metadata: Oracle TIMESTAMP defaults to TIMESTAMP(6).
+        val scale = if (metadata.contains("scale")) metadata.getLong("scale").toInt else 6
+        val preferNanos = metadata.contains("preferTimestampNanos") &&
+          metadata.getBoolean("preferTimestampNanos")
+        val resolved = JdbcUtils.resolveTimestampType(
+          isTimestampNTZ = true, scale = scale, preferTimestampNanos = preferNanos)
+        Some(resolved)
+      case _ => None
     }
   }
+
+  // JdbcUtils.getSchema passes the zonelessTimestampAsNTZ option through the column metadata.
+  private def zonelessTimestampAsNTZ(md: MetadataBuilder): Boolean = {
+    val metadata = if (md != null) md.build() else Metadata.empty
+    if (metadata.contains(JDBCOptions.JDBC_ZONELESS_TIMESTAMP_AS_NTZ)) {
+      metadata.getBoolean(JDBCOptions.JDBC_ZONELESS_TIMESTAMP_AS_NTZ)
+    } else {
+      timestampNTZAsWallClock
+    }
+  }
+
+  override def timestampNTZAsWallClock: Boolean = !conf.legacyOracleTimestampNTZMappingEnabled
 
   override def getJDBCType(dt: DataType): Option[JdbcType] = dt match {
     // For more details, please see
@@ -65,8 +251,163 @@ private case object OracleDialect extends JdbcDialect {
     case ByteType => Some(JdbcType("NUMBER(3)", java.sql.Types.SMALLINT))
     case ShortType => Some(JdbcType("NUMBER(5)", java.sql.Types.SMALLINT))
     case StringType => Some(JdbcType("VARCHAR2(255)", java.sql.Types.VARCHAR))
+    case v: VarcharType => Some(JdbcType(s"VARCHAR2(${v.length})", java.sql.Types.VARCHAR))
+    case TimestampType if !conf.legacyOracleTimestampMappingEnabled =>
+      Some(JdbcType("TIMESTAMP WITH LOCAL TIME ZONE", TIMESTAMP_LTZ))
     case _ => None
   }
 
+  override def compileValue(value: Any): Any = value match {
+    // The JDBC drivers support date literals in SQL statements written in the
+    // format: {d 'yyyy-mm-dd'} and timestamp literals in SQL statements written
+    // in the format: {ts 'yyyy-mm-dd hh:mm:ss.f...'}. For details, see
+    // 'Oracle Database JDBC Developer’s Guide and Reference, 11g Release 1 (11.1)'
+    // Appendix A Reference Information.
+    case stringValue: String => s"'${escapeSql(stringValue)}'"
+    case timestampValue: Timestamp => "{ts '" + timestampValue + "'}"
+    case localDateTimeValue: LocalDateTime => "{ts '" + Timestamp.valueOf(localDateTimeValue) + "'}"
+    case dateValue: Date => "{d '" + dateValue + "'}"
+    case arrayValue: Array[Any] => arrayValue.map(compileValue).mkString(", ")
+    case binaryValue: Array[Byte] =>
+      binaryValue.map("%02X".format(_)).mkString("HEXTORAW('", "", "')")
+    case _ => value
+  }
+
   override def isCascadingTruncateTable(): Option[Boolean] = Some(false)
+
+  // See https://docs.oracle.com/cd/E11882_01/appdev.112/e10827/appd.htm#g642406
+  override def isSyntaxErrorBestEffort(exception: SQLException): Boolean = {
+    "42000".equals(exception.getSQLState)
+  }
+
+  /**
+   * The SQL query used to truncate a table.
+   * @param table The table to truncate
+   * @param cascade Whether or not to cascade the truncation. Default value is the
+   *                value of isCascadingTruncateTable()
+   * @return The SQL query to use for truncating a table
+   */
+  override def getTruncateQuery(
+      table: String,
+      cascade: Option[Boolean] = isCascadingTruncateTable()): String = {
+    cascade match {
+      case Some(true) => s"TRUNCATE TABLE $table CASCADE"
+      case _ => s"TRUNCATE TABLE $table"
+    }
+  }
+
+  // see https://docs.oracle.com/cd/B28359_01/server.111/b28286/statements_3001.htm#SQLRF01001
+  override def getAddColumnQuery(
+      tableName: String,
+      columnName: String,
+      dataType: String): String =
+    s"ALTER TABLE $tableName ADD ${quoteIdentifier(columnName)} $dataType"
+
+  // see https://docs.oracle.com/cd/B28359_01/server.111/b28286/statements_3001.htm#SQLRF01001
+  override def getUpdateColumnTypeQuery(
+    tableName: String,
+    columnName: String,
+    newDataType: String): String =
+    s"ALTER TABLE $tableName MODIFY ${quoteIdentifier(columnName)} $newDataType"
+
+  override def getUpdateColumnNullabilityQuery(
+    tableName: String,
+    columnName: String,
+    isNullable: Boolean): String = {
+    val nullable = if (isNullable) "NULL" else "NOT NULL"
+    s"ALTER TABLE $tableName MODIFY ${quoteIdentifier(columnName)} $nullable"
+  }
+
+  override def getLimitClause(limit: Integer): String = {
+    // Oracle doesn't support LIMIT clause.
+    // We can use rownum <= n to limit the number of rows in the result set.
+    if (limit > 0) s"WHERE rownum <= $limit" else ""
+  }
+
+  override def getOffsetClause(offset: Integer): String = {
+    // Oracle doesn't support OFFSET clause.
+    // We can use rownum > n to skip some rows in the result set.
+    // Note: rn is an alias of rownum.
+    if (offset > 0) s"WHERE rn > $offset" else ""
+  }
+
+  class OracleSQLQueryBuilder(dialect: JdbcDialect, options: JDBCOptions)
+    extends JdbcSQLQueryBuilder(dialect, options) {
+
+    override def build(): String = {
+      val selectStmt = s"SELECT $hintClause$columnList FROM $tableOrQuery" +
+        s" $tableSampleClause $whereClause $groupByClause $orderByClause"
+      val finalSelectStmt = if (limit > 0) {
+        if (offset > 0) {
+          // Because the rownum is calculated when the value is returned,
+          // if we not give an alias for rownum and using it directly, e.g.
+          // SELECT $columnList FROM ($selectStmt) tab WHERE rownum > $offset AND
+          // rownum <= ${limit + offset}. The result is incorrect.
+          s"SELECT $columnList FROM (SELECT tab.*, rownum rn FROM ($selectStmt) tab)" +
+            s" WHERE rn > $offset AND rn <= ${limit + offset}"
+        } else {
+          val limitClause = dialect.getLimitClause(limit)
+          s"SELECT tab.* FROM ($selectStmt) tab $limitClause"
+        }
+      } else if (offset > 0) {
+        val offsetClause = dialect.getOffsetClause(offset)
+        // Using rownum directly will lead to incorrect result too.
+        s"SELECT $columnList FROM (SELECT tab.*, rownum rn FROM ($selectStmt) tab) $offsetClause"
+      } else {
+        selectStmt
+      }
+
+      options.prepareQuery + finalSelectStmt
+    }
+  }
+
+  override def getJdbcSQLQueryBuilder(options: JDBCOptions): JdbcSQLQueryBuilder =
+    new OracleSQLQueryBuilder(this, options)
+
+  override def supportsLimit: Boolean = true
+
+  override def supportsOffset: Boolean = true
+
+  override def supportsHint: Boolean = true
+
+  override def supportsJoin: Boolean = true
+
+  override def classifyException(
+      e: Throwable,
+      condition: String,
+      messageParameters: Map[String, String],
+      description: String,
+      isRuntime: Boolean): Throwable with SparkThrowable = {
+    e match {
+      case sqlException: SQLException =>
+        sqlException.getErrorCode match {
+          case 955 if condition == "FAILED_JDBC.RENAME_TABLE" =>
+            val newTable = messageParameters("newName")
+            throw QueryCompilationErrors.tableAlreadyExistsError(newTable)
+          case _ =>
+            super.classifyException(e, condition, messageParameters, description, isRuntime)
+        }
+      case _ => super.classifyException(e, condition, messageParameters, description, isRuntime)
+    }
+  }
+}
+
+private[jdbc] object OracleDialect {
+  final val BINARY_FLOAT = 100
+  final val BINARY_DOUBLE = 101
+  final val TIMESTAMP_TZ = -101
+  // oracle.jdbc.OracleType.TIMESTAMP_WITH_LOCAL_TIME_ZONE
+  final val TIMESTAMP_LTZ = -102
+  // INTERVAL YEAR [(year_precision)] TO MONTH
+  // Stores a period of time in years and months, where year_precision is the number of digits in
+  // the YEAR datetime field. Accepted values are 0 to 9. The default is 2.
+  // The size is fixed at 5 bytes.
+  final val INTERVAL_YM = -103
+  // INTERVAL DAY [(day_precision)] TO SECOND [(fractional_seconds_precision)]
+  // Stores a period of time in days, hours, minutes, and seconds, where
+  // - day_precision is the maximum number of digits in the DAY datetime field.
+  //   Accepted values are 0 to 9. The default is 2.
+  // - fractional_seconds_precision is the number of digits in the fractional part
+  //   of the SECOND field. Accepted values are 0 to 9. The default is 6.
+  final val INTERVAL_DS = -104
 }

@@ -20,21 +20,28 @@ package org.apache.spark.scheduler.local
 import java.io.File
 import java.net.URL
 import java.nio.ByteBuffer
+import javax.annotation.concurrent.GuardedBy
 
-import org.apache.spark.{SparkConf, SparkContext, SparkEnv, TaskState}
+import org.apache.spark.{SparkConf, SparkContext, SparkEnv, TaskState, VersionedCredentials}
 import org.apache.spark.TaskState.TaskState
+import org.apache.spark.deploy.SparkHadoopUtil
+import org.apache.spark.deploy.security.HadoopDelegationTokenManager
 import org.apache.spark.executor.{Executor, ExecutorBackend}
-import org.apache.spark.internal.Logging
+import org.apache.spark.internal.{config, Logging, LogKeys}
 import org.apache.spark.launcher.{LauncherBackend, SparkAppHandle}
+import org.apache.spark.resource.{CpuAmount, ResourceInformation, ResourceProfile}
 import org.apache.spark.rpc.{RpcCallContext, RpcEndpointRef, RpcEnv, ThreadSafeRpcEndpoint}
 import org.apache.spark.scheduler._
+import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages.{TaskThreadDump, UpdateDelegationTokens}
 import org.apache.spark.scheduler.cluster.ExecutorInfo
+import org.apache.spark.status.api.v1.ThreadStackTrace
+import org.apache.spark.util.Utils
 
 private case class ReviveOffers()
 
 private case class StatusUpdate(taskId: Long, state: TaskState, serializedData: ByteBuffer)
 
-private case class KillTask(taskId: Long, interruptThread: Boolean)
+private case class KillTask(taskId: Long, interruptThread: Boolean, reason: String)
 
 private case class StopExecutor()
 
@@ -51,13 +58,15 @@ private[spark] class LocalEndpoint(
     private val totalCores: Int)
   extends ThreadSafeRpcEndpoint with Logging {
 
-  private var freeCores = totalCores
+  private var freeCores: BigDecimal = CpuAmount.normalize(BigDecimal(totalCores))
 
   val localExecutorId = SparkContext.DRIVER_IDENTIFIER
-  val localExecutorHostname = "localhost"
+  val localExecutorHostname = Utils.localCanonicalHostName()
 
+  // local mode doesn't support extra resources like GPUs right now
   private val executor = new Executor(
-    localExecutorId, localExecutorHostname, SparkEnv.get, userClassPath, isLocal = true)
+    localExecutorId, localExecutorHostname, SparkEnv.get, userClassPath, isLocal = true,
+    resources = Map.empty[String, ResourceInformation])
 
   override def receive: PartialFunction[Any, Unit] = {
     case ReviveOffers =>
@@ -70,22 +79,29 @@ private[spark] class LocalEndpoint(
         reviveOffers()
       }
 
-    case KillTask(taskId, interruptThread) =>
-      executor.killTask(taskId, interruptThread)
+    case KillTask(taskId, interruptThread, reason) =>
+      executor.killTask(taskId, interruptThread, reason)
+
+    case UpdateDelegationTokens(tokenBytes) =>
+      logInfo(log"Received tokens of ${MDC(LogKeys.NUM_BYTES, tokenBytes.length)} bytes")
+      SparkHadoopUtil.get.addDelegationTokens(tokenBytes, scheduler.conf)
   }
 
   override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
     case StopExecutor =>
       executor.stop()
       context.reply(true)
+    case TaskThreadDump(taskId) =>
+      context.reply(executor.getTaskThreadDump(taskId))
   }
 
-  def reviveOffers() {
-    val offers = Seq(new WorkerOffer(localExecutorId, localExecutorHostname, freeCores))
-    for (task <- scheduler.resourceOffers(offers).flatten) {
+  def reviveOffers(): Unit = {
+    // local mode doesn't support extra resources like GPUs right now
+    val offers = IndexedSeq(new WorkerOffer(localExecutorId, localExecutorHostname, freeCores,
+      Some(rpcEnv.address.hostPort)))
+    for (task <- scheduler.resourceOffers(offers, true).flatten) {
       freeCores -= scheduler.CPUS_PER_TASK
-      executor.launchTask(executorBackend, taskId = task.taskId, attemptNumber = task.attemptNumber,
-        task.name, task.serializedTask)
+      executor.launchTask(executorBackend, task)
     }
   }
 }
@@ -97,16 +113,59 @@ private[spark] class LocalEndpoint(
  */
 private[spark] class LocalSchedulerBackend(
     conf: SparkConf,
-    scheduler: TaskSchedulerImpl,
+    protected val scheduler: TaskSchedulerImpl,
     val totalCores: Int)
-  extends SchedulerBackend with ExecutorBackend with Logging {
+  extends SchedulerBackend with ExecutorBackend with SupportsDelegationToken with Logging {
 
-  private val appId = "local-" + System.currentTimeMillis
-  private var localEndpoint: RpcEndpointRef = null
+  private val appId = conf.get("spark.test.appId", "local-" + System.currentTimeMillis)
+  // Written only under this backend's monitor (in start()), but read without it in
+  // reviveOffers()/killTask()/statusUpdate()/getTaskThreadDump(); volatile publishes the write to
+  // those readers.
+  @volatile private var localEndpoint: RpcEndpointRef = null
+  // Set true by stop() so that a stop request arriving before start() (e.g. a launcher KILLED
+  // request; launcherBackend.connect() runs in the constructor and onStopRequest fires on its own
+  // thread) prevents start() from bringing up the executor endpoint and, in particular, the
+  // UserCredentialManager renewal thread (which performs network I/O) on an already-killed app.
+  // Accessed only under this backend's monitor (start()/stop() are synchronized), which also
+  // serializes the two against each other.
+  @GuardedBy("this")
+  private var stopped = false
   private val userClassPath = getUserClasspath(conf)
   private val listenerBus = scheduler.sc.listenerBus
   private val launcherBackend = new LauncherBackend() {
+    override def conf: SparkConf = LocalSchedulerBackend.this.conf
     override def onStopRequest(): Unit = stop(SparkAppHandle.State.KILLED)
+  }
+
+  override protected def createTokenManager(): Option[HadoopDelegationTokenManager] = {
+    Some(new HadoopDelegationTokenManager(conf, scheduler.sc.hadoopConfiguration, localEndpoint))
+  }
+
+  override protected def tokenManagerRequired(): Boolean = {
+    super.tokenManagerRequired() || conf.get(config.DIRECT_CREDENTIAL_PROVIDERS_ENABLED)
+  }
+
+  override protected def updateDelegationTokens(tokens: Array[Byte]): Unit = {
+    SparkHadoopUtil.get.addDelegationTokens(tokens, conf)
+  }
+
+  /**
+   * Propagate OIDC user credentials in local mode. There are no remote executors here: the driver
+   * and the single in-JVM executor share `scheduler.sc.env.userCredentials`, so this updates that
+   * store directly and subsequently dispatched tasks (and driver-side access) observe the new
+   * credentials. `UserCredentialManager.start()` calls this synchronously for the initial
+   * credentials, so they are in the store before any task is offered.
+   *
+   * The store is taken from `scheduler.sc.env` (this backend's own env), not the global
+   * `SparkEnv.get`: `UserCredentialManager.stop()` only waits a bounded time for the renewal
+   * thread, so a renewal that outlives this SparkContext must not write into a different
+   * SparkContext's store (e.g. a new context created in the same JVM by a notebook, test, or
+   * Spark Connect session). Binding to this env's store confines a late renewal to this
+   * application's (by then unused) store.
+   */
+  override protected def propagateUserCredentials(
+      version: Long, credentials: Array[Byte]): Unit = {
+    VersionedCredentials.updateIfNewer(scheduler.sc.env.userCredentials, version, credentials)
   }
 
   /**
@@ -115,52 +174,120 @@ private[spark] class LocalSchedulerBackend(
    * @param conf Spark configuration.
    */
   def getUserClasspath(conf: SparkConf): Seq[URL] = {
-    val userClassPathStr = conf.getOption("spark.executor.extraClassPath")
+    val userClassPathStr = conf.get(config.EXECUTOR_CLASS_PATH)
     userClassPathStr.map(_.split(File.pathSeparator)).toSeq.flatten.map(new File(_).toURI.toURL)
   }
 
   launcherBackend.connect()
 
-  override def start() {
-    val rpcEnv = SparkEnv.get.rpcEnv
-    val executorEndpoint = new LocalEndpoint(rpcEnv, userClassPath, scheduler, this, totalCores)
-    localEndpoint = rpcEnv.setupEndpoint("LocalSchedulerBackendEndpoint", executorEndpoint)
-    listenerBus.post(SparkListenerExecutorAdded(
-      System.currentTimeMillis,
-      executorEndpoint.localExecutorId,
-      new ExecutorInfo(executorEndpoint.localExecutorHostname, totalCores, Map.empty)))
-    launcherBackend.setAppId(appId)
-    launcherBackend.setState(SparkAppHandle.State.RUNNING)
+  override def start(): Unit = {
+    // Serialize with stop() so a stop request that races start() (e.g. a launcher KILLED request;
+    // launcherBackend.connect() runs in the constructor and onStopRequest fires on its own thread)
+    // cannot interleave with the setup below. Without this, a stop() that observed a not-yet-set
+    // localEndpoint and a still-None userCredentialManager could skip both while start() went on to
+    // create the endpoint and start the UserCredentialManager, leaving the renewal thread (network
+    // I/O) running on an already-killed app.
+    synchronized {
+      // If the stop request won the race, do not bring up the executor endpoint or the
+      // token/credential managers on an app that is already stopping.
+      if (stopped) {
+        logInfo("Not starting LocalSchedulerBackend because it was already stopped")
+      } else {
+        val rpcEnv = SparkEnv.get.rpcEnv
+        val executorEndpoint = new LocalEndpoint(rpcEnv, userClassPath, scheduler, this, totalCores)
+        localEndpoint = rpcEnv.setupEndpoint("LocalSchedulerBackendEndpoint", executorEndpoint)
+
+        // call this after localEndpoint is assigned
+        setupTokenManager()
+        setupUserCredentialManager()
+
+        listenerBus.post(SparkListenerExecutorAdded(
+          System.currentTimeMillis,
+          executorEndpoint.localExecutorId,
+          new ExecutorInfo(executorEndpoint.localExecutorHostname, totalCores, Map.empty,
+            Map.empty)))
+        launcherBackend.setAppId(appId)
+        launcherBackend.setState(SparkAppHandle.State.RUNNING)
+      }
+    }
+    // No-op if start() bailed out above (localEndpoint stays null); guarded in reviveOffers().
+    reviveOffers()
   }
 
-  override def stop() {
+  override def stop(): Unit = {
     stop(SparkAppHandle.State.FINISHED)
   }
 
-  override def reviveOffers() {
-    localEndpoint.send(ReviveOffers)
+  override def reviveOffers(): Unit = {
+    // localEndpoint is null if a stop request (e.g. launcher KILLED) won the race with start(),
+    // which returns early in that case. The app is already stopping, so there is nothing to
+    // revive; mirror CoarseGrainedSchedulerBackend.reviveOffers, which likewise tolerates a
+    // not-yet-ready endpoint rather than throwing.
+    if (localEndpoint != null) {
+      localEndpoint.send(ReviveOffers)
+    }
   }
 
   override def defaultParallelism(): Int =
-    scheduler.conf.getInt("spark.default.parallelism", totalCores)
+    scheduler.conf.getInt(config.DEFAULT_PARALLELISM.key, totalCores)
 
-  override def killTask(taskId: Long, executorId: String, interruptThread: Boolean) {
-    localEndpoint.send(KillTask(taskId, interruptThread))
+  override def killTask(
+      taskId: Long, executorId: String, interruptThread: Boolean, reason: String): Unit = {
+    localEndpoint.send(KillTask(taskId, interruptThread, reason))
   }
 
-  override def statusUpdate(taskId: Long, state: TaskState, serializedData: ByteBuffer) {
+  override def statusUpdate(taskId: Long, state: TaskState, serializedData: ByteBuffer): Unit = {
     localEndpoint.send(StatusUpdate(taskId, state, serializedData))
   }
 
   override def applicationId(): String = appId
 
+  // Doesn't support different ResourceProfiles yet
+  // so we expect all executors to be of same ResourceProfile
+  override def maxNumConcurrentTasks(rp: ResourceProfile): Int = {
+    val cpusPerTask = ResourceProfile.getTaskCpusOrDefaultForProfile(rp, conf)
+    ResourceProfile.numTasksBasedOnCores(CpuAmount.normalize(BigDecimal(totalCores)), cpusPerTask)
+  }
+
   private def stop(finalState: SparkAppHandle.State): Unit = {
-    localEndpoint.ask(StopExecutor)
-    try {
-      launcherBackend.setState(finalState)
-    } finally {
-      launcherBackend.close()
+    // Serialize with start() (see the comment there): a KILLED request can race ahead of, or
+    // interleave with, start(). Holding the lock guarantees we observe a consistent view of
+    // localEndpoint and the two managers -- either start() has fully set them up (so we tear them
+    // down here) or it has not run yet (so, with stopped set below, it becomes a no-op and never
+    // brings up the renewal thread on a killed app).
+    synchronized {
+      // Mark stopped so a start() that has not run yet becomes a no-op. The executor endpoint only
+      // needs stopping if start() already created it; guard on localEndpoint being non-null,
+      // mirroring CoarseGrainedSchedulerBackend's `if (driverEndpoint != null)`. The token and
+      // user-credential managers are always stopped (each isolated with tryLogNonFatalError so a
+      // failure in one does not skip the other or the launcher state update below); the
+      // UserCredentialManager renewal thread must be shut down before SparkContext.stop() closes
+      // the shared CredentialProviderLoader, otherwise a renewal task could race against an
+      // already-closed loader.
+      stopped = true
+      if (localEndpoint != null) {
+        Utils.tryLogNonFatalError {
+          localEndpoint.ask(StopExecutor)
+        }
+      }
+      Utils.tryLogNonFatalError {
+        stopTokenManager()
+      }
+      Utils.tryLogNonFatalError {
+        stopUserCredentialManager()
+      }
+      try {
+        launcherBackend.setState(finalState)
+      } finally {
+        launcherBackend.close()
+      }
     }
   }
 
+  override def getTaskThreadDump(taskId: Long, executorId: String): Option[ThreadStackTrace] = {
+    localEndpoint.askSync[Option[ThreadStackTrace]](TaskThreadDump(taskId))
+  }
+
+  /** Visible for testing: the executor endpoint, or null before start() (or if it was skipped). */
+  private[spark] def localEndpointForTesting: RpcEndpointRef = localEndpoint
 }

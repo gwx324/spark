@@ -1,0 +1,829 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql
+
+import org.apache.spark.sql.catalyst.expressions.Cast
+import org.apache.spark.sql.functions.{array, explode, length, lit, map, struct, sum}
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.test.SharedSparkSession
+import org.apache.spark.sql.types._
+import org.apache.spark.util.ArrayImplicits._
+
+/**
+ * Comprehensive tests for Dataset.unpivot.
+ */
+class DatasetUnpivotSuite extends SharedSparkSession {
+
+  import testImplicits._
+
+  lazy val wideDataDs: Dataset[WideData] = Seq(
+    WideData(1, "one", "One", Some(1), Some(1L)),
+    WideData(2, "two", null, None, Some(2L)),
+    WideData(3, null, "three", Some(3), None),
+    WideData(4, null, null, None, None)
+  ).toDS()
+
+  val longDataRows = Seq(
+    Row(1, "str1", "one"),
+    Row(1, "str2", "One"),
+    Row(2, "str1", "two"),
+    Row(2, "str2", null),
+    Row(3, "str1", null),
+    Row(3, "str2", "three"),
+    Row(4, "str1", null),
+    Row(4, "str2", null)
+  )
+
+  val longDataWithoutIdRows: Seq[Row] =
+    longDataRows.map(row => Row(row.getString(1), row.getString(2)))
+
+  val longSchema: StructType = StructType(Seq(
+    StructField("id", IntegerType, nullable = false),
+    StructField("var", StringType, nullable = false),
+    StructField("val", StringType, nullable = true)
+  ))
+
+  lazy val wideStructDataDs: DataFrame = wideDataDs.select(
+    struct($"id").as("an"),
+    struct(
+      $"str1".as("one"),
+      $"str2".as("two")
+    ).as("str")
+  )
+  val longStructDataRows: Seq[Row] = longDataRows.map(row =>
+    Row(
+      row.getInt(0),
+      row.getString(1) match {
+        case "str1" => "one"
+        case "str2" => "two"
+      },
+      row.getString(2))
+  )
+
+  test("overloaded unpivot without values") {
+    val ds = wideDataDs.select($"id", $"str1", $"str2")
+    checkAnswer(
+      ds.unpivot(Array($"id"), "var", "val"),
+      ds.unpivot(Array($"id"), Array($"str1", $"str2"), "var", "val"))
+  }
+
+  test("unpivot with single id") {
+    val unpivoted = wideDataDs
+      .unpivot(
+        Array($"id"),
+        Array($"str1", $"str2"),
+        variableColumnName = "var",
+        valueColumnName = "val")
+    assert(unpivoted.schema === longSchema)
+    checkAnswer(unpivoted, longDataRows)
+  }
+
+  test("unpivot with two ids") {
+    val unpivotedRows = Seq(
+      Row(1, 1, "str1", "one"),
+      Row(1, 1, "str2", "One"),
+      Row(2, null, "str1", "two"),
+      Row(2, null, "str2", null),
+      Row(3, 3, "str1", null),
+      Row(3, 3, "str2", "three"),
+      Row(4, null, "str1", null),
+      Row(4, null, "str2", null))
+
+    val unpivoted = wideDataDs
+      .unpivot(
+        Array($"id", $"int1"),
+        Array($"str1", $"str2"),
+        variableColumnName = "var",
+        valueColumnName = "val")
+    assert(unpivoted.schema === StructType(Seq(
+      StructField("id", IntegerType, nullable = false),
+      StructField("int1", IntegerType, nullable = true),
+      StructField("var", StringType, nullable = false),
+      StructField("val", StringType, nullable = true))))
+    checkAnswer(unpivoted, unpivotedRows)
+  }
+
+  test("unpivot without ids") {
+    val unpivoted = wideDataDs
+      .unpivot(
+        Array.empty,
+        Array($"str1", $"str2"),
+        variableColumnName = "var",
+        valueColumnName = "val")
+    assert(unpivoted.schema === StructType(Seq(
+      StructField("var", StringType, nullable = false),
+      StructField("val", StringType, nullable = true))))
+    checkAnswer(unpivoted, longDataWithoutIdRows)
+  }
+
+  test("unpivot without values") {
+    val unpivoted = wideDataDs.select($"id", $"str1", $"str2")
+      .unpivot(
+        Array($"id"),
+        variableColumnName = "var",
+        valueColumnName = "val")
+    assert(unpivoted.schema === longSchema)
+    checkAnswer(unpivoted, longDataRows)
+
+    val e = intercept[AnalysisException] {
+      wideDataDs.select($"id", $"str1", $"str2")
+        .unpivot(
+          Array($"id"),
+          Array.empty,
+          variableColumnName = "var",
+          valueColumnName = "val")
+    }
+    checkError(
+      exception = e,
+      condition = "UNPIVOT_REQUIRES_VALUE_COLUMNS",
+      parameters = Map())
+
+    // ids expressions are not allowed when no values are given
+    val e2 = intercept[AnalysisException] {
+      wideDataDs.select($"id", $"int1", $"long1")
+        .unpivot(
+          Array($"id" * 2),
+          variableColumnName = "var",
+          valueColumnName = "val")
+    }
+    checkError(
+      exception = e2,
+      condition = "UNPIVOT_REQUIRES_ATTRIBUTES",
+      parameters = Map(
+        "given" -> "id",
+        "empty" -> "value",
+        "expressions" -> "\"(id * 2) AS `(id * 2)`\"")
+    )
+
+    val e3 = intercept[AnalysisException] {
+      wideDataDs.select($"id", $"int1", $"long1")
+        .unpivot(
+          Array($"id".as("uid")),
+          variableColumnName = "var",
+          valueColumnName = "val")
+    }
+    checkError(
+      exception = e3,
+      condition = "UNPIVOT_REQUIRES_ATTRIBUTES",
+      parameters = Map(
+        "given" -> "id",
+        "empty" -> "value",
+        "expressions" -> "\"id AS uid\"")
+    )
+  }
+
+  test("unpivot without ids or values") {
+    val unpivoted = wideDataDs.select($"str1", $"str2")
+      .unpivot(
+        Array.empty,
+        variableColumnName = "var",
+        valueColumnName = "val")
+    assert(unpivoted.schema === StructType(Seq(
+      StructField("var", StringType, nullable = false),
+      StructField("val", StringType, nullable = true))))
+    checkAnswer(unpivoted, longDataWithoutIdRows)
+
+    val e = intercept[AnalysisException] {
+      wideDataDs.select($"str1", $"str2")
+        .unpivot(
+          Array.empty,
+          Array.empty,
+          variableColumnName = "var",
+          valueColumnName = "val")
+    }
+    checkError(
+      exception = e,
+      condition = "UNPIVOT_REQUIRES_VALUE_COLUMNS",
+      parameters = Map())
+  }
+
+  test("unpivot with star values") {
+    val unpivoted = wideDataDs.select($"str1", $"str2")
+      .unpivot(
+        Array.empty,
+        Array($"*"),
+        variableColumnName = "var",
+        valueColumnName = "val")
+    assert(unpivoted.schema === StructType(Seq(
+      StructField("var", StringType, nullable = false),
+      StructField("val", StringType, nullable = true))))
+    checkAnswer(unpivoted, longDataWithoutIdRows)
+  }
+
+  test("unpivot with id and star values") {
+    val unpivoted = wideDataDs.select($"id", $"int1", $"long1")
+      .unpivot(
+        Array($"id"),
+        Array($"*"),
+        variableColumnName = "var",
+        valueColumnName = "val")
+
+    assert(unpivoted.schema === StructType(Seq(
+      StructField("id", IntegerType, nullable = false),
+      StructField("var", StringType, nullable = false),
+      StructField("val", LongType, nullable = true))))
+
+    checkAnswer(unpivoted, wideDataDs.collect().flatMap { row =>
+      Seq(
+        Row(row.id, "id", row.id),
+        Row(row.id, "int1", row.int1.orNull),
+        Row(row.id, "long1", row.long1.orNull)
+      )
+    }.toImmutableArraySeq)
+  }
+
+  test("unpivot with id and value expressions") {
+    // ids and values are all expressions (computed)
+    val unpivoted = wideDataDs
+      .unpivot(
+        Array(($"id" * 10).as("primary"), $"str1".as("secondary")),
+        Array(($"int1" + $"long1").as("sum"), length($"str2").as("len")),
+        variableColumnName = "var",
+        valueColumnName = "val")
+
+    assert(unpivoted.schema === StructType(Seq(
+      StructField("primary", IntegerType, nullable = false),
+      StructField("secondary", StringType, nullable = true),
+      StructField("var", StringType, nullable = false),
+      StructField("val", LongType, nullable = true))))
+
+    checkAnswer(unpivoted, wideDataDs.collect().flatMap { row =>
+      Seq(
+        Row(
+          row.id * 10,
+          row.str1,
+          "sum",
+          // sum of int1 and long1 when both are set, or null otherwise
+          row.int1.flatMap(i => row.long1.map(l => i + l)).orNull),
+        Row(
+          row.id * 10,
+          row.str1,
+          "len",
+          // length of str2 if set, or null otherwise
+          Option(row.str2).map(_.length).orNull)
+      )
+    }.toImmutableArraySeq)
+  }
+
+  test("unpivot with variable / value columns") {
+    // with value column `variable` and `value`
+    val unpivoted = wideDataDs
+      .withColumnRenamed("str1", "var")
+      .withColumnRenamed("str2", "val")
+      .unpivot(
+        Array($"id"),
+        Array($"var", $"val"),
+        variableColumnName = "var",
+        valueColumnName = "val")
+    checkAnswer(unpivoted, longDataRows.map(row => Row(
+      row.getInt(0),
+      row.getString(1) match {
+        case "str1" => "var"
+        case "str2" => "val"
+      },
+      row.getString(2))))
+  }
+
+  test("unpivot with incompatible value types") {
+    val e = intercept[AnalysisException] {
+      wideDataDs
+        .select(
+          $"id",
+          $"str1",
+          $"int1", $"int1".as("int2"), $"int1".as("int3"), $"int1".as("int4"),
+          $"long1", $"long1".as("long2")
+        )
+        .unpivot(
+          Array($"id"),
+          variableColumnName = "var",
+          valueColumnName = "val"
+        )
+    }
+    checkError(
+      exception = e,
+      condition = "UNPIVOT_VALUE_DATA_TYPE_MISMATCH",
+      parameters = Map(
+        "types" -> (
+          """"BIGINT" (`long1`, `long2`), """ +
+            """"INT" (`int1`, `int2`, `int3`, ...), """ +
+            """"STRING" (`str1`)"""
+          )
+      )
+    )
+  }
+
+  test("unpivot with compatible value types") {
+    val unpivoted = wideDataDs.unpivot(
+      Array($"id"),
+      Array($"int1", $"long1"),
+      variableColumnName = "var",
+      valueColumnName = "val")
+    assert(unpivoted.schema === StructType(Seq(
+      StructField("id", IntegerType, nullable = false),
+      StructField("var", StringType, nullable = false),
+      StructField("val", LongType, nullable = true)
+    )))
+
+    val unpivotedRows = Seq(
+      Row(1, "int1", 1L),
+      Row(1, "long1", 1L),
+      Row(2, "int1", null),
+      Row(2, "long1", 2L),
+      Row(3, "int1", 3L),
+      Row(3, "long1", null),
+      Row(4, "int1", null),
+      Row(4, "long1", null)
+    )
+    checkAnswer(unpivoted, unpivotedRows)
+  }
+
+  test("unpivot and drop nulls") {
+    checkAnswer(
+      wideDataDs
+        .unpivot(Array($"id"), Array($"str1", $"str2"), "var", "val")
+        .where($"val".isNotNull),
+      longDataRows.filter(_.getString(2) != null))
+  }
+
+  test("unpivot with invalid arguments") {
+    // unpivoting where id column does not exist
+    val e1 = intercept[AnalysisException] {
+      wideDataDs.unpivot(
+        Array($"1", $"2"),
+        Array($"str1", $"str2"),
+        variableColumnName = "var",
+        valueColumnName = "val"
+      )
+    }
+    checkError(
+      exception = e1,
+      condition = "UNRESOLVED_COLUMN.WITH_SUGGESTION",
+      parameters = Map(
+        "objectName" -> "`1`",
+        "proposal" -> "`id`, `int1`, `str1`, `long1`, `str2`"),
+      context = ExpectedContext(fragment = "$", callSitePattern = getCurrentClassCallSitePattern))
+
+    // unpivoting where value column does not exist
+    val e2 = intercept[AnalysisException] {
+      wideDataDs.unpivot(
+        Array($"id"),
+        Array($"does", $"not", $"exist"),
+        variableColumnName = "var",
+        valueColumnName = "val"
+      )
+    }
+    checkError(
+      exception = e2,
+      condition = "UNRESOLVED_COLUMN.WITH_SUGGESTION",
+      parameters = Map(
+        "objectName" -> "`does`",
+        "proposal" -> "`id`, `int1`, `long1`, `str1`, `str2`"),
+      context = ExpectedContext(fragment = "$", callSitePattern = getCurrentClassCallSitePattern))
+
+    // unpivoting without values where potential value columns are of incompatible types
+    val e3 = intercept[AnalysisException] {
+      wideDataDs.unpivot(
+        Array.empty,
+        variableColumnName = "var",
+        valueColumnName = "val"
+      )
+    }
+    checkError(
+      exception = e3,
+      condition = "UNPIVOT_VALUE_DATA_TYPE_MISMATCH",
+      parameters = Map(
+        "types" -> """"BIGINT" (`long1`), "INT" (`id`, `int1`), "STRING" (`str1`, `str2`)"""
+      )
+    )
+
+    // unpivoting with star id columns so that no value columns are left
+    val e4 = intercept[AnalysisException] {
+      wideDataDs.unpivot(
+        Array($"*"),
+        variableColumnName = "var",
+        valueColumnName = "val"
+      )
+    }
+    checkError(
+      exception = e4,
+      condition = "UNPIVOT_REQUIRES_VALUE_COLUMNS",
+      parameters = Map()
+    )
+
+    // unpivoting with star value columns
+    // where potential value columns are of incompatible types
+    val e5 = intercept[AnalysisException] {
+      wideDataDs.unpivot(
+        Array.empty,
+        Array($"*"),
+        variableColumnName = "var",
+        valueColumnName = "val"
+      )
+    }
+    checkError(
+      exception = e5,
+      condition = "UNPIVOT_VALUE_DATA_TYPE_MISMATCH",
+      parameters = Map(
+        "types" -> """"BIGINT" (`long1`), "INT" (`id`, `int1`), "STRING" (`str1`, `str2`)"""
+      )
+    )
+
+    // unpivoting without giving values and no non-id columns
+    val e6 = intercept[AnalysisException] {
+      wideDataDs.select($"id", $"str1", $"str2").unpivot(
+        Array($"id", $"str1", $"str2"),
+        variableColumnName = "var",
+        valueColumnName = "val"
+      )
+    }
+    checkError(
+      exception = e6,
+      condition = "UNPIVOT_REQUIRES_VALUE_COLUMNS",
+      parameters = Map.empty
+    )
+  }
+
+  test("unpivot after pivot") {
+    // see test "pivot courses" in DataFramePivotSuite
+    val pivoted = courseSales.groupBy("year")
+      .pivot("course", Array("dotNET", "Java").toImmutableArraySeq)
+      .agg(sum($"earnings"))
+    val unpivoted = pivoted.unpivot(Array($"year"), "course", "earnings")
+    val expected = courseSales.groupBy("year", "course").sum("earnings")
+    checkAnswer(unpivoted, expected)
+  }
+
+  test("unpivot of unpivot") {
+    checkAnswer(
+      wideDataDs
+        .unpivot(Array($"id"), Array($"str1", $"str2"), "var", "val")
+        .unpivot(Array($"id"), Array($"var", $"val"), "col", "value"),
+      longDataRows.flatMap(row => Seq(
+        Row(row.getInt(0), "var", row.getString(1)),
+        Row(row.getInt(0), "val", row.getString(2)))))
+  }
+
+  test("unpivot with dot and backtick") {
+    val ds = wideDataDs
+      .withColumnRenamed("id", "an.id")
+      .withColumnRenamed("str1", "str.one")
+      .withColumnRenamed("str2", "str.two")
+
+    val unpivoted = ds.unpivot(
+      Array($"`an.id`"),
+      Array($"`str.one`", $"`str.two`"),
+      variableColumnName = "var",
+      valueColumnName = "val")
+    checkAnswer(unpivoted, longDataRows.map(row => Row(
+      row.getInt(0),
+      row.getString(1) match {
+        case "str1" => "str.one"
+        case "str2" => "str.two"
+      },
+      row.getString(2))))
+
+    // without backticks, this references struct fields, which do not exist
+    val e = intercept[AnalysisException] {
+      ds.unpivot(
+        Array($"an.id"),
+        Array($"str.one", $"str.two"),
+        variableColumnName = "var",
+        valueColumnName = "val"
+      )
+    }
+    checkError(
+      exception = e,
+      condition = "UNRESOLVED_COLUMN.WITH_SUGGESTION",
+      parameters = Map(
+        "objectName" -> "`an`.`id`",
+        "proposal" -> "`an.id`, `int1`, `long1`, `str.one`, `str.two`"),
+      context = ExpectedContext(fragment = "$", callSitePattern = getCurrentClassCallSitePattern))
+  }
+
+  test("unpivot with struct fields") {
+    checkAnswer(
+      wideStructDataDs.unpivot(
+        Array($"an.id"),
+        Array($"str.one", $"str.two"),
+        "var",
+        "val"),
+      longStructDataRows)
+  }
+
+  test("unpivot with struct ids star") {
+    checkAnswer(
+      wideStructDataDs.unpivot(
+        Array($"an.*"),
+        Array($"str.one", $"str.two"),
+        "var",
+        "val"),
+      longStructDataRows)
+  }
+
+  test("unpivot with struct values star") {
+    checkAnswer(
+      wideStructDataDs.unpivot(
+        Array($"an.id"),
+        Array($"str.*"),
+        "var",
+        "val"),
+      longStructDataRows)
+  }
+
+  test("unpivot sql with struct fields") {
+    // accessing struct fields in FROM clause works
+    checkAnswer(
+      spark.sql("""SELECT * FROM (
+                  |  SELECT course, `the.earnings`.* FROM (
+                  |    SELECT col1 AS course,
+                  |           struct(col2 AS `2012`, col3 AS `2013`, col4 AS `2014`) `the.earnings`
+                  |    FROM VALUES ("dotNET", 15000, 48000.0, 22500L)
+                  |  )
+                  |)
+                  |UNPIVOT (
+                  |  earningsYear FOR year IN (`2012`, `2013`, `2014`)
+                  |);
+                  |""".stripMargin),
+      Seq(
+        ("dotNET", "2012", 15000),
+        ("dotNET", "2013", 48000),
+        ("dotNET", "2014", 22500)
+      ).toDF("course", "year", "earningsYear")
+    )
+
+    checkAnswer(
+      spark.sql("""SELECT * FROM (
+                  |  SELECT course, `the.earnings`.* FROM (
+                  |    SELECT col1 AS course,
+                  |           named_struct(
+                  |             'earnings2012', col2, 'earnings2013', col4, 'earnings2014', col6,
+                  |             'sales2012', col3, 'sales2013', col5, 'sales2014', col7
+                  |           ) AS `the.earnings`
+                  |    FROM VALUES ("dotNET", 15000, NULL, 48000.0, 1, 22500L, 1)
+                  |  )
+                  |)
+                  |UNPIVOT (
+                  |  (earnings, sales) FOR year IN (
+                  |    (`earnings2012`, `sales2012`) `2012`,
+                  |    (`earnings2013`, `sales2013`) `2013`,
+                  |    (`earnings2014`, `sales2014`) `2014`
+                  |  )
+                  |);
+                  |""".stripMargin),
+      Seq(
+        ("dotNET", "2012", 15000, null),
+        ("dotNET", "2013", 48000, Some(1)),
+        ("dotNET", "2014", 22500, Some(1))
+      ).toDF("course", "year", "earnings", "sales")
+    )
+
+    // accessing struct fields as unpivot columns does not work
+    val e = intercept[AnalysisException] {
+      spark.sql("""SELECT * FROM (
+                  |  SELECT col1 AS course,
+                  |         struct(col2 AS `2012`, col3 AS `2013`, col4 AS `2014`) AS `the.earnings`
+                  |  FROM VALUES ("dotNET", 15000, 48000, 22500)
+                  |)
+                  |UNPIVOT (
+                  |  earningsYear FOR year IN (`the.earnings`.`2012`,
+                  |                            `the.earnings`.`2013`,
+                  |                            `the.earnings`.`2014`)
+                  |);
+                  |""".stripMargin)
+    }
+    checkError(
+      exception = e,
+      condition = "UNPIVOT_REQUIRES_ATTRIBUTES",
+      parameters = Map(
+        "given" -> "value",
+        "empty" -> "id",
+        "expressions" -> (
+          "\"the.earnings.2012 AS `2012`\", " +
+            "\"the.earnings.2013 AS `2013`\", " +
+            "\"the.earnings.2014 AS `2014`\"")
+      ))
+
+    val e2 = intercept[AnalysisException] {
+      spark.sql("""SELECT * FROM (
+                  |  SELECT col1 AS course,
+                  |         named_struct('2012', col2, '2013', col4, '2014', col6) `the.earnings`,
+                  |         named_struct('2012', col3, '2013', col5, '2014', col7) `the.sales`
+                  |  FROM VALUES ("dotNET", 15000, NULL, 48000, 1, 22500, 1)
+                  |)
+                  |UNPIVOT (
+                  |  (earnings, sales) FOR year IN (
+                  |    (`the.earnings`.`2012`, `the.sales`.`2012`) `2012`,
+                  |    (`the.earnings`.`2013`, `the.sales`.`2013`) `2013`,
+                  |    (`the.earnings`.`2014`, `the.sales`.`2014`) `2014`
+                  |  )
+                  |);
+                  |""".stripMargin)
+    }
+    checkError(
+      exception = e2,
+      condition = "UNPIVOT_REQUIRES_ATTRIBUTES",
+      parameters = Map(
+        "given" -> "value",
+        "empty" -> "id",
+        "expressions" -> (
+          "\"the.earnings.2012 AS `2012`\", " +
+            "\"the.sales.2012 AS `2012`\", " +
+            "\"the.earnings.2013 AS `2013`\", " +
+            "\"the.sales.2013 AS `2013`\", " +
+            "\"the.earnings.2014 AS `2014`\", " +
+            "\"the.sales.2014 AS `2014`\"")
+      ))
+  }
+
+  test("unpivot sql with unpivot value number mismatch") {
+    Seq("col1", "col1, col2, col3").foreach { columns =>
+      withClue(columns) {
+        val e = intercept[AnalysisException] {
+          spark.sql(s"""SELECT * FROM VALUES (1, 2, 3)
+                       |UNPIVOT (
+                       |  (val1, val2) FOR col IN (($columns))
+                       |);
+                       |""".stripMargin)
+        }
+        checkError(
+          exception = e,
+          condition = "UNPIVOT_VALUE_SIZE_MISMATCH",
+          parameters = Map("names" -> "2"))
+      }
+    }
+  }
+
+  test("unpivot sql with value groups of different sizes") {
+    // b differs from a only in nested nullability, d differs from a in element type
+    Seq("(a), (b, c)", "(b, c), (a)", "(a), (d, c)", "(d, c), (a)").foreach { groups =>
+      withClue(groups) {
+        val e = intercept[AnalysisException] {
+          spark.sql(s"""SELECT * FROM (
+                       |  SELECT array(1) a, array(cast(null as int)) b, 1 c, array(1L) d
+                       |)
+                       |UNPIVOT (
+                       |  (val1, val2) FOR col IN ($groups)
+                       |);
+                       |""".stripMargin)
+        }
+        checkError(
+          exception = e,
+          condition = "UNPIVOT_VALUE_SIZE_MISMATCH",
+          parameters = Map("names" -> "2"))
+      }
+    }
+  }
+
+  test("unpivot merges nested nullability of all values") {
+    // jan and feb are NOT NULL, mar and apr are nullable
+    val df = Seq(
+      ("north", 10, 20, Some(30), Option.empty[Int]),
+      ("south", 5, 6, Option.empty[Int], Option.empty[Int])
+    ).toDF("store", "jan", "feb", "mar", "apr")
+    val nullableLoHi = new StructType().add("lo", IntegerType).add("hi", IntegerType)
+
+    Seq(
+      Array[Column]($"h1", $"h2") -> Seq(
+        Row("north", "h1", 10, 20, false), Row("north", "h2", 30, null, true),
+        Row("south", "h1", 5, 6, false), Row("south", "h2", null, null, true)),
+      Array[Column]($"h2", $"h1") -> Seq(
+        Row("north", "h2", 30, null, true), Row("north", "h1", 10, 20, false),
+        Row("south", "h2", null, null, true), Row("south", "h1", 5, 6, false))
+    ).foreach { case (values, expected) =>
+      val unpivoted = df
+        .select(
+          $"store",
+          struct($"jan".as("lo"), $"feb".as("hi")).as("h1"),
+          struct($"mar".as("lo"), $"apr".as("hi")).as("h2"))
+        .unpivot(Array($"store"), values, "half", "b")
+      assert(unpivoted.schema("b").dataType === nullableLoHi)
+      checkAnswer(
+        unpivoted.select($"store", $"half", $"b.lo", $"b.hi", $"b.hi".isNull),
+        expected)
+    }
+
+    val arrays = df
+      .select($"store", array($"jan", $"feb").as("h1"), array($"mar", $"apr").as("h2"))
+      .unpivot(Array($"store"), Array($"h1", $"h2"), "half", "months")
+    assert(arrays.schema("months").dataType === ArrayType(IntegerType, containsNull = true))
+    checkAnswer(
+      arrays.select($"store", $"half", explode($"months").as("m")).select($"half", $"m".isNull),
+      Seq(
+        Row("h1", false), Row("h1", false), Row("h2", false), Row("h2", true),
+        Row("h1", false), Row("h1", false), Row("h2", true), Row("h2", true)))
+
+    val maps = df
+      .select($"store", map(lit("k"), $"jan").as("m1"), map(lit("k"), $"mar").as("m2"))
+      .unpivot(Array($"store"), Array($"m1", $"m2"), "half", "m")
+    assert(maps.schema("m").dataType ===
+      MapType(StringType, IntegerType, valueContainsNull = true))
+    checkAnswer(
+      maps.select($"store", $"half", $"m".getItem("k").isNull),
+      Seq(
+        Row("north", "m1", false), Row("north", "m2", false),
+        Row("south", "m1", false), Row("south", "m2", true)))
+  }
+
+  test("unpivot keeps nested field names and metadata of the first value") {
+    val metadata1 = new MetadataBuilder().putString("comment", "first").build()
+    val metadata2 = new MetadataBuilder().putString("comment", "second").build()
+    // s1 and s2 differ only in the nested field name case, nullability and metadata
+    val schema = new StructType()
+      .add("id", IntegerType, nullable = false)
+      .add("s1", new StructType().add("f", IntegerType, nullable = false, metadata1))
+      .add("s2", new StructType().add("F", IntegerType, nullable = true, metadata2))
+    val df = spark.createDataFrame(
+      sparkContext.parallelize(Seq(Row(1, Row(1), Row(null)))), schema)
+
+    Seq(
+      Array[Column]($"s1", $"s2") -> new StructType().add("f", IntegerType, true, metadata1),
+      Array[Column]($"s2", $"s1") -> new StructType().add("F", IntegerType, true, metadata2)
+    ).foreach { case (values, expectedType) =>
+      val unpivoted = df.unpivot(Array($"id"), values, "col", "value")
+      assert(unpivoted.schema("value").dataType === expectedType)
+      // the values are not cast, since they have the same data type up to nullability
+      assert(!unpivoted.queryExecution.analyzed.exists(
+        _.expressions.exists(_.exists(_.isInstanceOf[Cast]))))
+      checkAnswer(
+        unpivoted.select($"col", $"value.f".isNull),
+        Seq(Row("s1", false), Row("s2", true)))
+    }
+  }
+
+  test("unpivot takes nested nullability of the first value with the legacy flag") {
+    withSQLConf(SQLConf.LEGACY_UNPIVOT_USE_FIRST_VALUE_NESTED_NULLABILITY.key -> "true") {
+      // a has NOT NULL elements, b has nullable elements
+      val df = Seq((1, Option.empty[Int])).toDF("id", "v")
+        .select($"id", array($"id").as("a"), array($"v").as("b"))
+      Seq(
+        Array[Column]($"a", $"b") -> false,
+        Array[Column]($"b", $"a") -> true
+      ).foreach { case (values, containsNull) =>
+        val unpivoted = df.unpivot(Array($"id"), values, "col", "value")
+        assert(unpivoted.schema("value").dataType === ArrayType(IntegerType, containsNull))
+      }
+    }
+  }
+
+  test("ORDER BY on a column dropped by UNPIVOT is rejected") {
+    // UNPIVOT drops the unpivoted value columns, so `ORDER BY t.a` cannot resolve against them;
+    // hidden-output insertion appends the column to an operator whose child does not produce it,
+    // and analysis fails with MISSING_ATTRIBUTES.
+    withSQLConf(SQLConf.ANALYZER_DUAL_RUN_LEGACY_AND_SINGLE_PASS_RESOLVER.key -> "false") {
+      checkError(
+        exception = intercept[AnalysisException] {
+          spark.sql(
+            """SELECT * FROM VALUES (1, 10, 20) AS t(id, a, b)
+              |UNPIVOT (val FOR name IN (a, b))
+              |ORDER BY t.a""".stripMargin)
+        },
+        condition = "MISSING_ATTRIBUTES.RESOLVED_ATTRIBUTE_MISSING_FROM_INPUT",
+        parameters = Map(
+          "missingAttributes" -> "\"a\"",
+          "input" -> "\"id\", \"name\", \"val\"",
+          "operator" -> "!Sort \\[a#\\d+ ASC NULLS FIRST\\], true"),
+        matchPVals = true,
+        queryContext =
+          Array(ExpectedContext(fragment = "ORDER BY t.a", start = 81, stop = 92)))
+    }
+  }
+
+  test("DataFrame sort on a column dropped by UNPIVOT is rejected") {
+    // The Column reference carries the dropped column's id, so it reaches hidden-output insertion
+    // rather than failing name resolution as a bare name would, and analysis fails with
+    // MISSING_ATTRIBUTES.
+    withSQLConf(SQLConf.ANALYZER_DUAL_RUN_LEGACY_AND_SINGLE_PASS_RESOLVER.key -> "false") {
+      val df = Seq((1, 10, 20)).toDF("id", "a", "b")
+      val unpivoted = df.unpivot(Array($"id"), Array($"a", $"b"), "name", "val")
+
+      checkError(
+        exception = intercept[AnalysisException] {
+          unpivoted.sort(df("a"))
+        },
+        condition = "MISSING_ATTRIBUTES.RESOLVED_ATTRIBUTE_MISSING_FROM_INPUT",
+        parameters = Map(
+          "missingAttributes" -> "\"a\"",
+          "input" -> "\"id\", \"name\", \"val\"",
+          "operator" -> "!Sort \\[a#\\d+ ASC NULLS FIRST\\], true"),
+        matchPVals = true)
+    }
+  }
+
+}
+
+case class WideData(id: Int, str1: String, str2: String, int1: Option[Int], long1: Option[Long])

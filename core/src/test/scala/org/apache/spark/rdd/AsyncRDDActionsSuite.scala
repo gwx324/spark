@@ -20,26 +20,30 @@ package org.apache.spark.rdd
 import java.util.concurrent.Semaphore
 
 import scala.concurrent._
-import scala.concurrent.duration.Duration
+// scalastyle:off executioncontextglobal
 import scala.concurrent.ExecutionContext.Implicits.global
+// scalastyle:on executioncontextglobal
+import scala.concurrent.duration.Duration
 
-import org.scalatest.BeforeAndAfterAll
-import org.scalatest.concurrent.Timeouts
+import org.scalatest.concurrent.{Signaler, ThreadSignaler, TimeLimits}
 import org.scalatest.time.SpanSugar._
 
 import org.apache.spark._
 import org.apache.spark.util.ThreadUtils
 
-class AsyncRDDActionsSuite extends SparkFunSuite with BeforeAndAfterAll with Timeouts {
+class AsyncRDDActionsSuite extends SparkFunSuite with TimeLimits {
 
   @transient private var sc: SparkContext = _
 
-  override def beforeAll() {
+  // Necessary to make ScalaTest 3.x interrupt a thread on the JVM like ScalaTest 2.2.x
+  implicit val defaultSignaler: Signaler = ThreadSignaler
+
+  override def beforeAll(): Unit = {
     super.beforeAll()
     sc = new SparkContext("local[2]", "test")
   }
 
-  override def afterAll() {
+  override def afterAll(): Unit = {
     try {
       LocalSparkContext.stop(sc)
       sc = null
@@ -63,7 +67,7 @@ class AsyncRDDActionsSuite extends SparkFunSuite with BeforeAndAfterAll with Tim
   }
 
   test("foreachAsync") {
-    zeroPartRdd.foreachAsync(i => Unit).get()
+    zeroPartRdd.foreachAsync(i => ()).get()
 
     val accum = sc.longAccumulator
     sc.parallelize(1 to 1000, 3).foreachAsync { i =>
@@ -73,7 +77,7 @@ class AsyncRDDActionsSuite extends SparkFunSuite with BeforeAndAfterAll with Tim
   }
 
   test("foreachPartitionAsync") {
-    zeroPartRdd.foreachPartitionAsync(iter => Unit).get()
+    zeroPartRdd.foreachPartitionAsync(iter => ()).get()
 
     val accum = sc.longAccumulator
     sc.parallelize(1 to 1000, 9).foreachPartitionAsync { iter =>
@@ -83,11 +87,11 @@ class AsyncRDDActionsSuite extends SparkFunSuite with BeforeAndAfterAll with Tim
   }
 
   test("takeAsync") {
-    def testTake(rdd: RDD[Int], input: Seq[Int], num: Int) {
+    def testTake(rdd: RDD[Int], input: Seq[Int], num: Int): Unit = {
       val expected = input.take(num)
       val saw = rdd.takeAsync(num).get()
       assert(saw == expected, "incorrect result for rdd with %d partitions (expected %s, saw %s)"
-        .format(rdd.partitions.size, expected, saw))
+        .format(rdd.partitions.length, expected, saw))
     }
     val input = Range(1, 1000)
 
@@ -130,16 +134,16 @@ class AsyncRDDActionsSuite extends SparkFunSuite with BeforeAndAfterAll with Tim
         info("Should not have reached this code path (onComplete matching Failure)")
         throw new Exception("Task should succeed")
     }
-    f.onSuccess { case a: Any =>
+    f.foreach { a =>
       sem.release()
     }
-    f.onFailure { case t =>
+    f.failed.foreach { t =>
       info("Should not have reached this code path (onFailure)")
       throw new Exception("Task should succeed")
     }
     assert(f.get() === 10)
 
-    failAfter(10 seconds) {
+    failAfter(10.seconds) {
       sem.acquire(2)
     }
   }
@@ -164,18 +168,18 @@ class AsyncRDDActionsSuite extends SparkFunSuite with BeforeAndAfterAll with Tim
       case scala.util.Failure(e) =>
         sem.release()
     }
-    f.onSuccess { case a: Any =>
+    f.foreach { a =>
       info("Should not have reached this code path (onSuccess)")
       throw new Exception("Task should fail")
     }
-    f.onFailure { case t =>
+    f.failed.foreach { t =>
       sem.release()
     }
     intercept[SparkException] {
       f.get()
     }
 
-    failAfter(10 seconds) {
+    failAfter(10.seconds) {
       sem.acquire(2)
     }
   }
@@ -197,16 +201,15 @@ class AsyncRDDActionsSuite extends SparkFunSuite with BeforeAndAfterAll with Tim
 
   test("FutureAction result, timeout") {
     val f = sc.parallelize(1 to 100, 4)
-              .mapPartitions(itr => { Thread.sleep(20); itr })
+              .mapPartitions(itr => { Thread.sleep(200); itr })
               .countAsync()
-    val e = intercept[SparkException] {
-      ThreadUtils.awaitResult(f, Duration(20, "milliseconds"))
+    intercept[TimeoutException] {
+      ThreadUtils.awaitResult(f, Duration(2, "milliseconds"))
     }
-    assert(e.getCause.isInstanceOf[TimeoutException])
   }
 
   private def testAsyncAction[R](action: RDD[Int] => FutureAction[R]): Unit = {
-    val executionContextInvoked = Promise[Unit]
+    val executionContextInvoked = Promise[Unit]()
     val fakeExecutionContext = new ExecutionContext {
       override def execute(runnable: Runnable): Unit = {
         executionContextInvoked.success(())

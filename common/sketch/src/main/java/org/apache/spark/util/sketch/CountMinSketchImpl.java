@@ -17,14 +17,7 @@
 
 package org.apache.spark.util.sketch;
 
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.ObjectInputStream;
-import java.io.ObjectOutputStream;
-import java.io.OutputStream;
-import java.io.Serializable;
+import java.io.*;
 import java.util.Arrays;
 import java.util.Random;
 
@@ -67,7 +60,7 @@ class CountMinSketchImpl extends CountMinSketch implements Serializable {
     this.eps = eps;
     this.confidence = confidence;
     this.width = (int) Math.ceil(2 / eps);
-    this.depth = (int) Math.ceil(-Math.log(1 - confidence) / Math.log(2));
+    this.depth = (int) Math.ceil(-Math.log1p(-confidence) / Math.log(2));
     initTablesWith(depth, width, seed);
   }
 
@@ -77,11 +70,9 @@ class CountMinSketchImpl extends CountMinSketch implements Serializable {
       return true;
     }
 
-    if (other == null || !(other instanceof CountMinSketchImpl)) {
+    if (!(other instanceof CountMinSketchImpl that)) {
       return false;
     }
-
-    CountMinSketchImpl that = (CountMinSketchImpl) other;
 
     return
       this.depth == that.depth &&
@@ -150,8 +141,10 @@ class CountMinSketchImpl extends CountMinSketch implements Serializable {
 
   @Override
   public void add(Object item, long count) {
-    if (item instanceof String) {
-      addString((String) item, count);
+    if (item instanceof String str) {
+      addString(str, count);
+    } else if (item instanceof byte[] bytes) {
+      addBinary(bytes, count);
     } else {
       addLong(Utils.integralToLong(item), count);
     }
@@ -232,8 +225,10 @@ class CountMinSketchImpl extends CountMinSketch implements Serializable {
 
   @Override
   public long estimateCount(Object item) {
-    if (item instanceof String) {
-      return estimateCountForStringItem((String) item);
+    if (item instanceof String str) {
+      return estimateCountForStringItem(str);
+    } else if (item instanceof byte[] bytes) {
+      return estimateCountForBinaryItem(bytes);
     } else {
       return estimateCountForLongItem(Utils.integralToLong(item));
     }
@@ -256,19 +251,26 @@ class CountMinSketchImpl extends CountMinSketch implements Serializable {
     return res;
   }
 
+  private long estimateCountForBinaryItem(byte[] item) {
+    long res = Long.MAX_VALUE;
+    int[] buckets = getHashBuckets(item, depth, width);
+    for (int i = 0; i < depth; ++i) {
+      res = Math.min(res, table[i][buckets[i]]);
+    }
+    return res;
+  }
+
   @Override
   public CountMinSketch mergeInPlace(CountMinSketch other) throws IncompatibleMergeException {
     if (other == null) {
       throw new IncompatibleMergeException("Cannot merge null estimator");
     }
 
-    if (!(other instanceof CountMinSketchImpl)) {
+    if (!(other instanceof CountMinSketchImpl that)) {
       throw new IncompatibleMergeException(
           "Cannot merge estimator of class " + other.getClass().getName()
       );
     }
-
-    CountMinSketchImpl that = (CountMinSketchImpl) other;
 
     if (this.depth != that.depth) {
       throw new IncompatibleMergeException("Cannot merge estimators of different depth");
@@ -314,6 +316,14 @@ class CountMinSketchImpl extends CountMinSketch implements Serializable {
     }
   }
 
+  @Override
+  public byte[] toByteArray() throws IOException {
+    try (ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+      writeTo(out);
+      return out.toByteArray();
+    }
+  }
+
   public static CountMinSketchImpl readFrom(InputStream in) throws IOException {
     CountMinSketchImpl sketch = new CountMinSketchImpl();
     sketch.readFrom0(in);
@@ -351,7 +361,7 @@ class CountMinSketchImpl extends CountMinSketch implements Serializable {
     this.writeTo(out);
   }
 
-  private void readObject(ObjectInputStream in) throws IOException, ClassNotFoundException {
+  private void readObject(ObjectInputStream in) throws IOException {
     this.readFrom0(in);
   }
 }

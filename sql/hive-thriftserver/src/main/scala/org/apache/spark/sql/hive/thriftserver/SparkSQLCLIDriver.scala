@@ -18,38 +18,49 @@
 package org.apache.spark.sql.hive.thriftserver
 
 import java.io._
-import java.util.{ArrayList => JArrayList, Locale}
+import java.util.{ArrayList => JArrayList, List => JList, Locale}
+import java.util.concurrent.TimeUnit
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import jline.console.ConsoleReader
+import jline.console.completer.{ArgumentCompleter, Completer, StringsCompleter}
 import jline.console.history.FileHistory
-import org.apache.commons.lang3.StringUtils
-import org.apache.commons.logging.LogFactory
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.hive.cli.{CliDriver, CliSessionState, OptionsProcessor}
-import org.apache.hadoop.hive.common.{HiveInterruptCallback, HiveInterruptUtils}
+import org.apache.hadoop.hive.common.HiveInterruptUtils
 import org.apache.hadoop.hive.conf.HiveConf
 import org.apache.hadoop.hive.ql.Driver
-import org.apache.hadoop.hive.ql.exec.Utilities
 import org.apache.hadoop.hive.ql.processors._
 import org.apache.hadoop.hive.ql.session.SessionState
-import org.apache.thrift.transport.TSocket
+import org.apache.hadoop.security.{Credentials, UserGroupInformation}
 
+import org.apache.spark.{ErrorMessageFormat, SparkConf, SparkThrowable, SparkThrowableHelper}
+import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.AnalysisException
-import org.apache.spark.sql.hive.HiveUtils
+import org.apache.spark.internal.LogKeys._
+import org.apache.spark.sql.catalyst.analysis.FunctionRegistry
+import org.apache.spark.sql.catalyst.util.SQLKeywordUtils
+import org.apache.spark.sql.hive.client.HiveClientImpl
+import org.apache.spark.sql.hive.security.HiveDelegationTokenProvider
+import org.apache.spark.sql.hive.thriftserver.SparkSQLCLIDriver.closeHiveSessionStateIfStarted
+import org.apache.spark.sql.internal.{SharedState, SQLConf}
+import org.apache.spark.sql.internal.SQLConf.LEGACY_EMPTY_CURRENT_DB_IN_CLI
+import org.apache.spark.util.{SignalUtils, SparkStringUtils, Utils}
 import org.apache.spark.util.ShutdownHookManager
+import org.apache.spark.util.SparkExitCode._
 
 /**
  * This code doesn't support remote connections in Hive 1.2+, as the underlying CliDriver
  * has dropped its support.
  */
 private[hive] object SparkSQLCLIDriver extends Logging {
-  private var prompt = "spark-sql"
-  private var continuedPrompt = "".padTo(prompt.length, ' ')
-  private var transport: TSocket = _
+  private val prompt = "spark-sql"
+  private val continuedPrompt = "".padTo(prompt.length, ' ')
+  private final val SPARK_HADOOP_PROP_PREFIX = "spark.hadoop."
+  private var exitCode = 0
 
+  initializeLogIfNecessary(true)
   installSignalHandler()
 
   /**
@@ -57,50 +68,50 @@ private[hive] object SparkSQLCLIDriver extends Logging {
    * a signal handler will invoke this registered callback if a Ctrl+C signal is detected while
    * a command is being processed by the current thread.
    */
-  def installSignalHandler() {
-    HiveInterruptUtils.add(new HiveInterruptCallback {
-      override def interrupt() {
-        // Handle remote execution mode
-        if (SparkSQLEnv.sparkContext != null) {
-          SparkSQLEnv.sparkContext.cancelAllJobs()
-        } else {
-          if (transport != null) {
-            // Force closing of TCP connection upon session termination
-            transport.getSocket.close()
-          }
-        }
+  def installSignalHandler(): Unit = {
+    HiveInterruptUtils.add(() => {
+      if (SparkSQLEnv.sparkContext != null) {
+        SparkSQLEnv.sparkContext.cancelAllJobs(
+          "because the user interrupted the Spark SQL CLI with Ctrl+C")
       }
     })
   }
 
-  def main(args: Array[String]) {
+  def exit(code: Int): Unit = {
+    exitCode = code
+    System.exit(exitCode)
+  }
+
+  def main(args: Array[String]): Unit = {
     val oproc = new OptionsProcessor()
     if (!oproc.process_stage1(args)) {
-      System.exit(1)
+      System.exit(EXIT_FAILURE)
     }
 
-    val cliConf = new HiveConf(classOf[SessionState])
-    // Override the location of the metastore since this is only used for local execution.
-    HiveUtils.newTemporaryConfiguration(useInMemoryDerby = false).foreach {
-      case (key, value) => cliConf.set(key, value)
-    }
+    val sparkConf = new SparkConf(loadDefaults = true)
+    val hadoopConf = SparkHadoopUtil.get.newConfiguration(sparkConf)
+
+    val cliConf = HiveClientImpl.newHiveConf(sparkConf, hadoopConf)
+
     val sessionState = new CliSessionState(cliConf)
 
     sessionState.in = System.in
-    try {
-      sessionState.out = new PrintStream(System.out, true, "UTF-8")
-      sessionState.info = new PrintStream(System.err, true, "UTF-8")
-      sessionState.err = new PrintStream(System.err, true, "UTF-8")
-    } catch {
-      case e: UnsupportedEncodingException => System.exit(3)
-    }
+    sessionState.out = SparkSQLEnv.out
+    sessionState.err = SparkSQLEnv.err
+    sessionState.info = SparkSQLEnv.err
 
     if (!oproc.process_stage2(sessionState)) {
-      System.exit(2)
+      closeHiveSessionStateIfStarted(sessionState)
+      exit(ERROR_MISUSE_SHELL_BUILTIN)
     }
 
     // Set all properties specified via command line.
     val conf: HiveConf = sessionState.getConf
+    // Hive 2.0.0 onwards HiveConf.getClassLoader returns the UDFClassLoader (created by Hive).
+    // Because of this spark cannot find the jars as class loader got changed
+    // Hive changed the class loader because of HIVE-11878, so it is required to use old
+    // classLoader as sparks loaded all the jars in this classLoader
+    conf.setClassLoader(Thread.currentThread().getContextClassLoader)
     sessionState.cmdProperties.entrySet().asScala.foreach { item =>
       val key = item.getKey.toString
       val value = item.getValue.toString
@@ -111,78 +122,89 @@ private[hive] object SparkSQLCLIDriver extends Logging {
       }
     }
 
-    SessionState.start(sessionState)
+    val tokenProvider = new HiveDelegationTokenProvider()
+    if (tokenProvider.delegationTokensRequired(sparkConf, hadoopConf)) {
+      val credentials = new Credentials()
+      tokenProvider.obtainDelegationTokens(hadoopConf, sparkConf, credentials)
+      UserGroupInformation.getCurrentUser.addCredentials(credentials)
+    }
+
+    val warehousePath = SharedState.resolveWarehousePath(sparkConf, conf)
+    val qualified = SharedState.qualifyWarehousePath(conf, warehousePath)
+    SharedState.setWarehousePathConf(sparkConf, conf, qualified)
+    SessionState.setCurrentSessionState(sessionState)
 
     // Clean up after we exit
-    ShutdownHookManager.addShutdownHook { () => SparkSQLEnv.stop() }
+    ShutdownHookManager.addShutdownHook { () =>
+      closeHiveSessionStateIfStarted(sessionState)
+      SparkSQLEnv.stop(exitCode)
+    }
 
-    val remoteMode = isRemoteMode(sessionState)
-    // "-h" option has been passed, so connect to Hive thrift server.
-    if (!remoteMode) {
-      // Hadoop-20 and above - we need to augment classpath using hiveconf
-      // components.
-      // See also: code in ExecDriver.java
-      var loader = conf.getClassLoader
-      val auxJars = HiveConf.getVar(conf, HiveConf.ConfVars.HIVEAUXJARS)
-      if (StringUtils.isNotBlank(auxJars)) {
-        loader = Utilities.addToClassPath(loader, StringUtils.split(auxJars, ","))
-      }
-      conf.setClassLoader(loader)
-      Thread.currentThread().setContextClassLoader(loader)
-    } else {
-      // Hive 1.2 + not supported in CLI
-      throw new RuntimeException("Remote operations not supported")
+    // Respect the configurations set by --hiveconf from the command line
+    // (based on Hive's CliDriver).
+    val hiveConfFromCmd = sessionState.getOverriddenConfigurations.entrySet().asScala
+    val newHiveConf = hiveConfFromCmd.map { kv =>
+      // If the same property is configured by spark.hadoop.xxx, we ignore it and
+      // obey settings from spark properties
+      val k = kv.getKey
+      val v = sys.props.getOrElseUpdate(SPARK_HADOOP_PROP_PREFIX + k, kv.getValue)
+      (k, v)
     }
 
     val cli = new SparkSQLCLIDriver
     cli.setHiveVariables(oproc.getHiveVariables)
 
-    // TODO work around for set the log output to console, because the HiveContext
-    // will set the output into an invalid buffer.
-    sessionState.in = System.in
-    try {
-      sessionState.out = new PrintStream(System.out, true, "UTF-8")
-      sessionState.info = new PrintStream(System.err, true, "UTF-8")
-      sessionState.err = new PrintStream(System.err, true, "UTF-8")
-    } catch {
-      case e: UnsupportedEncodingException => System.exit(3)
+    // In SparkSQL CLI, we may want to use jars augmented by hiveconf
+    // hive.aux.jars.path, here we add jars augmented by hiveconf to
+    // Spark's SessionResourceLoader to obtain these jars.
+    val auxJars = HiveConf.getVar(conf, HiveConf.getConfVars("hive.aux.jars.path"))
+    if (SparkStringUtils.isNotBlank(auxJars)) {
+      val resourceLoader = SparkSQLEnv.sparkSession.sessionState.resourceLoader
+      Utils.stringToSeq(auxJars).foreach(resourceLoader.addJar(_))
+    }
+
+    // The class loader of CliSessionState's conf is current main thread's class loader
+    // used to load jars passed by --jars. One class loader used by AddJarsCommand is
+    // sharedState.jarClassLoader which contain jar path passed by --jars in main thread.
+    // We set CliSessionState's conf class loader to sharedState.jarClassLoader.
+    // Thus we can load all jars passed by --jars and AddJarsCommand.
+    sessionState.getConf.setClassLoader(SparkSQLEnv.sparkSession.sharedState.jarClassLoader)
+
+    // We don't propagate hive.metastore.warehouse.dir, because it might has been adjusted in
+    // [[SharedState.loadHiveConfFile]] based on the user specified or default values of
+    // spark.sql.warehouse.dir and hive.metastore.warehouse.dir.
+    for ((k, v) <- newHiveConf if k != "hive.metastore.warehouse.dir") {
+      SparkSQLEnv.sparkSession.conf.set(k, v)
     }
 
     if (sessionState.database != null) {
-      SparkSQLEnv.sqlContext.sessionState.catalog.setCurrentDatabase(
-        s"${sessionState.database}")
+      SparkSQLEnv.sparkSession.sql(s"USE ${sessionState.database}")
     }
 
     // Execute -i init files (always in silent mode)
     cli.processInitFiles(sessionState)
 
-    // Respect the configurations set by --hiveconf from the command line
-    // (based on Hive's CliDriver).
-    val it = sessionState.getOverriddenConfigurations.entrySet().iterator()
-    while (it.hasNext) {
-      val kv = it.next()
-      SparkSQLEnv.sqlContext.setConf(kv.getKey, kv.getValue)
-    }
+    cli.printMasterAndAppId()
 
     if (sessionState.execString != null) {
-      System.exit(cli.processLine(sessionState.execString))
+      exit(cli.processLine(sessionState.execString))
     }
 
     try {
       if (sessionState.fileName != null) {
-        System.exit(cli.processFile(sessionState.fileName))
+        exit(cli.processFile(sessionState.fileName))
       }
     } catch {
       case e: FileNotFoundException =>
-        logError(s"Could not open input file for reading. (${e.getMessage})")
-        System.exit(3)
+        logError(log"Could not open input file for reading. (${MDC(ERROR, e.getMessage)})")
+        exit(ERROR_PATH_NOT_FOUND)
     }
 
-    val reader = new ConsoleReader()
+    val reader = new ConsoleReader(new FileInputStream(FileDescriptor.in), sessionState.out)
     reader.setBellEnabled(false)
     reader.setExpandEvents(false)
     // reader.setDebug(new PrintWriter(new FileWriter("writer.debug", true)))
-    CliDriver.getCommandCompleter.foreach((e) => reader.addCompleter(e))
+    getCommandCompleter().foreach(reader.addCompleter)
 
     val historyDirectory = System.getProperty("user.home")
 
@@ -191,14 +213,14 @@ private[hive] object SparkSQLCLIDriver extends Logging {
         val historyFile = historyDirectory + File.separator + ".hivehistory"
         reader.setHistory(new FileHistory(new File(historyFile)))
       } else {
-        logWarning("WARNING: Directory for Hive history file: " + historyDirectory +
-                           " does not exist.   History will not be available during this session.")
+        logWarning(
+          log"Directory for Hive history file: ${MDC(HISTORY_DIR, historyDirectory)}" +
+            log" does not exist. History will not be available during this session.")
       }
     } catch {
       case e: Exception =>
-        logWarning("WARNING: Encountered an error while trying to initialize Hive's " +
-                           "history file.  History will not be available during this session.")
-        logWarning(e.getMessage)
+        logWarning("Encountered an error while trying to initialize Hive's " +
+                     "history file. History will not be available during this session.", e)
     }
 
     // add shutdown hook to flush the history to history file
@@ -209,104 +231,229 @@ private[hive] object SparkSQLCLIDriver extends Logging {
             h.flush()
           } catch {
             case e: IOException =>
-              logWarning("WARNING: Failed to write command history file: " + e.getMessage)
+              logWarning(
+                log"Failed to write command history file: ${MDC(ERROR, e.getMessage)}")
           }
         case _ =>
       }
     }
 
-    // TODO: missing
-/*
-    val clientTransportTSocketField = classOf[CliSessionState].getDeclaredField("transport")
-    clientTransportTSocketField.setAccessible(true)
-
-    transport = clientTransportTSocketField.get(sessionState).asInstanceOf[TSocket]
-*/
-    transport = null
-
     var ret = 0
-    var prefix = ""
-    val currentDB = ReflectionUtils.invokeStatic(classOf[CliDriver], "getFormattedDb",
-      classOf[HiveConf] -> conf, classOf[CliSessionState] -> sessionState)
+    // Accumulated input that has not yet formed a complete statement. The
+    // interactive loop is line-level: we buffer input until the user types a
+    // line ending with `;`, then ask the parser-based [[SqlStatementSplitter]]
+    // to split the buffered text into statements. Line-level buffering keeps
+    // multi-line input accumulating until the user signals end-of-statement
+    // with `;`, so constructs that span several lines -- an un-closed
+    // bracketed comment (SPARK-33100, SPARK-37471) or a `BEGIN ... END`
+    // scripting block -- are assembled in full before being split.
+    var buffer = ""
+
+    def currentDB = {
+      if (!SparkSQLEnv.sparkSession.sessionState.conf
+        .getConf(LEGACY_EMPTY_CURRENT_DB_IN_CLI)) {
+        s" (${SparkSQLEnv.sparkSession.catalog.currentDatabase})"
+      } else {
+        ReflectionUtils.invokeStatic(classOf[CliDriver], "getFormattedDb",
+          classOf[HiveConf] -> conf, classOf[CliSessionState] -> sessionState)
+      }
+    }
 
     def promptWithCurrentDB: String = s"$prompt$currentDB"
     def continuedPromptWithDBSpaces: String = continuedPrompt + ReflectionUtils.invokeStatic(
       classOf[CliDriver], "spacesForString", classOf[String] -> currentDB)
 
+    val sqlParser = SparkSQLEnv.sparkSession.sessionState.sqlParser
     var currentPrompt = promptWithCurrentDB
     var line = reader.readLine(currentPrompt + "> ")
 
     while (line != null) {
-      if (!line.startsWith("--")) {
-        if (prefix.nonEmpty) {
-          prefix += '\n'
-        }
-
-        if (line.trim().endsWith(";") && !line.trim().endsWith("\\;")) {
-          line = prefix + line
-          ret = cli.processLine(line, true)
-          prefix = ""
-          currentPrompt = promptWithCurrentDB
+      // SPARK-55198: call line.trim to also skip comment line with leading whitespaces,
+      // this keeps the behavior align with HIVE-8396
+      if (!line.trim.startsWith("--")) {
+        val trimmed = line.trim
+        if (trimmed.endsWith(";") && !trimmed.endsWith("\\;")) {
+          // The line ends with `;` (and not the Hive-compat `\;` continuation
+          // escape) -- the user signaled end of statement. Ask the splitter
+          // to split the accumulated buffer into statements. The splitter
+          // correctly handles `;` inside quoted strings, comments, and SQL
+          // scripting compound blocks (`BEGIN ... END`).
+          val candidate = if (buffer.isEmpty) line else buffer + "\n" + line
+          val splitResult = sqlParser.splitStatements(candidate)
+          // An un-terminated bracketed comment cannot be completed by
+          // appending more SQL; flush it to the backend so the user sees a
+          // parse error rather than staying stuck on the continuation prompt
+          // forever (SPARK-37555).
+          val flushPartial =
+            splitResult.hasUnclosedComment && splitResult.partialStatement.nonEmpty
+          if (splitResult.completeStatements.nonEmpty || flushPartial) {
+            val parts =
+              splitResult.completeStatements.iterator.map(s => s.statement + s.terminator).toBuffer
+            if (flushPartial) parts += splitResult.partialStatement
+            ret = cli.processLine(parts.mkString("\n"), true)
+          }
+          buffer = if (flushPartial) "" else splitResult.partialStatement
+          currentPrompt =
+            if (buffer.isEmpty) promptWithCurrentDB else continuedPromptWithDBSpaces
         } else {
-          prefix = prefix + line
+          // The line does not signal end of statement (no trailing `;`, or
+          // the trailing `;` is escaped as `\;`). Accumulate and wait for
+          // more input. The `\;` escape survives into the buffer and is
+          // reattached at execution time by `processLine` (via its
+          // `oneCmd.endsWith("\\")` branch).
+          buffer = if (buffer.isEmpty) line else buffer + "\n" + line
           currentPrompt = continuedPromptWithDBSpaces
         }
       }
       line = reader.readLine(currentPrompt + "> ")
     }
 
-    sessionState.close()
+    // Stdin closed with un-terminated trailing input. Pass it to the backend so the
+    // user gets a parse error rather than silently dropping their input.
+    if (buffer.nonEmpty) {
+      ret = cli.processLine(buffer, true)
+    }
 
-    System.exit(ret)
+    closeHiveSessionStateIfStarted(sessionState)
+
+    exit(ret)
   }
 
-
-  def isRemoteMode(state: CliSessionState): Boolean = {
-    //    sessionState.isRemoteMode
-    state.isHiveServerQuery
+  def printUsage(): Unit = {
+    val processor = new OptionsProcessor()
+    ReflectionUtils.invoke(classOf[OptionsProcessor], processor, "printUsage")
   }
 
+  private def closeHiveSessionStateIfStarted(state: SessionState): Unit = {
+    if (ReflectionUtils.getSuperField(state, "isStarted").asInstanceOf[Boolean]) {
+      state.close()
+    }
+  }
+
+  private def getCommandCompleter(): Array[Completer] = {
+    // StringsCompleter matches against a pre-defined wordlist
+    // We start with an empty wordlist and build it up
+    val candidateStrings = new JArrayList[String]
+    // We add Spark SQL function names
+    // For functions that aren't infix operators, we add an open
+    // parenthesis at the end.
+    FunctionRegistry.builtin.listFunction().map(_.funcName).foreach { s =>
+      if (s.matches("[a-z_]+")) {
+        candidateStrings.add(s + "(")
+      } else {
+        candidateStrings.add(s)
+      }
+    }
+    // We add Spark SQL keywords, including lower-cased versions
+    SQLKeywordUtils.keywords.foreach { s =>
+      candidateStrings.add(s)
+      candidateStrings.add(s.toLowerCase(Locale.ROOT))
+    }
+
+    val strCompleter = new StringsCompleter(candidateStrings)
+    // Because we use parentheses in addition to whitespace
+    // as a keyword delimiter, we need to define a new ArgumentDelimiter
+    // that recognizes parenthesis as a delimiter.
+    val delim = new ArgumentCompleter.AbstractArgumentDelimiter() {
+      override def isDelimiterChar(buffer: CharSequence, pos: Int): Boolean = {
+        val c = buffer.charAt(pos)
+        Character.isWhitespace(c) || c == '(' || c == ')' || c == '[' || c == ']'
+      }
+    }
+    // The ArgumentCompleter allows us to match multiple tokens
+    // in the same line.
+    val argCompleter = new ArgumentCompleter(delim, strCompleter)
+    // By default ArgumentCompleter is in "strict" mode meaning
+    // a token is only auto-completed if all prior tokens
+    // match. We don't want that since there are valid tokens
+    // that are not in our wordlist (eg. table and column names)
+    argCompleter.setStrict(false)
+    // ArgumentCompleter always adds a space after a matched token.
+    // This is undesirable for function names because a space after
+    // the opening parenthesis is unnecessary (and uncommon) in Hive.
+    // We stack a custom Completer on top of our ArgumentCompleter
+    // to reverse this.
+    val customCompleter: Completer = new Completer() {
+      override def complete(buffer: String, offset: Int, completions: JList[CharSequence]): Int = {
+        val comp: JList[String] = completions.asInstanceOf[JList[String]]
+        val ret = argCompleter.complete(buffer, offset, completions)
+        // ConsoleReader will do the substitution if and only if there
+        // is exactly one valid completion, so we ignore other cases.
+        if (completions.size == 1 && comp.get(0).endsWith("( ")) comp.set(0, comp.get(0).trim)
+        ret
+      }
+    }
+
+    val confCompleter = new StringsCompleter(SQLConf.get.getAllDefinedConfs.map(_._1).asJava) {
+      override def complete(buffer: String, cursor: Int, clist: JList[CharSequence]): Int = {
+        super.complete(buffer, cursor, clist)
+      }
+    }
+
+    val setCompleter = new StringsCompleter("set", "Set", "SET") {
+      override def complete(buffer: String, cursor: Int, clist: JList[CharSequence]): Int = {
+        if (buffer != null && buffer.equalsIgnoreCase("set")) {
+          super.complete(buffer, cursor, clist)
+        } else {
+          -1
+        }
+      }
+    }
+
+    val propCompleter = new ArgumentCompleter(setCompleter, confCompleter) {
+      override def complete(buffer: String, offset: Int, completions: JList[CharSequence]): Int = {
+        val ret = super.complete(buffer, offset, completions)
+        if (completions.size == 1) completions.set(0, completions.get(0).asInstanceOf[String].trim)
+        ret
+      }
+    }
+    Array[Completer](propCompleter, customCompleter)
+  }
 }
 
 private[hive] class SparkSQLCLIDriver extends CliDriver with Logging {
-  private val sessionState = SessionState.get().asInstanceOf[CliSessionState]
+  private val sessionState = SessionState.get()
 
-  private val LOG = LogFactory.getLog("CliDriver")
+  private val console = new SessionState.LogHelper(log)
 
-  private val console = new SessionState.LogHelper(LOG)
-
-  private val isRemoteMode = {
-    SparkSQLCLIDriver.isRemoteMode(sessionState)
-  }
-
-  private val conf: Configuration =
-    if (sessionState != null) sessionState.getConf else new Configuration()
+  private val conf: Configuration = sessionState.getConf
 
   // Force initializing SparkSQLEnv. This is put here but not object SparkSQLCliDriver
   // because the Hive unit tests do not go through the main() code path.
-  if (!isRemoteMode) {
-    SparkSQLEnv.init()
-  } else {
-    // Hive 1.2 + not supported in CLI
-    throw new RuntimeException("Remote operations not supported")
+  SparkSQLEnv.init()
+  if (sessionState.getIsSilent) {
+    SparkSQLEnv.sparkContext.setLogLevel("warn")
+  }
+
+  override def setHiveVariables(hiveVariables: java.util.Map[String, String]): Unit = {
+    hiveVariables.asScala.foreach(kv =>
+      SparkSQLEnv.sparkSession.sessionState.conf.setConfString(kv._1, kv._2))
+  }
+
+  def printMasterAndAppId(): Unit = {
+    val master = SparkSQLEnv.sparkContext.master
+    val appId = SparkSQLEnv.sparkContext.applicationId
+    SparkSQLEnv.sparkContext.uiWebUrl.foreach {
+      webUrl => console.printInfo(s"Spark Web UI available at $webUrl")
+    }
+    console.printInfo(s"Spark master: $master, Application Id: $appId")
   }
 
   override def processCmd(cmd: String): Int = {
     val cmd_trimmed: String = cmd.trim()
-    val cmd_lower = cmd_trimmed.toLowerCase(Locale.ENGLISH)
+    val cmd_lower = cmd_trimmed.toLowerCase(Locale.ROOT)
     val tokens: Array[String] = cmd_trimmed.split("\\s+")
     val cmd_1: String = cmd_trimmed.substring(tokens(0).length()).trim()
     if (cmd_lower.equals("quit") ||
       cmd_lower.equals("exit")) {
-      sessionState.close()
-      System.exit(0)
+      closeHiveSessionStateIfStarted(sessionState)
+      SparkSQLCLIDriver.exit(EXIT_SUCCESS)
     }
-    if (tokens(0).toLowerCase(Locale.ENGLISH).equals("source") ||
-      cmd_trimmed.startsWith("!") || isRemoteMode) {
-      val start = System.currentTimeMillis()
+    if (tokens(0).toLowerCase(Locale.ROOT).equals("source") || cmd_trimmed.startsWith("!")) {
+      val startTimeNs = System.nanoTime()
       super.processCmd(cmd)
-      val end = System.currentTimeMillis()
-      val timeTaken: Double = (end - start) / 1000.0
+      val endTimeNs = System.nanoTime()
+      val timeTaken: Double = TimeUnit.NANOSECONDS.toMillis(endTimeNs - startTimeNs) / 1000.0
       console.printInfo(s"Time taken: $timeTaken seconds")
       0
     } else {
@@ -318,35 +465,59 @@ private[hive] class SparkSQLCLIDriver extends CliDriver with Logging {
         // scalastyle:off println
         if (proc.isInstanceOf[Driver] || proc.isInstanceOf[SetProcessor] ||
           proc.isInstanceOf[AddResourceProcessor] || proc.isInstanceOf[ListResourceProcessor] ||
+          proc.isInstanceOf[DeleteResourceProcessor] ||
           proc.isInstanceOf[ResetProcessor] ) {
           val driver = new SparkSQLDriver
 
           driver.init()
           val out = sessionState.out
           val err = sessionState.err
-          val start: Long = System.currentTimeMillis()
+          val startTimeNs: Long = System.nanoTime()
           if (sessionState.getIsVerbose) {
             out.println(cmd)
           }
-          val rc = driver.run(cmd)
-          val end = System.currentTimeMillis()
-          val timeTaken: Double = (end - start) / 1000.0
-
-          ret = rc.getResponseCode
-          if (ret != 0) {
-            // For analysis exception, only the error is printed out to the console.
-            rc.getException() match {
-              case e : AnalysisException =>
-                err.println(s"""Error in query: ${e.getMessage}""")
-              case _ => err.println(rc.getErrorMessage())
-            }
-            driver.close()
-            return ret
+          try {
+            driver.run(cmd)
+          } catch {
+            case t: Throwable =>
+              ret = 1
+              val format = SparkSQLEnv.sparkSession.sessionState.conf.errorMessageFormat
+              val msg = t match {
+                case st: SparkThrowable with Throwable =>
+                  SparkThrowableHelper.getMessage(st, format)
+                case _ => t.getMessage
+              }
+              err.println(msg)
+              // Print stack traces based on format and error type:
+              // - DEBUG format: Always print stack traces (for debugging)
+              // - PRETTY format: Only for internal errors (SQLSTATE XX***)
+              // - MINIMAL/STANDARD formats: Never print stack traces (JSON only)
+              val shouldPrintStackTrace = format match {
+                case ErrorMessageFormat.DEBUG => true // Always print in DEBUG mode
+                case ErrorMessageFormat.PRETTY =>
+                  // In PRETTY mode, only print for internal errors
+                  t match {
+                    case st: SparkThrowable =>
+                      val sqlState = st.getSqlState
+                      // Print if: internal error (XX***) OR no SQLSTATE
+                      sqlState == null || sqlState.startsWith("XX")
+                    case _ => true // Non-SparkThrowable exceptions always get stack traces
+                  }
+                case _ => false // MINIMAL and STANDARD never print stack traces
+              }
+              if (shouldPrintStackTrace && !sessionState.getIsSilent) {
+                t.printStackTrace(err)
+              }
+              driver.close()
+              return ret
           }
+          val endTimeNs = System.nanoTime()
+          val timeTaken: Double = TimeUnit.NANOSECONDS.toMillis(endTimeNs - startTimeNs) / 1000.0
 
           val res = new JArrayList[String]()
 
-          if (HiveConf.getBoolVar(conf, HiveConf.ConfVars.HIVE_CLI_PRINT_HEADER)) {
+          if (HiveConf.getBoolVar(conf, HiveConf.ConfVars.HIVE_CLI_PRINT_HEADER) ||
+              SparkSQLEnv.sparkSession.sessionState.conf.cliPrintHeader) {
             // Print the column names.
             Option(driver.getSchema.getFieldSchemas).foreach { fields =>
               out.println(fields.asScala.map(_.getName).mkString("\t"))
@@ -364,9 +535,9 @@ private[hive] class SparkSQLCLIDriver extends CliDriver with Logging {
             }
           } catch {
             case e: IOException =>
-              console.printError(
+              err.println(
                 s"""Failed with exception ${e.getClass.getName}: ${e.getMessage}
-                   |${org.apache.hadoop.util.StringUtils.stringifyException(e)}
+                   |${Utils.stringifyException(e)}
                  """.stripMargin)
               ret = 1
           }
@@ -380,7 +551,7 @@ private[hive] class SparkSQLCLIDriver extends CliDriver with Logging {
           if (counter != 0) {
             responseMsg += s", Fetched $counter row(s)"
           }
-          console.printInfo(responseMsg, null)
+          err.println(responseMsg)
           // Destroy the driver to release all the locks.
           driver.destroy()
         } else {
@@ -394,5 +565,90 @@ private[hive] class SparkSQLCLIDriver extends CliDriver with Logging {
       ret
     }
   }
-}
 
+  // Adapted processReader from Hive 2.3's CliDriver.processReader.
+  // SPARK-55198: call line.trim to also skip comment line with leading whitespaces,
+  // this keeps the spark-sql's behavior align with beeline.
+  override def processReader(r: BufferedReader): Int = {
+    val qsb = new StringBuilder
+    var line = r.readLine
+    while (line != null) {
+      // Skipping through comments
+      if (!line.trim.startsWith("--")) {
+        qsb.append(line + "\n")
+      }
+      line = r.readLine
+    }
+    processLine(qsb.toString)
+  }
+
+  // Adapted processLine from Hive 2.3's CliDriver.processLine.
+  override def processLine(line: String, allowInterrupting: Boolean): Int = {
+    def processStatements(): Int = {
+      var lastRet: Int = 0
+
+      // we can not use "split" function directly as ";" may be quoted
+      val commands = splitStatements(line)
+      var command: String = ""
+      for (oneCmd <- commands) {
+        if (oneCmd.endsWith("\\")) {
+          command += oneCmd.dropRight(1) + ";"
+        } else {
+          command += oneCmd
+          if (!SparkStringUtils.isBlank(command)) {
+            val ret = processCmd(command)
+            command = ""
+            lastRet = ret
+            val ignoreErrors =
+              HiveConf.getBoolVar(conf, HiveConf.getConfVars("hive.cli.errors.ignore"))
+            if (ret != 0 && !ignoreErrors) {
+              CommandProcessorFactory.clean(conf.asInstanceOf[HiveConf])
+              return ret
+            }
+          }
+        }
+      }
+      CommandProcessorFactory.clean(conf.asInstanceOf[HiveConf])
+      lastRet
+    }
+
+    if (allowInterrupting) {
+      // Hook up the custom Ctrl+C handler while processing this line. Once we are done
+      // processing the line, the old handler is restored.
+      var interruptRequested: Boolean = false
+      SignalUtils.withSignalHandler("INT") {
+        val initialRequest = !interruptRequested
+        interruptRequested = true
+
+        // Kill the VM on second ctrl+c
+        if (!initialRequest) {
+          console.printInfo("Exiting the JVM")
+          SparkSQLCLIDriver.exit(ERROR_COMMAND_NOT_FOUND)
+        }
+
+        // Interrupt the CLI thread to stop the current statement and return
+        // to prompt
+        console.printInfo("Interrupting... Be patient, this might take some time.")
+        console.printInfo("Press Ctrl+C again to kill JVM")
+
+        HiveInterruptUtils.interrupt()
+      } {
+        processStatements()
+      }
+    } else {
+      processStatements()
+    }
+  }
+
+  // Splits SQL into individual statements via the parser-based
+  // [[org.apache.spark.sql.catalyst.parser.SqlStatementSplitter]]. The returned
+  // list contains the text of every complete statement (without its terminator)
+  // followed by the trailing partial statement, if any -- the shape that
+  // [[processLine]] consumes.
+  // Note: [SPARK-31595], [SPARK-33100], [SPARK-54876]
+  private[hive] def splitStatements(line: String): List[String] = {
+    val result = SparkSQLEnv.sparkSession.sessionState.sqlParser.splitStatements(line)
+    val complete = result.completeStatements.iterator.map(_.statement).toList
+    if (result.partialStatement.isEmpty) complete else complete :+ result.partialStatement
+  }
+}

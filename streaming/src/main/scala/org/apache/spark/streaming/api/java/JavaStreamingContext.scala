@@ -21,7 +21,8 @@ import java.io.{Closeable, InputStream}
 import java.lang.{Boolean => JBoolean}
 import java.util.{List => JList, Map => JMap}
 
-import scala.collection.JavaConverters._
+import scala.annotation.varargs
+import scala.jdk.CollectionConverters._
 import scala.reflect.ClassTag
 
 import org.apache.hadoop.conf.Configuration
@@ -36,7 +37,6 @@ import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.rdd.RDD
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.streaming._
-import org.apache.spark.streaming.dstream.DStream
 import org.apache.spark.streaming.receiver.Receiver
 import org.apache.spark.streaming.scheduler.StreamingListener
 
@@ -44,13 +44,19 @@ import org.apache.spark.streaming.scheduler.StreamingListener
  * A Java-friendly version of [[org.apache.spark.streaming.StreamingContext]] which is the main
  * entry point for Spark Streaming functionality. It provides methods to create
  * [[org.apache.spark.streaming.api.java.JavaDStream]] and
- * [[org.apache.spark.streaming.api.java.JavaPairDStream.]] from input sources. The internal
+ * [[org.apache.spark.streaming.api.java.JavaPairDStream]] from input sources. The internal
  * org.apache.spark.api.java.JavaSparkContext (see core Spark documentation) can be accessed
  * using `context.sparkContext`. After creating and transforming DStreams, the streaming
  * computation can be started and stopped using `context.start()` and `context.stop()`,
  * respectively. `context.awaitTermination()` allows the current thread to wait for the
  * termination of a context by `stop()` or by an exception.
+ * @deprecated This is deprecated as of Spark 3.4.0.
+ *             There are no longer updates to DStream and it's a legacy project.
+ *             There is a newer and easier to use streaming engine
+ *             in Spark called Structured Streaming.
+ *             You should use Spark Structured Streaming for your streaming applications.
  */
+@deprecated("DStream is deprecated. Migrate to Structured Streaming.", "Spark 3.4.0")
 class JavaStreamingContext(val ssc: StreamingContext) extends Closeable {
 
   /**
@@ -67,7 +73,7 @@ class JavaStreamingContext(val ssc: StreamingContext) extends Closeable {
    * @param master Name of the Spark Master
    * @param appName Name to be used when registering with the scheduler
    * @param batchDuration The time interval at which streaming data will be divided into batches
-   * @param sparkHome The SPARK_HOME directory on the slave nodes
+   * @param sparkHome The SPARK_HOME directory on the worker nodes
    * @param jarFile JAR file containing job code, to ship to cluster. This can be a path on the
    *                local file system or an HDFS, HTTP, HTTPS, or FTP URL.
    */
@@ -84,7 +90,7 @@ class JavaStreamingContext(val ssc: StreamingContext) extends Closeable {
    * @param master Name of the Spark Master
    * @param appName Name to be used when registering with the scheduler
    * @param batchDuration The time interval at which streaming data will be divided into batches
-   * @param sparkHome The SPARK_HOME directory on the slave nodes
+   * @param sparkHome The SPARK_HOME directory on the worker nodes
    * @param jars Collection of JARs to send to the cluster. These can be paths on the local file
    *             system or HDFS, HTTP, HTTPS, or FTP URLs.
    */
@@ -101,7 +107,7 @@ class JavaStreamingContext(val ssc: StreamingContext) extends Closeable {
    * @param master Name of the Spark Master
    * @param appName Name to be used when registering with the scheduler
    * @param batchDuration The time interval at which streaming data will be divided into batches
-   * @param sparkHome The SPARK_HOME directory on the slave nodes
+   * @param sparkHome The SPARK_HOME directory on the worker nodes
    * @param jars Collection of JARs to send to the cluster. These can be paths on the local file
    *             system or HDFS, HTTP, HTTPS, or FTP URLs.
    * @param environment Environment variables to set on worker nodes
@@ -207,6 +213,8 @@ class JavaStreamingContext(val ssc: StreamingContext) extends Closeable {
    * as Text and input format as TextInputFormat). Files must be written to the
    * monitored directory by "moving" them from another location within the same
    * file system. File names starting with . are ignored.
+   * The text files must be encoded as UTF-8.
+   *
    * @param directory HDFS directory to monitor for new file
    */
   def textFileStream(directory: String): JavaDStream[String] = {
@@ -218,11 +226,11 @@ class JavaStreamingContext(val ssc: StreamingContext) extends Closeable {
    * for new files and reads them as flat binary files with fixed record lengths,
    * yielding byte arrays
    *
-   * '''Note:''' We ensure that the byte array for each record in the
-   * resulting RDDs of the DStream has the provided record length.
-   *
    * @param directory HDFS directory to monitor for new files
    * @param recordLength The length at which to split the records
+   *
+   * @note We ensure that the byte array for each record in the
+   * resulting RDDs of the DStream has the provided record length.
    */
   def binaryRecordsStream(directory: String, recordLength: Int): JavaDStream[Array[Byte]] = {
     ssc.binaryRecordsStream(directory, recordLength)
@@ -352,19 +360,19 @@ class JavaStreamingContext(val ssc: StreamingContext) extends Closeable {
    * Create an input stream from a queue of RDDs. In each batch,
    * it will process either one or all of the RDDs returned by the queue.
    *
-   * NOTE:
+   * @param queue      Queue of RDDs
+   * @tparam T         Type of objects in the RDD
+   *
+   * @note
    * 1. Changes to the queue after the stream is created will not be recognized.
    * 2. Arbitrary RDDs can be added to `queueStream`, there is no way to recover data of
    * those RDDs, so `queueStream` doesn't support checkpointing.
-   *
-   * @param queue      Queue of RDDs
-   * @tparam T         Type of objects in the RDD
    */
   def queueStream[T](queue: java.util.Queue[JavaRDD[T]]): JavaDStream[T] = {
     implicit val cm: ClassTag[T] =
       implicitly[ClassTag[AnyRef]].asInstanceOf[ClassTag[T]]
     val sQueue = new scala.collection.mutable.Queue[RDD[T]]
-    sQueue.enqueue(queue.asScala.map(_.rdd).toSeq: _*)
+    sQueue ++= queue.asScala.map(_.rdd)
     ssc.queueStream(sQueue)
   }
 
@@ -372,14 +380,14 @@ class JavaStreamingContext(val ssc: StreamingContext) extends Closeable {
    * Create an input stream from a queue of RDDs. In each batch,
    * it will process either one or all of the RDDs returned by the queue.
    *
-   * NOTE:
-   * 1. Changes to the queue after the stream is created will not be recognized.
-   * 2. Arbitrary RDDs can be added to `queueStream`, there is no way to recover data of
-   * those RDDs, so `queueStream` doesn't support checkpointing.
-   *
    * @param queue      Queue of RDDs
    * @param oneAtATime Whether only one RDD should be consumed from the queue in every interval
    * @tparam T         Type of objects in the RDD
+   *
+   * @note
+   * 1. Changes to the queue after the stream is created will not be recognized.
+   * 2. Arbitrary RDDs can be added to `queueStream`, there is no way to recover data of
+   * those RDDs, so `queueStream` doesn't support checkpointing.
    */
   def queueStream[T](
       queue: java.util.Queue[JavaRDD[T]],
@@ -388,7 +396,7 @@ class JavaStreamingContext(val ssc: StreamingContext) extends Closeable {
     implicit val cm: ClassTag[T] =
       implicitly[ClassTag[AnyRef]].asInstanceOf[ClassTag[T]]
     val sQueue = new scala.collection.mutable.Queue[RDD[T]]
-    sQueue.enqueue(queue.asScala.map(_.rdd).toSeq: _*)
+    sQueue ++= queue.asScala.map(_.rdd)
     ssc.queueStream(sQueue, oneAtATime)
   }
 
@@ -396,7 +404,7 @@ class JavaStreamingContext(val ssc: StreamingContext) extends Closeable {
    * Create an input stream from a queue of RDDs. In each batch,
    * it will process either one or all of the RDDs returned by the queue.
    *
-   * NOTE:
+   * @note
    * 1. Changes to the queue after the stream is created will not be recognized.
    * 2. Arbitrary RDDs can be added to `queueStream`, there is no way to recover data of
    * those RDDs, so `queueStream` doesn't support checkpointing.
@@ -413,13 +421,13 @@ class JavaStreamingContext(val ssc: StreamingContext) extends Closeable {
     implicit val cm: ClassTag[T] =
       implicitly[ClassTag[AnyRef]].asInstanceOf[ClassTag[T]]
     val sQueue = new scala.collection.mutable.Queue[RDD[T]]
-    sQueue.enqueue(queue.asScala.map(_.rdd).toSeq: _*)
+    sQueue ++= queue.asScala.map(_.rdd)
     ssc.queueStream(sQueue, oneAtATime, defaultRDD.rdd)
   }
 
   /**
      * Create an input stream with any arbitrary user implemented receiver.
-     * Find more details at: http://spark.apache.org/docs/latest/streaming-custom-receivers.html
+     * Find more details at: https://spark.apache.org/docs/latest/streaming-custom-receivers.html
      * @param receiver Custom implementation of Receiver
      */
   def receiverStream[T](receiver: Receiver[T]): JavaReceiverInputDStream[T] = {
@@ -431,32 +439,32 @@ class JavaStreamingContext(val ssc: StreamingContext) extends Closeable {
   /**
    * Create a unified DStream from multiple DStreams of the same type and same slide duration.
    */
-  def union[T](first: JavaDStream[T], rest: JList[JavaDStream[T]]): JavaDStream[T] = {
-    val dstreams: Seq[DStream[T]] = (Seq(first) ++ rest.asScala).map(_.dstream)
-    implicit val cm: ClassTag[T] = first.classTag
-    ssc.union(dstreams)(cm)
+  @varargs
+  def union[T](jdstreams: JavaDStream[T]*): JavaDStream[T] = {
+    require(jdstreams.nonEmpty, "Union called on no streams")
+    implicit val cm: ClassTag[T] = jdstreams.head.classTag
+    ssc.union(jdstreams.map(_.dstream))(cm)
   }
 
   /**
    * Create a unified DStream from multiple DStreams of the same type and same slide duration.
    */
-  def union[K, V](
-      first: JavaPairDStream[K, V],
-      rest: JList[JavaPairDStream[K, V]]
-    ): JavaPairDStream[K, V] = {
-    val dstreams: Seq[DStream[(K, V)]] = (Seq(first) ++ rest.asScala).map(_.dstream)
-    implicit val cm: ClassTag[(K, V)] = first.classTag
-    implicit val kcm: ClassTag[K] = first.kManifest
-    implicit val vcm: ClassTag[V] = first.vManifest
-    new JavaPairDStream[K, V](ssc.union(dstreams)(cm))(kcm, vcm)
+  @varargs
+  def union[K, V](jdstreams: JavaPairDStream[K, V]*): JavaPairDStream[K, V] = {
+    require(jdstreams.nonEmpty, "Union called on no streams")
+    implicit val cm: ClassTag[(K, V)] = jdstreams.head.classTag
+    implicit val kcm: ClassTag[K] = jdstreams.head.kManifest
+    implicit val vcm: ClassTag[V] = jdstreams.head.vManifest
+    new JavaPairDStream[K, V](ssc.union(jdstreams.map(_.dstream))(cm))(kcm, vcm)
   }
 
   /**
    * Create a new DStream in which each RDD is generated by applying a function on RDDs of
    * the DStreams. The order of the JavaRDDs in the transform function parameter will be the
-   * same as the order of corresponding DStreams in the list. Note that for adding a
-   * JavaPairDStream in the list of JavaDStreams, convert it to a JavaDStream using
-   * [[org.apache.spark.streaming.api.java.JavaPairDStream]].toJavaDStream().
+   * same as the order of corresponding DStreams in the list.
+   *
+   * @note For adding a JavaPairDStream in the list of JavaDStreams, convert it to a
+   * JavaDStream using [[org.apache.spark.streaming.api.java.JavaPairDStream]].toJavaDStream().
    * In the transform function, convert the JavaRDD corresponding to that JavaDStream to
    * a JavaPairRDD using org.apache.spark.api.java.JavaPairRDD.fromJavaRDD().
    */
@@ -476,9 +484,10 @@ class JavaStreamingContext(val ssc: StreamingContext) extends Closeable {
   /**
    * Create a new DStream in which each RDD is generated by applying a function on RDDs of
    * the DStreams. The order of the JavaRDDs in the transform function parameter will be the
-   * same as the order of corresponding DStreams in the list. Note that for adding a
-   * JavaPairDStream in the list of JavaDStreams, convert it to a JavaDStream using
-   * [[org.apache.spark.streaming.api.java.JavaPairDStream]].toJavaDStream().
+   * same as the order of corresponding DStreams in the list.
+   *
+   * @note For adding a JavaPairDStream in the list of JavaDStreams, convert it to
+   * a JavaDStream using [[org.apache.spark.streaming.api.java.JavaPairDStream]].toJavaDStream().
    * In the transform function, convert the JavaRDD corresponding to that JavaDStream to
    * a JavaPairRDD using org.apache.spark.api.java.JavaPairRDD.fromJavaRDD().
    */
@@ -502,7 +511,7 @@ class JavaStreamingContext(val ssc: StreamingContext) extends Closeable {
    * fault-tolerance. The graph will be checkpointed every batch interval.
    * @param directory HDFS-compatible directory where the checkpoint data will be reliably stored
    */
-  def checkpoint(directory: String) {
+  def checkpoint(directory: String): Unit = {
     ssc.checkpoint(directory)
   }
 
@@ -513,7 +522,7 @@ class JavaStreamingContext(val ssc: StreamingContext) extends Closeable {
    * if the developer wishes to query old data outside the DStream computation).
    * @param duration Minimum duration that each DStream should remember its RDDs
    */
-  def remember(duration: Duration) {
+  def remember(duration: Duration): Unit = {
     ssc.remember(duration)
   }
 
@@ -521,7 +530,7 @@ class JavaStreamingContext(val ssc: StreamingContext) extends Closeable {
    * Add a [[org.apache.spark.streaming.scheduler.StreamingListener]] object for
    * receiving system events related to streaming.
    */
-  def addStreamingListener(streamingListener: StreamingListener) {
+  def addStreamingListener(streamingListener: StreamingListener): Unit = {
     ssc.addStreamingListener(streamingListener)
   }
 

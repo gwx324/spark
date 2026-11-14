@@ -1,0 +1,76 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.internal.connector
+
+import org.apache.spark.sql.connector.expressions.Expression
+import org.apache.spark.sql.connector.expressions.GeneralScalarExpression
+import org.apache.spark.sql.connector.expressions.GetArrayItem
+import org.apache.spark.sql.connector.expressions.VariantGet
+import org.apache.spark.sql.connector.read.LookupParameter
+import org.apache.spark.sql.connector.util.V2ExpressionSQLBuilder
+
+/**
+ * The builder to generate `toString` information of V2 expressions.
+ */
+class ToStringSQLBuilder extends V2ExpressionSQLBuilder with Serializable {
+  override protected def visitUserDefinedScalarFunction(
+      funcName: String, canonicalName: String, inputs: Array[String]) =
+    s"""$funcName(${inputs.mkString(", ")})"""
+
+  override protected def visitUserDefinedAggregateFunction(
+      funcName: String,
+      canonicalName: String,
+      isDistinct: Boolean,
+      inputs: Array[String]): String = {
+    val distinct = if (isDistinct) "DISTINCT " else ""
+    s"""$funcName($distinct${inputs.mkString(", ")})"""
+  }
+
+  // A parameter has no value to repeat, so the null-safe expansion would print one parameter as
+  // three markers and misstate how many parameter fields the predicate carries.
+  override protected def visitBinaryComparison(
+      name: String, le: Expression, re: Expression): String = {
+    if (name == "<=>" && (le.isInstanceOf[LookupParameter] || re.isInstanceOf[LookupParameter])) {
+      inputToSQL(le) + " <=> " + inputToSQL(re)
+    } else {
+      super.visitBinaryComparison(name, le, re)
+    }
+  }
+
+  override protected def visitGetArrayItem(getArrayItem: GetArrayItem): String = {
+    s"${getArrayItem.childArray.toString}[${getArrayItem.ordinal.toString}]"
+  }
+
+  override protected def visitVariantGet(variantGet: VariantGet): String = {
+    val funcName = if (variantGet.failOnError()) "variant_get" else "try_variant_get"
+    val col = variantGet.child()
+    val path = variantGet.path()
+    val typ = variantGet.targetType().catalogString
+    val tz = Option(variantGet.timeZoneId()).map(z => s", tz=$z").getOrElse("")
+    s"$funcName($col, '$path', $typ$tz)"
+  }
+
+  // `super.visitUnexpectedExpr` builds its error message from `expr.toString`, which calls back
+  // into `ToStringSQLBuilder` for a `GeneralScalarExpression`, so an unknown name would recurse
+  // until StackOverflowError. Render it as a function call instead.
+  override protected def visitUnexpectedExpr(expr: Expression): String = expr match {
+    case e: GeneralScalarExpression => visitSQLFunction(e.name(), e.children())
+    case p: LookupParameter => p.describe()
+    case _ => super.visitUnexpectedExpr(expr)
+  }
+}

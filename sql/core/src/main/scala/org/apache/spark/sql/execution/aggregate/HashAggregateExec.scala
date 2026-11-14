@@ -17,18 +17,31 @@
 
 package org.apache.spark.sql.execution.aggregate
 
+import java.util.concurrent.TimeUnit._
+
+import scala.collection.mutable
+
 import org.apache.spark.TaskContext
+import org.apache.spark.internal.LogKeys.CONFIG
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.errors._
 import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.expressions.BindReferences.bindReferences
 import org.apache.spark.sql.catalyst.expressions.aggregate._
 import org.apache.spark.sql.catalyst.expressions.codegen._
-import org.apache.spark.sql.catalyst.plans.physical._
+import org.apache.spark.sql.catalyst.expressions.codegen.Block._
+import org.apache.spark.sql.catalyst.plans.logical.Aggregate
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
+import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
+import org.apache.spark.sql.catalyst.util.{truncatedString, UnsafeRowUtils}
+import org.apache.spark.sql.catalyst.util.DateTimeConstants.NANOS_PER_MILLIS
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
-import org.apache.spark.sql.types.{DecimalType, StringType, StructType}
+import org.apache.spark.sql.execution.vectorized.MutableColumnarRow
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.types.{CalendarIntervalType, DecimalType, StringType, UserDefinedType}
 import org.apache.spark.unsafe.KVIterator
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.Utils
 
 /**
@@ -36,21 +49,21 @@ import org.apache.spark.util.Utils
  */
 case class HashAggregateExec(
     requiredChildDistributionExpressions: Option[Seq[Expression]],
+    isStreaming: Boolean,
+    numShufflePartitions: Option[Int],
     groupingExpressions: Seq[NamedExpression],
     aggregateExpressions: Seq[AggregateExpression],
     aggregateAttributes: Seq[Attribute],
     initialInputBufferOffset: Int,
     resultExpressions: Seq[NamedExpression],
     child: SparkPlan)
-  extends UnaryExecNode with CodegenSupport {
+  extends AggregateCodegenSupport {
 
-  private[this] val aggregateBufferAttributes = {
-    aggregateExpressions.flatMap(_.aggregateFunction.aggBufferAttributes)
-  }
+  require(Aggregate.supportsHashAggregate(aggregateBufferAttributes, groupingExpressions))
+  require(!isStreaming ||
+    groupingExpressions.forall(e => UnsafeRowUtils.isBinaryStable(e.dataType)))
 
-  require(HashAggregateExec.supportsAggregate(aggregateBufferAttributes))
-
-  override lazy val allAttributes: AttributeSeq =
+  override def allAttributes: AttributeSeq =
     child.output ++ aggregateBufferAttributes ++ aggregateAttributes ++
       aggregateExpressions.flatMap(_.aggregateFunction.inputAggBufferAttributes)
 
@@ -58,27 +71,27 @@ case class HashAggregateExec(
     "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"),
     "peakMemory" -> SQLMetrics.createSizeMetric(sparkContext, "peak memory"),
     "spillSize" -> SQLMetrics.createSizeMetric(sparkContext, "spill size"),
-    "aggTime" -> SQLMetrics.createTimingMetric(sparkContext, "aggregate time"))
-
-  override def output: Seq[Attribute] = resultExpressions.map(_.toAttribute)
-
-  override def producedAttributes: AttributeSet =
-    AttributeSet(aggregateAttributes) ++
-    AttributeSet(resultExpressions.diff(groupingExpressions).map(_.toAttribute)) ++
-    AttributeSet(aggregateBufferAttributes)
-
-  override def requiredChildDistribution: List[Distribution] = {
-    requiredChildDistributionExpressions match {
-      case Some(exprs) if exprs.isEmpty => AllTuples :: Nil
-      case Some(exprs) if exprs.nonEmpty => ClusteredDistribution(exprs) :: Nil
-      case None => UnspecifiedDistribution :: Nil
+    "aggTime" -> SQLMetrics.createTimingMetric(sparkContext, "time in aggregation build"),
+    "avgHashProbe" ->
+      SQLMetrics.createAverageMetric(sparkContext, "avg hash probes per key"),
+    "numTasksFallBacked" -> SQLMetrics.createMetric(sparkContext, "number of sort fallback tasks")
+  ) ++ {
+    // Only the aggregates that can actually pass rows through report this, so the rest do not
+    // show a constant 0 in the SQL UI (see `UnionExec.metrics` for the same approach).
+    if (adaptivePartialAggEnabled) {
+      Map("numPassthroughRows" ->
+        SQLMetrics.createMetric(sparkContext, "number of pass-through output rows"))
+    } else {
+      Map.empty[String, SQLMetric]
     }
   }
 
   // This is for testing. We force TungstenAggregationIterator to fall back to the unsafe row hash
   // map and/or the sort-based aggregation once it has processed a given number of input rows.
   private val testFallbackStartsAt: Option[(Int, Int)] = {
-    sqlContext.getConf("spark.sql.TungstenAggregate.testFallbackStartsAt", null) match {
+    Option(session).map { s =>
+      s.conf.get("spark.sql.TungstenAggregate.testFallbackStartsAt", null)
+    }.orNull match {
       case null | "" => None
       case fallbackStartsAt =>
         val splits = fallbackStartsAt.split(",").map(_.trim)
@@ -86,34 +99,49 @@ case class HashAggregateExec(
     }
   }
 
-  protected override def doExecute(): RDD[InternalRow] = attachTree(this, "execute") {
+  protected override def doExecute(): RDD[InternalRow] = {
     val numOutputRows = longMetric("numOutputRows")
     val peakMemory = longMetric("peakMemory")
     val spillSize = longMetric("spillSize")
+    val avgHashProbe = longMetric("avgHashProbe")
+    val aggTime = longMetric("aggTime")
+    val numTasksFallBacked = longMetric("numTasksFallBacked")
+    // Registered only when the feature applies, and only read from the pass-through path.
+    val numPassthroughRows =
+      if (adaptivePartialAggEnabled) longMetric("numPassthroughRows") else null
 
-    child.execute().mapPartitions { iter =>
+    child.execute().mapPartitionsWithIndex { (partIndex, iter) =>
 
+      val beforeAgg = System.nanoTime()
       val hasInput = iter.hasNext
-      if (!hasInput && groupingExpressions.nonEmpty) {
+      val res = if (!hasInput && groupingExpressions.nonEmpty) {
         // This is a grouped aggregate and the input iterator is empty,
         // so return an empty iterator.
         Iterator.empty
       } else {
         val aggregationIterator =
           new TungstenAggregationIterator(
+            partIndex,
             groupingExpressions,
             aggregateExpressions,
             aggregateAttributes,
             initialInputBufferOffset,
             resultExpressions,
             (expressions, inputSchema) =>
-              newMutableProjection(expressions, inputSchema, subexpressionEliminationEnabled),
-            child.output,
+              MutableProjection.create(expressions, inputSchema),
+            inputAttributes,
             iter,
             testFallbackStartsAt,
             numOutputRows,
             peakMemory,
-            spillSize)
+            spillSize,
+            avgHashProbe,
+            numTasksFallBacked,
+            numPassthroughRows,
+            adaptivePartialAggEnabled,
+            adaptiveMinRows,
+            adaptiveMinCompaction,
+            adaptiveMinCompactionToSpill)
         if (!hasInput && groupingExpressions.isEmpty) {
           numOutputRows += 1
           Iterator.single[UnsafeRow](aggregationIterator.outputForEmptyGroupingKeyWithoutInput())
@@ -121,171 +149,145 @@ case class HashAggregateExec(
           aggregationIterator
         }
       }
+      aggTime += NANOSECONDS.toMillis(System.nanoTime() - beforeAgg)
+      res
     }
-  }
-
-  // all the mode of aggregate expressions
-  private val modes = aggregateExpressions.map(_.mode).distinct
-
-  override def usedInputs: AttributeSet = inputSet
-
-  override def supportCodegen: Boolean = {
-    // ImperativeAggregate is not supported right now
-    !aggregateExpressions.exists(_.aggregateFunction.isInstanceOf[ImperativeAggregate])
-  }
-
-  override def inputRDDs(): Seq[RDD[InternalRow]] = {
-    child.asInstanceOf[CodegenSupport].inputRDDs()
-  }
-
-  protected override def doProduce(ctx: CodegenContext): String = {
-    if (groupingExpressions.isEmpty) {
-      doProduceWithoutKeys(ctx)
-    } else {
-      doProduceWithKeys(ctx)
-    }
-  }
-
-  override def doConsume(ctx: CodegenContext, input: Seq[ExprCode], row: ExprCode): String = {
-    if (groupingExpressions.isEmpty) {
-      doConsumeWithoutKeys(ctx, input)
-    } else {
-      doConsumeWithKeys(ctx, input)
-    }
-  }
-
-  // The variables used as aggregation buffer
-  private var bufVars: Seq[ExprCode] = _
-
-  private def doProduceWithoutKeys(ctx: CodegenContext): String = {
-    val initAgg = ctx.freshName("initAgg")
-    ctx.addMutableState("boolean", initAgg, s"$initAgg = false;")
-
-    // generate variables for aggregation buffer
-    val functions = aggregateExpressions.map(_.aggregateFunction.asInstanceOf[DeclarativeAggregate])
-    val initExpr = functions.flatMap(f => f.initialValues)
-    bufVars = initExpr.map { e =>
-      val isNull = ctx.freshName("bufIsNull")
-      val value = ctx.freshName("bufValue")
-      ctx.addMutableState("boolean", isNull, "")
-      ctx.addMutableState(ctx.javaType(e.dataType), value, "")
-      // The initial expression should not access any column
-      val ev = e.genCode(ctx)
-      val initVars = s"""
-         | $isNull = ${ev.isNull};
-         | $value = ${ev.value};
-       """.stripMargin
-      ExprCode(ev.code + initVars, isNull, value)
-    }
-    val initBufVar = evaluateVariables(bufVars)
-
-    // generate variables for output
-    val (resultVars, genResult) = if (modes.contains(Final) || modes.contains(Complete)) {
-      // evaluate aggregate results
-      ctx.currentVars = bufVars
-      val aggResults = functions.map(_.evaluateExpression).map { e =>
-        BindReferences.bindReference(e, aggregateBufferAttributes).genCode(ctx)
-      }
-      val evaluateAggResults = evaluateVariables(aggResults)
-      // evaluate result expressions
-      ctx.currentVars = aggResults
-      val resultVars = resultExpressions.map { e =>
-        BindReferences.bindReference(e, aggregateAttributes).genCode(ctx)
-      }
-      (resultVars, s"""
-        |$evaluateAggResults
-        |${evaluateVariables(resultVars)}
-       """.stripMargin)
-    } else if (modes.contains(Partial) || modes.contains(PartialMerge)) {
-      // output the aggregate buffer directly
-      (bufVars, "")
-    } else {
-      // no aggregate function, the result should be literals
-      val resultVars = resultExpressions.map(_.genCode(ctx))
-      (resultVars, evaluateVariables(resultVars))
-    }
-
-    val doAgg = ctx.freshName("doAggregateWithoutKey")
-    ctx.addNewFunction(doAgg,
-      s"""
-         | private void $doAgg() throws java.io.IOException {
-         |   // initialize aggregation buffer
-         |   $initBufVar
-         |
-         |   ${child.asInstanceOf[CodegenSupport].produce(ctx, this)}
-         | }
-       """.stripMargin)
-
-    val numOutput = metricTerm(ctx, "numOutputRows")
-    val aggTime = metricTerm(ctx, "aggTime")
-    val beforeAgg = ctx.freshName("beforeAgg")
-    s"""
-       | while (!$initAgg) {
-       |   $initAgg = true;
-       |   long $beforeAgg = System.nanoTime();
-       |   $doAgg();
-       |   $aggTime.add((System.nanoTime() - $beforeAgg) / 1000000);
-       |
-       |   // output the result
-       |   ${genResult.trim}
-       |
-       |   $numOutput.add(1);
-       |   ${consume(ctx, resultVars).trim}
-       | }
-     """.stripMargin
-  }
-
-  private def doConsumeWithoutKeys(ctx: CodegenContext, input: Seq[ExprCode]): String = {
-    // only have DeclarativeAggregate
-    val functions = aggregateExpressions.map(_.aggregateFunction.asInstanceOf[DeclarativeAggregate])
-    val inputAttrs = functions.flatMap(_.aggBufferAttributes) ++ child.output
-    val updateExpr = aggregateExpressions.flatMap { e =>
-      e.mode match {
-        case Partial | Complete =>
-          e.aggregateFunction.asInstanceOf[DeclarativeAggregate].updateExpressions
-        case PartialMerge | Final =>
-          e.aggregateFunction.asInstanceOf[DeclarativeAggregate].mergeExpressions
-      }
-    }
-    ctx.currentVars = bufVars ++ input
-    val boundUpdateExpr = updateExpr.map(BindReferences.bindReference(_, inputAttrs))
-    val subExprs = ctx.subexpressionEliminationForWholeStageCodegen(boundUpdateExpr)
-    val effectiveCodes = subExprs.codes.mkString("\n")
-    val aggVals = ctx.withSubExprEliminationExprs(subExprs.states) {
-      boundUpdateExpr.map(_.genCode(ctx))
-    }
-    // aggregate buffer should be updated atomic
-    val updates = aggVals.zipWithIndex.map { case (ev, i) =>
-      s"""
-         | ${bufVars(i).isNull} = ${ev.isNull};
-         | ${bufVars(i).value} = ${ev.value};
-       """.stripMargin
-    }
-    s"""
-       | // do aggregate
-       | // common sub-expressions
-       | $effectiveCodes
-       | // evaluate aggregate function
-       | ${evaluateVariables(aggVals)}
-       | // update aggregation buffer
-       | ${updates.mkString("\n").trim}
-     """.stripMargin
   }
 
   private val groupingAttributes = groupingExpressions.map(_.toAttribute)
-  private val groupingKeySchema = StructType.fromAttributes(groupingAttributes)
+  private val groupingKeySchema = DataTypeUtils.fromAttributes(groupingAttributes)
   private val declFunctions = aggregateExpressions.map(_.aggregateFunction)
     .filter(_.isInstanceOf[DeclarativeAggregate])
     .map(_.asInstanceOf[DeclarativeAggregate])
-  private val bufferSchema = StructType.fromAttributes(aggregateBufferAttributes)
+  private val bufferSchema = DataTypeUtils.fromAttributes(aggregateBufferAttributes)
 
-  // The name for Vectorized HashMap
-  private var vectorizedHashMapTerm: String = _
-  private var isVectorizedHashMapEnabled: Boolean = _
+  /**
+   * Whether adaptive partial aggregation applies to this operator. When it does, the aggregation
+   * may bypass partial aggregation at runtime and pass the remaining input rows through as
+   * single-row partial buffers (see [[SQLConf.ADAPTIVE_PARTIAL_AGGREGATION_ENABLED]]). It only
+   * applies to a pre-shuffle partial aggregation with grouping keys:
+   *   - `Partial` and `PartialMerge` modes only: the downstream `Final` aggregation merges the
+   *     passed-through single-row buffers. `Final`/`Complete` produce the result themselves and
+   *     have no such downstream. A `PartialMerge` member is the non-distinct aggregate of the
+   *     DISTINCT intermediate phase (`AggUtils.planAggregateWithOneDistinct`): its input row is
+   *     already a partial buffer, so the pass-through applies the merge to an empty buffer, which
+   *     leaves the incoming buffer unchanged, and the downstream `Final` re-merges it. A pure
+   *     `PartialMerge` phase (the de-duplication on keys ++ distinct columns) must not bypass, or
+   *     duplicate (key, distinct column) rows would over-count DISTINCT. The built-in planner
+   *     never emits such a phase without a required distribution, so the
+   *     `requiredChildDistributionExpressions` check below already keeps it out. The
+   *     `exists(_.mode == Partial)` check is a defensive guard on top of it, and only for a
+   *     de-duplication phase that carries non-distinct aggregates: one with none at all has an
+   *     empty `aggregateExpressions`, is admitted by the `isEmpty` disjunct, and still relies on
+   *     the distribution check alone.
+   *   - grouping keys present: a global aggregation produces a single output row, so partial
+   *     aggregation achieves the maximum reduction and must never be bypassed.
+   *   - no required distribution: with no aggregate functions (a group-by-only aggregate) the
+   *     mode check is vacuously true for both phases, so `requiredChildDistributionExpressions`
+   *     tells them apart, the `Final` phase requiring a distribution and the pre-shuffle phase
+   *     not. It is not a general pre-shuffle test, because `AggUtils.planAggregateWithOneDistinct`
+   *     leaves it `None` on a post-shuffle aggregate. DISTINCT aggregate functions are allowed:
+   *     the phase that de-duplicates on (keys ++ distinct columns) requires a distribution, so
+   *     this check keeps it out, while the distinct partial phase that groups on the keys alone
+   *     (carrying the non-distinct aggregates as `PartialMerge`) is eligible even though it sits
+   *     after a shuffle: another `Exchange` and a `Final` follow it, so its passed-through
+   *     buffers are still merged.
+   *   - batch only: a streaming partial aggregate keeps state across batches, and it is built
+   *     with all-`Partial` modes and no required distribution, so it would otherwise qualify.
+   *     A batch `session_window` grouping likewise qualifies, but its partial aggregate feeds a
+   *     `MergingSessionsExec` that merges overlapping sessions, so it is kept out for now. The
+   *     static sibling `spark.sql.execution.bypassPartialAggregation` likewise stays away from
+   *     streaming and `session_window` groupings.
+   */
+  private val adaptivePartialAggEnabled: Boolean = {
+    conf.adaptivePartialAggregationEnabled &&
+      groupingExpressions.nonEmpty &&
+      !isStreaming &&
+      !groupingExpressions.exists(_.metadata.contains(SessionWindow.marker)) &&
+      aggregateExpressions.forall(a => a.mode == Partial || a.mode == PartialMerge) &&
+      (aggregateExpressions.exists(_.mode == Partial) || aggregateExpressions.isEmpty) &&
+      requiredChildDistributionExpressions.isEmpty
+  }
+
+  // The number of rows between two compaction-ratio evaluations, and the ratios below which the
+  // partial aggregation is considered ineffective: at the periodic check, and when the map is
+  // about to spill. Keeping the aggregation past that point means aggregating the rest of the
+  // input through spills, so the spill check never demands less compaction than the periodic one.
+  // Only read when the feature applies.
+  private val adaptiveMinRows: Long = conf.adaptivePartialAggregationMinRows
+  private val adaptiveMinCompaction: Double = conf.adaptivePartialAggregationMinCompaction
+  private val adaptiveMinCompactionToSpill: Double =
+    math.max(adaptiveMinCompaction, conf.adaptivePartialAggregationMinCompactionToSpill)
+
+  // The name for Fast HashMap
+  private var fastHashMapTerm: String = _
+  private var isFastHashMapEnabled: Boolean = false
+
+  // whether a vectorized hashmap is used instead
+  // we have decided to always use the row-based hashmap,
+  // but the vectorized hashmap can still be switched on for testing and benchmarking purposes.
+  private var isVectorizedHashMapEnabled: Boolean = false
 
   // The name for UnsafeRow HashMap
   private var hashMapTerm: String = _
   private var sorterTerm: String = _
+
+  // Codegen state for adaptive partial aggregation. When the aggregation maps stop collapsing
+  // enough rows, the operator stops populating them and instead streams each remaining row through
+  // as a single-row partial buffer for the Final aggregate to merge. The compaction ratio is
+  // measured at the operator level: all processed rows against the keys held by both the fast and
+  // the regular map, so two-level-map routing does not change the decision.
+  private var adaptivePassThroughTerm: String = _
+  private var processedRowsTerm: String = _
+  private var adaptiveChildrenConsumedTerm: String = _
+  // Whether the map output has already been emitted (and the maps freed). Once pass-through is
+  // active the maps are frozen; draining them -- which also frees them -- releases their memory
+  // before the rest of the input is streamed. The drain starts as soon as the first passed-through
+  // row queues a copy behind the maps, advancing one map row per queued row (see
+  // `handlePassThroughRow`); this flag lets the later output skip the maps.
+  private var adaptiveMapOutputDoneTerm: String = _
+  // Whether the map iterators have been set up (`finishHashMap`). The map-output function may be
+  // re-entered when its loops return via `shouldStop()` to drain the buffer, and `finishAggregate`
+  // destructs the map, so the setup must run only once.
+  private var adaptiveMapSetupDoneTerm: String = _
+  // The processed-row count at which the compaction ratio is evaluated next. It advances by
+  // `minRows` after every check, and the count is reset after a spill so the new in-memory map
+  // epoch is judged on its own rows.
+  private var adaptiveNextCheckRowTerm: String = _
+  // The fast map's key count as of the last spill. The fast map never spills and is never cleared,
+  // so its keys outlive the epoch the processed-row count is reset for; subtracting this baseline
+  // keeps both sides of the ratio on the same epoch. Once the fast map fills it stops accepting
+  // keys, so the difference settles at zero and the ratio is the regular map's alone.
+  private var adaptiveFastKeysAtSpillTerm: String = _
+  // The epoch's key count at its last periodic check, and at the check before that, where the
+  // window of recent rows that the spill check judges starts (see `adaptiveIneffective`). The
+  // checks run at multiples of `minRows`, and the next check row advances only past a check that
+  // keeps aggregating, so the window starts `2 * minRows` rows before the next check row, or at
+  // the epoch start before the second check.
+  private var adaptiveCheckKeysTerm: String = _
+  private var adaptiveWindowKeysTerm: String = _
+  // The name of the generated output function, promoted to a field so `doConsumeWithKeys` can emit
+  // pass-through rows directly from within the build loop.
+  private var outputFunc: String = _
+  // The name of the generated function that drains the frozen maps and, once they are fully
+  // drained, flushes the queue of passed-through rows held behind them. Promoted to a field so
+  // `doConsumeWithKeys` can advance the maps one row per passed-through row (see
+  // `handlePassThroughRow`).
+  private var adaptiveOutputMapAndFlushFuncName: String = _
+  // The queue of passed-through rows, held behind the frozen maps so the maps are emitted first.
+  // Each queued row advances the map output by one row, so the queue stays bounded by how many
+  // passed-through rows a child emits before it honours `shouldStop()` (see
+  // `handlePassThroughRow`).
+  private var adaptivePendingRowsTerm: String = _
+  // The initial aggregation buffer, and the reusable buffer each passed-through row starts from.
+  // The reusable buffer is reset with `copyFrom`, as on the interpreted path, so the per-row reset
+  // is a single call however many buffer slots there are. Both are created once per task and
+  // registered in `doProduceWithKeys`, which runs once, rather than in `doConsumeWithKeys`, which
+  // runs once per child of a fused `UnionExec`. Reusing one buffer is safe because a
+  // passed-through row is copied before it is queued, and `outputFunc` reads the buffer before it
+  // returns.
+  private var adaptiveEmptyBufferTerm: String = _
+  private var adaptivePassThroughBufferTerm: String = _
 
   /**
    * This is called by generated Java class, should be public.
@@ -300,11 +302,30 @@ case class HashAggregateExec(
       initialBuffer,
       bufferSchema,
       groupingKeySchema,
-      TaskContext.get().taskMemoryManager(),
+      TaskContext.get(),
       1024 * 16, // initial capacity
-      TaskContext.get().taskMemoryManager().pageSizeBytes,
-      false // disable tracking of performance metrics
+      TaskContext.get().taskMemoryManager().pageSizeBytes
     )
+  }
+
+  def getTaskContext(): TaskContext = {
+    TaskContext.get()
+  }
+
+  /**
+   * Registers a task-completion hook to close the generated fast hash map, so that the close hook
+   * is a plain method call on this plan, with the listener being a lambda in compiled Scala code,
+   * rather than an anonymous `TaskCompletionListener` emitted per fast hash map (one fewer
+   * generated inner class per map). This is called by the generated Java class, should be public.
+   */
+  def addFastHashMapCloseHook(fastHashMap: AutoCloseable): Unit = {
+    TaskContext.get().addTaskCompletionListener[Unit](_ => fastHashMap.close())
+  }
+
+  def getEmptyAggregationBuffer(): InternalRow = {
+    val initExpr = declFunctions.flatMap(f => f.initialValues)
+    val initialBuffer = UnsafeProjection.create(initExpr)(EmptyRow)
+    initialBuffer
   }
 
   /**
@@ -321,7 +342,9 @@ case class HashAggregateExec(
       hashMap: UnsafeFixedWidthAggregationMap,
       sorter: UnsafeKVExternalSorter,
       peakMemory: SQLMetric,
-      spillSize: SQLMetric): KVIterator[UnsafeRow, UnsafeRow] = {
+      spillSize: SQLMetric,
+      avgHashProbe: SQLMetric,
+      numTasksFallBacked: SQLMetric): KVIterator[UnsafeRow, UnsafeRow] = {
 
     // update peak execution memory
     val mapMemory = hashMap.getPeakMemoryUsedBytes
@@ -331,12 +354,16 @@ case class HashAggregateExec(
     peakMemory.add(maxMemory)
     metrics.incPeakExecutionMemory(maxMemory)
 
+    // Update average hashmap probe
+    avgHashProbe.set(hashMap.getAvgHashProbesPerKey)
+
     if (sorter == null) {
       // not spilled
       return hashMap.iterator()
     }
 
     // merge the final hashMap into sorter
+    numTasksFallBacked += 1
     sorter.merge(hashMap.destructAndCreateExternalSorter())
     hashMap.free()
     val sortedIter = sorter.sortedIterator()
@@ -346,10 +373,9 @@ case class HashAggregateExec(
 
       // Create a MutableProjection to merge the rows of same key together
       val mergeExpr = declFunctions.flatMap(_.mergeExpressions)
-      val mergeProjection = newMutableProjection(
+      val mergeProjection = MutableProjection.create(
         mergeExpr,
-        aggregateBufferAttributes ++ declFunctions.flatMap(_.inputAggBufferAttributes),
-        subexpressionEliminationEnabled)
+        aggregateBufferAttributes ++ declFunctions.flatMap(_.inputAggBufferAttributes))
       val joinedRow = new JoinedRow()
 
       var currentKey: UnsafeRow = null
@@ -372,7 +398,7 @@ case class HashAggregateExec(
           var findNextGroup = false
           while (!findNextGroup && sortedIter.next()) {
             val key = sortedIter.getKey
-            if (currentKey.equals(key)) {
+            if (hashMap.keysEqual(currentKey, key)) {
               mergeProjection(joinedRow(currentRow, sortedIter.getValue))
             } else {
               // We find a new group.
@@ -398,12 +424,15 @@ case class HashAggregateExec(
 
   /**
    * Generate the code for output.
+   * @return function name for the result code.
    */
-  private def generateResultCode(
-      ctx: CodegenContext,
-      keyTerm: String,
-      bufferTerm: String,
-      plan: String): String = {
+  private def generateResultFunction(ctx: CodegenContext): String = {
+    val funcName = ctx.freshName("doAggregateWithKeysOutput")
+    val keyTerm = ctx.freshName("keyTerm")
+    val bufferTerm = ctx.freshName("bufferTerm")
+    val numOutput = metricTerm(ctx, "numOutputRows")
+
+    val body =
     if (modes.contains(Final) || modes.contains(Complete)) {
       // generate output using resultExpressions
       ctx.currentVars = null
@@ -419,202 +448,538 @@ case class HashAggregateExec(
       val evaluateBufferVars = evaluateVariables(bufferVars)
       // evaluate the aggregation result
       ctx.currentVars = bufferVars
-      val aggResults = declFunctions.map(_.evaluateExpression).map { e =>
-        BindReferences.bindReference(e, aggregateBufferAttributes).genCode(ctx)
-      }
+      val aggResults = bindReferences(
+        declFunctions.map(_.evaluateExpression),
+        aggregateBufferAttributes).map(_.genCode(ctx))
       val evaluateAggResults = evaluateVariables(aggResults)
       // generate the final result
       ctx.currentVars = keyVars ++ aggResults
       val inputAttrs = groupingAttributes ++ aggregateAttributes
-      val resultVars = resultExpressions.map { e =>
-        BindReferences.bindReference(e, inputAttrs).genCode(ctx)
-      }
+      val resultVars = bindReferences[Expression](
+        resultExpressions,
+        inputAttrs).map(_.genCode(ctx))
+      val evaluateNondeterministicResults =
+        evaluateNondeterministicVariables(output, resultVars, resultExpressions)
       s"""
-       $evaluateKeyVars
-       $evaluateBufferVars
-       $evaluateAggResults
-       ${consume(ctx, resultVars)}
-       """
-
+         |$evaluateKeyVars
+         |$evaluateBufferVars
+         |$evaluateAggResults
+         |$evaluateNondeterministicResults
+         |${consume(ctx, resultVars)}
+       """.stripMargin
     } else if (modes.contains(Partial) || modes.contains(PartialMerge)) {
-      // This should be the last operator in a stage, we should output UnsafeRow directly
-      val joinerTerm = ctx.freshName("unsafeRowJoiner")
-      ctx.addMutableState(classOf[UnsafeRowJoiner].getName, joinerTerm,
-        s"$joinerTerm = $plan.createUnsafeJoiner();")
-      val resultRow = ctx.freshName("resultRow")
-      s"""
-       UnsafeRow $resultRow = $joinerTerm.join($keyTerm, $bufferTerm);
-       ${consume(ctx, null, resultRow)}
-       """
+      // resultExpressions are Attributes of groupingExpressions and aggregateBufferAttributes.
+      assert(resultExpressions.forall(_.isInstanceOf[Attribute]))
+      assert(resultExpressions.length ==
+        groupingExpressions.length + aggregateBufferAttributes.length)
 
+      ctx.currentVars = null
+
+      ctx.INPUT_ROW = keyTerm
+      val keyVars = groupingExpressions.zipWithIndex.map { case (e, i) =>
+        BoundReference(i, e.dataType, e.nullable).genCode(ctx)
+      }
+      val evaluateKeyVars = evaluateVariables(keyVars)
+
+      ctx.INPUT_ROW = bufferTerm
+      val resultBufferVars = aggregateBufferAttributes.zipWithIndex.map { case (e, i) =>
+        BoundReference(i, e.dataType, e.nullable).genCode(ctx)
+      }
+      val evaluateResultBufferVars = evaluateVariables(resultBufferVars)
+
+      ctx.currentVars = keyVars ++ resultBufferVars
+      val inputAttrs = resultExpressions.map(_.toAttribute)
+      val resultVars = bindReferences[Expression](
+        resultExpressions,
+        inputAttrs).map(_.genCode(ctx))
+      s"""
+         |$evaluateKeyVars
+         |$evaluateResultBufferVars
+         |${consume(ctx, resultVars)}
+       """.stripMargin
     } else {
       // generate result based on grouping key
       ctx.INPUT_ROW = keyTerm
       ctx.currentVars = null
-      val eval = resultExpressions.map{ e =>
-        BindReferences.bindReference(e, groupingAttributes).genCode(ctx)
-      }
-      consume(ctx, eval)
+      val resultVars = bindReferences[Expression](
+        resultExpressions,
+        groupingAttributes).map(_.genCode(ctx))
+      val evaluateNondeterministicResults =
+        evaluateNondeterministicVariables(output, resultVars, resultExpressions)
+      s"""
+         |$evaluateNondeterministicResults
+         |${consume(ctx, resultVars)}
+       """.stripMargin
     }
+    ctx.addNewFunction(funcName,
+      s"""
+         |private void $funcName(UnsafeRow $keyTerm, UnsafeRow $bufferTerm)
+         |    throws java.io.IOException {
+         |  $numOutput.add(1);
+         |  $body
+         |}
+       """.stripMargin)
   }
 
   /**
-   * Using the vectorized hash map in HashAggregate is currently supported for all primitive
-   * data types during partial aggregation. However, we currently only enable the hash map for a
-   * subset of cases that've been verified to show performance improvements on our benchmarks
-   * subject to an internal conf that sets an upper limit on the maximum length of the aggregate
-   * key/value schema.
-   *
+   * A required check for any fast hash map implementation (basically the common requirements
+   * for row-based and vectorized).
+   * Currently fast hash map is supported for primitive data types during partial aggregation.
    * This list of supported use-cases should be expanded over time.
    */
-  private def enableVectorizedHashMap(ctx: CodegenContext): Boolean = {
-    val schemaLength = (groupingKeySchema ++ bufferSchema).length
+  private def checkIfFastHashMapSupported(): Boolean = {
     val isSupported =
-      (groupingKeySchema ++ bufferSchema).forall(f => ctx.isPrimitiveType(f.dataType) ||
-        f.dataType.isInstanceOf[DecimalType] || f.dataType.isInstanceOf[StringType]) &&
-        bufferSchema.nonEmpty && modes.forall(mode => mode == Partial || mode == PartialMerge)
+      groupingExpressions.forall(e => UnsafeRowUtils.isBinaryStable(e.dataType)) &&
+      groupingKeySchema.forall(!_.dataType.isInstanceOf[UserDefinedType[_]]) &&
+      (groupingKeySchema ++ bufferSchema).forall(f => CodeGenerator.isPrimitiveType(f.dataType) ||
+        f.dataType.isInstanceOf[DecimalType] || f.dataType.isInstanceOf[StringType] ||
+        f.dataType.isInstanceOf[CalendarIntervalType])
 
-    // We do not support byte array based decimal type for aggregate values as
-    // ColumnVector.putDecimal for high-precision decimals doesn't currently support in-place
+    // For vectorized hash map, We do not support byte array based decimal type for aggregate values
+    // as ColumnVector.putDecimal for high-precision decimals doesn't currently support in-place
     // updates. Due to this, appending the byte array in the vectorized hash map can turn out to be
     // quite inefficient and can potentially OOM the executor.
+    // For row-based hash map, while decimal update is supported in UnsafeRow, we will just act
+    // conservative here, due to lack of testing and benchmarking.
     val isNotByteArrayDecimalType = bufferSchema.map(_.dataType).filter(_.isInstanceOf[DecimalType])
       .forall(!DecimalType.isByteArrayDecimalType(_))
 
-    isSupported  && isNotByteArrayDecimalType &&
-      schemaLength <= sqlContext.conf.vectorizedAggregateMapMaxColumns
+    val isEnabledForAggModes =
+      if (modes.forall(mode => mode == Partial || mode == PartialMerge)) {
+        true
+      } else {
+        !conf.getConf(SQLConf.ENABLE_TWOLEVEL_AGG_MAP_PARTIAL_ONLY)
+      }
+
+    isSupported && isNotByteArrayDecimalType && isEnabledForAggModes
   }
 
-  private def doProduceWithKeys(ctx: CodegenContext): String = {
-    val initAgg = ctx.freshName("initAgg")
-    ctx.addMutableState("boolean", initAgg, s"$initAgg = false;")
-    isVectorizedHashMapEnabled = enableVectorizedHashMap(ctx)
-    vectorizedHashMapTerm = ctx.freshName("vectorizedHashMap")
-    val vectorizedHashMapClassName = ctx.freshName("VectorizedHashMap")
-    val vectorizedHashMapGenerator = new VectorizedHashMapGenerator(ctx, aggregateExpressions,
-      vectorizedHashMapClassName, groupingKeySchema, bufferSchema)
-    // Create a name for iterator from vectorized HashMap
-    val iterTermForVectorizedHashMap = ctx.freshName("vectorizedHashMapIter")
-    if (isVectorizedHashMapEnabled) {
-      ctx.addMutableState(vectorizedHashMapClassName, vectorizedHashMapTerm,
-        s"$vectorizedHashMapTerm = new $vectorizedHashMapClassName();")
-      ctx.addMutableState(
-        "java.util.Iterator<org.apache.spark.sql.execution.vectorized.ColumnarBatch.Row>",
-        iterTermForVectorizedHashMap, "")
+  private def enableTwoLevelHashMap(): Unit = {
+    if (!checkIfFastHashMapSupported()) {
+      if (!Utils.isTesting) {
+        logInfo(log"${MDC(CONFIG, SQLConf.ENABLE_TWOLEVEL_AGG_MAP.key)} is set to true, but" +
+          log" current version of codegened fast hashmap does not support this aggregate.")
+      }
+    } else {
+      isFastHashMapEnabled = true
+
+      // This is for testing/benchmarking only.
+      // We enforce to first level to be a vectorized hashmap, instead of the default row-based one.
+      isVectorizedHashMapEnabled = conf.enableVectorizedHashMap
+    }
+  }
+
+  protected override def needHashTable: Boolean = true
+
+  protected override def doProduceWithKeys(ctx: CodegenContext): String = {
+    val initAgg = ctx.addMutableState(CodeGenerator.JAVA_BOOLEAN, "initAgg")
+    if (adaptivePartialAggEnabled) {
+      adaptivePassThroughTerm =
+        ctx.addMutableState(CodeGenerator.JAVA_BOOLEAN, "adaptivePassThrough")
+      processedRowsTerm = ctx.addMutableState(CodeGenerator.JAVA_LONG, "processedRows")
+      adaptiveNextCheckRowTerm =
+        ctx.addMutableState(CodeGenerator.JAVA_LONG, "adaptiveNextCheckRow",
+          v => s"$v = ${adaptiveMinRows}L;")
+      adaptiveChildrenConsumedTerm =
+        ctx.addMutableState(CodeGenerator.JAVA_BOOLEAN, "adaptiveChildrenConsumed")
+      adaptiveMapOutputDoneTerm =
+        ctx.addMutableState(CodeGenerator.JAVA_BOOLEAN, "adaptiveMapOutputDone")
+      adaptiveMapSetupDoneTerm =
+        ctx.addMutableState(CodeGenerator.JAVA_BOOLEAN, "adaptiveMapSetupDone")
+      adaptiveFastKeysAtSpillTerm =
+        ctx.addMutableState(CodeGenerator.JAVA_INT, "adaptiveFastKeysAtSpill")
+      adaptiveCheckKeysTerm = ctx.addMutableState(CodeGenerator.JAVA_LONG, "adaptiveCheckKeys")
+      adaptiveWindowKeysTerm = ctx.addMutableState(CodeGenerator.JAVA_LONG, "adaptiveWindowKeys")
+      adaptivePendingRowsTerm = ctx.addMutableState(
+        "java.util.LinkedList<UnsafeRow[]>", "adaptivePendingRows",
+        v => s"$v = new java.util.LinkedList<UnsafeRow[]>();", forceInline = true)
+    }
+    if (conf.enableTwoLevelAggMap) {
+      enableTwoLevelHashMap()
+    } else if (conf.enableVectorizedHashMap) {
+      logWarning("Two level hashmap is disabled but vectorized hashmap is enabled.")
+    }
+    val bitMaxCapacity = testFallbackStartsAt match {
+      case Some((fastMapCounter, _)) =>
+        // In testing, with fall back counter of fast hash map (`fastMapCounter`), set the max bit
+        // of map to be no more than log2(`fastMapCounter`). This helps control the number of keys
+        // in map to mimic fall back.
+        if (fastMapCounter <= 1) {
+          0
+        } else {
+          (math.log10(fastMapCounter) / math.log10(2)).floor.toInt
+        }
+      case _ => conf.fastHashAggregateRowMaxCapacityBit
     }
 
-    // create hashMap
     val thisPlan = ctx.addReferenceObj("plan", this)
-    hashMapTerm = ctx.freshName("hashMap")
-    val hashMapClassName = classOf[UnsafeFixedWidthAggregationMap].getName
-    ctx.addMutableState(hashMapClassName, hashMapTerm, "")
-    sorterTerm = ctx.freshName("sorter")
-    ctx.addMutableState(classOf[UnsafeKVExternalSorter].getName, sorterTerm, "")
 
-    // Create a name for iterator from HashMap
-    val iterTerm = ctx.freshName("mapIter")
-    ctx.addMutableState(classOf[KVIterator[UnsafeRow, UnsafeRow]].getName, iterTerm, "")
+    if (adaptivePartialAggEnabled) {
+      adaptiveEmptyBufferTerm = ctx.addMutableState("UnsafeRow", "adaptiveEmptyBuffer",
+        v => s"$v = (UnsafeRow) $thisPlan.getEmptyAggregationBuffer();", forceInline = true)
+      adaptivePassThroughBufferTerm = ctx.addMutableState("UnsafeRow",
+        "adaptivePassThroughBuffer", v => s"$v = $adaptiveEmptyBufferTerm.copy();",
+        forceInline = true)
+    }
+
+    // Create a name for the iterator from the fast hash map, and the code to create fast hash map.
+    val (iterTermForFastHashMap, createFastHashMap) = if (isFastHashMapEnabled) {
+      // Generates the fast hash map class and creates the fast hash map term.
+      val fastHashMapClassName = ctx.freshName("FastHashMap")
+      if (isVectorizedHashMapEnabled) {
+        val generatedMap = new VectorizedHashMapGenerator(ctx, aggregateExpressions,
+          fastHashMapClassName, groupingKeySchema, bufferSchema, bitMaxCapacity).generate()
+        ctx.addInnerClass(generatedMap)
+
+        // Inline mutable state since not many aggregation operations in a task
+        fastHashMapTerm = ctx.addMutableState(
+          fastHashMapClassName, "vectorizedFastHashMap", forceInline = true)
+        val iter = ctx.addMutableState(
+          "java.util.Iterator<InternalRow>",
+          "vectorizedFastHashMapIter",
+          forceInline = true)
+        val create = s"$fastHashMapTerm = new $fastHashMapClassName();"
+        (iter, create)
+      } else {
+        val generatedMap = new RowBasedHashMapGenerator(ctx, aggregateExpressions,
+          fastHashMapClassName, groupingKeySchema, bufferSchema, bitMaxCapacity).generate()
+        ctx.addInnerClass(generatedMap)
+
+        // Inline mutable state since not many aggregation operations in a task
+        fastHashMapTerm = ctx.addMutableState(
+          fastHashMapClassName, "fastHashMap", forceInline = true)
+        val iter = ctx.addMutableState(
+          "org.apache.spark.unsafe.KVIterator<UnsafeRow, UnsafeRow>",
+          "fastHashMapIter", forceInline = true)
+        val create = s"$fastHashMapTerm = new $fastHashMapClassName(" +
+          s"$thisPlan.getTaskContext().taskMemoryManager(), " +
+          s"$thisPlan.getEmptyAggregationBuffer());"
+        (iter, create)
+      }
+    } else ("", "")
+
+    // Generates the code to register a cleanup task with TaskContext to ensure that memory
+    // is guaranteed to be freed at the end of the task. This is necessary to avoid memory
+    // leaks in when the downstream operator does not fully consume the aggregation map's
+    // output (e.g. aggregate followed by limit).
+    val addHookToCloseFastHashMap = if (isFastHashMapEnabled) {
+      s"""
+         |$thisPlan.addFastHashMapCloseHook($fastHashMapTerm);
+       """.stripMargin
+    } else ""
+
+    // Create a name for the iterator from the regular hash map.
+    // Inline mutable state since not many aggregation operations in a task
+    val iterTerm = ctx.addMutableState(classOf[KVIterator[UnsafeRow, UnsafeRow]].getName,
+      "mapIter", forceInline = true)
+    // create hashMap
+    val hashMapClassName = classOf[UnsafeFixedWidthAggregationMap].getName
+    hashMapTerm = ctx.addMutableState(hashMapClassName, "hashMap", forceInline = true)
+    sorterTerm = ctx.addMutableState(classOf[UnsafeKVExternalSorter].getName, "sorter",
+      forceInline = true)
 
     val doAgg = ctx.freshName("doAggregateWithKeys")
     val peakMemory = metricTerm(ctx, "peakMemory")
     val spillSize = metricTerm(ctx, "spillSize")
-    ctx.addNewFunction(doAgg,
+    val avgHashProbe = metricTerm(ctx, "avgHashProbe")
+    val numTasksFallBacked = metricTerm(ctx, "numTasksFallBacked")
+
+    val finishRegularHashMap = s"$iterTerm = $thisPlan.finishAggregate(" +
+      s"$hashMapTerm, $sorterTerm, $peakMemory, $spillSize, $avgHashProbe, $numTasksFallBacked);"
+    val finishHashMap = if (isFastHashMapEnabled) {
       s"""
-        ${if (isVectorizedHashMapEnabled) vectorizedHashMapGenerator.generate() else ""}
-        private void $doAgg() throws java.io.IOException {
-          $hashMapTerm = $thisPlan.createHashMap();
-          ${child.asInstanceOf[CodegenSupport].produce(ctx, this)}
-
-          ${if (isVectorizedHashMapEnabled) {
-              s"$iterTermForVectorizedHashMap = $vectorizedHashMapTerm.rowIterator();"} else ""}
-
-          $iterTerm = $thisPlan.finishAggregate($hashMapTerm, $sorterTerm, $peakMemory, $spillSize);
-        }
-       """)
-
-    // generate code for output
-    val keyTerm = ctx.freshName("aggKey")
-    val bufferTerm = ctx.freshName("aggBuffer")
-    val outputCode = generateResultCode(ctx, keyTerm, bufferTerm, thisPlan)
-    val numOutput = metricTerm(ctx, "numOutputRows")
-
-    // The child could change `copyResult` to true, but we had already consumed all the rows,
-    // so `copyResult` should be reset to `false`.
-    ctx.copyResult = false
-
-    // Iterate over the aggregate rows and convert them from ColumnarBatch.Row to UnsafeRow
-    def outputFromGeneratedMap: Option[String] = {
-      if (isVectorizedHashMapEnabled) {
-        val row = ctx.freshName("vectorizedHashMapRow")
-        ctx.currentVars = null
-        ctx.INPUT_ROW = row
-        var schema: StructType = groupingKeySchema
-        bufferSchema.foreach(i => schema = schema.add(i))
-        val generateRow = GenerateUnsafeProjection.createCode(ctx, schema.toAttributes.zipWithIndex
-          .map { case (attr, i) => BoundReference(i, attr.dataType, attr.nullable) })
-        Option(
-          s"""
-             | while ($iterTermForVectorizedHashMap.hasNext()) {
-             |   $numOutput.add(1);
-             |   org.apache.spark.sql.execution.vectorized.ColumnarBatch.Row $row =
-             |     (org.apache.spark.sql.execution.vectorized.ColumnarBatch.Row)
-             |     $iterTermForVectorizedHashMap.next();
-             |   ${generateRow.code}
-             |   ${consume(ctx, Seq.empty, {generateRow.value})}
-             |
-             |   if (shouldStop()) return;
-             | }
-             |
-             | $vectorizedHashMapTerm.close();
-           """.stripMargin)
-      } else None
+         |$iterTermForFastHashMap = $fastHashMapTerm.rowIterator();
+         |$finishRegularHashMap
+       """.stripMargin
+    } else {
+      finishRegularHashMap
     }
 
-    val aggTime = metricTerm(ctx, "aggTime")
-    val beforeAgg = ctx.freshName("beforeAgg")
+    // `partitionIndex` is passed as a parameter so any bare `partitionIndex`
+    // reference in the child's produce resolves to the local parameter, not
+    // the protected `BufferedRowIterator.partitionIndex` field. When
+    // `addNewFunction` spills this helper into a nested class (as can happen
+    // once the outer class passes the code-size threshold), the bare field
+    // reference fails with `IllegalAccessError`.
+
+    // Generate code for output. With adaptive partial aggregation enabled this must happen before
+    // the `doAgg` helper below, because `doConsumeWithKeys` (invoked from the child's produce
+    // inside `doAgg`) emits pass-through rows by calling this output function directly. Otherwise
+    // the output function is generated after `doAgg`, so the early `consume(...)` inside it cannot
+    // change the codegen layout for plans the feature never touches.
+    val keyTerm = ctx.freshName("aggKey")
+    val bufferTerm = ctx.freshName("aggBuffer")
+    if (adaptivePartialAggEnabled) {
+      outputFunc = generateResultFunction(ctx)
+    }
+
+    // After the child input is consumed, finish the build: with adaptive partial aggregation mark
+    // that the child is fully consumed (to support re-entry; the map iterators are set up inside
+    // the map-output function), otherwise set up the map iterators for the output below.
+    // A child may leave its produce loop early rather than exhausting its input: `UnionExec` runs
+    // each child inside its own helper, so a streamed row that fills the output buffer returns
+    // only as far as here. Reaching the end of `produce` therefore does not by itself mean the
+    // input is consumed -- pending output says the child parked instead, and the build resumes on
+    // re-entry. Without this the rest of that partition is silently dropped.
+    val postChildProduce = if (adaptivePartialAggEnabled) {
+      s"if (!shouldStop()) { $adaptiveChildrenConsumedTerm = true; }"
+    } else {
+      finishHashMap
+    }
+    val limitNotReachedCondition = limitNotReachedCond
+
+    def outputFromFastHashMap: String = {
+      if (isFastHashMapEnabled) {
+        if (isVectorizedHashMapEnabled) {
+          outputFromVectorizedMap
+        } else {
+          outputFromRowBasedMap
+        }
+      } else ""
+    }
+
+    def outputFromRowBasedMap: String = {
+      s"""
+         |while ($limitNotReachedCondition $iterTermForFastHashMap.next()) {
+         |  UnsafeRow $keyTerm = (UnsafeRow) $iterTermForFastHashMap.getKey();
+         |  UnsafeRow $bufferTerm = (UnsafeRow) $iterTermForFastHashMap.getValue();
+         |  $outputFunc($keyTerm, $bufferTerm);
+         |
+         |  if (shouldStop()) return;
+         |}
+         |$fastHashMapTerm.close();
+       """.stripMargin
+    }
+
+    // Iterate over the aggregate rows and convert them from InternalRow to UnsafeRow
+    def outputFromVectorizedMap: String = {
+      val row = ctx.freshName("fastHashMapRow")
+      ctx.currentVars = null
+      ctx.INPUT_ROW = row
+      val generateKeyRow = GenerateUnsafeProjection.createCode(ctx,
+        toAttributes(groupingKeySchema).zipWithIndex
+          .map { case (attr, i) => BoundReference(i, attr.dataType, attr.nullable) }
+      )
+      val generateBufferRow = GenerateUnsafeProjection.createCode(ctx,
+        toAttributes(bufferSchema).zipWithIndex.map { case (attr, i) =>
+          BoundReference(groupingKeySchema.length + i, attr.dataType, attr.nullable)
+        })
+      s"""
+         |while ($limitNotReachedCondition $iterTermForFastHashMap.hasNext()) {
+         |  InternalRow $row = (InternalRow) $iterTermForFastHashMap.next();
+         |  ${generateKeyRow.code}
+         |  ${generateBufferRow.code}
+         |  $outputFunc(${generateKeyRow.value}, ${generateBufferRow.value});
+         |
+         |  if (shouldStop()) return;
+         |}
+         |
+         |$fastHashMapTerm.close();
+       """.stripMargin
+    }
+
+    def outputFromRegularHashMap: String = {
+      s"""
+         |while ($limitNotReachedCondition $iterTerm.next()) {
+         |  UnsafeRow $keyTerm = (UnsafeRow) $iterTerm.getKey();
+         |  UnsafeRow $bufferTerm = (UnsafeRow) $iterTerm.getValue();
+         |  $outputFunc($keyTerm, $bufferTerm);
+         |  if (shouldStop()) return;
+         |}
+         |$iterTerm.close();
+         |if ($sorterTerm == null) {
+         |  $hashMapTerm.free();
+         |}
+       """.stripMargin
+    }
+
+    // With adaptive partial aggregation, `aggTime` times the build up to the point where
+    // pass-through starts, plus the map iterator setup below (which in a task that has spilled also
+    // writes the map to disk and merges it with the spilled data), but never the pass-through rows:
+    // timing them would cost two `System.nanoTime()` calls per row, comparable to passing a row
+    // through. The timer starts before the build and stops right after the setup, which runs once,
+    // before the aggregate outputs anything: for the first passed-through row, or right after the
+    // build if no row is passed through. Fused with the Final, the build then goes on to pass the
+    // rest of the input through untimed.
+    val adaptiveBuildStartTerm = if (adaptivePartialAggEnabled) {
+      ctx.addMutableState(CodeGenerator.JAVA_LONG, "adaptiveBuildStart")
+    } else {
+      ""
+    }
+
+    // With adaptive partial aggregation the maps are frozen once pass-through is active, so their
+    // output (which also frees them) can happen as soon as pass-through fires, releasing the memory
+    // before the remaining input is streamed. The output loops are wrapped in a function so the
+    // same code runs either early (once pass-through freezes the maps) or at the end of the build.
+    // The done flag is set inside, after the loops, so a mid-output drain (the loops return via
+    // `shouldStop()`) leaves it unset and the caller resumes the map iterator on re-entry; once it
+    // is set the maps have been fully output and freed and will not be touched again. The iterator
+    // setup (`finishHashMap`, which destructs the map) is guarded to run only once, and stops the
+    // build timer (see `aggTime` above). The queue of passed-through rows held behind the maps is
+    // flushed here, right after the done flag is set: the maps must precede the held rows so the
+    // downstream Final merges a group's map buffer before its pass-through buffers (a group can
+    // straddle the freeze, since the maps only freeze once pass-through fires), and the copies were
+    // made when the row was queued, so emitting them here cannot corrupt the build's reusable rows.
+    adaptiveOutputMapAndFlushFuncName = if (adaptivePartialAggEnabled) {
+      val name = ctx.freshName("outputMapAndFlush")
+      val pair = ctx.freshName("pendingRow")
+      val aggTime = metricTerm(ctx, "aggTime")
+      ctx.addNewFunction(name,
+        s"""
+           |private void $name() throws java.io.IOException {
+           |  if (!$adaptiveMapSetupDoneTerm) {
+           |    $finishHashMap
+           |    $adaptiveMapSetupDoneTerm = true;
+           |    $aggTime.add((System.nanoTime() - $adaptiveBuildStartTerm) / $NANOS_PER_MILLIS);
+           |  }
+           |  $outputFromFastHashMap
+           |  $outputFromRegularHashMap
+           |  $adaptiveMapOutputDoneTerm = true;
+           |  while (!$adaptivePendingRowsTerm.isEmpty()) {
+           |    UnsafeRow[] $pair = (UnsafeRow[]) $adaptivePendingRowsTerm.poll();
+           |    $outputFunc($pair[0], $pair[1]);
+           |  }
+           |}
+         """.stripMargin)
+    } else {
+      ""
+    }
+
+    val doAggFuncName = ctx.addNewFunction(doAgg,
+      s"""
+         |private void $doAgg(int partitionIndex) throws java.io.IOException {
+         |  ${child.asInstanceOf[CodegenSupport].produce(ctx, this)}
+         |  $postChildProduce
+         |}
+       """.stripMargin)
+    // For a non-adaptive plan, generate the output function only after `doAgg` so its
+    // `consume(...)` cannot reorder the codegen layout (see above). It must still land before
+    // `adaptiveFinalOutput` reads it below.
+    if (!adaptivePartialAggEnabled) {
+      outputFunc = generateResultFunction(ctx)
+    }
+
+    // The build timer. With adaptive partial aggregation the map setup stops it (see `aggTime`
+    // above), so its start is kept in a field.
+    val (startBuildTimer, stopBuildTimer) = if (adaptivePartialAggEnabled) {
+      (s"$adaptiveBuildStartTerm = System.nanoTime();", "")
+    } else {
+      val aggTime = metricTerm(ctx, "aggTime")
+      val beforeAgg = ctx.freshName("beforeAgg")
+      (s"long $beforeAgg = System.nanoTime();",
+        s"$aggTime.add((System.nanoTime() - $beforeAgg) / $NANOS_PER_MILLIS);")
+    }
+    // Split by an exchange, `doAgg` may start appending pass-through rows to the output buffer
+    // mid-build. In that case `shouldStop()` becomes true and we must return so the buffered rows
+    // are drained; on re-entry the frozen maps are output first (`adaptiveOutputMapAndFlush`) and
+    // then the build resumes (guarded by `childrenConsumed`) until the child input is exhausted.
+    // Fused with the Final, nothing is buffered, so `shouldStop()` never fires and the maps are
+    // drained inside the build (see `handlePassThroughRow`).
+    val adaptiveStopCheck = if (adaptivePartialAggEnabled) {
+      "if (shouldStop()) return;"
+    } else {
+      ""
+    }
+    // Once pass-through is active the maps are frozen, so output them (releasing their memory)
+    // ahead of the passed-through rows. The output starts the moment the first passed-through row
+    // queues behind the maps (`handlePassThroughRow` advances the maps by one row per queued row),
+    // and continues on re-entry here; `adaptiveFinalOutput` covers the case where pass-through
+    // never fired during the build, when the full maps are the result. The output loops return via
+    // `shouldStop()` when the buffer fills, so the done flag is set inside the output function and
+    // re-entry resumes the map iterator. Only once the maps are fully drained are the queued
+    // pass-through rows flushed, so every map buffer precedes the rows that collided with it.
+    val adaptiveOutputMapAndFlush = if (adaptivePartialAggEnabled) {
+      s"""
+         |if (!$adaptiveMapOutputDoneTerm) {
+         |  $adaptiveOutputMapAndFlushFuncName();
+         |  if (shouldStop()) return;
+         |}
+       """.stripMargin
+    } else {
+      ""
+    }
+    // The resumed build only passes rows through, so it is not timed (see `aggTime` above). Split
+    // by an exchange, a child that checks `shouldStop()` between rows returns and re-enters here
+    // after every passed-through row, so a timer would cost two `System.nanoTime()` calls per row;
+    // a one-to-many child such as `GenerateExec` re-enters once per input row instead.
+    val adaptiveResumeBuild = if (adaptivePartialAggEnabled) {
+      s"""
+         |if (!$adaptiveChildrenConsumedTerm) {
+         |  $adaptiveOutputMapAndFlush
+         |  $doAggFuncName(partitionIndex);
+         |  if (shouldStop()) return;
+         |}
+       """.stripMargin
+    } else {
+      ""
+    }
+    val adaptiveFinalOutput = if (adaptivePartialAggEnabled) {
+      adaptiveOutputMapAndFlush
+    } else {
+      s"""
+         |$outputFromFastHashMap
+         |$outputFromRegularHashMap
+       """.stripMargin
+    }
     s"""
-     if (!$initAgg) {
-       $initAgg = true;
-       long $beforeAgg = System.nanoTime();
-       $doAgg();
-       $aggTime.add((System.nanoTime() - $beforeAgg) / 1000000);
-     }
-
-     // output the result
-     ${outputFromGeneratedMap.getOrElse("")}
-
-     while ($iterTerm.next()) {
-       $numOutput.add(1);
-       UnsafeRow $keyTerm = (UnsafeRow) $iterTerm.getKey();
-       UnsafeRow $bufferTerm = (UnsafeRow) $iterTerm.getValue();
-       $outputCode
-
-       if (shouldStop()) return;
-     }
-
-     $iterTerm.close();
-     if ($sorterTerm == null) {
-       $hashMapTerm.free();
-     }
-     """
+       |if (!$initAgg) {
+       |  $initAgg = true;
+       |  $createFastHashMap
+       |  $addHookToCloseFastHashMap
+       |  $hashMapTerm = $thisPlan.createHashMap();
+       |  $startBuildTimer
+       |  $doAggFuncName(partitionIndex);
+       |  $stopBuildTimer
+       |  $adaptiveStopCheck
+       |}
+       |$adaptiveResumeBuild
+       |$adaptiveFinalOutput
+     """.stripMargin
   }
 
-  private def doConsumeWithKeys(ctx: CodegenContext, input: Seq[ExprCode]): String = {
+  // Blocking operators normally suppress the child's `shouldStop()` check because they buffer all
+  // output. With adaptive partial aggregation, pass-through rows are appended to the output buffer
+  // while consuming child input, so the stop check is re-enabled to let the child yield between
+  // rows.
+  //
+  // This bounds the buffer only as far as the child honours it. Each passed-through row queues a
+  // copy and advances the frozen-map output by one row, and that one appended map row makes
+  // `shouldStop()` true, so a child that checks between rows never queues more than one row. A
+  // one-to-many child that does not check `shouldStop()` inside its fan-out (`GenerateExec` emits
+  // `for (index ...) { consume }` and `while (iterator.hasNext()) { consume }` with no check)
+  // appends every row produced from one input row before it can yield: the fan-out batch lands in
+  // `BufferedRowIterator.currentRows` (which is not spillable), and the map advances one row per
+  // queued row, so the buffer grows to roughly the batch width rather than `minRows`.
+  override def needStopCheck: Boolean = adaptivePartialAggEnabled
 
+  // Blocking operators normally do not copy their result because every output row is drained (via
+  // `shouldStop()`) before the next one is produced. Adaptive pass-through breaks that assumption:
+  // `outputFunc` writes every output row into the same reusable result `UnsafeRow`, and under a
+  // fan-out child several such rows are appended without an intervening drain - the frozen-map
+  // rows, emitted one per queued row inside the child's fan-out loop, and the held pass-through
+  // batch, flushed from `outputMapAndFlush` after the maps drain. Without a copy they would all
+  // alias the single result row. Such children report `needCopyResult` themselves, so propagate
+  // their requirement rather than copying for every adaptive aggregate.
+  override def needCopyResult: Boolean = adaptivePartialAggEnabled &&
+    child.asInstanceOf[CodegenSupport].needCopyResult
+
+  protected override def doConsumeWithKeys(ctx: CodegenContext, input: Seq[ExprCode]): String = {
     // create grouping key
-    ctx.currentVars = input
-    // make sure that the generated code will not be splitted as multiple functions
-    ctx.INPUT_ROW = null
     val unsafeRowKeyCode = GenerateUnsafeProjection.createCode(
-      ctx, groupingExpressions.map(e => BindReferences.bindReference[Expression](e, child.output)))
-    val vectorizedRowKeys = ctx.generateExpressions(
-      groupingExpressions.map(e => BindReferences.bindReference[Expression](e, child.output)))
+      ctx, bindReferences[Expression](groupingExpressions, child.output))
+    val fastRowKeys = ctx.generateExpressions(
+      bindReferences[Expression](groupingExpressions, child.output))
     val unsafeRowKeys = unsafeRowKeyCode.value
     val unsafeRowBuffer = ctx.freshName("unsafeRowAggBuffer")
-    val vectorizedRowBuffer = ctx.freshName("vectorizedAggBuffer")
+    val fastRowBuffer = ctx.freshName("fastAggBuffer")
 
-    // only have DeclarativeAggregate
-    val updateExpr = aggregateExpressions.flatMap { e =>
+    // Per-row local flag marking that the current row is being streamed through (held by no map).
+    val adaptiveRowBypassedTerm = ctx.freshName("adaptiveRowBypassed")
+
+    // To individually generate code for each aggregate function, an element in `updateExprs` holds
+    // all the expressions for the buffer of an aggregation function.
+    val updateExprs = aggregateExpressions.map { e =>
+      // only have DeclarativeAggregate
       e.mode match {
         case Partial | Complete =>
           e.aggregateFunction.asInstanceOf[DeclarativeAggregate].updateExpressions
@@ -623,160 +988,437 @@ case class HashAggregateExec(
       }
     }
 
-    // generate hash code for key
-    val hashExpr = Murmur3Hash(groupingExpressions, 42)
-    ctx.currentVars = input
-    val hashEval = BindReferences.bindReference(hashExpr, child.output).genCode(ctx)
-
-    val inputAttr = aggregateBufferAttributes ++ child.output
-    ctx.currentVars = new Array[ExprCode](aggregateBufferAttributes.length) ++ input
-
-    val (checkFallbackForGeneratedHashMap, checkFallbackForBytesToBytesMap, resetCounter,
-    incCounter) = if (testFallbackStartsAt.isDefined) {
-      val countTerm = ctx.freshName("fallbackCounter")
-      ctx.addMutableState("int", countTerm, s"$countTerm = 0;")
-      (s"$countTerm < ${testFallbackStartsAt.get._1}",
-        s"$countTerm < ${testFallbackStartsAt.get._2}", s"$countTerm = 0;", s"$countTerm += 1;")
-    } else {
-      ("true", "true", "", "")
+    val (checkFallbackForBytesToBytesMap, resetCounter, incCounter) = testFallbackStartsAt match {
+      case Some((_, regularMapCounter)) =>
+        val countTerm = ctx.addMutableState(CodeGenerator.JAVA_INT, "fallbackCounter")
+        (s"$countTerm < $regularMapCounter", s"$countTerm = 0;", s"$countTerm += 1;")
+      case _ => ("true", "", "")
     }
 
-    // We first generate code to probe and update the vectorized hash map. If the probe is
-    // successful the corresponding vectorized row buffer will hold the mutable row
-    val findOrInsertInVectorizedHashMap: Option[String] = {
-      if (isVectorizedHashMapEnabled) {
-        Option(
+    // The compaction ratio is measured at the operator level: processed rows against the keys
+    // held by both maps, so two-level-map routing does not change the decision. It is evaluated at
+    // two check points:
+    //   - periodically, every `minRows` rows, over the whole epoch against `minCompaction`;
+    //   - right before the map would spill, over the recent rows against the higher
+    //     `minCompactionToSpill`, in which case the map does not spill and the rest of the input
+    //     is passed through. Keeping the aggregation then means aggregating the rest of the input
+    //     through spills, which pays off only if that input keeps repeating keys. The recent rows,
+    //     those since the periodic check before last, measure that: when keys repeat across the
+    //     input, more of them find their key already in the map as it fills, so their ratio
+    //     climbs above the epoch's; when each key's rows arrive together, the two ratios match.
+    // Pass-through cannot be undone within the task, so the spill check, like the periodic one,
+    // waits until the current epoch has processed `minRows` rows; a map that fills sooner spills
+    // as usual. `minRows = 0` disables the periodic check: the row count is only ever compared
+    // after being incremented past 0, so it never matches and only the spill check remains,
+    // without a row floor and over the whole epoch.
+    def adaptiveEpochKeys: String = if (isFastHashMapEnabled) {
+      s"((long) $fastHashMapTerm.getNumKeys() - $adaptiveFastKeysAtSpillTerm + " +
+        s"$hashMapTerm.getNumKeys())"
+    } else {
+      s"((long) $hashMapTerm.getNumKeys())"
+    }
+    // Whether `rows` processed rows fail to collapse into `keys` keys by at least `threshold`.
+    def adaptiveIneffective(rows: String, keys: String, threshold: Double): String =
+      s"$rows < (double) $keys * ${threshold}D"
+
+    val findOrInsertRegularHashMap: String = {
+      // Assumes the grouping key projection (`unsafeRowKeyCode.code`) has already run for this row,
+      // so `unsafeRowKeyCode.value` holds the current key. The projection is emitted exactly once
+      // per regular-map row (see below); emitting it in more than one runtime branch is unsafe
+      // because the projection's subexpression/writer state assigned in one branch would be read
+      // stale from another (e.g. the adaptive pass-through path would reuse the last probed key).
+      val (computeKeyHash, lookupBuffer) =
+        if (UnsafeRowUtils.isBinaryStable(groupingKeySchema)) {
+          val unsafeRowKeyHash = ctx.freshName("unsafeRowKeyHash")
+          (s"int $unsafeRowKeyHash = ${unsafeRowKeyCode.value}.hashCode();",
+            s"$hashMapTerm.getAggregationBufferFromUnsafeRow(" +
+              s"$unsafeRowKeys, $unsafeRowKeyHash)")
+        } else {
+          ("", s"$hashMapTerm.getAggregationBufferFromUnsafeRow($unsafeRowKeys)")
+        }
+      val probeRegularMap =
+        s"""
+           |$computeKeyHash
+           |if ($checkFallbackForBytesToBytesMap) {
+           |  // try to get the buffer from hash map
+           |  $unsafeRowBuffer = $lookupBuffer;
+           |}
+         """.stripMargin
+
+      val spillMap =
+        s"""
+           |$sorterTerm = org.apache.spark.sql.execution.aggregate.HashAggregateExec
+           |  .spillHashMapToSorter($hashMapTerm, $sorterTerm);
+           |$resetCounter
+           |// the hash map had been spilled, so it should have enough memory now,
+           |// try to allocate buffer again.
+           |$unsafeRowBuffer = $lookupBuffer;
+           |if ($unsafeRowBuffer == null) {
+           |  // failed to allocate the first page
+           |  throw QueryExecutionErrors.aggregateOutOfMemoryError();
+           |}
+         """.stripMargin
+
+      if (adaptivePartialAggEnabled) {
+        // Spilling starts a new in-memory epoch, so the counters restart and the ratio of that
+        // epoch alone decides the remaining rows. The fast map neither spills nor clears, so its
+        // keys outlive the epoch; snapshotting them here keeps both sides of the ratio on the
+        // same rows. Once the fast map fills it stops accepting keys and the difference settles
+        // at zero, leaving the regular map's keys alone.
+        val snapshotFastKeys = if (isFastHashMapEnabled) {
+          s"$adaptiveFastKeysAtSpillTerm = $fastHashMapTerm.getNumKeys();"
+        } else {
+          ""
+        }
+        val spillAndRestartEpoch =
           s"""
-             |if ($checkFallbackForGeneratedHashMap) {
-             |  ${vectorizedRowKeys.map(_.code).mkString("\n")}
-             |  if (${vectorizedRowKeys.map("!" + _.isNull).mkString(" && ")}) {
-             |    $vectorizedRowBuffer = $vectorizedHashMapTerm.findOrInsert(
-             |        ${vectorizedRowKeys.map(_.value).mkString(", ")});
-             |  }
-             |}
-         """.stripMargin)
+             |$spillMap
+             |$processedRowsTerm = 0L;
+             |$adaptiveNextCheckRowTerm = ${adaptiveMinRows}L;
+             |$snapshotFastKeys
+             |$adaptiveCheckKeysTerm = 0L;
+             |$adaptiveWindowKeysTerm = 0L;
+           """.stripMargin
+        val windowRows = s"Math.max(0L, $adaptiveNextCheckRowTerm - ${2 * adaptiveMinRows}L)"
+        val recentIneffective = adaptiveIneffective(
+          s"($processedRowsTerm - $windowRows)",
+          s"($adaptiveEpochKeys - $adaptiveWindowKeysTerm)",
+          adaptiveMinCompactionToSpill)
+        // The spill check needs at least one processed row even when `minRows = 0`.
+        val spillCheckMinRows = math.max(adaptiveMinRows, 1L)
+        s"""
+           |// generate grouping key
+           |${unsafeRowKeyCode.code}
+           |if (!$adaptivePassThroughTerm) {
+           |  $probeRegularMap
+           |  if ($unsafeRowBuffer == null) {
+           |    if ($processedRowsTerm >= ${spillCheckMinRows}L && $recentIneffective) {
+           |      $adaptivePassThroughTerm = true;
+           |    } else {
+           |      $spillAndRestartEpoch
+           |    }
+           |  }
+           |}
+         """.stripMargin
       } else {
-        None
+        s"""
+           |// generate grouping key
+           |${unsafeRowKeyCode.code}
+           |$probeRegularMap
+           |// Can't allocate buffer from the hash map. Spill the map and fallback to sort-based
+           |// aggregation after processing all input rows.
+           |if ($unsafeRowBuffer == null) {
+           |  $spillMap
+           |}
+         """.stripMargin
       }
     }
 
-    val updateRowInVectorizedHashMap: Option[String] = {
-      if (isVectorizedHashMapEnabled) {
-        ctx.INPUT_ROW = vectorizedRowBuffer
-        val boundUpdateExpr = updateExpr.map(BindReferences.bindReference(_, inputAttr))
-        val subExprs = ctx.subexpressionEliminationForWholeStageCodegen(boundUpdateExpr)
-        val effectiveCodes = subExprs.codes.mkString("\n")
-        val vectorizedRowEvals = ctx.withSubExprEliminationExprs(subExprs.states) {
-          boundUpdateExpr.map(_.genCode(ctx))
-        }
-        val updateVectorizedRow = vectorizedRowEvals.zipWithIndex.map { case (ev, i) =>
-          val dt = updateExpr(i).dataType
-          ctx.updateColumn(vectorizedRowBuffer, dt, i, ev, updateExpr(i).nullable,
-            isVectorized = true)
-        }
-        Option(
+    val findOrInsertHashMap: String = {
+      val findCode = if (isFastHashMapEnabled) {
+        // If fast hash map is on, we first generate code to probe and update the fast hash map.
+        // If the probe is successful the corresponding fast row buffer will hold the mutable row.
+        // Once adaptive pass-through is active, skip the fast map entirely so the row is streamed
+        // through instead of being inserted anywhere.
+        val fastMapProbe =
           s"""
-             |// common sub-expressions
-             |$effectiveCodes
-             |// evaluate aggregate function
-             |${evaluateVariables(vectorizedRowEvals)}
-             |// update vectorized row
-             |${updateVectorizedRow.mkString("\n").trim}
-           """.stripMargin)
-      } else None
-    }
+             |${fastRowKeys.map(_.code).mkString("\n")}
+             |if (${fastRowKeys.map("!" + _.isNull).mkString(" && ")}) {
+             |  $fastRowBuffer = $fastHashMapTerm.findOrInsert(
+             |    ${fastRowKeys.map(_.value).mkString(", ")});
+             |}
+           """.stripMargin
+        val guardedFastMapProbe = if (adaptivePartialAggEnabled) {
+          s"""
+             |if (!$adaptivePassThroughTerm) {
+             |  $fastMapProbe
+             |}
+           """.stripMargin
+        } else {
+          fastMapProbe
+        }
+        s"""
+           |$guardedFastMapProbe
+           |// Cannot find the key in fast hash map, try regular hash map.
+           |if ($fastRowBuffer == null) {
+           |  $findOrInsertRegularHashMap
+           |}
+         """.stripMargin
+      } else {
+        findOrInsertRegularHashMap
+      }
 
-    // Next, we generate code to probe and update the unsafe row hash map.
-    val findOrInsertInUnsafeRowMap: String = {
+      // Every row is either accepted by an aggregation map or streamed through -- the fast map
+      // serves a row without it ever reaching the regular map, so both buffers are consulted to
+      // tell the two apart.
+      //
+      // An accepted row counts toward the compaction ratio, so the numerator matches the
+      // operator-level denominator. Counting inside the regular-map branch alone would drop the
+      // rows the fast map absorbed from the ratio and bypass an aggregation that is in fact
+      // reducing. A row no map holds is streamed once pass-through is active: both probes are
+      // skipped (guarded above), so neither buffer is set, and `rowBypassed` marks exactly those
+      // rows. The row that fails to insert at the spill boundary lands here too, while the row
+      // that merely flipped pass-through at the check point is already aggregated in the map that
+      // took it and must not be re-emitted.
+      val countOrPassThroughRow = if (adaptivePartialAggEnabled) {
+        val heldByAMap = if (isFastHashMapEnabled) {
+          s"($fastRowBuffer != null || $unsafeRowBuffer != null)"
+        } else {
+          s"($unsafeRowBuffer != null)"
+        }
+        val epochIneffective =
+          adaptiveIneffective(processedRowsTerm, adaptiveEpochKeys, adaptiveMinCompaction)
+        // The grouping key was already projected in `findOrInsertRegularHashMap`
+        // (`unsafeRowKeyCode.code`), so `unsafeRowKeyCode.value` holds this row's key. Only build
+        // the single-row partial buffer here: reset the reusable buffer to the initial aggregation
+        // buffer, so the update expressions below apply this row alone and `key ++ buffer` is
+        // emitted for the Final aggregate to merge.
+        s"""
+           |if ($heldByAMap) {
+           |  if (!$adaptivePassThroughTerm) {
+           |    $processedRowsTerm += 1;
+           |    if ($processedRowsTerm == $adaptiveNextCheckRowTerm) {
+           |      if ($epochIneffective) {
+           |        $adaptivePassThroughTerm = true;
+           |      } else {
+           |        $adaptiveNextCheckRowTerm += ${adaptiveMinRows}L;
+           |        $adaptiveWindowKeysTerm = $adaptiveCheckKeysTerm;
+           |        $adaptiveCheckKeysTerm = $adaptiveEpochKeys;
+           |      }
+           |    }
+           |  }
+           |} else if ($adaptivePassThroughTerm) {
+           |  $adaptiveRowBypassedTerm = true;
+           |  $adaptivePassThroughBufferTerm.copyFrom($adaptiveEmptyBufferTerm);
+           |  $unsafeRowBuffer = $adaptivePassThroughBufferTerm;
+           |}
+         """.stripMargin
+      } else {
+        ""
+      }
+
       s"""
-         | if ($vectorizedRowBuffer == null) {
-         |   // generate grouping key
-         |   ${unsafeRowKeyCode.code.trim}
-         |   ${hashEval.code.trim}
-         |   if ($checkFallbackForBytesToBytesMap) {
-         |     // try to get the buffer from hash map
-         |     $unsafeRowBuffer =
-         |       $hashMapTerm.getAggregationBufferFromUnsafeRow($unsafeRowKeys, ${hashEval.value});
-         |   }
-         |   if ($unsafeRowBuffer == null) {
-         |     if ($sorterTerm == null) {
-         |       $sorterTerm = $hashMapTerm.destructAndCreateExternalSorter();
-         |     } else {
-         |       $sorterTerm.merge($hashMapTerm.destructAndCreateExternalSorter());
-         |     }
-         |     $resetCounter
-         |     // the hash map had be spilled, it should have enough memory now,
-         |     // try  to allocate buffer again.
-         |     $unsafeRowBuffer =
-         |       $hashMapTerm.getAggregationBufferFromUnsafeRow($unsafeRowKeys, ${hashEval.value});
-         |     if ($unsafeRowBuffer == null) {
-         |       // failed to allocate the first page
-         |       throw new OutOfMemoryError("No enough memory for aggregation");
-         |     }
-         |   }
-         | }
+         |$findCode
+         |$countOrPassThroughRow
        """.stripMargin
     }
 
-    val updateRowInUnsafeRowMap: String = {
+    val inputAttrs = aggregateBufferAttributes ++ inputAttributes
+    // Here we set `currentVars(0)` to `currentVars(numBufferSlots)` to null, so that when
+    // generating code for buffer columns, we use `INPUT_ROW`(will be the buffer row), while
+    // generating input columns, we use `currentVars`.
+    ctx.currentVars = (new Array[ExprCode](aggregateBufferAttributes.length) ++ input)
+      .toImmutableArraySeq
+
+    val aggNames = aggregateExpressions.map(_.aggregateFunction.prettyName)
+    // Computes start offsets for each aggregation function code
+    // in the underlying buffer row.
+    val bufferStartOffsets = {
+      val offsets = mutable.ArrayBuffer[Int]()
+      var curOffset = 0
+      updateExprs.foreach { exprsForOneFunc =>
+        offsets += curOffset
+        curOffset += exprsForOneFunc.length
+      }
+      offsets.toArray
+    }
+
+    val updateRowInRegularHashMap: String = {
       ctx.INPUT_ROW = unsafeRowBuffer
-      val boundUpdateExpr = updateExpr.map(BindReferences.bindReference(_, inputAttr))
-      val subExprs = ctx.subexpressionEliminationForWholeStageCodegen(boundUpdateExpr)
-      val effectiveCodes = subExprs.codes.mkString("\n")
-      val unsafeRowBufferEvals = ctx.withSubExprEliminationExprs(subExprs.states) {
-        boundUpdateExpr.map(_.genCode(ctx))
+      val boundUpdateExprs = updateExprs.map { updateExprsForOneFunc =>
+        bindReferences(updateExprsForOneFunc, inputAttrs)
       }
-      val updateUnsafeRowBuffer = unsafeRowBufferEvals.zipWithIndex.map { case (ev, i) =>
-        val dt = updateExpr(i).dataType
-        ctx.updateColumn(unsafeRowBuffer, dt, i, ev, updateExpr(i).nullable)
+      val subExprs = ctx.subexpressionEliminationForWholeStageCodegen(boundUpdateExprs.flatten)
+      val effectiveCodes = ctx.evaluateSubExprEliminationState(subExprs.states.values)
+      val unsafeRowBufferEvals = boundUpdateExprs.map { boundUpdateExprsForOneFunc =>
+        ctx.withSubExprEliminationExprs(subExprs.states) {
+          boundUpdateExprsForOneFunc.map(_.genCode(ctx))
+        }
       }
+
+      val aggCodeBlocks = updateExprs.indices.map { i =>
+        val rowBufferEvalsForOneFunc = unsafeRowBufferEvals(i)
+        val boundUpdateExprsForOneFunc = boundUpdateExprs(i)
+        val bufferOffset = bufferStartOffsets(i)
+
+        // All the update code for aggregation buffers should be placed in the end
+        // of each aggregation function code.
+        val updateRowBuffers = rowBufferEvalsForOneFunc.zipWithIndex.map { case (ev, j) =>
+          val updateExpr = boundUpdateExprsForOneFunc(j)
+          val dt = updateExpr.dataType
+          val nullable = updateExpr.nullable
+          CodeGenerator.updateColumn(unsafeRowBuffer, dt, bufferOffset + j, ev, nullable)
+        }
+        code"""
+           |${ctx.registerComment(s"evaluate aggregate function for ${aggNames(i)}")}
+           |${evaluateVariables(rowBufferEvalsForOneFunc)}
+           |${ctx.registerComment("update unsafe row buffer")}
+           |${updateRowBuffers.mkString("\n").trim}
+         """.stripMargin
+      }
+
+      val codeToEvalAggFuncs = generateEvalCodeForAggFuncs(
+        ctx, input, inputAttrs, boundUpdateExprs, aggNames, aggCodeBlocks, subExprs)
       s"""
          |// common sub-expressions
          |$effectiveCodes
-         |// evaluate aggregate function
-         |${evaluateVariables(unsafeRowBufferEvals)}
-         |// update unsafe row buffer
-         |${updateUnsafeRowBuffer.mkString("\n").trim}
-           """.stripMargin
+         |// evaluate aggregate functions and update aggregation buffers
+         |$codeToEvalAggFuncs
+       """.stripMargin
     }
 
+    val updateRowInHashMap: String = {
+      if (isFastHashMapEnabled) {
+        if (isVectorizedHashMapEnabled) {
+          ctx.INPUT_ROW = fastRowBuffer
+          val boundUpdateExprs = updateExprs.map { updateExprsForOneFunc =>
+            bindReferences(updateExprsForOneFunc, inputAttrs)
+          }
+          val subExprs = ctx.subexpressionEliminationForWholeStageCodegen(boundUpdateExprs.flatten)
+          val effectiveCodes = ctx.evaluateSubExprEliminationState(subExprs.states.values)
+          val fastRowEvals = boundUpdateExprs.map { boundUpdateExprsForOneFunc =>
+            ctx.withSubExprEliminationExprs(subExprs.states) {
+              boundUpdateExprsForOneFunc.map(_.genCode(ctx))
+            }
+          }
+
+          val aggCodeBlocks = fastRowEvals.zipWithIndex.map { case (fastRowEvalsForOneFunc, i) =>
+            val boundUpdateExprsForOneFunc = boundUpdateExprs(i)
+            val bufferOffset = bufferStartOffsets(i)
+            // All the update code for aggregation buffers should be placed in the end
+            // of each aggregation function code.
+            val updateRowBuffer = fastRowEvalsForOneFunc.zipWithIndex.map { case (ev, j) =>
+              val updateExpr = boundUpdateExprsForOneFunc(j)
+              val dt = updateExpr.dataType
+              val nullable = updateExpr.nullable
+              CodeGenerator.updateColumn(fastRowBuffer, dt, bufferOffset + j, ev, nullable,
+                isVectorized = true)
+            }
+            code"""
+               |${ctx.registerComment(s"evaluate aggregate function for ${aggNames(i)}")}
+               |${evaluateVariables(fastRowEvalsForOneFunc)}
+               |${ctx.registerComment("update fast row")}
+               |${updateRowBuffer.mkString("\n").trim}
+             """.stripMargin
+          }
+
+          val codeToEvalAggFuncs = generateEvalCodeForAggFuncs(
+            ctx, input, inputAttrs, boundUpdateExprs, aggNames, aggCodeBlocks, subExprs)
+
+          // If vectorized fast hash map is on, we first generate code to update row
+          // in vectorized fast hash map, if the previous loop up hit vectorized fast hash map.
+          // Otherwise, update row in regular hash map.
+          s"""
+             |if ($fastRowBuffer != null) {
+             |  // common sub-expressions
+             |  $effectiveCodes
+             |  // evaluate aggregate functions and update aggregation buffers
+             |  $codeToEvalAggFuncs
+             |} else {
+             |  $updateRowInRegularHashMap
+             |}
+          """.stripMargin
+        } else {
+          // If row-based hash map is on and the previous loop up hit fast hash map,
+          // we reuse regular hash buffer to update row of fast hash map.
+          // Otherwise, update row in regular hash map.
+          s"""
+             |// Updates the proper row buffer
+             |if ($fastRowBuffer != null) {
+             |  $unsafeRowBuffer = $fastRowBuffer;
+             |}
+             |$updateRowInRegularHashMap
+          """.stripMargin
+        }
+      } else {
+        updateRowInRegularHashMap
+      }
+    }
+
+    val declareRowBuffer: String = {
+      val declareBuffers = if (isFastHashMapEnabled) {
+        val fastRowType = if (isVectorizedHashMapEnabled) {
+          classOf[MutableColumnarRow].getName
+        } else {
+          "UnsafeRow"
+        }
+        s"""
+           |UnsafeRow $unsafeRowBuffer = null;
+           |$fastRowType $fastRowBuffer = null;
+         """.stripMargin
+      } else {
+        s"UnsafeRow $unsafeRowBuffer = null;"
+      }
+      val declareBypassed = if (adaptivePartialAggEnabled) {
+        s"boolean $adaptiveRowBypassedTerm = false;"
+      } else {
+        ""
+      }
+      s"""
+         |$declareBuffers
+         |$declareBypassed
+       """.stripMargin
+    }
 
     // We try to do hash map based in-memory aggregation first. If there is not enough memory (the
     // hash map will return null for new key), we spill the hash map to disk to free memory, then
     // continue to do in-memory aggregation and spilling until all the rows had been processed.
     // Finally, sort the spilled aggregate buffers by key, and merge them together for same key.
+    //
+    // With adaptive partial aggregation, once pass-through is active `updateRowInHashMap` fills the
+    // single-row buffer built above; we then emit `key ++ buffer` straight to the parent so the row
+    // skips both the fast map and the regular map.
+    //
+    // The maps were frozen when pass-through fired, so a group can straddle the freeze and hold
+    // both a map buffer and pass-through buffers. The downstream Final merges in emit order, so
+    // every map buffer must precede the pass-through buffers of the same group. We hold each
+    // passed-through row in a queue behind the maps: the row is queued as a copy, and queuing it
+    // advances the map output by one row. That one appended map row is what makes `shouldStop()`
+    // true, so a child that honours the check yields at the end of its batch and never queues more
+    // than one row; a one-to-many child that cannot yield mid-fan-out queues its whole batch at
+    // once, bounding the queue by the batch width. The map drains one row per queued row (the same
+    // cadence the 1:1 shape already uses), and once the maps are fully drained the queue is
+    // flushed, so the maps always precede the held rows. Fused with the Final, nothing is
+    // buffered, `shouldStop()` never fires, and the single output call drains the whole map before
+    // the held row follows.
+    val handlePassThroughRow = if (adaptivePartialAggEnabled) {
+      val numPassthroughRows = metricTerm(ctx, "numPassthroughRows")
+      s"""
+         |if ($adaptiveRowBypassedTerm) {
+         |  $numPassthroughRows.add(1);
+         |  if ($adaptiveMapOutputDoneTerm) {
+         |    $outputFunc(${unsafeRowKeyCode.value}, $unsafeRowBuffer);
+         |  } else {
+         |    $adaptivePendingRowsTerm.add(new UnsafeRow[] {
+         |      ${unsafeRowKeyCode.value}.copy(), $unsafeRowBuffer.copy() });
+         |    $adaptiveOutputMapAndFlushFuncName();
+         |  }
+         |}
+       """.stripMargin
+    } else {
+      ""
+    }
     s"""
-     UnsafeRow $unsafeRowBuffer = null;
-     org.apache.spark.sql.execution.vectorized.ColumnarBatch.Row $vectorizedRowBuffer = null;
-
-     ${findOrInsertInVectorizedHashMap.getOrElse("")}
-
-     $findOrInsertInUnsafeRowMap
-
-     $incCounter
-
-     if ($vectorizedRowBuffer != null) {
-       // update vectorized row
-       ${updateRowInVectorizedHashMap.getOrElse("")}
-     } else {
-       // update unsafe row
-       $updateRowInUnsafeRowMap
-     }
-     """
+       |$declareRowBuffer
+       |$findOrInsertHashMap
+       |$incCounter
+       |$updateRowInHashMap
+       |$handlePassThroughRow
+     """.stripMargin
   }
 
-  override def verboseString: String = toString(verbose = true)
+  override def verboseString(maxFields: Int): String = toString(verbose = true, maxFields)
 
-  override def simpleString: String = toString(verbose = false)
+  override def simpleString(maxFields: Int): String = toString(verbose = false, maxFields)
 
-  private def toString(verbose: Boolean): String = {
+  private def toString(verbose: Boolean, maxFields: Int): String = {
     val allAggregateExpressions = aggregateExpressions
 
     testFallbackStartsAt match {
       case None =>
-        val keyString = Utils.truncatedString(groupingExpressions, "[", ", ", "]")
-        val functionString = Utils.truncatedString(allAggregateExpressions, "[", ", ", "]")
-        val outputString = Utils.truncatedString(output, "[", ", ", "]")
+        val keyString = truncatedString(groupingExpressions, "[", ", ", "]", maxFields)
+        val functionString = truncatedString(allAggregateExpressions, "[", ", ", "]", maxFields)
+        val outputString = truncatedString(output, "[", ", ", "]", maxFields)
         if (verbose) {
           s"HashAggregate(keys=$keyString, functions=$functionString, output=$outputString)"
         } else {
@@ -787,11 +1429,30 @@ case class HashAggregateExec(
           s"$allAggregateExpressions $resultExpressions fallbackStartsAt=$fallbackStartsAt"
     }
   }
+
+  override protected def withNewChildInternal(newChild: SparkPlan): HashAggregateExec =
+    copy(child = newChild)
 }
 
 object HashAggregateExec {
-  def supportsAggregate(aggregateBufferAttributes: Seq[Attribute]): Boolean = {
-    val aggregationBufferSchema = StructType.fromAttributes(aggregateBufferAttributes)
-    UnsafeFixedWidthAggregationMap.supportsAggregationBufferSchema(aggregationBufferSchema)
+  /**
+   * Spills the in-memory hash map to disk and returns the sorter holding the spilled data. Called
+   * by the generated code of [[HashAggregateExec]] (through the static forwarder) when a buffer
+   * cannot be allocated from the hash map: the first spill destructs the map into a new sorter, and
+   * later spills merge into the existing one. Returning the sorter lets the generated code keep it
+   * in a single mutable field.
+   *
+   * Extracting this type-independent spill machinery into a shared helper keeps it compiled once
+   * per JVM instead of being re-emitted into every HashAggregateExec stage's generated code.
+   */
+  def spillHashMapToSorter(
+      hashMap: UnsafeFixedWidthAggregationMap,
+      sorter: UnsafeKVExternalSorter): UnsafeKVExternalSorter = {
+    if (sorter == null) {
+      hashMap.destructAndCreateExternalSorter()
+    } else {
+      sorter.merge(hashMap.destructAndCreateExternalSorter())
+      sorter
+    }
   }
 }

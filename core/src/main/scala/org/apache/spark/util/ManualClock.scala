@@ -17,26 +17,30 @@
 
 package org.apache.spark.util
 
+import java.util.concurrent.TimeUnit
+
 /**
  * A `Clock` whose time can be manually set and modified. Its reported time does not change
  * as time elapses, but only as its time is modified by callers. This is mainly useful for
  * testing.
  *
+ * For this implementation, `getTimeMillis()` and `nanoTime()` always return the same value
+ * (adjusted for the correct unit).
+ *
  * @param time initial time (in milliseconds since the epoch)
  */
 private[spark] class ManualClock(private var time: Long) extends Clock {
-
-  private var _isWaiting = false
 
   /**
    * @return `ManualClock` with initial time 0
    */
   def this() = this(0L)
 
-  def getTimeMillis(): Long =
-    synchronized {
-      time
-    }
+  override def getTimeMillis(): Long = synchronized {
+    time
+  }
+
+  override def nanoTime(): Long = TimeUnit.MILLISECONDS.toNanos(getTimeMillis())
 
   /**
    * @param timeToSet new time (in milliseconds) that the clock should represent
@@ -58,20 +62,10 @@ private[spark] class ManualClock(private var time: Long) extends Clock {
    * @param targetTime block until the clock time is set or advanced to at least this time
    * @return current time reported by the clock when waiting finishes
    */
-  def waitTillTime(targetTime: Long): Long = synchronized {
-    _isWaiting = true
-    try {
-      while (time < targetTime) {
-        wait(10)
-      }
-      getTimeMillis()
-    } finally {
-      _isWaiting = false
+  override def waitTillTime(targetTime: Long): Long = synchronized {
+    while (time < targetTime) {
+      wait(10)
     }
+    getTimeMillis()
   }
-
-  /**
-   * Returns whether there is any thread being blocked in `waitTillTime`.
-   */
-  def isWaiting: Boolean = synchronized { _isWaiting }
 }

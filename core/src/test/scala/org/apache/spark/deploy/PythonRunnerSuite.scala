@@ -17,7 +17,10 @@
 
 package org.apache.spark.deploy
 
-import org.apache.spark.SparkFunSuite
+import java.io.File
+
+import org.apache.spark.{SparkFunSuite, SparkThrowable}
+import org.apache.spark.api.python.{PythonErrorUtils, PythonUtils}
 import org.apache.spark.util.Utils
 
 class PythonRunnerSuite extends SparkFunSuite {
@@ -63,5 +66,47 @@ class PythonRunnerSuite extends SparkFunSuite {
     intercept[IllegalArgumentException] { PythonRunner.formatPaths("two,three,four:five:six") }
     intercept[IllegalArgumentException] { PythonRunner.formatPaths("hdfs:/some.py,foo.py") }
     intercept[IllegalArgumentException] { PythonRunner.formatPaths("foo.py,hdfs:/some.py") }
+  }
+
+  // Test the paths Spark itself adds to the PYTHONPATH
+  test("SPARK-60855: sparkPythonPath should only contain the zips under SPARK_HOME") {
+    val sparkPythonPath = PythonUtils.sparkPythonPath
+    // Spark's jars contain no Python code, so the jar containing PythonUtils must not be added.
+    // SBT loads PythonUtils from the spark-core jar, which makes this catch it being added back.
+    assert(!sparkPythonPath.split(File.pathSeparator).exists(_.endsWith(".jar")), sparkPythonPath)
+    // Compare the whole string, so that an empty entry, which Python reads as the current
+    // directory, also fails. It is empty when SPARK_HOME is unset.
+    val expected = sys.env.get("SPARK_HOME").toSeq.flatMap { sparkHome =>
+      Seq("pyspark.zip", PythonUtils.PY4J_ZIP_NAME)
+        .map(name => Seq(sparkHome, "python", "lib", name).mkString(File.separator))
+    }
+    assert(sparkPythonPath === expected.mkString(File.pathSeparator))
+  }
+
+  test("SPARK-54052: PythonErrorUtils should have corresponding methods in SparkThrowable") {
+    // Find default methods in SparkThrowable
+    val defaultMethods = classOf[SparkThrowable]
+      .getMethods
+      .filter(m => m.getDeclaringClass == classOf[SparkThrowable])
+      .map(_.getName)
+      .toSet
+
+    // Find methods defined in PythonErrorUtils object
+    val utilsMethods = PythonErrorUtils.getClass
+      .getDeclaredMethods
+      .filterNot(_.isSynthetic)
+      .map(_.getName)
+      .filterNot(_.contains("$"))
+      .toSet
+
+    // Compare
+    assert(
+      utilsMethods == defaultMethods,
+      s"""
+         |PythonErrorUtils methods and SparkThrowable default methods differ!
+         |Missing in PythonErrorUtils: ${defaultMethods.diff(utilsMethods).mkString(", ")}
+         |Extra in PythonErrorUtils: ${utilsMethods.diff(defaultMethods).mkString(", ")}
+         |""".stripMargin
+    )
   }
 }

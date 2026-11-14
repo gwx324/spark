@@ -17,33 +17,32 @@
 
 package org.apache.spark.ml.classification
 
-import com.github.fommil.netlib.BLAS.{getInstance => blas}
 import org.json4s.{DefaultFormats, JObject}
 import org.json4s.JsonDSL._
 
 import org.apache.spark.annotation.Since
 import org.apache.spark.internal.Logging
-import org.apache.spark.ml.{PredictionModel, Predictor}
-import org.apache.spark.ml.feature.LabeledPoint
-import org.apache.spark.ml.linalg.Vector
+import org.apache.spark.ml.linalg.{DenseVector, SparseVector, Vector, Vectors}
 import org.apache.spark.ml.param.ParamMap
 import org.apache.spark.ml.regression.DecisionTreeRegressionModel
 import org.apache.spark.ml.tree._
 import org.apache.spark.ml.tree.impl.GradientBoostedTrees
 import org.apache.spark.ml.util._
+import org.apache.spark.ml.util.DatasetUtils.extractInstances
 import org.apache.spark.ml.util.DefaultParamsReader.Metadata
+import org.apache.spark.ml.util.Instrumentation.instrumented
 import org.apache.spark.mllib.tree.configuration.{Algo => OldAlgo}
+import org.apache.spark.mllib.tree.loss.{ClassificationLoss => OldClassificationLoss}
 import org.apache.spark.mllib.tree.model.{GradientBoostedTreesModel => OldGBTModel}
-import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.{DataFrame, Dataset, Row}
+import org.apache.spark.sql._
 import org.apache.spark.sql.functions._
-import org.apache.spark.sql.types.DoubleType
+import org.apache.spark.sql.types.StructType
+import org.apache.spark.storage.StorageLevel
 
 /**
  * Gradient-Boosted Trees (GBTs) (http://en.wikipedia.org/wiki/Gradient_boosting)
  * learning algorithm for classification.
  * It supports binary labels, as well as both continuous and categorical features.
- * Note: Multiclass labels are not currently supported.
  *
  * The implementation is based upon: J.H. Friedman. "Stochastic Gradient Boosting." 1999.
  *
@@ -54,11 +53,13 @@ import org.apache.spark.sql.types.DoubleType
  *    based on the loss function, whereas the original gradient boosting method does not.
  *  - We expect to implement TreeBoost in the future:
  *    [https://issues.apache.org/jira/browse/SPARK-4240]
+ *
+ * @note Multiclass labels are not currently supported.
  */
 @Since("1.4.0")
 class GBTClassifier @Since("1.4.0") (
     @Since("1.4.0") override val uid: String)
-  extends Predictor[Vector, GBTClassifier, GBTClassificationModel]
+  extends ProbabilisticClassifier[Vector, GBTClassifier, GBTClassificationModel]
   with GBTClassifierParams with DefaultParamsWritable with Logging {
 
   @Since("1.4.0")
@@ -68,53 +69,86 @@ class GBTClassifier @Since("1.4.0") (
 
   // Parameters from TreeClassifierParams:
 
+  /** @group setParam */
   @Since("1.4.0")
-  override def setMaxDepth(value: Int): this.type = super.setMaxDepth(value)
+  def setMaxDepth(value: Int): this.type = set(maxDepth, value)
 
+  /** @group setParam */
   @Since("1.4.0")
-  override def setMaxBins(value: Int): this.type = super.setMaxBins(value)
+  def setMaxBins(value: Int): this.type = set(maxBins, value)
 
+  /** @group setParam */
   @Since("1.4.0")
-  override def setMinInstancesPerNode(value: Int): this.type =
-    super.setMinInstancesPerNode(value)
+  def setMinInstancesPerNode(value: Int): this.type = set(minInstancesPerNode, value)
 
-  @Since("1.4.0")
-  override def setMinInfoGain(value: Double): this.type = super.setMinInfoGain(value)
+  /** @group setParam */
+  @Since("3.0.0")
+  def setMinWeightFractionPerNode(value: Double): this.type = set(minWeightFractionPerNode, value)
 
+  /** @group setParam */
   @Since("1.4.0")
-  override def setMaxMemoryInMB(value: Int): this.type = super.setMaxMemoryInMB(value)
+  def setMinInfoGain(value: Double): this.type = set(minInfoGain, value)
 
+  /** @group expertSetParam */
   @Since("1.4.0")
-  override def setCacheNodeIds(value: Boolean): this.type = super.setCacheNodeIds(value)
+  def setMaxMemoryInMB(value: Int): this.type = set(maxMemoryInMB, value)
 
+  /** @group expertSetParam */
   @Since("1.4.0")
-  override def setCheckpointInterval(value: Int): this.type = super.setCheckpointInterval(value)
+  def setCacheNodeIds(value: Boolean): this.type = set(cacheNodeIds, value)
+
+  /**
+   * Specifies how often to checkpoint the cached node IDs.
+   * E.g. 10 means that the cache will get checkpointed every 10 iterations.
+   * This is only used if cacheNodeIds is true and if the checkpoint directory is set in
+   * [[org.apache.spark.SparkContext]].
+   * Must be at least 1.
+   * (default = 10)
+   * @group setParam
+   */
+  @Since("1.4.0")
+  def setCheckpointInterval(value: Int): this.type = set(checkpointInterval, value)
+
+  /** @group expertSetParam */
+  @Since("4.4.0")
+  def setIntermediateStorageLevel(value: String): this.type = set(intermediateStorageLevel, value)
 
   /**
    * The impurity setting is ignored for GBT models.
    * Individual trees are built using impurity "Variance."
+   *
+   * @group setParam
    */
   @Since("1.4.0")
-  override def setImpurity(value: String): this.type = {
+  def setImpurity(value: String): this.type = {
     logWarning("GBTClassifier.setImpurity should NOT be used")
     this
   }
 
   // Parameters from TreeEnsembleParams:
 
+  /** @group setParam */
   @Since("1.4.0")
-  override def setSubsamplingRate(value: Double): this.type = super.setSubsamplingRate(value)
+  def setSubsamplingRate(value: Double): this.type = set(subsamplingRate, value)
 
+  /** @group setParam */
   @Since("1.4.0")
-  override def setSeed(value: Long): this.type = super.setSeed(value)
+  def setSeed(value: Long): this.type = set(seed, value)
 
   // Parameters from GBTParams:
 
+  /** @group setParam */
   @Since("1.4.0")
-  override def setMaxIter(value: Int): this.type = super.setMaxIter(value)
+  def setMaxIter(value: Int): this.type = set(maxIter, value)
 
+  /** @group setParam */
   @Since("1.4.0")
-  override def setStepSize(value: Double): this.type = super.setStepSize(value)
+  def setStepSize(value: Double): this.type = set(stepSize, value)
+
+  /** @group setParam */
+  @Since("2.3.0")
+  def setFeatureSubsetStrategy(value: String): this.type =
+    set(featureSubsetStrategy, value)
 
   // Parameters from GBTClassifierParams:
 
@@ -122,23 +156,63 @@ class GBTClassifier @Since("1.4.0") (
   @Since("1.4.0")
   def setLossType(value: String): this.type = set(lossType, value)
 
-  override protected def train(dataset: Dataset[_]): GBTClassificationModel = {
-    val categoricalFeatures: Map[Int, Int] =
-      MetadataUtils.getCategoricalFeatures(dataset.schema($(featuresCol)))
-    // We copy and modify this from Classifier.extractLabeledPoints since GBT only supports
-    // 2 classes now.  This lets us provide a more precise error message.
-    val oldDataset: RDD[LabeledPoint] =
-      dataset.select(col($(labelCol)).cast(DoubleType), col($(featuresCol))).rdd.map {
-        case Row(label: Double, features: Vector) =>
-          require(label == 0 || label == 1, s"GBTClassifier was given" +
-            s" dataset with invalid label $label.  Labels must be in {0,1}; note that" +
-            s" GBTClassifier currently only supports binary classification.")
-          LabeledPoint(label, features)
-      }
-    val numFeatures = oldDataset.first().features.size
+  /** @group setParam */
+  @Since("2.4.0")
+  def setValidationIndicatorCol(value: String): this.type = {
+    set(validationIndicatorCol, value)
+  }
+
+  /**
+   * Sets the value of param [[weightCol]].
+   * If this is not set or empty, we treat all instance weights as 1.0.
+   * By default the weightCol is not set, so all instances have weight 1.0.
+   *
+   * @group setParam
+   */
+  @Since("3.0.0")
+  def setWeightCol(value: String): this.type = set(weightCol, value)
+
+  override protected def train(
+      dataset: Dataset[_]): GBTClassificationModel = instrumented { instr =>
+    val withValidation = isDefined(validationIndicatorCol) && $(validationIndicatorCol).nonEmpty
+    val (trainDataset, validationDataset) = if (withValidation) {
+      (extractInstances(this, dataset.filter(not(col($(validationIndicatorCol)))), Some(2)),
+        extractInstances(this, dataset.filter(col($(validationIndicatorCol))), Some(2)))
+    } else {
+      (extractInstances(this, dataset, Some(2)), null)
+    }
+
+    val numClasses = 2
+    if (isDefined(thresholds)) {
+      require($(thresholds).length == numClasses, this.getClass.getSimpleName +
+        ".train() called with non-matching numClasses and thresholds.length." +
+        s" numClasses=$numClasses, but thresholds has length ${$(thresholds).length}")
+    }
+
+    instr.logPipelineStage(this)
+    instr.logDataset(dataset)
+    instr.logParams(this, labelCol, weightCol, featuresCol, predictionCol, leafCol,
+      impurity, lossType, maxDepth, maxBins, maxIter, maxMemoryInMB, minInfoGain,
+      minInstancesPerNode, minWeightFractionPerNode, seed, stepSize, subsamplingRate, cacheNodeIds,
+      checkpointInterval, featureSubsetStrategy, validationIndicatorCol, validationTol,
+      thresholds, intermediateStorageLevel)
+    instr.logNumClasses(numClasses)
+
+    val categoricalFeatures = MetadataUtils.getCategoricalFeatures(dataset.schema($(featuresCol)))
     val boostingStrategy = super.getOldBoostingStrategy(categoricalFeatures, OldAlgo.Classification)
-    val (baseLearners, learnerWeights) = GradientBoostedTrees.run(oldDataset, boostingStrategy,
-      $(seed))
+    val storageLevel = StorageLevel.fromString($(intermediateStorageLevel))
+    val (baseLearners, learnerWeights) = if (withValidation) {
+      GradientBoostedTrees.runWithValidation(trainDataset, validationDataset, boostingStrategy,
+        $(seed), $(featureSubsetStrategy), Some(instr), storageLevel)
+    } else {
+      GradientBoostedTrees.run(trainDataset, boostingStrategy, $(seed), $(featureSubsetStrategy),
+        Some(instr), storageLevel)
+    }
+    baseLearners.foreach(copyValues(_))
+
+    val numFeatures = baseLearners.head.numFeatures
+    instr.logNumFeatures(numFeatures)
+
     new GBTClassificationModel(uid, baseLearners, learnerWeights, numFeatures)
   }
 
@@ -161,18 +235,20 @@ object GBTClassifier extends DefaultParamsReadable[GBTClassifier] {
  * Gradient-Boosted Trees (GBTs) (http://en.wikipedia.org/wiki/Gradient_boosting)
  * model for classification.
  * It supports binary labels, as well as both continuous and categorical features.
- * Note: Multiclass labels are not currently supported.
  *
  * @param _trees  Decision trees in the ensemble.
  * @param _treeWeights  Weights for the decision trees in the ensemble.
+ *
+ * @note Multiclass labels are not currently supported.
  */
 @Since("1.6.0")
 class GBTClassificationModel private[ml](
     @Since("1.6.0") override val uid: String,
     private val _trees: Array[DecisionTreeRegressionModel],
     private val _treeWeights: Array[Double],
-    @Since("1.6.0") override val numFeatures: Int)
-  extends PredictionModel[Vector, GBTClassificationModel]
+    @Since("1.6.0") override val numFeatures: Int,
+    @Since("2.2.0") override val numClasses: Int)
+  extends ProbabilisticClassificationModel[Vector, GBTClassificationModel]
   with GBTClassifierParams with TreeEnsembleModel[DecisionTreeRegressionModel]
   with MLWritable with Serializable {
 
@@ -185,45 +261,164 @@ class GBTClassificationModel private[ml](
    *
    * @param _trees  Decision trees in the ensemble.
    * @param _treeWeights  Weights for the decision trees in the ensemble.
+   * @param numFeatures  The number of features.
+   */
+  private[ml] def this(
+      uid: String,
+      _trees: Array[DecisionTreeRegressionModel],
+      _treeWeights: Array[Double],
+      numFeatures: Int) =
+  this(uid, _trees, _treeWeights, numFeatures, 2)
+
+  /**
+   * Construct a GBTClassificationModel
+   *
+   * @param _trees  Decision trees in the ensemble.
+   * @param _treeWeights  Weights for the decision trees in the ensemble.
    */
   @Since("1.6.0")
   def this(uid: String, _trees: Array[DecisionTreeRegressionModel], _treeWeights: Array[Double]) =
-    this(uid, _trees, _treeWeights, -1)
+    this(uid, _trees, _treeWeights, -1, 2)
+
+  // For ml connect only
+  private[ml] def this() = this("",
+    Array(new DecisionTreeRegressionModel), Array(Double.NaN), -1, -1)
+
+  private[spark] override def estimatedSize: Long = estimateMatadataSize + getEstimatedSize()
 
   @Since("1.4.0")
   override def trees: Array[DecisionTreeRegressionModel] = _trees
 
+  /**
+   * Number of trees in ensemble
+   */
+  @Since("2.0.0")
+  val getNumTrees: Int = trees.length
+
   @Since("1.4.0")
   override def treeWeights: Array[Double] = _treeWeights
 
-  override protected def transformImpl(dataset: Dataset[_]): DataFrame = {
-    val bcastModel = dataset.sparkSession.sparkContext.broadcast(this)
-    val predictUDF = udf { (features: Any) =>
-      bcastModel.value.predict(features.asInstanceOf[Vector])
+  @Since("1.6.0")
+  override def transformSchema(schema: StructType): StructType = {
+    var outputSchema = super.transformSchema(schema)
+    if ($(leafCol).nonEmpty) {
+      outputSchema = SchemaUtils.updateField(outputSchema, getLeafField($(leafCol)))
     }
-    dataset.withColumn($(predictionCol), predictUDF(col($(featuresCol))))
+    outputSchema
   }
 
-  override protected def predict(features: Vector): Double = {
-    // TODO: When we add a generic Boosting class, handle transform there?  SPARK-7129
-    // Classifies by thresholding sum of weighted tree predictions
-    val treePredictions = _trees.map(_.rootNode.predictImpl(features).prediction)
-    val prediction = blas.ddot(numTrees, treePredictions, 1, _treeWeights, 1)
-    if (prediction > 0.0) 1.0 else 0.0
+  override def transform(dataset: Dataset[_]): DataFrame = {
+    val outputSchema = transformSchema(dataset.schema, logging = true)
+
+    val outputData = super.transform(dataset)
+    if ($(leafCol).nonEmpty) {
+      val localRootNodes = _trees.map(_.rootNode)
+      val leafUDF = udf { features: Vector =>
+        TreeEnsembleModel.predictLeaf(features, localRootNodes)
+      }
+      outputData.withColumn($(leafCol), leafUDF(col($(featuresCol))),
+        outputSchema($(leafCol)).metadata)
+    } else {
+      outputData
+    }
   }
 
-  /** Number of trees in ensemble */
-  val numTrees: Int = trees.length
+  override protected def predictRawColumn(features: Column): Column = {
+    val localRootNodes = _trees.map(_.rootNode)
+    val localTreeWeights = _treeWeights.clone()
+    udf((features: Vector) =>
+      GBTClassificationModel.predictRaw(features, localRootNodes, localTreeWeights)
+    ).apply(features)
+  }
+
+  override protected def raw2probabilityColumn(rawPrediction: Column): Column = {
+    val localLoss = loss
+    udf((rawPrediction: Vector) =>
+      GBTClassificationModel.raw2probability(rawPrediction, localLoss)
+    ).apply(rawPrediction)
+  }
+
+  override protected def predictProbabilityColumn(features: Column): Column = {
+    val localRootNodes = _trees.map(_.rootNode)
+    val localTreeWeights = _treeWeights.clone()
+    val localLoss = loss
+    udf((features: Vector) => {
+      val rawPrediction =
+        GBTClassificationModel.predictRaw(features, localRootNodes, localTreeWeights)
+      GBTClassificationModel.raw2probability(rawPrediction, localLoss)
+    }).apply(features)
+  }
+
+  override protected def raw2predictionColumn(rawPrediction: Column): Column = {
+    if (isDefined(thresholds)) {
+      val localThresholds = getThresholds.clone()
+      val localLoss = loss
+      udf((rawPrediction: Vector) => {
+        val probability = GBTClassificationModel.raw2probability(rawPrediction, localLoss)
+        ProbabilisticClassificationModel.probability2prediction(probability, localThresholds)
+      }).apply(rawPrediction)
+    } else {
+      udf((rawPrediction: Vector) => rawPrediction.argmax.toDouble).apply(rawPrediction)
+    }
+  }
+
+  override protected def predictionColumn(features: Column): Column = {
+    val localRootNodes = _trees.map(_.rootNode)
+    val localTreeWeights = _treeWeights.clone()
+    if (isDefined(thresholds)) {
+      val localThresholds = getThresholds.clone()
+      val localLoss = loss
+      udf((features: Vector) => {
+        val rawPrediction =
+          GBTClassificationModel.predictRaw(features, localRootNodes, localTreeWeights)
+        val probability = GBTClassificationModel.raw2probability(rawPrediction, localLoss)
+        ProbabilisticClassificationModel.probability2prediction(probability, localThresholds)
+      }).apply(features)
+    } else {
+      udf((features: Vector) => {
+        val margin = TreeEnsembleModel.predictRaw(features, localRootNodes, localTreeWeights)
+        if (margin > 0.0) 1.0 else 0.0
+      }).apply(features)
+    }
+  }
+
+  override def predict(features: Vector): Double = {
+    // If thresholds defined, use predictRaw to get probabilities, otherwise use optimization
+    if (isDefined(thresholds)) {
+      super.predict(features)
+    } else {
+      if (TreeEnsembleModel.predictRaw(features, _trees, _treeWeights) > 0.0) 1.0 else 0.0
+    }
+  }
+
+  @Since("3.0.0")
+  override def predictRaw(features: Vector): Vector = {
+    val prediction = TreeEnsembleModel.predictRaw(features, _trees, _treeWeights)
+    Vectors.dense(Array(-prediction, prediction))
+  }
+
+  override protected def raw2probabilityInPlace(rawPrediction: Vector): Vector = {
+    rawPrediction match {
+      case dv: DenseVector =>
+        dv.values(0) = loss.computeProbability(dv.values(0))
+        dv.values(1) = 1.0 - dv.values(0)
+        dv
+      case sv: SparseVector =>
+        throw new RuntimeException("Unexpected error in GBTClassificationModel:" +
+          " raw2probabilityInPlace encountered SparseVector")
+    }
+  }
 
   @Since("1.4.0")
   override def copy(extra: ParamMap): GBTClassificationModel = {
-    copyValues(new GBTClassificationModel(uid, _trees, _treeWeights, numFeatures),
+    copyValues(new GBTClassificationModel(uid, _trees, _treeWeights, numFeatures, numClasses),
       extra).setParent(parent)
   }
 
   @Since("1.4.0")
   override def toString: String = {
-    s"GBTClassificationModel (uid=$uid) with $numTrees trees"
+    s"GBTClassificationModel: uid = $uid, numTrees=$getNumTrees, numClasses=$numClasses, " +
+      s"numFeatures=$numFeatures"
   }
 
   /**
@@ -233,15 +428,31 @@ class GBTClassificationModel private[ml](
    * The importance vector is normalized to sum to 1. This method is suggested by Hastie et al.
    * (Hastie, Tibshirani, Friedman. "The Elements of Statistical Learning, 2nd Edition." 2001.)
    * and follows the implementation from scikit-learn.
-
+   *
    * See `DecisionTreeClassificationModel.featureImportances`
    */
   @Since("2.0.0")
-  lazy val featureImportances: Vector = TreeEnsembleModel.featureImportances(trees, numFeatures)
+  lazy val featureImportances: Vector =
+    TreeEnsembleModel.featureImportances(trees, numFeatures, perTreeNormalization = false)
 
   /** (private[ml]) Convert to a model in the old API */
   private[ml] def toOld: OldGBTModel = {
     new OldGBTModel(OldAlgo.Classification, _trees.map(_.toOld), _treeWeights)
+  }
+
+  // hard coded loss, which is not meant to be changed in the model
+  private val loss = getOldLossType
+
+  /**
+   * Method to compute error or loss for every iteration of gradient boosting.
+   *
+   * @param dataset Dataset for validation.
+   */
+  @Since("2.4.0")
+  def evaluateEachIteration(dataset: Dataset[_]): Array[Double] = {
+    val data = extractInstances(this, dataset, Some(2))
+    GradientBoostedTrees.evaluateEachIteration(data, trees, treeWeights, loss,
+      OldAlgo.Classification)
   }
 
   @Since("2.0.0")
@@ -250,6 +461,26 @@ class GBTClassificationModel private[ml](
 
 @Since("2.0.0")
 object GBTClassificationModel extends MLReadable[GBTClassificationModel] {
+
+  private def predictRaw(
+      features: Vector,
+      rootNodes: Array[Node],
+      treeWeights: Array[Double]): Vector = {
+    val prediction = TreeEnsembleModel.predictRaw(features, rootNodes, treeWeights)
+    Vectors.dense(-prediction, prediction)
+  }
+
+  private def raw2probability(
+      rawPrediction: Vector,
+      loss: OldClassificationLoss): Vector = {
+    val probability = rawPrediction.copy.toDense
+    probability.values(0) = loss.computeProbability(probability.values(0))
+    probability.values(1) = 1.0 - probability.values(0)
+    probability
+  }
+
+  private val numFeaturesKey: String = "numFeatures"
+  private val numTreesKey: String = "numTrees"
 
   @Since("2.0.0")
   override def read: MLReader[GBTClassificationModel] = new GBTClassificationModelReader
@@ -263,8 +494,8 @@ object GBTClassificationModel extends MLReadable[GBTClassificationModel] {
     override protected def saveImpl(path: String): Unit = {
 
       val extraMetadata: JObject = Map(
-        "numFeatures" -> instance.numFeatures,
-        "numTrees" -> instance.getNumTrees)
+        numFeaturesKey -> instance.numFeatures,
+        numTreesKey -> instance.getNumTrees)
       EnsembleModelReadWrite.saveImpl(instance, path, sparkSession, extraMetadata)
     }
   }
@@ -279,20 +510,22 @@ object GBTClassificationModel extends MLReadable[GBTClassificationModel] {
       implicit val format = DefaultFormats
       val (metadata: Metadata, treesData: Array[(Metadata, Node)], treeWeights: Array[Double]) =
         EnsembleModelReadWrite.loadImpl(path, sparkSession, className, treeClassName)
-      val numFeatures = (metadata.metadata \ "numFeatures").extract[Int]
-      val numTrees = (metadata.metadata \ "numTrees").extract[Int]
+      val numFeatures = (metadata.metadata \ numFeaturesKey).extract[Int]
+      val numTrees = (metadata.metadata \ numTreesKey).extract[Int]
 
-      val trees: Array[DecisionTreeRegressionModel] = treesData.map {
+      val trees = treesData.map {
         case (treeMetadata, root) =>
-          val tree =
-            new DecisionTreeRegressionModel(treeMetadata.uid, root, numFeatures)
-          DefaultParamsReader.getAndSetParams(tree, treeMetadata)
+          val tree = new DecisionTreeRegressionModel(treeMetadata.uid, root, numFeatures)
+          treeMetadata.getAndSetParams(tree)
           tree
       }
       require(numTrees == trees.length, s"GBTClassificationModel.load expected $numTrees" +
         s" trees based on metadata but found ${trees.length} trees.")
-      val model = new GBTClassificationModel(metadata.uid, trees, treeWeights, numFeatures)
-      DefaultParamsReader.getAndSetParams(model, metadata)
+      val model = new GBTClassificationModel(metadata.uid,
+        trees, treeWeights, numFeatures)
+      // We ignore the impurity while loading models because in previous models it was wrongly
+      // set to gini (see SPARK-25959).
+      metadata.getAndSetParams(model, Some(List("impurity")))
       model
     }
   }
@@ -302,7 +535,8 @@ object GBTClassificationModel extends MLReadable[GBTClassificationModel] {
       oldModel: OldGBTModel,
       parent: GBTClassifier,
       categoricalFeatures: Map[Int, Int],
-      numFeatures: Int = -1): GBTClassificationModel = {
+      numFeatures: Int = -1,
+      numClasses: Int = 2): GBTClassificationModel = {
     require(oldModel.algo == OldAlgo.Classification, "Cannot convert GradientBoostedTreesModel" +
       s" with algo=${oldModel.algo} (old API) to GBTClassificationModel (new API).")
     val newTrees = oldModel.trees.map { tree =>
@@ -310,6 +544,6 @@ object GBTClassificationModel extends MLReadable[GBTClassificationModel] {
       DecisionTreeRegressionModel.fromOld(tree, null, categoricalFeatures)
     }
     val uid = if (parent != null) parent.uid else Identifiable.randomUID("gbtc")
-    new GBTClassificationModel(uid, newTrees, oldModel.treeWeights, numFeatures)
+    new GBTClassificationModel(uid, newTrees, oldModel.treeWeights, numFeatures, numClasses)
   }
 }

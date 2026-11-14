@@ -1,0 +1,78 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+# Publishes the status of each open PR's fork build as a `Build` check on the PR.
+# Fork builds still run in contributors' forks on push (build_main.yml); this
+# workflow only reports their results. Running on a schedule avoids
+# `pull_request_target` and needs no maintainer approval for fork PRs.
+#
+# Each pass synchronizes existing `Build` checks with their fork runs. Missing
+# checks are linked to the PR head's fork build, unless no run exists, the run was
+# skipped, or the PR is from fork master. Those cases get `action_required` guidance
+# after the registration grace period. Fork master is reserved for syncing upstream;
+# PR builds should use other branches. Existing run-linked checks remain supported,
+# including older master-branch builds. GitHub may delay or drop scheduled runs, so
+# neither the initial check nor result updates are immediate.
+
+name: Build Status
+
+on:
+  schedule:
+  # Quick sync: open PRs updated in the last QUICK_SYNC_LOOKBACK_DAYS (set in the script).
+  - cron: "*/10 * * * *"
+  # Full sync: all open PRs every 4 hours, between quick syncs and away from the busy top of
+  # the hour and midnight UTC, when GitHub delays or drops scheduled runs.
+  # FULL_SYNC below must match this schedule.
+  - cron: "35 2-22/4 * * *"
+
+# Passes do not overlap, so two passes cannot both create a missing Build check.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Update
+    if: github.repository == 'apache/spark'
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      checks: write
+      contents: read
+      pull-requests: read
+      statuses: read
+    steps:
+      - name: Checkout build status script
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/workflows/update_build_status.js
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Sync status updates
+        uses: actions/github-script@v9
+        env:
+          FULL_SYNC: ${{ github.event.schedule == '35 2-22/4 * * *' }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Retry server errors (including GraphQL timeouts) and 429s with a short backoff.
+          retries: 3
+          script: |
+            await require(process.env.GITHUB_WORKSPACE
+              + '/.github/workflows/update_build_status.js')({github, context, core})

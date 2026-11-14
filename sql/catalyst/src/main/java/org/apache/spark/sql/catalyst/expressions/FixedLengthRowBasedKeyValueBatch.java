@@ -46,6 +46,8 @@ public final class FixedLengthRowBasedKeyValueBatch extends RowBasedKeyValueBatc
   public UnsafeRow appendRow(Object kbase, long koff, int klen,
                              Object vbase, long voff, int vlen) {
     // if run out of max supported rows or page size, return null
+    assert(vlen == this.vlen);
+    assert(klen == this.klen);
     if (numRows >= capacity || page == null || page.size() - pageCursor < recordLength) {
       return null;
     }
@@ -62,7 +64,7 @@ public final class FixedLengthRowBasedKeyValueBatch extends RowBasedKeyValueBatc
 
     keyRowId = numRows;
     keyRow.pointTo(base, recordOffset, klen);
-    valueRow.pointTo(base, recordOffset + klen, vlen + 4);
+    valueRow.pointTo(base, recordOffset + klen, vlen);
     numRows++;
     return valueRow;
   }
@@ -95,7 +97,7 @@ public final class FixedLengthRowBasedKeyValueBatch extends RowBasedKeyValueBatc
       getKeyRow(rowId);
     }
     assert(rowId >= 0);
-    valueRow.pointTo(base, keyRow.getBaseOffset() + klen, vlen + 4);
+    valueRow.pointTo(base, keyRow.getBaseOffset() + klen, vlen);
     return valueRow;
   }
 
@@ -131,7 +133,7 @@ public final class FixedLengthRowBasedKeyValueBatch extends RowBasedKeyValueBatc
         }
 
         key.pointTo(base, offsetInPage, klen);
-        value.pointTo(base, offsetInPage + klen, vlen + 4);
+        value.pointTo(base, offsetInPage + klen, vlen);
 
         offsetInPage += recordLength;
         recordsInPage -= 1;
@@ -162,13 +164,13 @@ public final class FixedLengthRowBasedKeyValueBatch extends RowBasedKeyValueBatc
     };
   }
 
-  protected FixedLengthRowBasedKeyValueBatch(StructType keySchema, StructType valueSchema,
-                                             int maxRows, TaskMemoryManager manager) {
+  FixedLengthRowBasedKeyValueBatch(StructType keySchema, StructType valueSchema,
+      int maxRows, TaskMemoryManager manager) {
     super(keySchema, valueSchema, maxRows, manager);
-    klen = keySchema.defaultSize()
-            + UnsafeRow.calculateBitSetWidthInBytes(keySchema.length());
-    vlen = valueSchema.defaultSize()
-            + UnsafeRow.calculateBitSetWidthInBytes(valueSchema.length());
+    int keySize = keySchema.size() * 8; // each fixed-length field is stored in a 8-byte word
+    int valueSize = valueSchema.size() * 8;
+    klen = keySize + UnsafeRow.calculateBitSetWidthInBytes(keySchema.length());
+    vlen = valueSize + UnsafeRow.calculateBitSetWidthInBytes(valueSchema.length());
     recordLength = klen + vlen + 8;
   }
 }

@@ -17,23 +17,28 @@
 
 package org.apache.spark.ml.classification
 
-import scala.collection.JavaConverters._
+import java.io.{DataInputStream, DataOutputStream}
 
 import org.apache.hadoop.fs.Path
 
-import org.apache.spark.annotation.{Experimental, Since}
-import org.apache.spark.ml.{PredictionModel, Predictor, PredictorParams}
+import org.apache.spark.annotation.Since
 import org.apache.spark.ml.ann.{FeedForwardTopology, FeedForwardTrainer}
-import org.apache.spark.ml.feature.LabeledPoint
+import org.apache.spark.ml.feature.OneHotEncoderModel
 import org.apache.spark.ml.linalg.{Vector, Vectors}
 import org.apache.spark.ml.param._
-import org.apache.spark.ml.param.shared.{HasMaxIter, HasSeed, HasStepSize, HasTol}
+import org.apache.spark.ml.param.shared._
 import org.apache.spark.ml.util._
-import org.apache.spark.sql.Dataset
+import org.apache.spark.ml.util.DatasetUtils._
+import org.apache.spark.ml.util.Instrumentation.instrumented
+import org.apache.spark.sql._
+import org.apache.spark.util.VersionUtils.majorMinorVersion
 
 /** Params for Multilayer Perceptron. */
-private[classification] trait MultilayerPerceptronParams extends PredictorParams
-  with HasSeed with HasMaxIter with HasTol with HasStepSize {
+private[classification] trait MultilayerPerceptronParams extends ProbabilisticClassifierParams
+  with HasSeed with HasMaxIter with HasTol with HasStepSize with HasSolver with HasBlockSize {
+
+  import MultilayerPerceptronClassifier._
+
   /**
    * Layer sizes including input size and output size.
    *
@@ -51,26 +56,6 @@ private[classification] trait MultilayerPerceptronParams extends PredictorParams
   final def getLayers: Array[Int] = $(layers)
 
   /**
-   * Block size for stacking input data in matrices to speed up the computation.
-   * Data is stacked within partitions. If block size is more than remaining data in
-   * a partition then it is adjusted to the size of this data.
-   * Recommended size is between 10 and 1000.
-   * Default: 128
-   *
-   * @group expertParam
-   */
-  @Since("1.5.0")
-  final val blockSize: IntParam = new IntParam(this, "blockSize",
-    "Block size for stacking input data in matrices. Data is stacked within partitions." +
-      " If block size is more than remaining data in a partition then " +
-      "it is adjusted to the size of this data. Recommended size is between 10 and 1000",
-    ParamValidators.gt(0))
-
-  /** @group expertGetParam */
-  @Since("1.5.0")
-  final def getBlockSize: Int = $(blockSize)
-
-  /**
    * The solver algorithm for optimization.
    * Supported options: "gd" (minibatch gradient descent) or "l-bfgs".
    * Default: "l-bfgs"
@@ -78,14 +63,10 @@ private[classification] trait MultilayerPerceptronParams extends PredictorParams
    * @group expertParam
    */
   @Since("2.0.0")
-  final val solver: Param[String] = new Param[String](this, "solver",
+  final override val solver: Param[String] = new Param[String](this, "solver",
     "The solver algorithm for optimization. Supported options: " +
-      s"${MultilayerPerceptronClassifier.supportedSolvers.mkString(", ")}. (Default l-bfgs)",
-    ParamValidators.inArray[String](MultilayerPerceptronClassifier.supportedSolvers))
-
-  /** @group expertGetParam */
-  @Since("2.0.0")
-  final def getSolver: String = $(solver)
+      s"${supportedSolvers.mkString(", ")}. (Default l-bfgs)",
+    ParamValidators.inArray[String](supportedSolvers))
 
   /**
    * The initial weights of the model.
@@ -93,49 +74,18 @@ private[classification] trait MultilayerPerceptronParams extends PredictorParams
    * @group expertParam
    */
   @Since("2.0.0")
-  final val initialWeights: Param[Vector] = new Param[Vector](this, "initialWeights",
-    "The initial weights of the model")
+  final val initialWeights: Param[Vector] = new Param[Vector](this.uid, "initialWeights",
+    "The initial weights of the model", classOf[Vector])
 
   /** @group expertGetParam */
   @Since("2.0.0")
   final def getInitialWeights: Vector = $(initialWeights)
 
   setDefault(maxIter -> 100, tol -> 1e-6, blockSize -> 128,
-    solver -> MultilayerPerceptronClassifier.LBFGS, stepSize -> 0.03)
-}
-
-/** Label to vector converter. */
-private object LabelConverter {
-  // TODO: Use OneHotEncoder instead
-  /**
-   * Encodes a label as a vector.
-   * Returns a vector of given length with zeroes at all positions
-   * and value 1.0 at the position that corresponds to the label.
-   *
-   * @param labeledPoint labeled point
-   * @param labelCount total number of labels
-   * @return pair of features and vector encoding of a label
-   */
-  def encodeLabeledPoint(labeledPoint: LabeledPoint, labelCount: Int): (Vector, Vector) = {
-    val output = Array.fill(labelCount)(0.0)
-    output(labeledPoint.label.toInt) = 1.0
-    (labeledPoint.features, Vectors.dense(output))
-  }
-
-  /**
-   * Converts a vector to a label.
-   * Returns the position of the maximal element of a vector.
-   *
-   * @param output label encoded with a vector
-   * @return label
-   */
-  def decodeLabel(output: Vector): Double = {
-    output.argmax.toDouble
-  }
+    solver -> LBFGS, stepSize -> 0.03)
 }
 
 /**
- * :: Experimental ::
  * Classifier trainer based on the Multilayer Perceptron.
  * Each layer has sigmoid activation function, output layer has softmax.
  * Number of inputs has to be equal to the size of feature vectors.
@@ -143,10 +93,10 @@ private object LabelConverter {
  *
  */
 @Since("1.5.0")
-@Experimental
 class MultilayerPerceptronClassifier @Since("1.5.0") (
     @Since("1.5.0") override val uid: String)
-  extends Predictor[Vector, MultilayerPerceptronClassifier, MultilayerPerceptronClassificationModel]
+  extends ProbabilisticClassifier[Vector, MultilayerPerceptronClassifier,
+    MultilayerPerceptronClassificationModel]
   with MultilayerPerceptronParams with DefaultParamsWritable {
 
   @Since("1.5.0")
@@ -225,19 +175,51 @@ class MultilayerPerceptronClassifier @Since("1.5.0") (
   @Since("1.5.0")
   override def copy(extra: ParamMap): MultilayerPerceptronClassifier = defaultCopy(extra)
 
+  private[spark] override def estimateModelSize(dataset: Dataset[_]): Long = {
+    val topology = FeedForwardTopology.multiLayerPerceptron($(layers), softmaxOnTop = true)
+    val expectedWeightSize = topology.layers.map(_.weightSize).sum
+
+    var size = this.estimateMatadataSize
+    size += Vectors.getDenseSize(expectedWeightSize) // weights
+    size
+  }
+
   /**
    * Train a model using the given dataset and parameters.
-   * Developers can implement this instead of [[fit()]] to avoid dealing with schema validation
+   * Developers can implement this instead of `fit()` to avoid dealing with schema validation
    * and copying parameters into the model.
    *
    * @param dataset Training dataset
    * @return Fitted model
    */
-  override protected def train(dataset: Dataset[_]): MultilayerPerceptronClassificationModel = {
+  override protected def train(
+      dataset: Dataset[_]): MultilayerPerceptronClassificationModel = instrumented { instr =>
+    instr.logPipelineStage(this)
+    instr.logDataset(dataset)
+    instr.logParams(this, labelCol, featuresCol, predictionCol, rawPredictionCol, layers, maxIter,
+      tol, blockSize, solver, stepSize, seed, thresholds)
+
     val myLayers = $(layers)
     val labels = myLayers.last
-    val lpData = extractLabeledPoints(dataset)
-    val data = lpData.map(lp => LabelConverter.encodeLabeledPoint(lp, labels))
+    instr.logNumClasses(labels)
+    instr.logNumFeatures(myLayers.head)
+
+    val validated = dataset.select(
+      checkClassificationLabels($(labelCol), Some(labels)).as("_validated_label_"),
+      checkNonNanVectors($(featuresCol)).as("_validated_features_")
+    )
+
+    // One-hot encoding for labels using OneHotEncoderModel.
+    // As we already know the length of encoding, we skip fitting and directly create
+    // the model.
+    val encodedLabelCol = "_encoded" + $(labelCol)
+    val encodeModel = new OneHotEncoderModel(uid, Array(labels))
+      .setInputCols(Array("_validated_label_"))
+      .setOutputCols(Array(encodedLabelCol))
+      .setDropLast(false)
+    val encodedDataset = encodeModel.transform(validated)
+    val data = encodedDataset.select("_validated_features_", encodedLabelCol)
+      .rdd.map { case Row(features: Vector, encodedLabel: Vector) => (features, encodedLabel) }
     val topology = FeedForwardTopology.multiLayerPerceptron(myLayers, softmaxOnTop = true)
     val trainer = new FeedForwardTrainer(topology, myLayers(0), myLayers.last)
     if (isDefined(initialWeights)) {
@@ -259,8 +241,18 @@ class MultilayerPerceptronClassifier @Since("1.5.0") (
         s"The solver $solver is not supported by MultilayerPerceptronClassifier.")
     }
     trainer.setStackSize($(blockSize))
-    val mlpModel = trainer.train(data)
-    new MultilayerPerceptronClassificationModel(uid, myLayers, mlpModel.weights)
+    val (mlpModel, objectiveHistory) = trainer.train(data)
+    createModel(dataset, mlpModel.weights, objectiveHistory)
+  }
+
+  private def createModel(
+      dataset: Dataset[_],
+      weights: Vector,
+      objectiveHistory: Array[Double]): MultilayerPerceptronClassificationModel = {
+    val model = copyValues(new MultilayerPerceptronClassificationModel(uid, weights))
+
+    model.createSummary(dataset, objectiveHistory)
+    model
   }
 }
 
@@ -282,59 +274,141 @@ object MultilayerPerceptronClassifier
 }
 
 /**
- * :: Experimental ::
  * Classification model based on the Multilayer Perceptron.
  * Each layer has sigmoid activation function, output layer has softmax.
  *
  * @param uid uid
- * @param layers array of layer sizes including input and output layers
- * @param weights vector of initial weights for the model that consists of the weights of layers
- * @return prediction model
+ * @param weights the weights of layers
  */
 @Since("1.5.0")
-@Experimental
 class MultilayerPerceptronClassificationModel private[ml] (
     @Since("1.5.0") override val uid: String,
-    @Since("1.5.0") val layers: Array[Int],
     @Since("2.0.0") val weights: Vector)
-  extends PredictionModel[Vector, MultilayerPerceptronClassificationModel]
-  with Serializable with MLWritable {
+  extends ProbabilisticClassificationModel[Vector, MultilayerPerceptronClassificationModel]
+  with MultilayerPerceptronParams with Serializable with MLWritable
+  with HasTrainingSummary[MultilayerPerceptronClassificationTrainingSummary]{
+
+  // For ml connect only
+  private[ml] def this() = this("", Vectors.empty)
 
   @Since("1.6.0")
-  override val numFeatures: Int = layers.head
+  override lazy val numFeatures: Int = $(layers).head
 
-  private val mlpModel = FeedForwardTopology
-    .multiLayerPerceptron(layers, softmaxOnTop = true)
+  @transient private[ml] lazy val mlpModel = FeedForwardTopology
+    .multiLayerPerceptron($(layers), softmaxOnTop = true)
     .model(weights)
 
   /**
-   * Returns layers in a Java List.
+   * Gets summary of model on training set. An exception is thrown
+   * if `hasSummary` is false.
    */
-  private[ml] def javaLayers: java.util.List[Int] = {
-    layers.toList.asJava
+  @Since("3.1.0")
+  override def summary: MultilayerPerceptronClassificationTrainingSummary = super.summary
+
+  /**
+   * Evaluates the model on a test dataset.
+   *
+   * @param dataset Test dataset to evaluate model on.
+   */
+  @Since("3.1.0")
+  def evaluate(dataset: Dataset[_]): MultilayerPerceptronClassificationSummary = {
+    // Handle possible missing or invalid probability or prediction columns
+    val (summaryModel, _, predictionColName) = findSummaryModel()
+    new MultilayerPerceptronClassificationSummaryImpl(summaryModel.transform(dataset),
+      predictionColName, $(labelCol), "")
   }
 
   /**
    * Predict label for the given features.
-   * This internal method is used to implement [[transform()]] and output [[predictionCol]].
+   * This internal method is used to implement `transform()` and output [[predictionCol]].
    */
-  override protected def predict(features: Vector): Double = {
-    LabelConverter.decodeLabel(mlpModel.predict(features))
+  override def predict(features: Vector): Double = {
+    mlpModel.predict(features).argmax.toDouble
   }
 
   @Since("1.5.0")
   override def copy(extra: ParamMap): MultilayerPerceptronClassificationModel = {
-    copyValues(new MultilayerPerceptronClassificationModel(uid, layers, weights), extra)
+    val copied = new MultilayerPerceptronClassificationModel(uid, weights)
+      .setParent(parent)
+    copyValues(copied, extra)
+  }
+
+  private[spark] override def estimatedSize: Long = {
+    var size = this.estimateMatadataSize
+    if (this.weights != null) {
+      size += this.weights.getSizeInBytes
+    }
+    size
   }
 
   @Since("2.0.0")
   override def write: MLWriter =
     new MultilayerPerceptronClassificationModel.MultilayerPerceptronClassificationModelWriter(this)
+
+  override protected def raw2probabilityInPlace(rawPrediction: Vector): Vector = {
+    mlpModel.raw2ProbabilityInPlace(rawPrediction)
+  }
+
+  @Since("3.0.0")
+  override def predictRaw(features: Vector): Vector = mlpModel.predictRaw(features)
+
+  override def numClasses: Int = $(layers).last
+
+  @Since("3.0.0")
+  override def toString: String = {
+    s"MultilayerPerceptronClassificationModel: uid=$uid, numLayers=${$(layers).length}, " +
+      s"numClasses=$numClasses, numFeatures=$numFeatures"
+  }
+
+  private[spark] def createSummary(
+    dataset: Dataset[_], objectiveHistory: Array[Double]
+  ): Unit = {
+    val (summaryModel, _, predictionColName) = findSummaryModel()
+    val summary = new MultilayerPerceptronClassificationTrainingSummaryImpl(
+      summaryModel.transform(dataset),
+      predictionColName,
+      $(labelCol),
+      "",
+      objectiveHistory)
+    setSummary(Some(summary))
+  }
+
+  override private[spark] def saveSummary(path: String): Unit = {
+    ReadWriteUtils.saveObjectToLocal[Tuple1[Array[Double]]](
+      path, Tuple1(summary.objectiveHistory),
+      (data, dos) => {
+        ReadWriteUtils.serializeDoubleArray(data._1, dos)
+      }
+    )
+  }
+
+  override private[spark] def loadSummary(path: String, dataset: DataFrame): Unit = {
+    val Tuple1(objectiveHistory: Array[Double])
+    = ReadWriteUtils.loadObjectFromLocal[Tuple1[Array[Double]]](
+      path,
+      dis => {
+        Tuple1(ReadWriteUtils.deserializeDoubleArray(dis))
+      }
+    )
+    createSummary(dataset, objectiveHistory)
+  }
 }
 
 @Since("2.0.0")
 object MultilayerPerceptronClassificationModel
   extends MLReadable[MultilayerPerceptronClassificationModel] {
+  private[ml] case class Data(weights: Vector)
+
+  private[ml] def serializeData(data: Data, dos: DataOutputStream): Unit = {
+    import ReadWriteUtils._
+    serializeVector(data.weights, dos)
+  }
+
+  private[ml] def deserializeData(dis: DataInputStream): Data = {
+    import ReadWriteUtils._
+    val weights = deserializeVector(dis)
+    Data(weights)
+  }
 
   @Since("2.0.0")
   override def read: MLReader[MultilayerPerceptronClassificationModel] =
@@ -348,15 +422,13 @@ object MultilayerPerceptronClassificationModel
   class MultilayerPerceptronClassificationModelWriter(
       instance: MultilayerPerceptronClassificationModel) extends MLWriter {
 
-    private case class Data(layers: Array[Int], weights: Vector)
-
     override protected def saveImpl(path: String): Unit = {
       // Save metadata and Params
-      DefaultParamsWriter.saveMetadata(instance, path, sc)
-      // Save model data: layers, weights
-      val data = Data(instance.layers, instance.weights)
+      DefaultParamsWriter.saveMetadata(instance, path, sparkSession)
+      // Save model data: weights
+      val data = Data(instance.weights)
       val dataPath = new Path(path, "data").toString
-      sparkSession.createDataFrame(Seq(data)).repartition(1).write.parquet(dataPath)
+      ReadWriteUtils.saveObject[Data](dataPath, data, sparkSession, serializeData)
     }
   }
 
@@ -367,16 +439,71 @@ object MultilayerPerceptronClassificationModel
     private val className = classOf[MultilayerPerceptronClassificationModel].getName
 
     override def load(path: String): MultilayerPerceptronClassificationModel = {
-      val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
+      val metadata = DefaultParamsReader.loadMetadata(path, sparkSession, className)
+      val (majorVersion, _) = majorMinorVersion(metadata.sparkVersion)
 
       val dataPath = new Path(path, "data").toString
-      val data = sparkSession.read.parquet(dataPath).select("layers", "weights").head()
-      val layers = data.getAs[Seq[Int]](0).toArray
-      val weights = data.getAs[Vector](1)
-      val model = new MultilayerPerceptronClassificationModel(metadata.uid, layers, weights)
-
-      DefaultParamsReader.getAndSetParams(model, metadata)
+      val model = if (majorVersion < 3) { // model prior to 3.0.0
+        val df = sparkSession.read.parquet(dataPath)
+        val data = df.select("layers", "weights").head()
+        val layers = data.getAs[Seq[Int]](0).toArray
+        val weights = data.getAs[Vector](1)
+        val model = new MultilayerPerceptronClassificationModel(metadata.uid, weights)
+        model.set("layers", layers)
+      } else {
+        val data = ReadWriteUtils.loadObject[Data](dataPath, sparkSession, deserializeData)
+        new MultilayerPerceptronClassificationModel(metadata.uid, data.weights)
+      }
+      metadata.getAndSetParams(model)
       model
     }
   }
 }
+
+
+/**
+ * Abstraction for MultilayerPerceptronClassification results for a given model.
+ */
+sealed trait MultilayerPerceptronClassificationSummary extends ClassificationSummary
+
+/**
+ * Abstraction for MultilayerPerceptronClassification training results.
+ */
+sealed trait MultilayerPerceptronClassificationTrainingSummary
+  extends MultilayerPerceptronClassificationSummary with TrainingSummary
+
+/**
+ * MultilayerPerceptronClassification training results.
+ *
+ * @param predictions dataframe output by the model's `transform` method.
+ * @param predictionCol field in "predictions" which gives the prediction for a data instance as a
+ *                      double.
+ * @param labelCol field in "predictions" which gives the true label of each instance.
+ * @param weightCol field in "predictions" which gives the weight of each instance.
+ * @param objectiveHistory objective function (scaled loss + regularization) at each iteration.
+ */
+private class MultilayerPerceptronClassificationTrainingSummaryImpl(
+    predictions: DataFrame,
+    predictionCol: String,
+    labelCol: String,
+    weightCol: String,
+    override val objectiveHistory: Array[Double])
+  extends MultilayerPerceptronClassificationSummaryImpl(
+    predictions, predictionCol, labelCol, weightCol)
+    with MultilayerPerceptronClassificationTrainingSummary
+
+/**
+ * MultilayerPerceptronClassification results for a given model.
+ *
+ * @param predictions dataframe output by the model's `transform` method.
+ * @param predictionCol field in "predictions" which gives the prediction for a data instance as a
+ *                      double.
+ * @param labelCol field in "predictions" which gives the true label of each instance.
+ * @param weightCol field in "predictions" which gives the weight of each instance.
+ */
+private class MultilayerPerceptronClassificationSummaryImpl(
+    @transient override val predictions: DataFrame,
+    override val predictionCol: String,
+    override val labelCol: String,
+    override val weightCol: String)
+  extends MultilayerPerceptronClassificationSummary
